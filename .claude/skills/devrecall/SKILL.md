@@ -1,6 +1,6 @@
 ---
 name: devrecall
-description: Work on the DevRecall interview-prep repo. Use when continuing the build ("continue", "next track", "what's left"), writing or extending a track's questions, fact-checking/reviewing a track, adding app features, or running a mock interview from the repo's question bank.
+description: Work on the DevRecall interview-prep repo. Use when continuing the build ("continue", "next track", "what's left"), writing lessons (theory pages) or extending a track's questions, fact-checking/reviewing a track, adding app features, or running a mock interview from the repo's question bank.
 ---
 
 # DevRecall
@@ -19,6 +19,13 @@ State lives in files, not in chat history, so any new window can continue from t
 - Keep each track's `essentials:` list (8–10 must-know ids, priority order) current. Don't rename overview headings casually: `learn:` and `content/study-plans.yaml` reference them.
 - Big files: write in chunks (Write the first part, then append with a Bash heredoc), and validate after each chunk.
 - Run `npm run validate -- --track <id>` until it reports 0 errors and 0 warnings, then `npm run progress`, then add a Work log line (ISO date · what · next).
+
+## Mode: write lessons (current phase)
+- Follow `docs/CONTENT_GUIDE.md §9` exactly. The reference set is `content/lessons/13-sql-postgres/`, so match its depth and tone.
+- Next item: any lesson with `status: planned` first, then the next `todo` track in `PROGRESS.md › Lesson batches`.
+- For a new track: read the track YAML (overview + all questions), its `notionRefs` and its row in `../.claude/skills/senior-interview/references/notion-map.md`, then fetch those Notion pages and sub-pages **read-only** as a topic checklist. Write the outline as `planned` stubs (frontmatter + bullets) covering every question id, then write each lesson and flip it to `drafted`.
+- Parallelize by track (one agent per track within a batch). Each agent owns only `content/lessons/<its-track>/`; it reports Notion corrections back instead of editing `PROGRESS.md`.
+- Validate: `npm run validate -- --track <id>` must give 0 errors and 0 warnings, then `npm run progress` and a Work log line. At the end of a batch, run `npm run build` and render-check the Mermaid diagrams in a browser.
 
 ## Mode: review / fact-check a track
 - Read the track and check every `verify: true` item, and anything that looks off, against official docs. For Next.js, use `node_modules/next/dist/docs/`.

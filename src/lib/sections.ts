@@ -1,16 +1,25 @@
-// Splits a track overview into heading sections and links each question to the section(s) that teach it.
+// Splits a track overview (or a lesson) into heading sections and links each question to the section(s) that teach it.
 // Pure functions: shared by the server (content.ts), the scripts and the Markdown heading-id plugin.
 
 export type Section = {
-  /** Anchor id used on the track page (`/tracks/<slug>#<anchor>`). */
+  /** Anchor id used on the page (`/tracks/<slug>#<anchor>` or `/tracks/<slug>/learn/<lesson>#<anchor>`). */
   anchor: string;
+  /** Lesson slug when the section comes from a lesson; absent for the track overview. */
+  lesson?: string;
+  /** Lesson title, for link labels. */
+  lessonTitle?: string;
   title: string;
   depth: 2 | 3;
   /** Heading + body up to the next h2/h3, Markdown. */
   markdown: string;
 };
 
-export type LearnRef = { anchor: string; title: string };
+export type LearnRef = { anchor: string; title: string; lesson?: string; lessonTitle?: string };
+
+/** URL of a section: the track page or one of its lessons. */
+export function sectionHref(slug: string, ref: LearnRef): string {
+  return ref.lesson ? `/tracks/${slug}/learn/${ref.lesson}#${ref.anchor}` : `/tracks/${slug}#${ref.anchor}`;
+}
 
 /** Heading text → anchor. Strips Vietnamese diacritics and Markdown punctuation. */
 export function slugify(text: string): string {
@@ -36,7 +45,7 @@ export function anchorer() {
   };
 }
 
-export function splitSections(overview: string): Section[] {
+export function splitSections(overview: string, lesson?: { slug: string; title: string }): Section[] {
   const next = anchorer();
   const sections: Section[] = [];
   let current: Section | null = null;
@@ -51,6 +60,7 @@ export function splitSections(overview: string): Section[] {
     if (heading) {
       const title = heading[2].replace(/[*_`]/g, "");
       current = { anchor: next(title), title, depth: heading[1].length as 2 | 3, markdown: line };
+      if (lesson) Object.assign(current, { lesson: lesson.slug, lessonTitle: lesson.title });
       sections.push(current);
     } else if (current) {
       current.markdown += `\n${line}`;
@@ -68,7 +78,11 @@ const STOP = new Set(
   ),
 );
 /** Sections that summarise everything; never the best place to learn one specific idea. */
-const SKIP = new Set(["tl;dr", "tldr", "cheat sheet", "khung tra loi"]);
+const SKIP = new Set(["tl;dr", "tldr", "cheat sheet", "khung tra loi", "tom tat", "tu kiem tra"]);
+/** Lessons explain in prose, so they're the better place to learn; the overview is the summary. */
+const LESSON_BOOST = 1.2;
+/** The lesson lists this question in its `questions:` frontmatter. */
+const LISTED_BOOST = 1.6;
 
 function fold(text: string) {
   return text
@@ -150,13 +164,22 @@ function renderBlocks(blocks: Block[]): string {
   return parts.join("\n\n");
 }
 
-export type MatchInput = { q: string; hint: string; tags?: string[]; learn?: string };
+export type MatchInput = {
+  q: string;
+  hint: string;
+  tags?: string[];
+  /** Heading text, or `<lesson-slug>#<heading>` for a lesson section. */
+  learn?: string;
+  /** Slugs of lessons whose frontmatter lists this question. */
+  lessons?: string[];
+};
 export type LearnMatch = LearnRef & { excerpt?: string };
 
 /**
  * Returns up to `limit` sections most relevant to a question, best first. The first one carries an
  * `excerpt`: the few rows/bullets of that section that match best.
  * `learn` (heading text) on the question pins the section; the excerpt is still picked inside it.
+ * `sections` may mix the overview and lessons (see `Section.lesson`).
  */
 export function createMatcher(sections: Section[]) {
   const blocks = sections.flatMap((s, i) => (SKIP.has(fold(s.title).trim()) ? [] : blocksOf(s, i)));
@@ -183,6 +206,7 @@ export function createMatcher(sections: Section[]) {
     add(q.hint, 1);
     const k1 = 1.2;
     const b = 0.75;
+    const listed = new Set(q.lessons ?? []);
     const scored = docs
       .map((d) => {
         let score = 0;
@@ -191,12 +215,14 @@ export function createMatcher(sections: Section[]) {
           if (!f) continue;
           score += w * idf(t) * ((f * (k1 + 1)) / (f + k1 * (1 - b + (b * d.len) / avg)));
         }
+        const lesson = sections[d.b.section].lesson;
+        if (lesson) score *= listed.has(lesson) ? LISTED_BOOST : LESSON_BOOST;
         return { d, score };
       })
       .filter((x) => x.score > 0)
       .sort((a, c) => c.score - a.score);
 
-    const pinned = q.learn ? sections.findIndex((s) => fold(s.title).trim() === fold(q.learn!).trim()) : -1;
+    const pinned = q.learn ? findSection(sections, q.learn) : -1;
     const order: number[] = pinned >= 0 ? [pinned] : [];
     for (const x of scored) if (!order.includes(x.d.b.section)) order.push(x.d.b.section);
     if (!order.length) return [];
@@ -208,6 +234,7 @@ export function createMatcher(sections: Section[]) {
       if (rank > 0 && (inSection[0]?.score ?? 0) < best * 0.6) break;
       const s = sections[si];
       const ref: LearnMatch = { anchor: s.anchor, title: s.title };
+      if (s.lesson) Object.assign(ref, { lesson: s.lesson, lessonTitle: s.lessonTitle });
       if (rank === 0 && inSection.length) {
         const top = inSection[0].score;
         const picked = new Set(inSection.filter((x) => x.score >= top * 0.5).slice(0, 4).map((x) => x.d.b));
@@ -218,6 +245,20 @@ export function createMatcher(sections: Section[]) {
     }
     return refs;
   };
+}
+
+/**
+ * Index of the section a `learn` value names: `<lesson-slug>#<heading>` for a lesson, or a plain heading
+ * (overview first, then any lesson). -1 if none.
+ */
+export function findSection(sections: Section[], learn: string): number {
+  const hash = learn.indexOf("#");
+  const lesson = hash > 0 && /^[a-z0-9-]+$/.test(learn.slice(0, hash)) ? learn.slice(0, hash) : undefined;
+  const heading = fold(lesson ? learn.slice(hash + 1) : learn).trim();
+  const same = (s: Section) => fold(s.title).trim() === heading;
+  if (lesson) return sections.findIndex((s) => s.lesson === lesson && same(s));
+  const inOverview = sections.findIndex((s) => !s.lesson && same(s));
+  return inOverview >= 0 ? inOverview : sections.findIndex(same);
 }
 
 // --- Markdown plugin: give h2/h3 the same anchors -------------------------------------------

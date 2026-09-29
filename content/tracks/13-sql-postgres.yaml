@@ -877,7 +877,7 @@ questions:
       Ngay lập tức:
       - Tìm table già nhất: `SELECT relname, age(relfrozenxid) FROM pg_class WHERE relkind='r' ORDER BY 2 DESC`.
       - Gỡ thứ chặn freeze: transaction dài, replication slot cũ, prepared xact.
-      - Chạy `VACUUM (FREEZE, VERBOSE)` trên table đó (có thể cần tăng `maintenance_work_mem`, tắt cost delay).
+      - Chạy **`VACUUM` thường** (có thể thêm `VERBOSE`) trên table đó, tăng `maintenance_work_mem`, tắt cost delay. Docs khuyên **không** dùng `VACUUM FULL` (cần cấp xid) hay `VACUUM FREEZE` (làm nhiều việc hơn cần thiết) trong tình huống khẩn cấp này.
       Lâu dài: theo dõi `age(datfrozenxid)`; autovacuum anti-wraparound (`autovacuum_freeze_max_age`, mặc định 200M) không được bị chặn; alert ở ~50% ngưỡng.
     followUp: Why can an autovacuum "to prevent wraparound" not be cancelled like a normal autovacuum, and why does that matter during migrations?
     tags: [xid-wraparound, vacuum, scenario]

@@ -61,7 +61,7 @@ This is Markdown rendered above the questions. Structure:
 
 Headings become anchors (`sec-<slug>`) that questions and study plans link to, so **renaming a heading breaks `learn` and `study-plans.yaml` references**. The validator catches this. Put the teachable facts in table rows and bullets: that's what gets excerpted under a question as *Kiến thức liên quan*.
 
-Mermaid tips: use `flowchart TD/LR` or `sequenceDiagram`, and quote labels that contain special characters (`A["x < y"]`).
+Mermaid tips: use `flowchart TD/LR` or `sequenceDiagram`, and quote labels that contain special characters (`A["x < y"]`). In a `sequenceDiagram`, never put `;` in a message or note: it ends the statement and breaks the diagram.
 
 ## 7. Sources
 
@@ -73,3 +73,61 @@ Mermaid tips: use `flowchart TD/LR` or `sequenceDiagram`, and quote labels that 
 
 - A plan has days, and each day lists items `{ track, take?, read?, extra? }`. `take` is the first N `essentials` (default: all), `read` is overview headings (default: TL;DR + Cheat sheet), and `extra` is additional question ids.
 - The validator checks tracks, headings and ids. Keep each day at about 15–35 questions.
+
+## 9. Lessons (full theory pages)
+
+The `overview` is a summary. **Lessons are where the theory is taught.** Someone who has never seen the topic should be able to read a track's lessons in order and then answer its questions. The reference set is `content/lessons/13-sql-postgres/`.
+
+### Files & frontmatter
+
+- One file per lesson: `content/lessons/<track-id>/<NN-slug>.md`, for example `content/lessons/13-sql-postgres/03-indexes.md`. `NN` sets the order and `slug` is the URL (`/tracks/sql-postgres/learn/indexes`). **Don't rename a published slug**, because study plans and `learn:` refs point at it.
+- Frontmatter (zod `lessonFrontmatterSchema` in `src/lib/schema.ts`):
+
+```yaml
+---
+title: Indexes trong PostgreSQL        # Vietnamese or English, a specific name
+summary: B-tree hoạt động ra sao, composite/covering/partial index, và vì sao planner bỏ qua index.
+status: drafted                        # planned (stub, hidden) → drafted → reviewed (human fact-check)
+questions: [sql-postgres-003, sql-postgres-018]  # cards of THIS track that the lesson teaches (4–12)
+references:
+  - { title: "PostgreSQL docs: Indexes", url: "https://www.postgresql.org/docs/current/indexes.html" }
+notionRefs: []                         # personal notes, optional
+verify: true                           # the lesson has version-dependent/uncertain facts
+# noDiagram: true                      # only if no flow/structure is worth drawing
+---
+```
+
+- A **`planned` stub** is frontmatter plus the outline as bullets under each heading. Writing the outline first lets the next window continue exactly where the last one stopped.
+
+### Size & split
+
+- 5–10 lessons per track (broad tracks: 8–12), each **≥ 1,500 words on the validator's counter** (code excluded; it counts each Vietnamese syllable, so the numbers run high). The reference set lands at 3–6K per lesson; past ~6K, split it.
+- One lesson = one coherent idea a learner can finish in 10–20 minutes (e.g. "MVCC & VACUUM", not "Postgres internals"). Order lessons from foundations → mechanics → production.
+- Together, the lessons of a track should cover **every question** in the track. Each question id should appear in the `questions:` of at least one lesson. `npm run progress` shows "Qs linked".
+
+### Required outline (h2, in this order; the validator checks it)
+
+1. `## Bối cảnh & vấn đề`: the problem that exists without this; a concrete story or a failing example first.
+2. `## Khái niệm`: each concept as an `### h3` with 1–3 paragraphs of **explanation** (what it is, why it works that way) and a short example. Tables are fine as a recap *after* the prose, never as a replacement.
+3. `## Cơ chế hoạt động`: step by step, with **≥ 1 ```mermaid** diagram (flowchart / sequence / state). Explain the diagram in text too.
+4. `## Ví dụ thực tế`: at least one worked example with a runnable snippet **and its output** (SQL + result rows, a TS snippet + console output, a curl + response).
+5. `## Trade-offs & lựa chọn thay thế`: a comparison table plus "when to pick which" in prose.
+6. `## Edge cases & failure modes`: what breaks under load, bad input, crashes and concurrency.
+7. `## Pitfalls`: common mistakes as bullets: ❌ the wrong thing → ✅ the right thing, and why.
+8. `## Tóm tắt`: 5–8 bullets to review.
+
+Don't write `## Tự kiểm tra`: the page renders it from `questions:`. Extra `##` sections between these are allowed when the topic needs them (e.g. `## So sánh với SQL Server`).
+
+### Writing style: clear, complete and easy to understand
+
+- **Define before use.** The first time a term appears, explain it in one plain sentence. Don't assume the previous lesson was read in full; link to it instead (`[MVCC](/tracks/sql-postgres/learn/mvcc-vacuum#sec-...)`).
+- **Why before how.** Every mechanism answers "why is it designed this way?" and "what would go wrong otherwise?"
+- **One idea per paragraph**, 2–5 sentences. Use bold for the key term, not whole sentences.
+- **Concrete over abstract**: real numbers (8 KB page, 200 connections), real names (`pg_stat_activity`), and real error messages.
+- Vietnamese prose with English technical terms, as in the rest of the repo. Code in TypeScript, and SQL in the PostgreSQL dialect.
+- Connect to interviews: end key subsections with a short "**Interview angle:**" line saying what an interviewer probes here.
+
+### Sources
+
+- Official docs first (see §7). Use the author's Notion pages (see `notionRefs` and the Notion map) as a **topic checklist**: every topic they cover should appear in some lesson, **explained correctly**. When a note is wrong, follow the docs and log it in `PROGRESS.md › Notion corrections`.
+- Mark the lesson `verify: true` when it has version-dependent claims, and also say "(verify)" inline next to the specific claim.

@@ -23,3 +23,8 @@ export const LEVEL_LABELS: Record<Level, string> = {
   senior: "Senior probing",
   cv: "From real projects",
 };
+
+/** Reading time in minutes (~200 words per minute), at least 1. */
+export function readingMinutes(words: number): number {
+  return Math.max(1, Math.round(words / 200));
+}

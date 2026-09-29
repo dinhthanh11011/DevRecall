@@ -77,6 +77,19 @@ export function PlanDays({ days }: { days: Day[] }) {
                       <Link href={`/tracks/${item.slug}`} className="font-medium hover:underline">
                         {item.title}
                       </Link>
+                      {item.lessons.length > 0 && (
+                        <span className="text-xs text-zinc-500">
+                          📚 Bài học:{" "}
+                          {item.lessons.map((l, k) => (
+                            <span key={l.slug}>
+                              {k > 0 && " · "}
+                              <Link href={`/tracks/${item.slug}/learn/${l.slug}`} className="text-emerald-700 hover:underline dark:text-emerald-400">
+                                {l.title}
+                              </Link>
+                            </span>
+                          ))}
+                        </span>
+                      )}
                       {item.read.length > 0 && (
                         <span className="text-xs text-zinc-500">
                           Đọc:{" "}

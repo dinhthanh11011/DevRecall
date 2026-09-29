@@ -1,10 +1,11 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { getAllSlugs, getNeighbours, getTrack, getTrackData } from "@/lib/content";
+import { getAllSlugs, getLessons, getNeighbours, getTrack, getTrackData } from "@/lib/content";
+import { readingMinutes } from "@/lib/constants";
 import { Markdown } from "@/components/Markdown";
 import { QuestionList } from "@/components/QuestionList";
-import { StatusBadge } from "@/components/Badges";
+import { Chip, StatusBadge } from "@/components/Badges";
 import { TrackProgress } from "@/components/ProgressBar";
 
 export const dynamicParams = false;
@@ -25,6 +26,7 @@ export default async function TrackPage(props: PageProps<"/tracks/[slug]">) {
   const data = getTrackData(slug);
   if (!track || !data) notFound();
   const { prev, next } = getNeighbours(slug);
+  const lessons = getLessons(slug);
 
   return (
     <div className="space-y-10">
@@ -60,7 +62,40 @@ export default async function TrackPage(props: PageProps<"/tracks/[slug]">) {
         </div>
       </header>
 
+      {lessons.length > 0 && (
+        <section id="lessons" className="scroll-mt-16 space-y-3">
+          <div className="flex flex-wrap items-baseline justify-between gap-2">
+            <h2 className="text-2xl font-semibold">📚 Bài học</h2>
+            <span className="text-xs text-zinc-500">
+              {lessons.length} bài · ~{readingMinutes(lessons.reduce((n, l) => n + l.words, 0))} phút đọc. Học theo thứ tự, rồi làm câu hỏi.
+            </span>
+          </div>
+          <ol className="grid gap-3 sm:grid-cols-2">
+            {lessons.map((l) => (
+              <li key={l.slug}>
+                <Link
+                  href={`/tracks/${track.slug}/learn/${l.slug}`}
+                  className="block h-full rounded-xl border border-zinc-200 bg-white p-4 hover:border-sky-400 dark:border-zinc-800 dark:bg-zinc-900"
+                >
+                  <div className="mb-1 flex items-center gap-2 text-xs text-zinc-500">
+                    <span className="font-mono">{String(l.order).padStart(2, "0")}</span>
+                    <span>~{readingMinutes(l.words)} phút</span>
+                    {l.questions > 0 && <span>· {l.questions} câu</span>}
+                    {l.verify && <Chip>⚠ verify</Chip>}
+                  </div>
+                  <p className="font-medium">{l.title}</p>
+                  <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">{l.summary}</p>
+                </Link>
+              </li>
+            ))}
+          </ol>
+        </section>
+      )}
+
       <section className="rounded-xl border border-zinc-200 bg-white p-6 dark:border-zinc-800 dark:bg-zinc-900">
+        {lessons.length > 0 && (
+          <p className="mb-4 text-xs font-semibold uppercase tracking-wide text-zinc-500">Tóm tắt & cheat sheet của track</p>
+        )}
         <Markdown anchors>{track.overview}</Markdown>
       </section>
 

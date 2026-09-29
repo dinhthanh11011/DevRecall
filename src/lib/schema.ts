@@ -64,6 +64,48 @@ export const roadmapSchema = z.object({
   ),
 });
 
+/** Frontmatter of `content/lessons/<track-id>/<NN-slug>.md`. Slug and order come from the file name. */
+export const lessonFrontmatterSchema = z.object({
+  title: z.string().min(2),
+  /** One-line Vietnamese summary shown in the lesson list. */
+  summary: z.string().min(10),
+  status: z.enum(TRACK_STATUSES),
+  /** Question ids this lesson teaches; rendered as "Tự kiểm tra" and preferred by the learn matcher. */
+  questions: z.array(z.string()).default([]),
+  references: z.array(link).default([]),
+  notionRefs: z.array(link).default([]),
+  /** true = the lesson contains version-dependent or uncertain facts that need a human fact-check. */
+  verify: z.boolean().optional(),
+  /** The topic has no flow worth drawing; skips the mermaid requirement. */
+  noDiagram: z.boolean().optional(),
+});
+
+export type LessonFrontmatter = z.infer<typeof lessonFrontmatterSchema>;
+export type Lesson = LessonFrontmatter & {
+  /** File name without `NN-` and `.md`, e.g. `indexes`. Used in the URL. */
+  slug: string;
+  order: number;
+  trackId: string;
+  /** Markdown body (without frontmatter). */
+  body: string;
+  words: number;
+};
+
+/** Required h2 headings (in order) and size for a `drafted` lesson. */
+export const LESSON_TARGETS = {
+  minWords: 1500,
+  headings: [
+    "Bối cảnh & vấn đề",
+    "Khái niệm",
+    "Cơ chế hoạt động",
+    "Ví dụ thực tế",
+    "Trade-offs & lựa chọn thay thế",
+    "Edge cases & failure modes",
+    "Pitfalls",
+    "Tóm tắt",
+  ],
+} as const;
+
 const planItem = z.object({
   /** Track id (`NN-slug`). */
   track: z.string(),
@@ -73,6 +115,8 @@ const planItem = z.object({
   take: z.number().int().positive().optional(),
   /** Extra question ids on top of the essentials. */
   extra: z.array(z.string()).optional(),
+  /** Lesson slugs of this track to read (full theory). */
+  lessons: z.array(z.string()).optional(),
 });
 
 export const studyPlansSchema = z.object({

@@ -155,7 +155,7 @@ plans:
       - title: "Ngày 8 · SQL & PostgreSQL"
         goal: Index & planner, MVCC, isolation levels, locking, migration an toàn, connection pooling.
         items:
-          - { track: 13-sql-postgres, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+          - { track: 13-sql-postgres, read: [TL;DR, Cheat sheet], lessons: [btree-indexes, planner-explain, isolation-levels, mvcc-vacuum, locking-concurrency, connection-pooling, zero-downtime-migrations] }
       - title: "Ngày 9 · Multi-tenancy & NoSQL/Search"
         goal: Mô hình tenancy, RLS, tenant context; Elasticsearch mapping/query, DynamoDB key design.
         items:

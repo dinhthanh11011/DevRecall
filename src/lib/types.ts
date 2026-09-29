@@ -27,3 +27,8 @@ export type IndexEntry = {
   type: QuestionType;
   essential: boolean;
 };
+
+/** One row of `/search`: a question, or a lesson section (heading + snippet). */
+export type SearchEntry =
+  | { kind: "question"; id: string; slug: string; track: string; level: Level; q: string; tags: string[] }
+  | { kind: "lesson"; id: string; slug: string; track: string; href: string; title: string; snippet: string };

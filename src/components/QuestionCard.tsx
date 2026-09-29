@@ -67,7 +67,16 @@ export function Answer({ q }: { q: Question }) {
   );
 }
 
-export function QuestionCard({ q, index }: { q: RichQuestion; index: number }) {
+export function QuestionCard({
+  q,
+  index,
+  onTrackPage = true,
+}: {
+  q: RichQuestion;
+  index: number;
+  /** Rendered on the track page, so overview refs can link to `#anchor`. */
+  onTrackPage?: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const rating = useProgress()[q.id]?.r;
 
@@ -113,7 +122,7 @@ export function QuestionCard({ q, index }: { q: RichQuestion; index: number }) {
       {open && (
         <div className="space-y-4 border-t border-zinc-100 p-4 pl-9 dark:border-zinc-800">
           <Answer q={q} />
-          <LearnPanel refs={q.refs} slug={q.id.replace(/-\d{3}$/, "")} samePage />
+          <LearnPanel refs={q.refs} slug={q.id.replace(/-\d{3}$/, "")} samePage={onTrackPage} />
           <RatingButtons id={q.id} />
         </div>
       )}

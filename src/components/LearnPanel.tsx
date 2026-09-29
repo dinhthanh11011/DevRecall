@@ -1,12 +1,13 @@
 "use client";
 
 import { useState } from "react";
-import type { LearnMatch, Section } from "@/lib/types";
+import type { LearnMatch, LearnRef, Section } from "@/lib/types";
+import { sectionHref } from "@/lib/sections";
 import { Markdown } from "./Markdown";
 
 /**
- * "Kiến thức liên quan": the overview rows/bullets that teach this question, the full section on demand,
- * and links into the track page. `sections` is optional (the track page already shows the overview).
+ * "Kiến thức liên quan": the overview/lesson rows, bullets or paragraphs that teach this question, the full
+ * section on demand, and links into the track page or the lesson. `sections` is optional (the track page already shows the overview).
  */
 export function LearnPanel({
   refs,
@@ -21,22 +22,23 @@ export function LearnPanel({
   trackTitle?: string;
   sections?: Section[];
   references?: { title: string; url: string }[];
-  /** On the track page itself: link to `#anchor` instead of `/tracks/<slug>#anchor`. */
+  /** On the track page itself: link overview sections as `#anchor` instead of `/tracks/<slug>#anchor`. */
   samePage?: boolean;
 }) {
   const [full, setFull] = useState(false);
   const primary = refs[0];
-  const href = (anchor: string) => (samePage ? `#${anchor}` : `/tracks/${slug}#${anchor}`);
-  const section = primary && sections?.find((s) => s.anchor === primary.anchor);
+  const href = (r: LearnRef) => (samePage && !r.lesson ? `#${r.anchor}` : sectionHref(slug, r));
+  const label = (r: LearnRef) => (r.lesson ? `📚 ${r.lessonTitle ?? r.lesson} › ${r.title}` : r.title);
+  const section = primary && sections?.find((s) => s.anchor === primary.anchor && s.lesson === primary.lesson);
 
   return (
     <section className="space-y-3 rounded-lg border border-sky-200 bg-sky-50/60 p-4 dark:border-sky-900 dark:bg-sky-950/30">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h4 className="text-xs font-semibold uppercase tracking-wide text-sky-800 dark:text-sky-300">📖 Kiến thức liên quan</h4>
         {primary ? (
-          <a href={href(primary.anchor)} className="text-xs text-sky-700 hover:underline dark:text-sky-400">
+          <a href={href(primary)} className="text-xs text-sky-700 hover:underline dark:text-sky-400">
             {trackTitle ? `${trackTitle} › ` : ""}
-            {primary.title} →
+            {label(primary)} →
           </a>
         ) : (
           <a href={samePage ? "#" : `/tracks/${slug}`} className="text-xs text-sky-700 hover:underline dark:text-sky-400">
@@ -54,8 +56,8 @@ export function LearnPanel({
           </button>
         )}
         {refs.slice(1).map((r) => (
-          <a key={r.anchor} href={href(r.anchor)} className="text-zinc-600 hover:underline dark:text-zinc-400">
-            Xem thêm: {r.title}
+          <a key={`${r.lesson}#${r.anchor}`} href={href(r)} className="text-zinc-600 hover:underline dark:text-zinc-400">
+            Xem thêm: {label(r)}
           </a>
         ))}
       </div>
