@@ -1,0 +1,1124 @@
+id: 09-react
+slug: react
+title: React
+tier: 3
+status: drafted
+summary: Rendering & reconciliation, hooks pitfalls, effects, memoization vs React Compiler, concurrent features, React 19 Actions (`use`, `useActionState`, `useOptimistic`), error boundaries, testing — theo React 19.2.
+cvLinked: true
+prerequisites: [03-javascript]
+overview: |-
+  ## TL;DR
+
+  - React = **UI là function của state**. Mỗi render là một snapshot (props + state + closure); React so sánh cây mới với cây cũ (**reconciliation**) rồi **commit** thay đổi tối thiểu vào DOM.
+  - Hầu hết bug React thật đến từ 4 chỗ: **effect dùng sai** (sync state bằng effect, thiếu cleanup, race condition), **stale closure**, **identity** (object/function mới mỗi render phá memo & deps), **key sai** (state dính nhầm item).
+  - React 18 đưa **concurrent rendering** (transition, deferred value, Suspense streaming SSR, automatic batching). React 19 đưa **Actions** (`useActionState`, `useOptimistic`, `useFormStatus`, `<form action>`), `use()`, `ref` là prop, `<Context>` làm provider. React 19.2 thêm `<Activity>` và `useEffectEvent`.
+  - **React Compiler** (1.0, 2025) tự memoize → `useMemo`/`useCallback`/`memo` thủ công ít cần hơn, nhưng code phải tuân **Rules of React** (render thuần, không mutate props/state).
+  - Senior bar: biết **đo** (React Profiler, Performance panel) trước khi tối ưu; biết đặt state ở đâu (local, lifted, URL, server cache, global store).
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Render vs commit | Render = gọi component tính JSX (thuần, có thể bị gọi lại/bỏ); commit = áp vào DOM + chạy effect | `console.log` trong body chạy 2 lần ở StrictMode dev |
+  | Reconciliation | So cây cũ/mới theo **type + vị trí + key** | Đổi `<Input>` thành `<textarea>` cùng vị trí → unmount state |
+  | Key | Danh tính của phần tử trong list, quyết định state đi theo ai | `key={item.id}`, không phải `index` khi list đổi thứ tự |
+  | Snapshot / closure | Handler thấy state **của render đã tạo ra nó** | `setCount(count + 1)` 3 lần → +1 |
+  | Effect | Đồng bộ component với hệ thống **bên ngoài** React | subscribe WebSocket, đổi `document.title` |
+  | Memoization | Giữ lại value/function/render giữa các render nếu deps không đổi | `memo(Row)` + `useCallback(onSelect)` |
+  | Transition | Đánh dấu update **không khẩn cấp**, có thể bị ngắt | `startTransition(() => setFilter(q))` |
+  | Suspense | Boundary hiển thị fallback khi con đang "chờ" (lazy, `use(promise)`, data framework) | `<Suspense fallback={<Skeleton/>}>` |
+  | Action | Hàm (có thể async) chạy trong transition, gắn với form/pending/optimistic | `<form action={saveAction}>` |
+  | Error boundary | Class component bắt lỗi **khi render** của cây con | `static getDerivedStateFromError` |
+
+  ## Cơ chế hoạt động
+
+  ### Vòng đời một update
+
+  ```mermaid
+  flowchart TD
+    A["Trigger: setState / props mới /<br/>context đổi / parent render"] --> B["Schedule update<br/>(lane: sync, default, transition)"]
+    B --> C["Render phase<br/>gọi component, tạo cây mới<br/>(thuần, có thể bị ngắt ở concurrent)"]
+    C --> D["Reconcile: so type + key<br/>tính danh sách thay đổi"]
+    D --> E["Commit phase (đồng bộ)<br/>cập nhật DOM, gắn ref"]
+    E --> F["useLayoutEffect<br/>(trước paint)"]
+    F --> G["Browser paint"]
+    G --> H["useEffect<br/>(sau paint, thường)"]
+    C -. "update khẩn cấp hơn đến" .-> B
+  ```
+
+  ### Reconciliation quyết định giữ hay huỷ state
+
+  ```mermaid
+  flowchart LR
+    A["Cùng vị trí trong cây"] --> B{"Cùng type?"}
+    B -- no --> C["Unmount cây cũ<br/>mount mới (mất state)"]
+    B -- yes --> D{"Cùng key?"}
+    D -- no --> C
+    D -- yes --> E["Giữ instance/state<br/>cập nhật props"]
+  ```
+
+  ### React 19 Action với form
+
+  ```mermaid
+  sequenceDiagram
+    participant U as User
+    participant F as Form
+    participant R as React
+    participant S as Server / API
+    U->>F: submit
+    F->>R: startTransition(action)
+    R->>R: isPending = true, useOptimistic hiển thị ngay
+    R->>S: await action(prevState, formData)
+    S-->>R: result / error
+    R->>R: set state (useActionState), optimistic tự revert về state thật
+    R-->>U: UI mới, form uncontrolled được reset
+  ```
+
+  ## Trade-offs
+
+  | Quyết định | Lựa chọn A | Lựa chọn B | Khi nào chọn |
+  |---|---|---|---|
+  | Memo thủ công vs React Compiler | `memo/useMemo/useCallback` có chủ đích | Compiler tự memoize | Compiler khi codebase tuân Rules of React; thủ công cho hot path đã đo |
+  | Controlled vs uncontrolled input | State React là nguồn thật (validate khi gõ) | DOM giữ giá trị, đọc lúc submit (`FormData`) | Form lớn/đơn giản → uncontrolled + Actions; cần format/validate realtime → controlled |
+  | Context vs store (Redux/Zustand) | Context: dependency injection, ít đổi | Store có selector, tránh re-render toàn cây | Theme/auth/locale → context; state đổi thường xuyên nhiều consumer → store |
+  | Fetch trong effect vs data library/RSC | Tự viết: race, cache, retry đều tự lo | React Query/SWR/RSC | Hầu như luôn dùng library/framework |
+  | Class vs function component | Class: lifecycle, error boundary | Hooks: tái sử dụng logic, compiler hỗ trợ | Code mới dùng function; class chỉ cho error boundary/legacy |
+  | `useTransition` vs `useDeferredValue` | Bọc **setter** mình kiểm soát | Trì hoãn **value** nhận từ ngoài | Có quyền với setState → transition; chỉ có prop → deferred |
+
+  ## Pitfalls
+
+  - Dùng `useEffect` để tính derived state (`setFullName(first + last)`) → render thừa, lệch một nhịp. Tính trực tiếp trong render.
+  - Fetch trong effect không cleanup/ignore flag → **race condition** (response cũ đè response mới).
+  - Object/array/function literal truyền xuống `memo` child hoặc deps → memo vô dụng, effect chạy mãi.
+  - `key={index}` hoặc `key={Math.random()}` → state dính sai dòng / remount mỗi render.
+  - Mutate state (`arr.push`) rồi `setArr(arr)` → cùng reference, React bỏ qua render.
+  - Nghĩ error boundary bắt lỗi trong event handler/`setTimeout`/promise — **không**.
+  - Đặt Context provider value là object mới mỗi render → mọi consumer re-render.
+  - Test implementation details (state nội bộ, class name) thay vì hành vi người dùng.
+
+  ## Cheat sheet
+
+  - Rules of Hooks: chỉ gọi ở top level, chỉ trong component/custom hook. `use()` là ngoại lệ: gọi được trong `if`/loop.
+  - Updater function khi state mới phụ thuộc state cũ: `setN(n => n + 1)`. Updater phải **thuần**.
+  - Effect: setup + cleanup đối xứng; StrictMode dev chạy setup → cleanup → setup để lộ thiếu cleanup.
+  - `useLayoutEffect`: đo DOM trước paint (tooltip position). Mặc định dùng `useEffect`.
+  - `useRef`: giá trị mutable không gây render; không đọc/ghi `ref.current` trong render.
+  - React 19: `ref` là prop thường cho function component; `<Ctx value={v}>` thay `<Ctx.Provider>`; ref callback có thể trả cleanup.
+  - React 19 Actions: `useActionState(fn, init)` → `[state, formAction, isPending]`; `useOptimistic(state, reducer)`; `useFormStatus()` (react-dom) đọc form cha.
+  - React 19.2: `<Activity mode="hidden">` giữ state nhưng unmount effect; `useEffectEvent` tách logic không reactive khỏi deps.
+  - Error boundary: vẫn phải là class (hoặc thư viện `react-error-boundary`); không bắt lỗi event handler/async.
+  - Test: `getByRole` > `getByText` > `getByTestId`; `findBy*` cho async; `userEvent` thay `fireEvent`; mock network bằng MSW.
+notionRefs:
+  - title: ReactJS
+    url: https://app.notion.com/p/2a5ef77f8ab280ae864bd7906bd21875
+references:
+  - title: react.dev — Render and Commit
+    url: https://react.dev/learn/render-and-commit
+  - title: react.dev — Preserving and Resetting State
+    url: https://react.dev/learn/preserving-and-resetting-state
+  - title: react.dev — You Might Not Need an Effect
+    url: https://react.dev/learn/you-might-not-need-an-effect
+  - title: react.dev — Synchronizing with Effects
+    url: https://react.dev/learn/synchronizing-with-effects
+  - title: react.dev — React 19 release post
+    url: https://react.dev/blog/2024/12/05/react-19
+  - title: react.dev — React 19.2 release post
+    url: https://react.dev/blog/2025/10/01/react-19-2
+  - title: react.dev — React Compiler
+    url: https://react.dev/learn/react-compiler
+  - title: react.dev — Rules of React
+    url: https://react.dev/reference/rules
+  - title: react.dev — useActionState
+    url: https://react.dev/reference/react/useActionState
+  - title: react.dev — useOptimistic
+    url: https://react.dev/reference/react/useOptimistic
+  - title: react.dev — use
+    url: https://react.dev/reference/react/use
+  - title: react.dev — useTransition
+    url: https://react.dev/reference/react/useTransition
+  - title: react.dev — Component (class) and error boundaries
+    url: https://react.dev/reference/react/Component
+  - title: Testing Library — Guiding principles & queries
+    url: https://testing-library.com/docs/queries/about
+questions:
+  - id: react-001
+    level: easy
+    type: concept
+    q: What triggers a React component to re-render? Does changing a prop "cause" a render?
+    hint: |-
+      - Nguyên nhân gốc chỉ có: **state của chính nó đổi** (`setState`/`dispatch`), **context** nó đọc đổi, hoặc **parent render lại** (mặc định con render theo, kể cả props y hệt).
+      - Props mới không tự trigger — props đổi vì parent render. Con bọc `memo` mới bỏ qua được khi props shallow-equal.
+      - `setState` với giá trị `Object.is` bằng giá trị cũ → React bail out (có thể vẫn gọi component một lần nhưng không commit).
+      - Render ≠ DOM update: render có thể không đổi gì trên DOM.
+    followUp: A parent re-renders 60 times per second because of a scroll listener. How do you stop the whole subtree from re-rendering?
+    redFlags:
+      - Says re-render means the DOM is rewritten
+      - Thinks children re-render only when their props change
+    tags: [rendering]
+  - id: react-002
+    level: easy
+    type: output
+    q: What does this log after one click, and what is the final `count`?
+    example: |-
+      ```tsx
+      function Counter() {
+        const [count, setCount] = useState(0);
+        function handleClick() {
+          setCount(count + 1);
+          setCount(count + 1);
+          setCount((c) => c + 1);
+          console.log(count);
+        }
+        return <button onClick={handleClick}>{count}</button>;
+      }
+      ```
+    hint: |-
+      - Log `0`: `count` trong handler là **snapshot** của render hiện tại; `setState` không đổi biến local.
+      - Queue: `0 + 1` → thay bằng 1; `0 + 1` → thay bằng 1; updater `c => c + 1` → 2. Kết quả `count = 2`, **một** lần render (batching).
+      - Updater function nhận giá trị mới nhất trong queue → dùng khi state mới phụ thuộc state cũ.
+    followUp: Would the result change if these calls were inside a `setTimeout` in React 18+?
+    tags: [state, batching, closure]
+  - id: react-003
+    level: easy
+    type: concept
+    q: Why does React need `key` in lists, and why is `key={index}` a problem?
+    hint: |-
+      - Key là **danh tính** của phần tử giữa các render; reconciliation dùng (type, key) để quyết định giữ state/DOM của phần tử nào.
+      - `index` ổn chỉ khi list **không đổi thứ tự, không thêm/xoá ở giữa**, item không có state.
+      - Khi thêm ở đầu/sắp xếp: state (input đang gõ, checkbox, animation) **đi theo vị trí** chứ không theo item → dữ liệu hiển thị lệch; thêm nữa là re-render/DOM thừa.
+      - `key={Math.random()}` → remount mỗi render (mất focus, state, tốn chi phí).
+      - Key chỉ cần unique giữa **siblings**; dùng ID ổn định từ dữ liệu.
+    followUp: How can you use `key` deliberately to reset a component's state?
+    tags: [reconciliation, keys]
+  - id: react-004
+    level: easy
+    type: compare
+    q: Controlled vs uncontrolled inputs — what is the difference and when do you pick each?
+    hint: |-
+      - **Controlled**: `value` + `onChange` từ state React → React là nguồn thật; dễ validate/format khi gõ, disable nút theo state; tốn render mỗi phím.
+      - **Uncontrolled**: DOM giữ giá trị (`defaultValue`), đọc qua `ref` hoặc `FormData` khi submit; ít render, hợp với form lớn và React 19 `<form action>`.
+      - Không đổi qua lại giữa hai chế độ (từ `value={undefined}` sang có giá trị) → warning "changing an uncontrolled input to be controlled".
+      - Thư viện như React Hook Form dựa trên uncontrolled để hiệu năng tốt.
+    followUp: With React 19 form Actions, what happens to uncontrolled fields after a successful submit?
+    tags: [forms]
+  - id: react-005
+    level: easy
+    type: compare
+    q: "`useEffect` vs `useLayoutEffect` — when does each run and when do you need the layout version?"
+    hint: |-
+      - Cả hai chạy sau commit DOM. `useLayoutEffect` chạy **đồng bộ trước khi browser paint** → chặn paint; `useEffect` thường chạy **sau paint**.
+      - Dùng layout effect khi cần **đo DOM rồi sửa** trước khi user thấy (vị trí tooltip, scroll restore, tránh flicker).
+      - Mặc định dùng `useEffect`; layout effect nặng làm chậm frame.
+      - Lưu ý: effect do **tương tác rời rạc** (click) có thể được React flush sớm trước paint; đừng dựa vào thời điểm chính xác để đúng logic.
+      - Server rendering: layout effect không chạy trên server.
+    followUp: Your tooltip flickers at the wrong position for one frame. Walk through the fix.
+    tags: [effects, hooks]
+  - id: react-006
+    level: easy
+    type: concept
+    q: What does `useRef` give you, and why shouldn't you read or write `ref.current` during render?
+    hint: |-
+      - Một object `{ current }` **ổn định** qua các render; đổi `current` **không** gây render.
+      - Dùng cho: DOM node, timer id, instance bên ngoài (map, chart), giá trị "mới nhất" cho callback, cờ `isMounted` hiếm khi cần.
+      - Không đọc/ghi trong render: render phải thuần và có thể bị gọi nhiều lần/bỏ dở (concurrent) → giá trị ref không nhất quán với UI; React Compiler cũng coi đó là vi phạm. Đọc/ghi trong effect hoặc handler.
+      - Ngoại lệ chấp nhận: lazy init `if (ref.current === null) ref.current = new Thing()`.
+    followUp: Why is storing "previous props" in a ref during render fragile under concurrent rendering?
+    tags: [hooks, refs]
+  - id: react-007
+    level: easy
+    type: concept
+    q: What are the Rules of Hooks, and why does React depend on call order?
+    hint: |-
+      - Chỉ gọi hook ở **top level** của component hoặc custom hook — không trong `if`, loop, callback, sau `return` sớm.
+      - Chỉ gọi trong React function component/custom hook (không trong function thường, class).
+      - Lý do: React lưu state của hook theo **thứ tự gọi** trong một linked list gắn với fiber; đổi thứ tự → hook nhận nhầm state của hook khác.
+      - Ngoại lệ React 19: `use()` gọi được có điều kiện.
+      - Enforce bằng `eslint-plugin-react-hooks`.
+    followUp: How does a custom hook share logic but not state between two components that use it?
+    tags: [hooks]
+  - id: react-008
+    level: easy
+    type: concept
+    q: What is a custom hook, and when should logic be a custom hook vs a plain utility function?
+    hint: |-
+      - Function tên bắt đầu bằng `use` và **gọi hook khác** — đóng gói logic có state/effect/ref để tái sử dụng (`useDebouncedValue`, `useOrderForm`).
+      - Mỗi component dùng hook có **state riêng**; hook chia sẻ logic, không chia sẻ state (muốn chia sẻ state → context/store).
+      - Không gọi hook nào → nên là function thường (`formatMoney`), không đặt tên `use…` (gây nhầm, bị lint áp rule).
+      - Lợi ích lớn: tách **business logic** khỏi **presentation**, test hook riêng bằng `renderHook`.
+    followUp: Your `useCheckout` hook returns 15 values and 10 callbacks. Is that a smell? How would you split it?
+    tags: [hooks, architecture]
+  - id: react-009
+    level: easy
+    type: concept
+    q: What is an error boundary, and which errors does it NOT catch?
+    hint: |-
+      - Component bắt lỗi JS xảy ra **khi render, trong lifecycle, trong constructor** của cây con, hiển thị fallback thay vì unmount cả app.
+      - Phải là **class** với `static getDerivedStateFromError` (render fallback) và/hoặc `componentDidCatch` (log). Chưa có hook tương đương; thường dùng thư viện `react-error-boundary`.
+      - Không bắt: lỗi trong **event handler**, code async (`setTimeout`, promise sau await trong handler), lỗi của chính boundary, lỗi server rendering ở một số môi trường.
+      - Lỗi trong `startTransition`/Action có thể được ném lên boundary gần nhất.
+      - Đặt nhiều boundary theo vùng (widget, route) thay vì một cái cho cả app.
+    followUp: How do you report errors caught by boundaries to your monitoring tool in React 19?
+    tags: [errors, error-boundary]
+  - id: react-010
+    level: easy
+    type: concept
+    q: What does `<StrictMode>` do in development, and why do effects run twice?
+    hint: |-
+      - Chỉ ở **development**: render component **hai lần** (phát hiện render không thuần), chạy **setup → cleanup → setup** cho effect khi mount (phát hiện thiếu cleanup), gọi ref callback hai lần, cảnh báo API cũ.
+      - Production không double-invoke.
+      - Nếu effect chạy 2 lần gây bug (gửi 2 analytics, 2 subscription) → effect thiếu cleanup hoặc logic không thuộc effect (nên ở event handler).
+      - Không "fix" bằng `useRef` cờ đã chạy — đó là che bug.
+    followUp: Your effect sends a `POST /track` on mount and you see two requests in dev. What is the right fix?
+    redFlags:
+      - Removes StrictMode to make the problem go away
+    tags: [strict-mode, effects]
+  - id: react-011
+    level: easy
+    type: compare
+    q: "`useMemo` vs `useCallback` vs `React.memo` — what does each memoize?"
+    hint: |-
+      - `useMemo(fn, deps)`: cache **giá trị** trả về của `fn` (tính toán nặng, giữ reference object/array ổn định).
+      - `useCallback(fn, deps)`: cache **chính function** (= `useMemo(() => fn, deps)`), để reference ổn định cho child `memo` hoặc deps của effect.
+      - `memo(Component)`: bỏ qua **render của component** nếu props shallow-equal với lần trước.
+      - Chúng chỉ có tác dụng khi kết hợp đúng: `useCallback` vô nghĩa nếu child không `memo` và function không nằm trong deps nào.
+      - React Compiler tự làm phần lớn việc này.
+    followUp: Give an example where adding `useCallback` makes performance worse or changes nothing.
+    tags: [memoization, performance]
+  - id: react-012
+    level: easy
+    type: concept
+    q: What is `React.lazy`, and how do you code-split a route with it?
+    hint: |-
+      - `const Page = lazy(() => import('./Page'))` → tạo chunk riêng, tải khi render lần đầu; phải bọc trong `<Suspense fallback>`.
+      - Module import phải có **default export** là component (hoặc map lại `.then(m => ({ default: m.X }))`).
+      - Khai báo `lazy` ở **top-level module**, không trong component (mỗi render tạo component mới → remount, mất state).
+      - Kết hợp error boundary để xử lý lỗi tải chunk (deploy mới xoá chunk cũ).
+      - Route-level split là điểm khởi đầu tốt nhất; component-level cho widget nặng (editor, chart).
+    followUp: After a deploy, users on old tabs get "ChunkLoadError". How do you handle it gracefully?
+    tags: [code-splitting, performance, suspense]
+  - id: react-013
+    level: medium
+    type: gotcha
+    q: List situations where you do NOT need `useEffect`, and what to do instead.
+    hint: |-
+      - **Derived state** từ props/state → tính trực tiếp trong render (hoặc `useMemo` nếu nặng).
+      - **Phản ứng với event của user** (submit, click → gửi request, toast) → làm trong **event handler**, không set cờ rồi effect bắt cờ.
+      - **Reset state khi prop đổi** → dùng `key` trên component.
+      - **Điều chỉnh một phần state khi prop đổi** → so sánh trong render với state "prevProp" (hiếm), hoặc thiết kế lại.
+      - **Chuỗi effect** set state nối nhau → gom logic vào một handler/reducer.
+      - **Fetch data** → data library/framework (React Query, RSC); nếu tự viết phải có cleanup chống race.
+      - Effect chỉ để **đồng bộ với hệ thống bên ngoài** (DOM API, subscription, widget non-React, network sync).
+    followUp: Rewrite "when `items` change, compute `total` and store it in state" without an effect.
+    tags: [effects, anti-patterns]
+  - id: react-014
+    level: medium
+    type: debug
+    q: Typing fast in a search box sometimes shows results for an older query. Why, and how do you fix it?
+    example: |-
+      ```tsx
+      function Search({ query }: { query: string }) {
+        const [results, setResults] = useState<Item[]>([]);
+        useEffect(() => {
+          fetch(`/api/search?q=${query}`)
+            .then((r) => r.json())
+            .then(setResults);
+        }, [query]);
+        return <List items={results} />;
+      }
+      ```
+    hint: |-
+      - **Race condition**: request cho `"re"` và `"rea"` chạy song song; nếu `"re"` về **sau**, nó ghi đè kết quả mới.
+      - Fix trong effect: cờ `ignore` trong cleanup hoặc `AbortController` (hủy luôn request cũ):
+        `const c = new AbortController(); fetch(url, { signal: c.signal })…; return () => c.abort();` — nhớ bỏ qua `AbortError`.
+      - Thêm: `encodeURIComponent(query)`, debounce input, kiểm tra `r.ok`.
+      - Tốt hơn: React Query/SWR (query key theo `query`, tự bỏ response cũ, cache, dedupe) hoặc fetch ở server.
+    followUp: Why does `useDeferredValue` alone not fix this race condition?
+    redFlags:
+      - Only adds debounce and calls it fixed
+    tags: [effects, race-condition, debug]
+  - id: react-015
+    level: medium
+    type: debug
+    q: This interval should count up every second but gets stuck at 1. Explain and give two fixes.
+    example: |-
+      ```tsx
+      function Timer() {
+        const [seconds, setSeconds] = useState(0);
+        useEffect(() => {
+          const id = setInterval(() => setSeconds(seconds + 1), 1000);
+          return () => clearInterval(id);
+        }, []);
+        return <p>{seconds}</p>;
+      }
+      ```
+    hint: |-
+      - **Stale closure**: effect chạy một lần (`[]`), callback interval giữ `seconds = 0` của render đầu → luôn set `0 + 1 = 1`.
+      - Fix 1: updater `setSeconds(s => s + 1)` — không cần đọc `seconds`, deps `[]` là đúng.
+      - Fix 2: đưa `seconds` vào deps → interval bị tạo lại mỗi giây (chạy được nhưng lãng phí, lệch nhịp).
+      - Khi callback cần đọc giá trị mới nhất mà không muốn re-subscribe → `useEffectEvent` (React 19.2) hoặc ref "latest value".
+      - Lint `react-hooks/exhaustive-deps` đã cảnh báo sẵn — đừng tắt nó.
+    followUp: The interval callback needs both the latest `seconds` and a `speed` prop. How do you write it with `useEffectEvent`?
+    verify: true
+    tags: [closure, effects, debug]
+  - id: react-016
+    level: medium
+    type: concept
+    q: Explain how reconciliation decides whether to keep or reset state. What happens when you render a component conditionally at the same position?
+    hint: |-
+      - React so sánh theo **vị trí trong cây + type + key**. Cùng type & key ở cùng vị trí → giữ state, cập nhật props. Khác → unmount cũ, mount mới.
+      - `{isAdmin ? <Form/> : <Form/>}` → cùng type, cùng vị trí → **state được giữ** (thường gây bug "form của user A hiện cho user B"). Thêm `key={userId}` để reset.
+      - `{show && <A/>}` vs `<A/>` luôn render: vị trí trong mảng children cố định (false vẫn chiếm slot) nên sibling không bị remount.
+      - Khai báo component **bên trong** component khác → mỗi render là type mới → remount liên tục, mất focus.
+    followUp: Why does defining `const Row = () => …` inside the parent's body cause input focus loss?
+    tags: [reconciliation, state]
+  - id: react-017
+    level: medium
+    type: gotcha
+    q: Why does passing an inline object or arrow function to a `memo` child defeat memoization? When does it not matter?
+    hint: |-
+      - `memo` so sánh props bằng `Object.is` từng prop; `{}` / `[]` / `() => {}` literal là **reference mới mỗi render** → luôn khác → child luôn render.
+      - Fix: `useMemo`/`useCallback` cho prop đó, đưa hằng số ra ngoài component, hoặc truyền primitive.
+      - Không quan trọng khi child **không** `memo` và rẻ, hoặc parent ít render. Tối ưu khi Profiler cho thấy vấn đề.
+      - `children` JSX cũng là object mới mỗi render → `memo` child nhận `children` gần như luôn render lại.
+      - React Compiler tự ổn định các reference này.
+    followUp: How does the React Compiler decide what to memoize, and what makes it bail out?
+    tags: [memoization, performance]
+  - id: react-018
+    level: medium
+    type: compare
+    q: Compare `useTransition` and `useDeferredValue`. Give a concrete use case for each.
+    hint: |-
+      - `useTransition` → `[isPending, startTransition]`: bọc **setState mình kiểm soát** để đánh dấu không khẩn cấp; React có thể ngắt render đó khi có input mới. VD: đổi tab nặng, filter list 10k item, navigation.
+      - `useDeferredValue(value)`: trả về bản **trễ** của một value (thường là prop) — render khẩn cấp dùng giá trị cũ, render nền dùng giá trị mới. VD: component nhận `query` từ parent và render chart nặng.
+      - Cả hai không làm code nhanh hơn — chỉ giữ UI **responsive** (input không lag). Không thay thế debounce cho network.
+      - Input controlled **không** được đặt trong transition (gõ sẽ lag/nhảy).
+      - React 19: `startTransition` nhận async function (Action); `useDeferredValue(value, initialValue)`.
+    followUp: Why must the text input's own state update stay outside the transition?
+    verify: true
+    tags: [concurrent, performance]
+  - id: react-019
+    level: medium
+    type: concept
+    q: What does automatic batching in React 18+ change compared to React 17?
+    hint: |-
+      - React 17: chỉ batch update trong **React event handler**; `setTimeout`, promise, native event → mỗi `setState` một render.
+      - React 18+ (với `createRoot`): batch **mọi nơi** — timeout, promise, native handler → một render cho nhiều update trong cùng tick.
+      - Muốn render ngay (hiếm, VD đo DOM sau update) → `flushSync(() => setX(1))` (react-dom).
+      - Legacy `ReactDOM.render` giữ hành vi cũ — và đã bị **xoá** ở React 19.
+    followUp: When have you actually needed `flushSync`, and what does it cost?
+    verify: true
+    tags: [batching, react-18]
+  - id: react-020
+    level: medium
+    type: concept
+    q: How does `useActionState` work in React 19? Show a form that displays a server-side validation error.
+    hint: |-
+      - `const [state, formAction, isPending] = useActionState(action, initialState)`.
+      - `action(prevState, formData)` — có thể async; giá trị trả về thành `state` mới. Chạy trong transition nên có `isPending`.
+      - Truyền `formAction` vào `<form action={formAction}>` (hoặc `formAction` của button); gọi nhiều lần được **xếp hàng tuần tự**.
+      - Lỗi **mong đợi** (validation) nên trả về trong state, không `throw` (throw → error boundary).
+      - Trước đây là `useFormState` của react-dom (canary) — đã đổi tên.
+    example: |-
+      ```tsx
+      type State = { error?: string; ok?: boolean };
+
+      async function saveEmail(_prev: State, formData: FormData): Promise<State> {
+        const email = String(formData.get('email'));
+        const res = await fetch('/api/profile', { method: 'POST', body: JSON.stringify({ email }) });
+        if (res.status === 422) return { error: 'Email is invalid' };
+        return { ok: true };
+      }
+
+      function EmailForm() {
+        const [state, formAction, isPending] = useActionState(saveEmail, {});
+        return (
+          <form action={formAction}>
+            <input name="email" defaultValue="" />
+            <button disabled={isPending}>{isPending ? 'Saving…' : 'Save'}</button>
+            {state.error && <p role="alert">{state.error}</p>}
+          </form>
+        );
+      }
+      ```
+    followUp: How does `useFormStatus` differ, and why must it be called from a child of the form?
+    verify: true
+    tags: [react-19, actions, forms]
+  - id: react-021
+    level: medium
+    type: concept
+    q: How does `useOptimistic` work, and what happens to the optimistic value when the action fails?
+    hint: |-
+      - `const [optimistic, addOptimistic] = useOptimistic(state, (current, input) => next)`.
+      - Gọi `addOptimistic(input)` **bên trong một Action/transition** → UI hiển thị `optimistic` ngay trong lúc action đang chạy.
+      - Khi transition kết thúc, React **bỏ lớp optimistic** và render theo `state` thật (props/state từ server). Thành công → state thật đã chứa item mới; thất bại → item optimistic **tự biến mất** (revert), bạn tự hiển thị lỗi.
+      - Không cần tự viết rollback; nhưng phải cập nhật state thật sau khi thành công (setState, revalidate, router refresh).
+      - Gọi ngoài transition → React cảnh báo và giá trị không được giữ.
+    example: |-
+      ```tsx
+      function Comments({ comments, send }: { comments: Comment[]; send: (t: string) => Promise<void> }) {
+        const [optimistic, addOptimistic] = useOptimistic(
+          comments,
+          (list, text: string) => [...list, { id: 'temp', text, pending: true }],
+        );
+        async function action(formData: FormData) {
+          const text = String(formData.get('text'));
+          addOptimistic(text);
+          await send(text); // throws → optimistic comment disappears
+        }
+        return (
+          <form action={action}>
+            {optimistic.map((c) => <p key={c.id} style={{ opacity: c.pending ? 0.5 : 1 }}>{c.text}</p>)}
+            <input name="text" />
+          </form>
+        );
+      }
+      ```
+    followUp: Compare this with an optimistic update in React Query's `onMutate`. Which one handles cache consistency across screens?
+    verify: true
+    tags: [react-19, actions, optimistic-ui]
+  - id: react-022
+    level: medium
+    type: concept
+    q: What is the `use` API in React 19, and how is it different from a hook like `useContext`?
+    hint: |-
+      - `use(resource)` đọc giá trị của **Promise** hoặc **Context**.
+      - Với Promise: component **suspend** tới khi resolve (cần `<Suspense>` bên trên), reject → error boundary gần nhất.
+      - Khác hook thường: gọi được **trong `if`/loop** (vẫn phải trong component/hook).
+      - Promise phải **ổn định** giữa các render: tạo ở Server Component rồi truyền xuống, hoặc từ cache/data library. Tạo promise mới trong render của Client Component → suspend vô hạn/refetch mỗi render (React cảnh báo uncached promise).
+      - Không dùng trong `try/catch` để bắt lỗi — dùng error boundary.
+    followUp: In Next.js, why would you pass an un-awaited promise from a Server Component to a Client Component and call `use()` there?
+    verify: true
+    tags: [react-19, suspense, use]
+  - id: react-023
+    level: medium
+    type: concept
+    q: What changed about refs in React 19 — `forwardRef`, ref as a prop, and ref callback cleanup?
+    hint: |-
+      - Function component nhận `ref` như **prop thường**: `function Input({ ref, ...props }) { return <input ref={ref} {...props} /> }` — không cần `forwardRef` (sẽ bị deprecate trong tương lai).
+      - Ref callback có thể **trả về cleanup** (`ref={(node) => { observe(node); return () => unobserve(node) }}`), thay cho việc React gọi lại với `null`.
+      - `useImperativeHandle` vẫn dùng để expose API giới hạn (`focus`, `reset`) thay vì cả DOM node.
+      - Class component: `ref` vẫn trỏ instance, không phải prop.
+      - Codemod có sẵn để bỏ `forwardRef`.
+    followUp: Why is exposing an imperative handle usually preferable to exposing the raw DOM node from a design-system component?
+    verify: true
+    tags: [react-19, refs]
+  - id: react-024
+    level: medium
+    type: gotcha
+    q: Why can Context cause performance problems, and what are your options?
+    hint: |-
+      - Mọi consumer (`useContext`/`use`) re-render khi `value` đổi theo `Object.is` — **không có selector**; `memo` không chặn được.
+      - Lỗi phổ biến: `value={{ user, setUser }}` → object mới mỗi lần provider render → mọi consumer render.
+      - Giải pháp: `useMemo` value; **tách context** theo tần suất thay đổi (state vs dispatch/actions); đẩy provider xuống sâu; tách component con đọc context nhỏ.
+      - State đổi thường xuyên + nhiều consumer → store có selector (Redux, Zustand, Jotai) hoặc `useSyncExternalStore`.
+      - Context hợp với dependency injection: theme, locale, auth, feature flags, client instance.
+    followUp: Implement a tiny store with `useSyncExternalStore` that lets components subscribe to a slice.
+    tags: [context, performance]
+  - id: react-025
+    level: medium
+    type: compare
+    q: "`useState` vs `useReducer` — when does a reducer make the code better, not just more verbose?"
+    hint: |-
+      - `useReducer` tốt khi: nhiều state phụ thuộc nhau cập nhật cùng lúc (form wizard, cart), có **state machine** rõ (idle/loading/success/error), logic update cần test riêng (reducer là pure function), nhiều event cùng sửa một state.
+      - `dispatch` ổn định reference → truyền xuống sâu không cần `useCallback`.
+      - `useState` tốt cho giá trị độc lập, đơn giản.
+      - Dấu hiệu nên chuyển: nhiều `setX` liên tiếp trong một handler, state không hợp lệ có thể xảy ra (`isLoading && error`).
+      - Reducer phải thuần: không fetch, không `Date.now()`, không mutate.
+    followUp: Model a checkout flow's states so that "loading and error at the same time" is impossible.
+    tags: [state, hooks]
+  - id: react-026
+    level: medium
+    type: concept
+    q: How do you avoid re-rendering an expensive subtree using composition instead of memoization?
+    hint: |-
+      - **Đẩy state xuống**: tách phần có state hay đổi (input, hover) thành component nhỏ → phần còn lại không render.
+      - **Nâng content lên / truyền `children`**: component giữ state nhận phần nặng qua `children`; khi state đổi, `children` là element đã được tạo bởi parent (cùng reference) → React không render lại nó.
+      - Ví dụ: `<ScrollTracker><ExpensiveTree/></ScrollTracker>` — `ScrollTracker` setState khi cuộn, `ExpensiveTree` không render lại.
+      - Rẻ hơn và bền hơn `memo` + `useCallback` rải rác.
+    example: |-
+      ```tsx
+      function ColorPicker({ children }: { children: React.ReactNode }) {
+        const [color, setColor] = useState('red');
+        return (
+          <div style={{ color }}>
+            <input value={color} onChange={(e) => setColor(e.target.value)} />
+            {children /* not re-rendered when color changes */}
+          </div>
+        );
+      }
+      // <ColorPicker><ExpensiveTree /></ColorPicker>
+      ```
+    followUp: Why doesn't `children` re-render here even though the parent of `children` is re-rendering?
+    tags: [performance, composition]
+  - id: react-027
+    level: medium
+    type: compare
+    q: Map class component lifecycles to hooks. Which ones have no direct hook equivalent?
+    hint: |-
+      - `constructor` → `useState` (lazy init) / `useRef`.
+      - `componentDidMount` + `componentWillUnmount` → `useEffect(() => { …; return cleanup }, [])`.
+      - `componentDidUpdate(prevProps)` → `useEffect` với deps (nghĩ theo "đồng bộ với X", không theo "sau update").
+      - `shouldComponentUpdate` / `PureComponent` → `memo`.
+      - `getDerivedStateFromProps` → tính trong render hoặc `key` reset.
+      - `getSnapshotBeforeUpdate` → gần với `useLayoutEffect` nhưng **không có hook tương đương chính xác**.
+      - `getDerivedStateFromError` / `componentDidCatch` → **không có hook**, vẫn cần class error boundary.
+    followUp: When migrating a class with `componentDidUpdate` that compares 5 props, how do you avoid one giant effect?
+    tags: [class-components, hooks, migration]
+  - id: react-028
+    level: medium
+    type: concept
+    q: What is the React Compiler, what does it require from your code, and how do you adopt it incrementally?
+    hint: |-
+      - Build-time compiler (Babel plugin `babel-plugin-react-compiler`; 1.0 stable 10/2025) tự **memoize** component, hook, value và JSX ở mức chi tiết — thay phần lớn `useMemo`/`useCallback`/`memo`.
+      - Yêu cầu code tuân **Rules of React**: render thuần, không mutate props/state/value đã render, hooks đúng rule. Compiler **bỏ qua (bail out)** component vi phạm thay vì làm sai.
+      - Adopt dần: bật lint rules (eslint-plugin-react-hooks có các rule của compiler), chạy trên một thư mục (`sources`) hoặc opt-in theo file (`"use memo"`), opt-out với `"use no memo"`.
+      - Next.js 16: `reactCompiler: true` (stable, không bật mặc định; build chậm hơn vì dùng Babel).
+      - Vẫn cần đo; compiler không sửa thuật toán O(n²) hay list 10k dòng (cần virtualization).
+    followUp: A component stops updating after enabling the compiler. What category of bug is most likely?
+    verify: true
+    tags: [react-compiler, performance]
+  - id: react-029
+    level: medium
+    type: gotcha
+    q: How do events from a portal propagate, and what changed in event delegation in React 17?
+    hint: |-
+      - Portal (`createPortal(child, domNode)`) render ra DOM node khác, nhưng event **bubble theo cây React**, không theo cây DOM → click trong modal portal vẫn tới `onClick` của component cha React.
+      - Gotcha: "click outside to close" dùng `onClick` ở wrapper cha sẽ nhận cả click trong modal → dùng `stopPropagation` có chủ đích hoặc kiểm tra `contains` trên DOM.
+      - React 17: gắn listener ở **root container** thay vì `document` → nhúng nhiều React version, `e.stopPropagation()` với listener native trên `document` hoạt động hợp lý hơn; bỏ **event pooling** (đọc `e.target` trong async ok).
+      - `onScroll` không bubble trong React 17+.
+    followUp: Your dropdown closes when the user clicks inside a menu rendered in a portal. How do you debug it?
+    tags: [events, portals]
+  - id: react-030
+    level: medium
+    type: concept
+    q: What problem does `useSyncExternalStore` solve, and when do you need it?
+    hint: |-
+      - Subscribe vào **store bên ngoài React** (Redux, Zustand, `window.matchMedia`, `navigator.onLine`, WebSocket cache) một cách an toàn với concurrent rendering.
+      - Tránh **tearing**: trong concurrent render, các component đọc cùng store ở thời điểm khác nhau có thể thấy giá trị khác nhau; hook này ép đọc snapshot nhất quán.
+      - API: `useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot?)`. `getSnapshot` phải trả giá trị **cached/ổn định** (không tạo object mới mỗi lần) → nếu không sẽ loop vô hạn.
+      - Thư viện state hiện đại đã dùng nó bên trong; app code ít khi gọi trực tiếp trừ browser API.
+    example: |-
+      ```ts
+      function useOnline() {
+        return useSyncExternalStore(
+          (cb) => {
+            window.addEventListener('online', cb);
+            window.addEventListener('offline', cb);
+            return () => { window.removeEventListener('online', cb); window.removeEventListener('offline', cb); };
+          },
+          () => navigator.onLine,
+          () => true, // server snapshot
+        );
+      }
+      ```
+    followUp: Why does returning `{ ...state }` from `getSnapshot` cause an infinite loop?
+    tags: [hooks, concurrent, state]
+  - id: react-031
+    level: medium
+    type: concept
+    q: What is the difference between CSR, SSR with hydration, and React Server Components from React's point of view?
+    hint: |-
+      - **CSR**: server trả HTML rỗng + JS; React render trên browser → FCP chậm, SEO yếu, bundle lớn.
+      - **SSR + hydration**: server render HTML (`renderToPipeableStream`), browser nhận HTML ngay, sau đó tải JS và **hydrate** (gắn event, so khớp cây). Toàn bộ component vẫn ship JS xuống client.
+      - Streaming SSR + Suspense (React 18): gửi HTML theo từng boundary; **selective hydration** ưu tiên vùng user tương tác.
+      - **RSC**: component chỉ chạy trên server, output là RSC payload (không ship code của nó xuống client); chỉ Client Components (`'use client'`) cần hydrate. Cần framework (Next.js).
+      - SSR ≠ RSC: RSC có thể không SSR (chỉ payload khi navigation), SSR có thể không có RSC (Pages Router).
+    followUp: Why can a Server Component not use `useState`, but can render a Client Component that does?
+    tags: [ssr, rsc, hydration]
+  - id: react-032
+    level: medium
+    type: concept
+    q: How do you query elements in React Testing Library, and why is `getByRole` the preferred query?
+    hint: |-
+      - Thứ tự ưu tiên (theo Testing Library): `getByRole` (kèm `name`) → `getByLabelText` → `getByPlaceholderText` → `getByText` → `getByDisplayValue` → `getByAltText`/`getByTitle` → `getByTestId` (cuối cùng).
+      - `getByRole` phản ánh cách **user và công nghệ hỗ trợ** thấy UI → test bền khi đổi markup/class, đồng thời kiểm tra luôn accessibility (button không có accessible name → test fail).
+      - Biến thể: `getBy` (throw nếu không có), `queryBy` (null, để assert không tồn tại), `findBy` (async, chờ xuất hiện).
+      - Dùng `screen` thay vì destructure từ `render`.
+    example: |-
+      ```tsx
+      render(<LoginForm />);
+      await userEvent.type(screen.getByLabelText(/email/i), 'a@b.co');
+      await userEvent.click(screen.getByRole('button', { name: /sign in/i }));
+      expect(await screen.findByRole('alert')).toHaveTextContent(/invalid password/i);
+      ```
+    followUp: When is `getByTestId` actually the right choice?
+    tags: [testing, rtl, a11y]
+  - id: react-033
+    level: medium
+    type: gotcha
+    q: What causes the "not wrapped in act(...)" warning in tests, and how do you fix it properly?
+    hint: |-
+      - React cảnh báo khi state update xảy ra **ngoài** `act` — thường là update async (fetch resolve, timer, promise) xảy ra **sau** khi test đã assert/kết thúc.
+      - RTL đã bọc `render`, `userEvent`, `fireEvent` trong `act`; warning thường có nghĩa **test không chờ** hiệu ứng async.
+      - Fix đúng: `await screen.findBy…`, `await waitFor(() => …)`, `await userEvent…`; với fake timers dùng `vi/jest.advanceTimersByTime` trong `act` hoặc cấu hình `userEvent.setup({ advanceTimers })`.
+      - Không "fix" bằng bọc lung tung `act(() => {})` hoặc tắt warning.
+      - React 19: import `act` từ `react` (không còn `react-dom/test-utils`).
+    followUp: A test passes locally and flakes in CI with this warning. What is your debugging approach?
+    verify: true
+    tags: [testing, rtl, async]
+  - id: react-034
+    level: medium
+    type: debug
+    q: Clicking "Add" does not update the list on screen, though the console shows the item was added. Why?
+    example: |-
+      ```tsx
+      function Todos() {
+        const [todos, setTodos] = useState<Todo[]>([]);
+        function add(title: string) {
+          todos.push({ id: crypto.randomUUID(), title });
+          setTodos(todos);
+          console.log(todos.length); // increases
+        }
+        return <TodoList items={todos} onAdd={add} />;
+      }
+      ```
+    hint: |-
+      - **Mutate state** rồi set cùng reference: `Object.is(prev, next)` là `true` → React bail out, không render.
+      - Nếu có render vì lý do khác, UI "tự dưng" cập nhật — bug khó tái hiện; `memo` child dựa trên reference càng hỏng.
+      - Fix: tạo mảng mới `setTodos(prev => [...prev, newTodo])`; update lồng nhau dùng spread từng tầng hoặc Immer (`produce`).
+      - Mutation cũng phá React Compiler và time-travel/devtools.
+    followUp: How would you update `order.items[3].qty` immutably, and when would you reach for Immer?
+    tags: [state, immutability, debug]
+  - id: react-035
+    level: hard
+    type: debug
+    q: This component causes an infinite render loop / "Maximum update depth exceeded". Find every cause.
+    example: |-
+      ```tsx
+      function Report({ filters }: { filters: Filters }) {
+        const [data, setData] = useState<Row[]>([]);
+        const query = { ...filters, page: 1 };
+
+        useEffect(() => {
+          fetchReport(query).then(setData);
+        }, [query]);
+
+        const [total, setTotal] = useState(0);
+        setTotal(data.length);
+
+        return <Table rows={data} />;
+      }
+      ```
+    hint: |-
+      - `setTotal(...)` gọi **trực tiếp trong render** → mỗi render lại set state → render tiếp → loop (React báo "Too many re-renders"). `total` là derived state: `const total = data.length`.
+      - `query` là object **mới mỗi render** → deps `[query]` luôn đổi → effect chạy mỗi render → `setData` → render → effect… (loop mạng). Fix: deps theo primitive (`filters.status`, …) hoặc `useMemo(() => ({ ...filters, page: 1 }), [filters])` — với điều kiện chính `filters` ổn định từ parent.
+      - Thiếu cleanup → race condition như câu search.
+      - Tốt nhất: data library với query key `['report', filters]`.
+    followUp: The parent passes `filters={{ status }}` inline. Whose responsibility is it to stabilize it?
+    tags: [effects, debug, performance]
+  - id: react-036
+    level: hard
+    type: scenario
+    q: A product list with 5,000 rows lags on every keystroke in the filter input. Walk through how you diagnose and fix it.
+    hint: |-
+      - **Đo trước**: React DevTools Profiler (component nào render, bao lâu, "why did this render"), Performance panel (scripting vs layout/paint), kiểm tra production build (dev chậm hơn nhiều).
+      - Nguyên nhân thường gặp: filter state ở component cha của cả list → cả 5,000 row render mỗi phím; row nhận callback/object mới; filter tính toán nặng trong render.
+      - Fix theo thứ tự tác động: **virtualization** (TanStack Virtual/react-window) → chỉ render ~30 row; tách input state khỏi list (đẩy state xuống / deferred value); `useDeferredValue(query)` hoặc `startTransition` để giữ input mượt; `memo(Row)` + reference ổn định (hoặc React Compiler); `useMemo` cho filter nặng; debounce nếu filter gọi server.
+      - Đo lại sau mỗi thay đổi (INP, commit duration).
+    followUp: Virtualization breaks Ctrl+F browser search and screen readers. How do you mitigate?
+    tags: [performance, scenario, virtualization]
+  - id: react-037
+    level: hard
+    type: gotcha
+    q: How does Suspense decide what to show when a component suspends during a transition vs during an urgent update?
+    hint: |-
+      - Component suspend → React tìm `<Suspense>` gần nhất phía trên và hiện `fallback`.
+      - Nếu update là **transition** (`startTransition`, navigation của router) và nội dung **đã hiển thị** trước đó: React **giữ UI cũ** (không thay bằng fallback) cho tới khi nội dung mới sẵn sàng → tránh "flash" spinner; `isPending` để hiển thị chỉ báo nhẹ.
+      - Update khẩn cấp (không transition) → hiển thị fallback ngay.
+      - Suspense boundary **mới mount** lần đầu vẫn hiện fallback kể cả trong transition.
+      - Thiết kế boundary theo **vùng UX** (không quá nhỏ gây popcorn, không quá lớn che cả trang); `key` trên boundary để reset khi đổi entity.
+      - React 19 SSR: batching hiển thị boundary gần nhau để giảm nhảy layout (19.2).
+    followUp: Changing a search param replaces the whole page with a spinner. How do you keep the old results visible?
+    verify: true
+    tags: [suspense, concurrent]
+  - id: react-038
+    level: hard
+    type: debug
+    q: "In production you see: \"Hydration failed because the server rendered HTML didn't match the client\". List the common causes and how you find the offending component."
+    hint: |-
+      - Nguồn khác nhau giữa server và client khi render lần đầu: `Date.now()`/`new Date().toLocaleString()` (timezone/locale khác), `Math.random()`/ID tự sinh (dùng `useId`), `typeof window !== 'undefined'` rẽ nhánh trong render, đọc `localStorage` trong render, dữ liệu khác nhau (cache server cũ).
+      - **HTML lồng sai** (`<div>` trong `<p>`, `<a>` trong `<a>`, `<tr>` ngoài `<tbody>`) → browser tự sửa DOM → mismatch.
+      - Extension trình duyệt chèn attribute/node; CDN/proxy chỉnh HTML.
+      - Tìm: React 19 báo **diff** chi tiết trong console (dev); bisect bằng cách comment component; kiểm tra "view source" vs DOM.
+      - Fix: render giá trị client-only sau mount (`useEffect` set state → render lần 2), `suppressHydrationWarning` **chỉ** cho text không tránh được (timestamp), truyền giá trị từ server xuống (timezone), `useSyncExternalStore` với `getServerSnapshot`.
+    followUp: Why is "just add `suppressHydrationWarning` on `<body>`" a bad fix?
+    tags: [hydration, ssr, debug]
+  - id: react-039
+    level: hard
+    type: design
+    q: A dashboard subscribes to a WebSocket price feed updating 50 times per second. How do you render it without melting the UI?
+    hint: |-
+      - Tách **nguồn dữ liệu** khỏi React: giữ giá mới nhất trong store ngoài React (Map/Zustand), component subscribe theo **key/slice** (`useSyncExternalStore` với selector) → chỉ ô đổi render.
+      - **Throttle/coalesce** update theo frame (`requestAnimationFrame`) hoặc 4–10 lần/giây — mắt người không cần 50 fps cho số.
+      - Không `setState` cho mỗi message ở component cha của cả bảng.
+      - Virtualize bảng; `memo` row; tránh layout thrash (cập nhật text, không đổi kích thước).
+      - Subscription trong effect có cleanup; reconnect + backoff; đánh dấu dữ liệu stale khi mất kết nối.
+      - Có thể cập nhật DOM trực tiếp qua ref cho ô cực nóng (ngoài React) nếu đo thấy cần.
+    followUp: How do you test this component deterministically?
+    tags: [realtime, performance, websocket]
+  - id: react-040
+    level: hard
+    type: gotcha
+    q: What are the caveats of `useEffectEvent` (React 19.2)? When is using it a mistake?
+    hint: |-
+      - Tạo **Effect Event**: function luôn thấy props/state **mới nhất** nhưng **không reactive** → không cần (và không được) đưa vào deps; effect không chạy lại khi giá trị nó đọc thay đổi.
+      - Use case: effect kết nối theo `roomId` (reactive) nhưng khi có message thì đọc `theme`/`muted` (không muốn reconnect khi đổi theme).
+      - Chỉ gọi **từ bên trong effect** (hoặc Effect Event khác); không truyền xuống component khác, không gọi trong render hay event handler thường.
+      - Sai lầm: dùng để "né" exhaustive-deps cho giá trị **thật sự** nên làm effect chạy lại → bug đồng bộ âm thầm.
+      - Cần eslint-plugin-react-hooks bản mới để lint hiểu nó.
+    example: |-
+      ```tsx
+      function ChatRoom({ roomId, muted }: { roomId: string; muted: boolean }) {
+        const onMessage = useEffectEvent((msg: Message) => {
+          if (!muted) playSound();
+          addMessage(msg);
+        });
+        useEffect(() => {
+          const conn = connect(roomId);
+          conn.on('message', onMessage);
+          return () => conn.close();
+        }, [roomId]); // muted changes do NOT reconnect
+      }
+      ```
+    followUp: Before 19.2, how did you implement the same pattern, and what was fragile about it?
+    verify: true
+    tags: [react-19, effects, hooks]
+  - id: react-041
+    level: hard
+    type: concept
+    q: What is `<Activity>` in React 19.2, and how is it different from conditional rendering or CSS `display:none`?
+    hint: |-
+      - `<Activity mode="visible" | "hidden">`: khi `hidden`, React ẩn con (tương đương `display: none`), **giữ state** (và DOM), nhưng **unmount effects** (chạy cleanup) và ưu tiên thấp cho update của cây ẩn; khi `visible` lại, effect được mount lại.
+      - So với `{show && <Tab/>}`: conditional unmount mất state (input đang gõ, scroll).
+      - So với CSS ẩn thủ công: cây ẩn vẫn chạy effect/subscription, vẫn render với ưu tiên thường → tốn tài nguyên.
+      - Use case: tab, back-navigation giữ state, pre-render màn hình user sắp mở.
+      - Chú ý: component phải xử lý cleanup/re-setup đúng (StrictMode đã giúp lộ bug này).
+    followUp: What happens to a video element or a WebSocket subscription inside a hidden Activity?
+    verify: true
+    tags: [react-19, activity, state]
+  - id: react-042
+    level: hard
+    type: gotcha
+    q: What does React 19 change about error handling and reporting (re-throwing, `onCaughtError`, `onUncaughtError`)?
+    hint: |-
+      - React 19 **không còn re-throw** lỗi đã bị error boundary bắt (trước đây lỗi bị log 2–3 lần và bắn `window.onerror`) → giảm log trùng.
+      - `createRoot`/`hydrateRoot` nhận options: `onCaughtError` (lỗi boundary đã bắt), `onUncaughtError` (không boundary nào bắt, app unmount), `onRecoverableError` (React tự phục hồi, VD hydration mismatch fallback về client render).
+      - Đây là chỗ gắn Sentry/Datadog tập trung thay vì chỉ `componentDidCatch`.
+      - Nếu monitoring của bạn dựa vào `window.onerror` để thấy lỗi render → có thể **mất tín hiệu** sau khi upgrade.
+    followUp: After upgrading to React 19, your error dashboard shows a big drop in frontend errors. Good news or a problem?
+    verify: true
+    tags: [react-19, errors, observability]
+  - id: react-043
+    level: hard
+    type: debug
+    q: A memoized row still re-renders on every parent render. Explain why, using this code.
+    example: |-
+      ```tsx
+      const Row = memo(function Row({ item, onSelect, style }: RowProps) {
+        return <li style={style} onClick={() => onSelect(item.id)}>{item.name}</li>;
+      });
+
+      function List({ items }: { items: Item[] }) {
+        const [selected, setSelected] = useState<string | null>(null);
+        const handleSelect = useCallback((id: string) => {
+          setSelected(id);
+          track('select', { id, previous: selected });
+        }, [selected]);
+
+        return (
+          <ul>
+            {items.map((item) => (
+              <Row key={item.id} item={item} onSelect={handleSelect} style={{ padding: 8 }} />
+            ))}
+          </ul>
+        );
+      }
+      ```
+    hint: |-
+      - `style={{ padding: 8 }}` là object mới mỗi render → `memo` luôn thấy props khác.
+      - `handleSelect` có deps `[selected]` → đổi reference **mỗi lần chọn** → mọi row render lại khi chọn một row.
+      - Nếu `items` được tạo lại ở parent (`.map`/`.filter` không memo) → `item` object mới → cũng phá memo.
+      - Fix: đưa style ra hằng số/CSS class; bỏ `selected` khỏi deps của `handleSelect` (đọc giá trị trước qua ref, hoặc chuyển `track` sang nơi phản ứng với thay đổi) — **không** đặt side effect vào updater function; ổn định `items`.
+      - Kiểm chứng bằng Profiler "Why did this render?".
+    followUp: Would the React Compiler fix all three issues automatically? Which one would still need a code change?
+    tags: [memoization, debug, performance]
+  - id: react-044
+    level: hard
+    type: scenario
+    q: After a deploy, some users see a white screen with "ChunkLoadError" when navigating. What happened and how do you make the app resilient?
+    hint: |-
+      - Tab cũ chạy bundle của build cũ; khi navigate, `import()` xin chunk hash cũ — server/CDN đã xoá (deploy thay thế) → 404 → lazy component throw → không có error boundary → trắng trang.
+      - Phòng ngừa: giữ **asset của vài build trước** trên CDN (không xoá ngay), asset immutable có hash.
+      - Xử lý: error boundary quanh route lazy; bắt `ChunkLoadError`/"Failed to fetch dynamically imported module" → reload trang **một lần** (cờ trong sessionStorage chống loop) hoặc hiển thị "Có phiên bản mới, tải lại".
+      - Phát hiện version mới: poll `/version.json` hoặc header, hiển thị banner.
+      - Framework (Next.js `deploymentId`) có cơ chế hard navigation khi version skew.
+    followUp: How would you retry the import once before falling back to a full reload?
+    tags: [code-splitting, deployment, errors]
+  - id: react-045
+    level: hard
+    type: gotcha
+    q: Why is fetching data in `useEffect` considered an anti-pattern for most apps, even with correct cleanup?
+    hint: |-
+      - **Waterfall**: con chỉ fetch sau khi cha render xong + fetch xong → request tuần tự.
+      - Chỉ bắt đầu **sau khi JS tải và render** → chậm hơn fetch trên server/khi route match.
+      - Không có cache/dedupe: hai component cùng dữ liệu = hai request; quay lại màn hình = fetch lại + spinner.
+      - Tự lo race, retry, stale, refetch khi focus, pagination, SSR — mỗi team viết lại một cách.
+      - Thay thế: framework data loading (RSC/loader), React Query/SWR, preloading ở router; effect chỉ còn cho sync với hệ thống ngoài.
+    followUp: Where would you start the fetch so it runs in parallel with downloading the route's code?
+    tags: [data-fetching, effects, performance]
+  - id: react-046
+    level: hard
+    type: design
+    q: Design a reusable `<DataTable>` component for a design system used by 10 teams. How do you keep the API flexible without it becoming a 60-prop monster?
+    hint: |-
+      - **Headless core + styled layer**: logic (sort, filter, selection, pagination) trong hook (`useTable`, hoặc dựa trên TanStack Table), UI mặc định dùng hook đó; team cần custom thì dùng hook trực tiếp.
+      - **Composition/compound components** (`<Table><Table.Header/>…`) và render props/slots cho cell, thay vì boolean prop cho mọi biến thể.
+      - Controlled + uncontrolled cho state (sort/page): `value`/`onChange` hoặc `default*`.
+      - Column definition có kiểu (generic `ColumnDef<T>`), accessor an toàn kiểu.
+      - A11y: semantic `<table>`, keyboard navigation, `aria-sort`; performance: virtualization optional.
+      - Versioning & deprecation, Storybook + visual regression test, docs cho pattern.
+    followUp: One team needs inline editing, another needs server-side pagination. How does the API accommodate both without forking?
+    tags: [design-system, architecture, component-design]
+  - id: react-047
+    level: hard
+    type: compare
+    q: How do you test a component that fetches data — mock `fetch`, mock the module, or MSW? What are the trade-offs?
+    hint: |-
+      - Mock module/hook (`vi.mock('./api')`): nhanh, nhưng test gắn với chi tiết implementation; đổi từ fetch sang React Query → test vỡ dù hành vi đúng.
+      - Mock `global.fetch`: bớt coupling, nhưng phải giả lập Response thủ công, dễ sai header/status.
+      - **MSW** (Mock Service Worker): chặn ở tầng network, định nghĩa handler theo URL → cùng handler dùng cho test (Node), Storybook, dev; test hành vi thật (loading, error, retry). Nhược: setup ban đầu, phải reset handler giữa test.
+      - Luôn test: loading → data, error state, empty state; dùng `findBy*`.
+      - Với React Query: tạo `QueryClient` mới mỗi test, tắt retry.
+    example: |-
+      ```ts
+      server.use(
+        http.get('/api/orders', () => HttpResponse.json({ message: 'boom' }, { status: 500 })),
+      );
+      render(<Orders />, { wrapper: Providers });
+      expect(await screen.findByRole('alert')).toHaveTextContent(/could not load orders/i);
+      ```
+    followUp: Your test suite takes 12 minutes. Which React tests would you move to Playwright, and which to unit tests of hooks?
+    tags: [testing, msw, rtl]
+  - id: react-048
+    level: hard
+    type: gotcha
+    q: Why can a controlled input's cursor jump to the end while typing? Give two causes.
+    hint: |-
+      - Giá trị được **format/biến đổi** trong `onChange` (uppercase, thêm dấu phẩy tiền tệ) → React set `value` khác với cái browser vừa có → cursor nhảy về cuối.
+      - Update **async** (setState sau `await`, hoặc state nằm trong transition/store cập nhật trễ) → React ghi đè DOM value sau khi user đã gõ tiếp.
+      - Component bị **remount** mỗi phím (key đổi, component định nghĩa trong component) → mất cả focus.
+      - Fix: giữ raw value khi gõ, format khi blur; cập nhật state đồng bộ trong `onChange`; nếu phải format live thì tự tính & restore `selectionStart` trong layout effect; hoặc dùng uncontrolled/mask library.
+    followUp: Why must the input's own state update never be inside `startTransition`?
+    tags: [forms, gotcha]
+  - id: react-049
+    level: hard
+    type: concept
+    q: How does React decide the priority of updates (lanes), and why is render allowed to be interrupted but commit is not?
+    hint: |-
+      - Mỗi update gán **lane** (ưu tiên): sync/discrete (click, gõ phím), continuous (scroll, mousemove), default, transition, idle.
+      - Concurrent rendering: render phase chia nhỏ theo unit of work (fiber), **nhường main thread** (time slicing) và có thể **bỏ dở** để làm update ưu tiên cao hơn, rồi render lại sau.
+      - Commit **đồng bộ, không ngắt** vì phải áp thay đổi DOM nhất quán (không để user thấy nửa cũ nửa mới) và chạy layout effects.
+      - Hệ quả thực tế: render phải **thuần và idempotent** — có thể chạy nhiều lần mà không commit; side effect trong render → bug.
+    followUp: Give an example of a side effect in render that only breaks under concurrent features.
+    tags: [internals, concurrent, fiber]
+  - id: react-050
+    level: hard
+    type: scenario
+    q: A modal form loses what the user typed whenever a background poll refreshes the page data. What is happening and how do you fix it?
+    hint: |-
+      - Kiểm tra **remount**: poll trả dữ liệu mới → parent đổi `key` (VD `key={data.updatedAt}`), hoặc render nhánh loading (`if (isLoading) return <Spinner/>`) làm cây form unmount, hoặc component form được khai báo trong component cha.
+      - Kiểm tra **controlled value bị ghi đè**: form khởi tạo state từ props trong effect `useEffect(() => setForm(props.data), [props.data])` → mỗi lần poll reset input.
+      - Fix: form giữ **draft state** riêng, chỉ khởi tạo một lần (lazy init hoặc `key` theo entity id, không theo version); không thay form bằng spinner khi refetch (dùng `isFetching` nhẹ, giữ UI cũ); báo xung đột nếu dữ liệu server đổi trong lúc sửa.
+    followUp: How would you tell the user "this record changed on the server while you were editing"?
+    tags: [state, scenario, forms]
+  - id: react-051
+    level: senior
+    type: design
+    q: How do you decide where each piece of state lives in a large React app — local, lifted, context, URL, server cache, or global store?
+    hint: |-
+      Framework quyết định (không có một đáp án):
+      - **Server state** (dữ liệu từ API): React Query/RTK Query/RSC — cache, stale, refetch — **không** copy vào global store.
+      - **URL state**: filter, sort, page, tab đang chọn — share link, back/forward, reload giữ nguyên.
+      - **Local UI state**: open/close, hover, input draft — ở component gần nhất cần nó.
+      - **Lifted state**: vài sibling cần chung → cha chung gần nhất.
+      - **Context**: giá trị ít đổi, nhiều nơi đọc (theme, auth user, locale, feature flags).
+      - **Global client store**: state client phức tạp, nhiều màn hình ghi/đọc (cart offline, editor, wizard dài) — Redux Toolkit/Zustand.
+      - Nguyên tắc: một nguồn sự thật cho mỗi dữ liệu; derived không lưu.
+    followUp: A teammate stores the API response in Redux and also in React Query "just in case". What problems do you expect?
+    tags: [architecture, state]
+  - id: react-052
+    level: senior
+    type: open
+    q: Your team wants to enable the React Compiler on a 4-year-old codebase with many manual `useMemo`s and some class components. How do you roll it out?
+    hint: |-
+      Đo độ trưởng thành:
+      - Baseline trước: Profiler/INP/Web Vitals trên flow chính, bundle size, thời gian build.
+      - Bật lint rules của compiler trước để thấy vi phạm Rules of React (mutation, đọc ref trong render); sửa dần.
+      - Rollout theo thư mục/feature (`sources`/opt-in), feature flag hoặc canary; theo dõi lỗi và bug "UI không cập nhật".
+      - Không xoá `useMemo`/`useCallback` hàng loạt ngay — compiler làm việc cùng chúng; dọn dần sau khi ổn định.
+      - Class components không được compile — chấp nhận hoặc chuyển dần.
+      - Chấp nhận trade-off build time (Babel).
+    followUp: How do you prove to management that it was worth it?
+    verify: true
+    tags: [react-compiler, leadership, migration]
+  - id: react-053
+    level: senior
+    type: design
+    q: Design the frontend architecture for a B2B dashboard with 40 screens, role-based UI, and 6 teams contributing. What boundaries do you draw?
+    hint: |-
+      Không có đáp án duy nhất; đánh giá lập luận:
+      - **Feature-based** folder (orders/, customers/) với public API mỗi feature, lint rule cấm import sâu chéo feature.
+      - Tách lớp: UI components (design system) · feature components · hooks (business logic) · data layer (API client, query keys) · routing.
+      - Role-based UI: permission từ server → context/hook `useCan('orders:refund')`; **UI chỉ ẩn**, server vẫn kiểm tra.
+      - Code splitting theo route/feature; shared deps quản lý bằng monorepo (Nx/Turborepo) nếu nhiều package.
+      - Micro-frontends chỉ khi team cần deploy độc lập thật sự — chi phí cao (shared deps, UX nhất quán).
+      - Chuẩn chung: error boundary theo route, loading/empty/error pattern, testing pyramid, ADR.
+    followUp: When would you actually recommend micro-frontends, and what would you share between them?
+    tags: [architecture, scale, design]
+  - id: react-054
+    level: senior
+    type: open
+    q: How do you evaluate whether to migrate an existing React SPA (Vite + React Router) to Next.js App Router with Server Components?
+    hint: |-
+      - Lợi ích tiềm năng: SEO/first load (nếu có trang public), giảm JS nhờ RSC, data fetching gần DB, streaming.
+      - Chi phí: mô hình tư duy mới (server/client boundary), hạ tầng server (không còn chỉ static hosting), thư viện client-only phải bọc, auth/session đổi, team learning curve, caching của framework.
+      - Câu hỏi quyết định: app có public/SEO không hay chỉ dashboard sau login? Bottleneck hiện tại là gì (bundle, API latency, waterfall)? Có thể giải bằng code splitting + React Query + prefetch không?
+      - Nếu migrate: incremental (route by route, proxy/rewrite), đo trước/sau.
+    followUp: Which parts of a logged-in dashboard benefit least from Server Components?
+    tags: [architecture, nextjs, migration]
+  - id: react-055
+    level: senior
+    type: design
+    q: How do you design a form system for 30+ complex forms (multi-step, conditional fields, server validation, autosave)?
+    hint: |-
+      - Chọn nền tảng: React Hook Form (uncontrolled, hiệu năng) hoặc TanStack Form; schema **dùng chung FE/BE** (zod) cho kiểu + validation.
+      - Mô hình: form state (draft) tách khỏi server state; submit qua mutation/Action; lỗi server map về field (Problem Details `errors[]`).
+      - Multi-step: state machine hoặc reducer cho bước; persist draft (autosave debounce + idempotent PUT, hoặc localStorage) và cảnh báo khi rời trang.
+      - Conditional fields: schema điều kiện (discriminated union), unregister field ẩn.
+      - A11y: label, error liên kết `aria-describedby`, focus lỗi đầu tiên.
+      - Component field chuẩn trong design system để 30 form nhất quán.
+    followUp: Autosave and manual submit race each other. How do you prevent the older save from overwriting the newer one?
+    tags: [forms, architecture, design]
+  - id: react-056
+    level: senior
+    type: open
+    q: How do you set up a frontend performance budget and keep it from regressing across many PRs?
+    hint: |-
+      - Chọn metric đo được và liên quan user: LCP, INP, CLS (field data qua RUM/`web-vitals`), JS per route (bundle analyzer), số request.
+      - Budget theo route quan trọng (checkout, landing), không chỉ tổng.
+      - CI: size-limit/bundle diff comment trên PR, Lighthouse CI cho vài trang, fail khi vượt ngưỡng (có quy trình xin ngoại lệ).
+      - Production: dashboard RUM theo release để bắt regression mà lab không thấy.
+      - Văn hoá: owner rõ, review dependency mới (kích thước, tree-shaking), lazy-load mặc định cho phần nặng.
+    followUp: INP got worse after a release but bundle size did not change. Where do you look?
+    tags: [performance, process, web-vitals]
+  - id: react-057
+    level: senior
+    type: behavioral
+    q: Tell me about a React performance or rendering bug you debugged in production. How did you find the root cause?
+    hint: |-
+      STAR skeleton:
+      - **S/T**: màn hình nào, triệu chứng user thấy (lag, trắng trang, dữ liệu sai), ảnh hưởng (bao nhiêu user/đơn hàng).
+      - **A**: cách tái hiện, công cụ (Profiler, Performance panel, logging, source map), giả thuyết đã loại bỏ, root cause (stale closure, key sai, effect loop, re-render cascade…), fix và test thêm để chống tái phát.
+      - **R**: số liệu trước/sau (điền số liệu thật của bạn: render time, INP, error rate).
+      - Reflection: bài học/quy ước team rút ra (lint rule, pattern, monitoring).
+    followUp: What would have caught this before it reached production?
+    tags: [behavioral, debugging, performance]
+  - id: react-058
+    level: cv
+    type: scenario
+    q: On a banking SPA you introduced code splitting and lazy loading. Was it route-level or component-level, and what did the bundle look like before and after?
+    hint: |-
+      Câu trả lời mạnh:
+      - Phân tích trước bằng bundle analyzer: chunk nào lớn (chart, PDF, date lib, locale), trang nào user vào đầu tiên.
+      - Chiến lược: route-level `React.lazy` + `Suspense` trước; component-level cho widget nặng hiếm dùng (export PDF, biểu đồ); dynamic `import()` cho thư viện chỉ dùng khi thao tác.
+      - Xử lý: loading skeleton, error boundary + ChunkLoadError, prefetch route kế tiếp khi hover/idle.
+      - Kết quả **có số**: kích thước initial JS, LCP/TTI trước/sau (điền số liệu thật của bạn).
+      - Trade-off: nhiều request nhỏ, waterfall chunk, flash loading.
+    followUp: How did you make sure a lazily loaded route did not create a loading waterfall (chunk, then data)?
+    tags: [cv, code-splitting, performance]
+  - id: react-059
+    level: cv
+    type: scenario
+    q: You used memoization on the banking SPA. Walk me through one concrete case where memoization fixed a measured problem, and one where you removed it.
+    hint: |-
+      Nội dung mạnh:
+      - Case fix: triệu chứng (bảng giao dịch lag khi filter), đo bằng Profiler, nguyên nhân (callback/object mới phá `memo`, selector Redux trả object mới), fix (`memo` row, `useCallback`, selector memoized với `createSelector`), số liệu trước/sau (điền số liệu thật của bạn).
+      - Case bỏ: memo trên component rẻ, deps sai gây stale data, code khó đọc.
+      - Nguyên tắc rút ra: đo trước, sửa cấu trúc (đẩy state xuống, composition) trước khi memo.
+    followUp: With Redux Toolkit, how do selectors interact with `React.memo` and re-renders?
+    tags: [cv, memoization, redux]
+  - id: react-060
+    level: cv
+    type: design
+    q: You wrote custom hooks that separate business logic from presentation. Show me the shape of one such hook and how you tested it.
+    hint: |-
+      Câu trả lời mạnh:
+      - Ví dụ cụ thể (VD `useTransferForm`, `useAccountBalance`): input, output (state + actions), dependency (API client, store) được inject để test.
+      - Component chỉ render + gọi action; hook không biết về JSX/CSS.
+      - Test: `renderHook` + wrapper provider, mock network bằng MSW, test chuyển trạng thái (loading/error/success), edge cases (số tiền âm, vượt hạn mức).
+      - Ranh giới: hook quá to thì tách; logic thuần (tính phí, validate) tách thành function thuần để unit test không cần React.
+      - (Điền ví dụ thật của bạn.)
+    followUp: When does a custom hook become the wrong abstraction?
+    tags: [cv, hooks, testing, architecture]
+  - id: react-061
+    level: cv
+    type: design
+    q: You built a reusable core component library for the banking app. How did you design component APIs, handle theming, and prevent breaking changes for consuming teams?
+    hint: |-
+      Gợi ý:
+      - API: composition, props nhất quán (`variant`, `size`), controlled/uncontrolled, forward `ref` (React 19: ref là prop), spread native props, a11y mặc định.
+      - Theming: design tokens (CSS variables), dark mode, không hard-code màu.
+      - Chất lượng: Storybook, visual regression, test a11y, TypeScript types xuất ra chuẩn.
+      - Phát hành: semver, changelog, deprecation warning trong dev trước khi xoá prop, codemod nếu đổi lớn.
+      - Số liệu/adoption: bao nhiêu màn hình/team dùng (điền số liệu thật của bạn).
+    followUp: A consuming team keeps overriding your component's internals with CSS. What do you change?
+    tags: [cv, design-system, components]
+  - id: react-062
+    level: cv
+    type: scenario
+    q: On a financial platform you worked with React class components and Socket.IO real-time data. How did you manage subscriptions and prevent memory leaks or excessive re-renders?
+    hint: |-
+      Nội dung mạnh:
+      - Subscribe trong `componentDidMount`, **unsubscribe** trong `componentWillUnmount` (off đúng handler reference), xử lý đổi symbol trong `componentDidUpdate` (unsubscribe cũ, subscribe mới).
+      - Hạn chế render: `shouldComponentUpdate`/`PureComponent`, throttle/batch message theo khoảng thời gian, lưu dữ liệu nóng ngoài state khi không cần hiển thị ngay.
+      - Kết nối: một socket dùng chung (service/singleton), reconnect + resubscribe, trạng thái "stale" khi mất kết nối.
+      - Leak từng gặp và cách phát hiện (heap snapshot, listener count) — (điền ví dụ thật của bạn).
+    followUp: If you rewrote that component with hooks today, what would the subscription code look like?
+    tags: [cv, class-components, realtime, socket-io]
+  - id: react-063
+    level: cv
+    type: scenario
+    q: You did load testing on that financial platform. What did you load test on the frontend side versus the backend, and what did you learn?
+    hint: |-
+      Câu trả lời mạnh phân biệt:
+      - Backend/socket: số kết nối đồng thời, message/giây, latency p95/p99, tool (k6, Artillery, JMeter, Socket.IO load tools), bottleneck tìm thấy (CPU, event loop lag, Redis adapter).
+      - Frontend: browser chịu được bao nhiêu update/giây (CPU profiling, long tasks, memory theo thời gian), test trên máy yếu.
+      - Kết quả và thay đổi đã làm (throttle, batching, scale adapter) — (điền số liệu thật của bạn).
+      - Hạn chế của kịch bản test (không giống traffic thật).
+    followUp: How did you make the load test realistic in terms of user behavior and data?
+    tags: [cv, load-testing, realtime, performance]
+  - id: react-064
+    level: cv
+    type: design
+    q: On the multi-tenant commerce platform frontend, how did you handle tenant-specific branding and feature differences in React without forking components?
+    hint: |-
+      Gợi ý:
+      - Tenant config tải từ server (theme tokens, feature flags, payment methods) → context/provider ở gốc app; CSS variables cho branding.
+      - Component đọc flag qua hook (`useFeature('guestCheckout')`), không `if (tenant === 'x')` rải rác.
+      - Slot/composition cho phần tuỳ biến lớn; lazy-load module chỉ tenant nào bật mới tải.
+      - Test ma trận tenant chính; tránh flash theme sai khi load (SSR theme).
+      - (Điền ví dụ thật của bạn: số tenant, loại khác biệt.)
+    followUp: How did you prevent the tenant config from causing a full-app re-render when it refreshed?
+    tags: [cv, multi-tenancy, theming, architecture]
+  - id: react-065
+    level: cv
+    type: behavioral
+    q: You refactored legacy frontend code. Describe one refactor — how did you de-risk it and prove behavior did not change?
+    hint: |-
+      STAR:
+      - **S**: code cũ (class component khổng lồ, logic trộn UI, không test), vì sao phải refactor (bug lặp, tính năng mới bị chặn).
+      - **A**: viết characterization test trước (RTL theo hành vi), refactor từng bước nhỏ (tách hook, tách component), feature flag/canary, review theo PR nhỏ.
+      - **R**: số bug/incident giảm, thời gian làm feature mới, kích thước component (điền số liệu thật của bạn).
+      - Reflection: điều sẽ làm khác (VD dùng codemod, thống nhất với QA sớm hơn).
+    followUp: How did you convince the product owner to allocate time for it?
+    tags: [cv, refactoring, behavioral, testing]

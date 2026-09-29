@@ -1,0 +1,823 @@
+id: 14-multi-tenancy
+slug: multi-tenancy
+title: Multi-tenancy & Data Isolation
+tier: 4
+status: drafted
+summary: Silo/pool/bridge, tenant context propagation, Postgres RLS, tenant-aware cache, noisy neighbor, per-tenant migration, chống cross-tenant leak.
+cvLinked: true
+prerequisites: []
+overview: |-
+  ## TL;DR
+
+  - Multi-tenancy = một hệ thống phục vụ nhiều tenant, dữ liệu và cấu hình **cách ly logic hoặc vật lý**. Ba mô hình (thuật ngữ AWS SaaS Lens): **silo** (tài nguyên riêng mỗi tenant), **pool** (dùng chung, phân biệt bằng `tenant_id`), **bridge** (lai: ví dụ app chung, DB/schema riêng, hoặc tenant lớn silo còn lại pool).
+  - Lỗi đắt nhất không phải chậm mà là **cross-tenant leak**. Phòng thủ nhiều lớp: tenant context từ nguồn tin cậy (token/subdomain đã xác thực) → propagate (AsyncLocalStorage) → data layer bắt buộc filter (repository/RLS) → **mọi** kênh phụ (cache key, search index, queue, file storage, log) cũng mang tenant.
+  - **Noisy neighbor** là cái giá của pool: quota, rate limit per tenant, fair queuing, tách tenant lớn ra.
+  - Vận hành: migration phải chạy cho mọi tenant (hoặc mọi schema/DB), onboarding/offboarding, xoá dữ liệu tenant, cost attribution.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Tenant | Đơn vị khách hàng được cách ly (công ty, merchant, shop) | Merchant A và B cùng chạy trên platform |
+  | Silo | Mỗi tenant một stack/DB riêng | Enterprise tenant có DB riêng, key KMS riêng |
+  | Pool | Mọi tenant chung table, cột `tenant_id` | `orders(tenant_id, id, ...)` |
+  | Bridge | Kết hợp: chung compute, tách storage; hoặc tier-based | Free/Pro ở pool, Enterprise ở silo |
+  | Schema-per-tenant | Một DB, mỗi tenant một schema | `tenant_42.orders` |
+  | Tenant resolution | Xác định tenant của request | Subdomain `acme.app.com`, claim `tenant_id` trong JWT |
+  | Tenant context | Tenant hiện tại đi theo request qua mọi lớp | `AsyncLocalStorage<{ tenantId }>` |
+  | Row-Level Security | DB tự thêm điều kiện theo policy | `USING (tenant_id = current_setting('app.tenant_id')::bigint)` |
+  | Tenant-aware cache key | Key cache luôn chứa tenant | `t:42:product:123:v3` |
+  | Noisy neighbor | Một tenant chiếm tài nguyên chung làm tenant khác chậm | Import 5M sản phẩm làm DB CPU 100% |
+  | Cross-tenant leak | Tenant A thấy/sửa được dữ liệu tenant B | `GET /orders/991` không check tenant |
+
+  ## Cơ chế hoạt động
+
+  ### Tenant context từ edge tới database
+
+  ```mermaid
+  sequenceDiagram
+    participant C as Client
+    participant GW as API / Middleware
+    participant ALS as AsyncLocalStorage
+    participant SVC as Service / Repository
+    participant DB as Postgres (RLS)
+    participant R as Redis / ES / Queue
+    C->>GW: Request + JWT (sub, tenant_id)
+    GW->>GW: Verify JWT, check user is member of tenant
+    GW->>ALS: als.run({ tenantId, userId }, next)
+    SVC->>ALS: getStore() → tenantId
+    SVC->>DB: BEGIN, set_config app.tenant_id = 42 (local), query, COMMIT
+    DB-->>SVC: chỉ row của tenant 42 (policy)
+    SVC->>R: key/index/message luôn có tenantId
+  ```
+
+  ### Chọn mô hình isolation
+
+  ```mermaid
+  flowchart TD
+    A["Tenant mới"] --> B{"Yêu cầu compliance / hợp đồng<br/>đòi cách ly vật lý?"}
+    B -- yes --> S["Silo: DB/account riêng"]
+    B -- no --> C{"Tenant rất lớn / tải đột biến<br/>ảnh hưởng người khác?"}
+    C -- yes --> BR["Bridge: tách DB/shard riêng,<br/>code & control plane chung"]
+    C -- no --> P["Pool: chung table + tenant_id + RLS"]
+    P --> M["Theo dõi usage per tenant"]
+    M -- "vượt ngưỡng" --> BR
+  ```
+
+  ## Trade-offs
+
+  | Tiêu chí | Silo (DB per tenant) | Bridge (schema per tenant / tier) | Pool (shared table) |
+  |---|---|---|---|
+  | Isolation | Mạnh nhất, blast radius nhỏ | Trung bình | Logic — phụ thuộc code/RLS |
+  | Chi phí / tenant | Cao | Trung bình | Thấp nhất |
+  | Onboarding | Chậm (provision) | Trung bình | Tức thì (insert row) |
+  | Migration | N lần, dễ lệch version | N schema, catalog phình | Một lần |
+  | Noisy neighbor | Gần như không | Còn chung compute | Rủi ro cao nhất |
+  | Backup/restore 1 tenant | Dễ | Khá dễ | Khó (phải trích xuất theo tenant_id) |
+  | Cross-tenant analytics | Khó | Khó | Dễ |
+  | Connection pool | Bùng nổ số pool | Có thể dùng `search_path` (cẩn thận pooler) | Một pool |
+
+  ## Pitfalls
+
+  - Lấy `tenant_id` từ **body/query param/header do client gửi** mà không đối chiếu với identity đã xác thực.
+  - Chỉ filter theo `tenant_id` ở list endpoint, quên ở `GET /:id`, `UPDATE`, `DELETE`, export, webhook, admin tool.
+  - Cache key, Elasticsearch query, S3 prefix, queue message thiếu tenant.
+  - `SET app.tenant_id` (session-level) sau PgBouncer transaction mode → context dính sang request khác.
+  - Owner của table/superuser **bypass RLS**; view tạo bởi owner cũng bypass (trừ `security_invoker`, PG 15+).
+  - Background job/consumer không có HTTP request → tenant context rỗng → code "fallback" chạy không filter.
+  - Unique constraint toàn cục (`email`) thay vì theo tenant `(tenant_id, email)`, và lỗi unique có thể **lộ sự tồn tại** dữ liệu của tenant khác.
+  - Log/trace không có `tenant_id` → không điều tra được incident theo tenant.
+
+  ## Cheat sheet
+
+  - Nguồn tenant đáng tin: claim trong token đã verify / subdomain map qua DB + kiểm tra membership. Không tin header thô.
+  - Propagate: `AsyncLocalStorage.run()` ở middleware; job/message mang `tenantId` trong payload rồi `run()` lại ở consumer.
+  - DB: `tenant_id` trong mọi table nghiệp vụ, đầu mọi index, trong unique và **composite FK** `(tenant_id, parent_id)`.
+  - RLS: `ENABLE` + `FORCE ROW LEVEL SECURITY`, app role không phải owner, `set_config('app.tenant_id', $1, true)` trong transaction, policy `USING` + `WITH CHECK`.
+  - Cache: `t:{tenantId}:...`; ES: filter `tenant_id` bắt buộc (alias có filter / routing) hoặc index per tenant cho tenant lớn.
+  - Noisy neighbor: rate limit & quota per tenant, fair queue, statement_timeout, tách tenant lớn.
+  - Test: tạo 2 tenant trong mọi integration test, gọi mọi endpoint bằng token tenant A với id của tenant B → expect 404.
+notionRefs:
+  - title: Multi-tenancy
+    url: https://app.notion.com/p/2e9ef77f8ab2800397eff0a5007d9bdd
+  - title: SaaS
+    url: https://app.notion.com/p/2e9ef77f8ab2805eb17bfa6d452b0f71
+references:
+  - title: AWS Well-Architected SaaS Lens — Silo, pool, and bridge models
+    url: https://docs.aws.amazon.com/wellarchitected/latest/saas-lens/silo-pool-and-bridge-models.html
+  - title: AWS Whitepaper — SaaS Tenant Isolation Strategies
+    url: https://docs.aws.amazon.com/whitepapers/latest/saas-tenant-isolation-strategies/saas-tenant-isolation-strategies.html
+  - title: PostgreSQL docs — Row Security Policies
+    url: https://www.postgresql.org/docs/current/ddl-rowsecurity.html
+  - title: PostgreSQL docs — CREATE POLICY
+    url: https://www.postgresql.org/docs/current/sql-createpolicy.html
+  - title: Node.js docs — Asynchronous context tracking (AsyncLocalStorage)
+    url: https://nodejs.org/api/async_context.html
+  - title: Microsoft Learn — Row-level security (SQL Server)
+    url: https://learn.microsoft.com/en-us/sql/relational-databases/security/row-level-security
+  - title: Azure Architecture Center — Multitenant architecture
+    url: https://learn.microsoft.com/en-us/azure/architecture/guide/multitenant/overview
+  - title: OWASP — Authorization Cheat Sheet (IDOR)
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html
+questions:
+  - id: multi-tenancy-001
+    level: easy
+    type: concept
+    q: What is multi-tenancy, and what is a tenant in a B2B2C e-commerce platform?
+    hint: |-
+      Multi-tenancy: một instance hệ thống (code, hạ tầng) phục vụ nhiều khách hàng, mỗi khách có dữ liệu và cấu hình **cách ly**.
+      B2B2C: platform → **merchant/brand (tenant)** → end customer của merchant. Customer thuộc về tenant; cùng một người có thể là customer của nhiều tenant với dữ liệu tách biệt.
+      Lợi ích: chi phí thấp, deploy một lần. Giá: phức tạp về isolation, noisy neighbor, per-tenant config.
+    followUp: Is an end customer of a merchant also a tenant? How do you model users who belong to multiple tenants?
+    tags: [basics]
+  - id: multi-tenancy-002
+    level: easy
+    type: compare
+    q: Explain the silo, pool and bridge tenancy models.
+    hint: |-
+      - **Silo**: mỗi tenant tài nguyên riêng (DB, đôi khi cả compute/account). Isolation mạnh, dễ compliance, restore riêng; đắt, onboarding chậm, vận hành N bản.
+      - **Pool**: dùng chung mọi thứ, phân biệt bằng `tenant_id`. Rẻ, scale tốt, một migration; isolation phụ thuộc code/RLS, noisy neighbor.
+      - **Bridge**: lai — ví dụ compute chung nhưng schema/DB riêng, hoặc tier: tenant thường ở pool, enterprise ở silo.
+      Thuật ngữ phổ biến qua AWS SaaS Lens; có thể áp dụng khác nhau cho từng tầng (compute pool, storage silo).
+    followUp: Can you mix models per layer — for example, pooled compute with siloed storage? When would you?
+    tags: [silo, pool, bridge]
+  - id: multi-tenancy-003
+    level: easy
+    type: concept
+    q: What are the common ways to resolve the tenant for a request, and which sources can you trust?
+    hint: |-
+      Nguồn: subdomain/custom domain (`acme.shop.com`), path (`/t/acme/...`), header (`X-Tenant-Id`), claim trong JWT, API key.
+      Tin được: thông tin **đã xác thực** (claim trong token đã verify chữ ký; API key tra DB ra tenant). Subdomain/header chỉ là **gợi ý** → phải kiểm tra user thực sự là member của tenant đó.
+      Không bao giờ lấy `tenantId` từ body rồi dùng thẳng để query.
+    followUp: A user belongs to three tenants and switches between them in the UI. How does the backend know which one is active, securely?
+    redFlags:
+      - Trusts an X-Tenant-Id header from the browser without checking membership
+    tags: [tenant-resolution, security]
+  - id: multi-tenancy-004
+    level: easy
+    type: concept
+    q: What is the noisy neighbor problem?
+    hint: |-
+      Trong pool, một tenant dùng quá nhiều tài nguyên chung (DB CPU, connection, queue, cache memory, ES) → tenant khác chậm hoặc lỗi.
+      Ví dụ: merchant lớn import catalog 5 triệu sản phẩm, flash sale, report nặng, bot scraping.
+      Giảm: rate limit & quota per tenant, fair queuing, timeouts, tách workload nặng sang worker/replica riêng, chuyển tenant lớn sang silo/shard riêng.
+    followUp: How do you even know which tenant is the noisy one when the DB is at 100% CPU?
+    tags: [noisy-neighbor]
+  - id: multi-tenancy-005
+    level: easy
+    type: concept
+    q: What is Row-Level Security in PostgreSQL and why is it attractive for pooled multi-tenancy?
+    hint: |-
+      RLS: `ALTER TABLE t ENABLE ROW LEVEL SECURITY` + `CREATE POLICY` → DB **tự động thêm điều kiện** vào mọi SELECT/UPDATE/DELETE (và kiểm tra INSERT) theo policy. Bật RLS mà không có policy → mặc định **deny** (không thấy row nào).
+      Hấp dẫn vì là lớp phòng thủ **ở tầng DB**: quên `WHERE tenant_id = ?` trong code không còn làm leak.
+      Tenant hiện tại thường truyền qua setting: `current_setting('app.tenant_id')`.
+      SQL Server có tương đương từ 2016: security policy + predicate function + `SESSION_CONTEXT`.
+    followUp: Which roles bypass RLS by default?
+    tags: [rls, postgres]
+  - id: multi-tenancy-006
+    level: easy
+    type: gotcha
+    q: Why must cache keys be tenant-aware? Give an example of a bad key.
+    hint: |-
+      Cache là "database thứ hai" không có RLS. Key `product:123` hoặc `homepage:banners` dùng chung → tenant B nhận dữ liệu (giá, banner, config) đã cache của tenant A.
+      Key tốt: `t:{tenantId}:product:{id}:v{schemaVersion}`; cả HTTP/CDN cache cũng phải vary theo tenant (host) và không cache response có dữ liệu cá nhân.
+      Thêm: invalidation theo tenant (prefix/version per tenant), giới hạn memory per tenant.
+    example: |-
+      ```ts
+      // BAD
+      const key = `price:${sku}`;
+      // GOOD
+      const key = `t:${ctx.tenantId}:price:${sku}`;
+      ```
+    followUp: How would you invalidate everything cached for one tenant without SCAN over millions of keys?
+    tags: [caching, redis, leak]
+  - id: multi-tenancy-007
+    level: easy
+    type: compare
+    q: What are the pros and cons of schema-per-tenant in a single database?
+    hint: |-
+      Ưu: isolation tốt hơn pool (không cần `tenant_id` trên mọi query), backup/restore/xoá theo tenant dễ (`DROP SCHEMA`), customize được.
+      Nhược: migration chạy N lần (dễ lệch version giữa schema), catalog phình khi hàng nghìn tenant × hàng trăm table (planner, `pg_dump`, autovacuum chậm), cross-tenant analytics khó, connection/search_path phức tạp với pooler.
+      Hợp: vài chục–vài trăm tenant B2B, mỗi tenant dữ liệu vừa phải.
+    followUp: What breaks when you have 20,000 schemas in one Postgres database?
+    tags: [schema-per-tenant, bridge]
+  - id: multi-tenancy-008
+    level: medium
+    type: design
+    q: How would you choose between pool, bridge and silo for a new SaaS product? What factors drive the decision?
+    hint: |-
+      Yếu tố:
+      - Số tenant & phân bố kích thước (long tail nhiều tenant nhỏ → pool).
+      - Compliance/hợp đồng (data residency, dedicated DB, customer-managed key → silo cho tier đó).
+      - Mức customize schema theo tenant.
+      - Chi phí vận hành team (N DB = N lần migrate, monitor).
+      - Yêu cầu restore/xoá theo tenant, SLA khác nhau theo tier.
+      Mặc định thực dụng: **pool + RLS + tenant_id ở mọi nơi**, thiết kế để có thể "nhấc" tenant lớn sang shard/silo (bridge) sau này.
+    followUp: What must be true in your pooled design from day one so that moving a tenant to its own database later is feasible?
+    tags: [design, silo, pool, bridge]
+  - id: multi-tenancy-009
+    level: medium
+    type: concept
+    q: How do you propagate tenant context through a Node.js request without passing `tenantId` to every function?
+    hint: |-
+      `AsyncLocalStorage` (`node:async_hooks`): middleware gọi `als.run(store, next)`; mọi code async trong chuỗi đó đọc `als.getStore()`.
+      Quy tắc:
+      - Dùng `run()` (có phạm vi rõ) thay vì `enterWith()`.
+      - Store **bất biến** sau khi tạo; không đổi tenant giữa chừng.
+      - Hàm cần tenant mà `getStore()` rỗng → **throw**, không fallback "không filter".
+      - Node 24 chuyển implementation mặc định sang `AsyncContextFrame` (nhanh hơn, API không đổi).
+      NestJS: `nestjs-cls` hoặc request-scoped provider (request scope có chi phí khởi tạo mỗi request).
+    example: |-
+      ```ts
+      import { AsyncLocalStorage } from 'node:async_hooks';
+      type Ctx = { tenantId: string; userId: string };
+      export const als = new AsyncLocalStorage<Ctx>();
+
+      app.use((req, res, next) => {
+        const { tenantId, sub } = req.auth; // đã verify JWT + membership
+        als.run({ tenantId, userId: sub }, next);
+      });
+
+      export function currentTenant(): string {
+        const ctx = als.getStore();
+        if (!ctx) throw new Error('No tenant context');
+        return ctx.tenantId;
+      }
+      ```
+    followUp: Name situations where the AsyncLocalStorage context is lost, and how you fix them.
+    tags: [asynclocalstorage, nodejs, context]
+    verify: true
+  - id: multi-tenancy-010
+    level: medium
+    type: compare
+    q: "Where should tenant filtering be enforced: in every query, in a repository base class, in ORM global scopes, or in the database with RLS?"
+    hint: |-
+      - **Mỗi query thủ công**: dễ quên — một câu thiếu là leak.
+      - **Repository/base class** tự thêm `tenant_id` từ context: tập trung, dễ review; raw query và code bypass repository vẫn rủi ro.
+      - **ORM global scope/filter** (Prisma extension, TypeORM subscriber, EF Core global query filter): tự động, nhưng raw SQL, join thủ công, một số API (bulk update) có thể không áp dụng.
+      - **RLS**: lớp cuối ở DB, bắt được cả raw SQL; cần quản lý role/setting cẩn thận, debug khó hơn, chi phí nhỏ khi policy đơn giản.
+      Khuyến nghị: defense in depth — repository/ORM filter **và** RLS (hoặc ít nhất test tự động phát hiện thiếu filter).
+    followUp: How would you enforce in CI that no one writes a query against a tenant table without the tenant filter?
+    tags: [data-access, rls, orm]
+  - id: multi-tenancy-011
+    level: medium
+    type: concept
+    q: Write an RLS policy for a pooled `orders` table and explain USING vs WITH CHECK.
+    hint: |-
+      `USING`: điều kiện row **hiện có** phải thoả để được thấy/UPDATE/DELETE.
+      `WITH CHECK`: điều kiện row **mới** (INSERT, hoặc giá trị sau UPDATE) phải thoả → chặn ghi row sang tenant khác hoặc đổi `tenant_id`.
+      Nếu `FOR ALL` chỉ có `USING`, Postgres dùng nó cho cả check. Dùng `current_setting('app.tenant_id', true)` (missing_ok) → khi chưa set trả NULL → so sánh NULL → không thấy row nào (fail closed).
+    example: |-
+      ```sql
+      ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE orders FORCE ROW LEVEL SECURITY;
+
+      CREATE POLICY tenant_isolation ON orders
+        USING (tenant_id = current_setting('app.tenant_id', true)::bigint)
+        WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::bigint);
+
+      -- per request, inside a transaction:
+      BEGIN;
+      SELECT set_config('app.tenant_id', '42', true);  -- true = local to transaction
+      SELECT * FROM orders WHERE id = 991;              -- only visible if tenant 42
+      COMMIT;
+      ```
+    followUp: Why is `true` (is_local) in `set_config` critical when you use a connection pool?
+    tags: [rls, postgres, policy]
+  - id: multi-tenancy-012
+    level: medium
+    type: gotcha
+    q: Who bypasses Postgres Row-Level Security, and what are the non-obvious ways RLS gets bypassed?
+    hint: |-
+      - **Superuser** và role có `BYPASSRLS` luôn bypass.
+      - **Table owner** bypass trừ khi `ALTER TABLE ... FORCE ROW LEVEL SECURITY`. Nếu app kết nối bằng role migration/owner → RLS vô dụng. Dùng role app riêng, không phải owner.
+      - **View**: mặc định chạy với quyền của view owner → nếu owner là table owner, bypass. PG 15+ có `WITH (security_invoker = true)`.
+      - `SECURITY DEFINER` function chạy với quyền người tạo.
+      - FK/unique check không áp dụng RLS → lỗi unique/FK có thể lộ sự tồn tại của row tenant khác (covert channel).
+      - `pg_dump`, replication, logical decoding, backup → dữ liệu mọi tenant.
+    followUp: How would you write a test that proves the application role cannot bypass RLS?
+    redFlags:
+      - "Once RLS is enabled, nobody can see other tenants' rows"
+    tags: [rls, postgres, security]
+    verify: true
+  - id: multi-tenancy-013
+    level: medium
+    type: gotcha
+    q: How do you pass the tenant to Postgres for RLS when you use PgBouncer in transaction mode?
+    hint: |-
+      Session-level `SET app.tenant_id = 42` dính vào **server connection**; transaction sau (có thể của tenant khác) mượn connection đó sẽ **thừa hưởng** giá trị → leak.
+      Đúng: mỗi unit of work là một transaction, đầu transaction `SELECT set_config('app.tenant_id', $1, true)` (hoặc `SET LOCAL`), giá trị tự mất khi commit/rollback.
+      Wrapper bắt buộc: `withTenantTx(tenantId, fn)`; không cho code chạy query ngoài wrapper trên tenant tables.
+      Autocommit query đơn lẻ không có transaction → setting không áp dụng; phải bọc transaction.
+    example: |-
+      ```ts
+      export async function withTenantTx<T>(fn: (c: PoolClient) => Promise<T>): Promise<T> {
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          await client.query(`SELECT set_config('app.tenant_id', $1, true)`, [currentTenant()]);
+          const r = await fn(client);
+          await client.query('COMMIT');
+          return r;
+        } catch (e) { await client.query('ROLLBACK'); throw e; }
+        finally { client.release(); }
+      }
+      ```
+    followUp: What is the extra round-trip cost of this pattern and how can you reduce it?
+    tags: [rls, pgbouncer, pooling]
+  - id: multi-tenancy-014
+    level: medium
+    type: design
+    q: How do you prevent a row in tenant A from referencing a parent row in tenant B at the schema level?
+    hint: |-
+      FK thường `order_items.order_id → orders.id` không biết tenant: bug có thể tạo item của tenant A trỏ vào order tenant B.
+      Dùng **composite key**: `orders` có `UNIQUE (tenant_id, id)`; `order_items` có `FOREIGN KEY (tenant_id, order_id) REFERENCES orders (tenant_id, id)` → DB đảm bảo cùng tenant.
+      Bonus: index `(tenant_id, order_id)` phục vụ join và đúng thứ tự "tenant trước".
+      Tương tự cho unique nghiệp vụ: `UNIQUE (tenant_id, sku)`, `UNIQUE (tenant_id, email)` thay vì global.
+    example: |-
+      ```sql
+      ALTER TABLE orders ADD CONSTRAINT orders_tenant_id_id UNIQUE (tenant_id, id);
+      ALTER TABLE order_items
+        ADD CONSTRAINT order_items_order_fk
+        FOREIGN KEY (tenant_id, order_id) REFERENCES orders (tenant_id, id);
+      ```
+    followUp: Is the extra unique index worth the storage cost on a very large table?
+    tags: [schema, foreign-keys, integrity]
+  - id: multi-tenancy-015
+    level: medium
+    type: design
+    q: A user can belong to several tenants with different roles. How do you model authorization so users only access resources in their current tenant?
+    hint: |-
+      Mô hình: `users` (identity toàn cục) — `memberships(user_id, tenant_id, role)` — resource có `tenant_id`.
+      Mỗi request: xác định **active tenant** (claim trong token được cấp khi user chọn tenant, hoặc subdomain) → kiểm tra membership → role/permission **trong tenant đó**.
+      Check tài nguyên: `resource.tenant_id === ctx.tenantId` **và** permission (RBAC/ABAC). Truy vấn luôn filter theo tenant; resource không thuộc tenant → **404** (không 403, tránh lộ tồn tại).
+      Token đổi tenant → cấp token mới (hoặc ký lại) thay vì client tự đổi header.
+      Platform admin/support: role riêng, có audit log, impersonation có thời hạn.
+    followUp: How do you handle support staff who must view a tenant's data for troubleshooting?
+    tags: [authorization, rbac, membership]
+  - id: multi-tenancy-016
+    level: medium
+    type: concept
+    q: How do you keep tenant context in background jobs and Kafka consumers where there is no HTTP request?
+    hint: |-
+      Context **không tự đi qua** queue/broker. Producer phải đưa `tenantId` vào payload/header của message; consumer đọc ra rồi `als.run({ tenantId }, handler)` trước khi gọi service.
+      Validate: message thiếu `tenantId` → dead-letter, không xử lý "toàn cục".
+      Job định kỳ cho mọi tenant: lặp qua tenant và `run()` riêng cho từng tenant (cô lập lỗi, giới hạn concurrency, không để tenant lớn chặn cả vòng).
+      Partition key Kafka theo `tenantId` (hoặc entity id) để giữ thứ tự theo tenant — cẩn thận hot partition cho tenant lớn.
+    example: |-
+      ```ts
+      consumer.run({
+        eachMessage: async ({ message }) => {
+          const tenantId = message.headers?.['tenant-id']?.toString();
+          if (!tenantId) throw new Error('Missing tenant-id header'); // → DLQ
+          await als.run({ tenantId, userId: 'system' }, () => handle(message));
+        },
+      });
+      ```
+    followUp: A nightly job iterates 3,000 tenants and one tenant's failure stops the rest. How do you redesign it?
+    tags: [asynclocalstorage, kafka, background-jobs]
+  - id: multi-tenancy-017
+    level: medium
+    type: design
+    q: How do you implement per-tenant rate limiting and quotas?
+    hint: |-
+      - Rate limit key theo `tenantId` (và thêm theo user/API key trong tenant): token bucket/sliding window trong Redis (Lua script atomic) ở gateway.
+      - Giới hạn theo **plan/tier** (config per tenant), trả `429` + `Retry-After`.
+      - Quota tài nguyên: số sản phẩm, dung lượng file, số job đồng thời per tenant.
+      - Tầng sâu hơn: concurrency limit per tenant ở worker pool, `statement_timeout` cho report, queue riêng cho tenant lớn.
+      - Đo usage per tenant (metrics có label `tenant_id` — cẩn thận cardinality cao trong Prometheus; dùng top-N hoặc log-based).
+    followUp: Adding `tenant_id` as a Prometheus label with 50,000 tenants — what goes wrong and what do you do instead?
+    tags: [rate-limiting, noisy-neighbor, quota]
+  - id: multi-tenancy-018
+    level: medium
+    type: compare
+    q: "Elasticsearch for many tenants: index per tenant, shared index with a tenant filter, or something in between?"
+    hint: |-
+      - **Index per tenant**: isolation rõ, xoá tenant = xoá index, mapping riêng; nhưng hàng nghìn index nhỏ → quá nhiều shard (mỗi shard tốn heap/overhead cluster state) → cluster chậm.
+      - **Shared index** + field `tenant_id` (keyword) + **bắt buộc filter**: hiệu quả tài nguyên; rủi ro leak nếu quên filter; relevance (IDF) bị ảnh hưởng bởi tenant khác; mapping chung.
+      - **Routing** theo `tenant_id` → document của tenant nằm trên một shard, query chỉ chạm shard đó; tenant lớn gây shard lệch.
+      - **Filtered alias** per tenant (`alias` + filter `tenant_id`) → app query alias, giảm rủi ro quên filter.
+      Thực tế: shared index + alias/routing cho long tail, index riêng cho tenant rất lớn.
+    followUp: How would you enforce the tenant filter so a developer cannot forget it in a new search endpoint?
+    tags: [elasticsearch, search, isolation]
+  - id: multi-tenancy-019
+    level: medium
+    type: concept
+    q: How does SQL Server implement row-level security, and how would you pass the tenant from a Node.js app?
+    hint: |-
+      SQL Server 2016+: tạo **inline table-valued function** làm predicate, rồi `CREATE SECURITY POLICY` với **FILTER PREDICATE** (lọc đọc) và **BLOCK PREDICATE** (chặn ghi sai tenant: AFTER INSERT/UPDATE...).
+      Tenant truyền qua `sp_set_session_context @key = N'TenantId', @value = @tid, @read_only = 1`; predicate đọc `SESSION_CONTEXT(N'TenantId')`.
+      Với connection pool (tedious/mssql): session context tồn tại theo connection → phải set lại mỗi lần mượn connection; connection reset (`sp_reset_connection`) khi trả về pool xoá session context.
+      Giống Postgres: user có quyền cao (db_owner, sysadmin) và cách predicate viết ảnh hưởng hiệu năng.
+    example: |-
+      ```sql
+      CREATE FUNCTION sec.fn_tenant(@TenantId int)
+        RETURNS TABLE WITH SCHEMABINDING
+      AS RETURN SELECT 1 AS ok WHERE @TenantId = CAST(SESSION_CONTEXT(N'TenantId') AS int);
+      GO
+      CREATE SECURITY POLICY sec.TenantPolicy
+        ADD FILTER PREDICATE sec.fn_tenant(TenantId) ON dbo.Orders,
+        ADD BLOCK PREDICATE sec.fn_tenant(TenantId) ON dbo.Orders AFTER INSERT
+        WITH (STATE = ON);
+      ```
+    followUp: What happens to the session context when the driver resets a pooled connection?
+    tags: [sql-server, rls, session-context]
+    verify: true
+  - id: multi-tenancy-020
+    level: medium
+    type: gotcha
+    q: Should resource IDs be global or per-tenant, and does using UUIDs solve IDOR in a multi-tenant API?
+    hint: |-
+      ID global (bigint/UUID) đơn giản cho join, cache, event. ID hiển thị theo tenant (`order_no` 1001, 1002…) là **thuộc tính nghiệp vụ** với unique `(tenant_id, order_no)`.
+      UUID **không** giải quyết IDOR: chỉ khó đoán hơn, nhưng ID vẫn lộ qua URL, log, email, share link. Kiểm soát truy cập vẫn phải là `WHERE tenant_id = ctx AND id = ?` + permission check.
+      Sequential ID lộ quy mô (đối thủ đoán số đơn/ngày) → lý do để dùng ID không tuần tự ở bề mặt public.
+    followUp: How would you design a public share link for an order that works without login but can be revoked?
+    tags: [idor, ids, security]
+  - id: multi-tenancy-021
+    level: hard
+    type: debug
+    q: In production, a few requests log `No tenant context` or, worse, act under another tenant. Find the bugs in this code.
+    example: |-
+      ```ts
+      const als = new AsyncLocalStorage<{ tenantId: string }>();
+      let lastTenant: string | undefined;            // "fallback"
+
+      app.use(async (req, res, next) => {
+        const auth = await verify(req);              // awaits before entering context
+        als.enterWith({ tenantId: auth.tenantId });
+        lastTenant = auth.tenantId;
+        next();
+      });
+
+      // legacy callback-based pool captured at module load
+      legacyPool.acquire((err, conn) => {
+        const t = als.getStore()?.tenantId ?? lastTenant;
+        conn.query(sql, [t]);
+      });
+      ```
+    hint: |-
+      - `lastTenant` là **biến module toàn cục** dùng chung giữa các request đồng thời → request A dùng tenant của request B. Không bao giờ fallback kiểu này; thiếu context thì throw.
+      - `enterWith()` gắn context vào execution hiện tại và có thể "rò" sang code chạy sau trong cùng async resource; dùng `als.run(store, next)` để giới hạn phạm vi.
+      - Thư viện callback/pool tự quản queue (callback chạy trong context của nơi **khác**, ví dụ context lúc connection được trả về) → mất/nhầm context. Fix: `AsyncResource.bind(cb)` hoặc `AsyncLocalStorage.bind(fn)`, hoặc dùng API promise-based; tốt nhất truyền `tenantId` tường minh ở tầng data access.
+      - EventEmitter listener chạy theo context của nơi `emit()` → cân nhắc `EventEmitterAsyncResource`.
+    followUp: How would you write a load test that proves tenant context never crosses between concurrent requests?
+    redFlags:
+      - Stores the current tenant in a module-level variable or a singleton service field
+    tags: [asynclocalstorage, debug, leak]
+  - id: multi-tenancy-022
+    level: hard
+    type: debug
+    q: Merchant B reports seeing merchant A's promotional banner and prices on the home page. Find the bug.
+    example: |-
+      ```ts
+      async function getHomepage(req: Request) {
+        const key = `homepage:${req.query.locale ?? 'en'}`;
+        const cached = await redis.get(key);
+        if (cached) return JSON.parse(cached);
+        const data = await loadHomepage(currentTenant(), req.query.locale);
+        await redis.set(key, JSON.stringify(data), 'EX', 300);
+        res.setHeader('Cache-Control', 'public, max-age=300');
+        return data;
+      }
+      ```
+    hint: |-
+      - Redis key thiếu tenant → tenant nào gọi trước 5 phút thì mọi tenant nhận dữ liệu đó. Fix: `t:${tenantId}:homepage:${locale}`.
+      - `Cache-Control: public` cho phép **CDN/proxy dùng chung** response; nếu CDN không đưa `Host`/tenant vào cache key (hoặc tenant xác định bằng header/cookie thay vì host) → leak ở tầng CDN. Fix: cache key CDN gồm host, hoặc `Vary` phù hợp, hoặc `private` nếu có dữ liệu cá nhân/giá theo customer.
+      - Giá có thể phụ thuộc customer group → không cache ở mức tenant chung được.
+      Incident: flush key sai, purge CDN, xác định phạm vi ảnh hưởng qua log.
+    followUp: How would you add a guard in your cache client so that a key without a tenant prefix cannot be written?
+    tags: [caching, cdn, debug, leak]
+  - id: multi-tenancy-023
+    level: hard
+    type: debug
+    q: RLS is enabled, yet an internal reporting endpoint returns rows from every tenant. Why?
+    example: |-
+      ```sql
+      -- migration run as role app_owner (table owner)
+      ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+      CREATE POLICY p ON orders USING (tenant_id = current_setting('app.tenant_id')::bigint);
+      CREATE VIEW order_summary AS
+        SELECT tenant_id, date_trunc('day', created_at) d, sum(total) FROM orders GROUP BY 1, 2;
+      ```
+      ```ts
+      // reporting service connects as app_owner
+      await db.query('SELECT * FROM order_summary');
+      ```
+    hint: |-
+      - Service kết nối bằng **table owner** → owner bypass RLS vì chưa `FORCE ROW LEVEL SECURITY`.
+      - View tạo bởi owner mặc định chạy với quyền owner → kể cả role app thường truy vấn view cũng bypass. PG 15+: `CREATE VIEW ... WITH (security_invoker = true)`.
+      - `current_setting('app.tenant_id')` không có `missing_ok` → khi chưa set sẽ **lỗi** (fail closed nhưng gây 500); với `true` → NULL → không row nào. Chọn có chủ đích.
+      Fix: role riêng cho app (NOLOGIN owner, LOGIN app không phải owner, không `BYPASSRLS`), `FORCE RLS`, view `security_invoker`, test tự động bằng đúng role của app.
+    followUp: Reporting legitimately needs cross-tenant aggregates for the platform team. How do you allow that safely?
+    tags: [rls, postgres, debug]
+    verify: true
+  - id: multi-tenancy-024
+    level: hard
+    type: debug
+    q: A pentest found that any logged-in merchant can read another merchant's orders. Spot the bug and fix it at more than one layer.
+    example: |-
+      ```ts
+      router.get('/orders/:id', auth, async (req, res) => {
+        const order = await db.query('SELECT * FROM orders WHERE id = $1', [req.params.id]);
+        if (!order.rows[0]) return res.status(404).end();
+        res.json(order.rows[0]);
+      });
+
+      router.put('/orders/:id/address', auth, async (req, res) => {
+        await db.query('UPDATE orders SET address = $1, tenant_id = $2 WHERE id = $3',
+          [req.body.address, req.body.tenantId, req.params.id]);
+        res.status(204).end();
+      });
+      ```
+    hint: |-
+      - GET chỉ filter `id` → **IDOR**. Fix: `WHERE id = $1 AND tenant_id = $2` với tenant từ context; không thấy → 404.
+      - PUT lấy `tenantId` từ **body** và cho phép sửa cột `tenant_id` → kẻ tấn công có thể "chuyển" order sang tenant của mình. Không bao giờ nhận tenant từ client; không cho update `tenant_id`.
+      - Thêm lớp DB: RLS `USING` + `WITH CHECK`, composite FK.
+      - Thêm lớp test: suite tự động gọi mọi route với token tenant A và id tenant B.
+      - Kiểm tra quyền trong tenant (user thường có được sửa address của order người khác?).
+    followUp: How would you find all other endpoints with the same bug across a 300-route codebase?
+    tags: [idor, authorization, debug]
+  - id: multi-tenancy-025
+    level: hard
+    type: scenario
+    q: Every Monday 9am the platform slows down for all merchants. You find one large merchant runs a full catalog import then. What do you do short-term and long-term?
+    hint: |-
+      Ngắn hạn:
+      - Xác định bằng dữ liệu: `pg_stat_statements`/APM theo tenant, queue depth theo tenant.
+      - Throttle import của tenant đó (concurrency 1–2 worker, batch nhỏ, sleep), chuyển sang giờ thấp điểm, `statement_timeout`.
+      Dài hạn:
+      - Queue riêng/fair scheduling per tenant (round-robin giữa tenant, không FIFO toàn cục).
+      - Import ghi vào staging rồi merge theo batch; indexer ES dùng bulk với giới hạn.
+      - Quota theo plan; tenant lớn → dedicated worker pool hoặc DB/shard riêng (bridge).
+      - SLO và alert theo tenant.
+    followUp: How do you implement fair queuing across tenants with BullMQ or Kafka?
+    tags: [noisy-neighbor, scenario, queues]
+  - id: multi-tenancy-026
+    level: hard
+    type: scenario
+    q: You run schema-per-tenant (or DB-per-tenant) for 800 tenants. A migration fails on tenant 312 of 800. What state are you in and how should the migration system be designed?
+    hint: |-
+      Trạng thái: 311 tenant ở version mới, 1 lỗi (có thể dở dang nếu DDL không transactional — Postgres DDL phần lớn transactional, trừ `CONCURRENTLY`), 488 ở version cũ → **app phải chạy được với cả hai version** (expand/contract bắt buộc).
+      Thiết kế:
+      - Bảng version per tenant (`tenant_migrations`), runner idempotent, resume từ chỗ lỗi.
+      - Chạy theo wave (canary vài tenant → 10% → all), concurrency giới hạn, timeout per tenant.
+      - Migration chỉ additive trong một release; contract ở release sau khi mọi tenant đã lên.
+      - Dashboard version theo tenant; alert khi lệch quá lâu.
+      - Test migration trên bản copy tenant lớn nhất.
+    followUp: How does this differ from a pooled schema, and which do you find operationally safer?
+    tags: [migrations, per-tenant, scenario]
+  - id: multi-tenancy-027
+    level: hard
+    type: scenario
+    q: A customer reports they can see another company's invoice PDF. Walk me through your incident response.
+    hint: |-
+      1. **Contain**: tắt tính năng/endpoint liên quan, revoke link, purge cache/CDN.
+      2. **Scope**: log truy cập (cần có `tenant_id`, `user_id`, resource id) → ai đã xem gì, từ khi nào; so resource tenant với caller tenant.
+      3. **Root cause**: S3 key không có tenant prefix / presigned URL đoán được / cache key / IDOR / job render PDF chạy sai context.
+      4. **Fix** + test hồi quy cross-tenant.
+      5. **Notify**: legal/DPO, tenant bị ảnh hưởng, nghĩa vụ báo cáo theo GDPR/hợp đồng (thời hạn thông báo).
+      6. **Postmortem** blameless: lớp phòng thủ nào đáng lẽ bắt được.
+    followUp: What logging would you need to have in place beforehand to answer "exactly who saw what"?
+    tags: [incident, leak, scenario]
+  - id: multi-tenancy-028
+    level: hard
+    type: concept
+    q: What is the performance impact of RLS, and how do you keep RLS policies fast?
+    hint: |-
+      Policy được thêm như điều kiện WHERE → nếu đơn giản (`tenant_id = current_setting(...)::bigint`) và có index bắt đầu bằng `tenant_id` thì chi phí gần như bằng filter thủ công.
+      Chậm khi: policy gọi subquery/function phức tạp mỗi row (`tenant_id IN (SELECT ... FROM memberships WHERE user_id = ...)`), function không `STABLE`/`LEAKPROOF` → planner không đẩy điều kiện user vào trước policy, không dùng index cho điều kiện của user.
+      Tips: giữ policy so sánh với hằng số lấy từ setting; bọc `current_setting` trong subselect `(SELECT current_setting(...))` để evaluate một lần; index `(tenant_id, ...)`; kiểm tra bằng `EXPLAIN` dưới đúng role.
+    followUp: What does LEAKPROOF mean and why does it matter for RLS query plans?
+    tags: [rls, performance]
+    verify: true
+  - id: multi-tenancy-029
+    level: hard
+    type: design
+    q: A large tenant must be moved from the shared pool database to its own database with minimal downtime. How?
+    hint: |-
+      Tiền đề: mọi table có `tenant_id`, ID global (không trùng khi tách), routing tenant → DB qua **tenant catalog** (control plane).
+      Các bước:
+      1. Provision DB mới cùng schema version.
+      2. Copy snapshot dữ liệu tenant (`COPY ... WHERE tenant_id = X`) + CDC (logical replication với row filter — PG 15+ — hoặc Debezium) để bắt thay đổi.
+      3. Kiểm tra đối chiếu (count, checksum theo table).
+      4. Cutover: tạm dừng ghi tenant đó vài giây (maintenance flag), chờ CDC bắt kịp, đổi routing trong catalog, invalidate cache routing.
+      5. Giữ dữ liệu cũ read-only một thời gian để rollback, rồi xoá.
+      Đừng quên: ES index, Redis key, file storage, job đang chạy.
+    followUp: What breaks if some IDs were sequences local to the shared database?
+    tags: [migration, silo, bridge, design]
+    verify: true
+  - id: multi-tenancy-030
+    level: hard
+    type: design
+    q: A tenant churns and requests deletion of all their data (and later, an export). Across which systems must you act, and how do you make it provable?
+    hint: |-
+      Hệ thống: DB chính (mọi table có `tenant_id`), read replica/warehouse, Elasticsearch, Redis, object storage (ảnh, PDF), queue/Kafka topic (retention), log/APM (PII), email provider, backup.
+      Cách làm:
+      - Registry: danh sách "data stores chứa dữ liệu tenant" duy trì cùng code (mỗi service đăng ký handler xoá/export).
+      - Workflow async idempotent, có trạng thái từng bước, retry, báo cáo hoàn tất.
+      - Backup: không sửa được backup → retention có hạn, hoặc crypto-shredding (mã hoá theo key per tenant, xoá key).
+      - Silo: `DROP DATABASE`/xoá account dễ hơn nhiều — lợi thế thật của silo.
+      - Export: format máy đọc được, stream, giới hạn tải.
+    followUp: What is crypto-shredding and what does it require from your design up front?
+    tags: [gdpr, deletion, design]
+  - id: multi-tenancy-031
+    level: hard
+    type: design
+    q: How do you systematically test for cross-tenant data leaks rather than relying on code review?
+    hint: |-
+      - **Fixture 2 tenant** mặc định trong mọi integration test; test helper tạo dữ liệu song song cho cả hai.
+      - **Contract test tự động theo route table**: duyệt mọi route có `:id`, tạo resource ở tenant B, gọi bằng token tenant A → expect 404/403; với list → không có id của B.
+      - Test ở tầng DB: chạy query bằng role app, không set tenant → 0 row / lỗi; set tenant A → không thấy B.
+      - Kiểm tra kênh phụ: cache key lint (prefix bắt buộc), ES query builder bắt buộc filter, S3 key prefix.
+      - Canary data trong production: "tenant honeypot" với dữ liệu đặc biệt, alert nếu xuất hiện ở response tenant khác.
+      - Pentest/bug bounty định kỳ.
+    followUp: How would you make the route-based leak test stay up to date when new endpoints are added?
+    tags: [testing, leak, security]
+  - id: multi-tenancy-032
+    level: hard
+    type: gotcha
+    q: With database-per-tenant and 2,000 tenants, your Node service runs out of memory and Postgres hits max_connections. Why, and what are your options?
+    hint: |-
+      Mỗi tenant một `pg.Pool` × vài connection × số pod → hàng chục nghìn connection, mỗi pool tốn memory & timer; DB server bị process-per-connection đè nặng.
+      Options:
+      - Pool **lazy + LRU**: chỉ giữ pool cho tenant đang hoạt động, đóng pool idle, max connection nhỏ per tenant.
+      - Nhiều tenant DB trên cùng server qua **PgBouncer** (PgBouncer pool per db/user, giới hạn `max_db_connections`).
+      - Gom tenant nhỏ về pool/schema chung (bridge), chỉ tenant lớn giữ DB riêng.
+      - Router tenant → DB server (catalog) + cache.
+    followUp: How do you handle a request for a tenant whose pool was just evicted — cold-start latency and thundering herd?
+    tags: [silo, pooling, connections]
+  - id: multi-tenancy-033
+    level: senior
+    type: design
+    q: Design end-to-end tenant isolation for a multi-tenant B2B2C e-commerce platform (API, database, cache, search, files, events).
+    hint: |-
+      Câu trả lời mạnh đi qua từng lớp:
+      - **Identity**: token có `tenant_id` + roles cho active tenant; membership check; end customer có identity theo tenant.
+      - **Edge**: resolve tenant từ custom domain → catalog; rate limit per tenant.
+      - **Context**: ALS, throw khi thiếu.
+      - **DB**: pool + `tenant_id` mọi nơi + composite FK + RLS; tenant lớn → shard/silo.
+      - **Cache**: prefix tenant, version per tenant để invalidate.
+      - **Search**: shared index + filtered alias/routing, index riêng cho tenant lớn.
+      - **Files**: prefix `tenant/{id}/`, presigned URL ngắn hạn, bucket policy.
+      - **Events**: `tenantId` trong header, consumer re-establish context.
+      - **Observability**: tenant id trong log/trace; **testing**: leak suite; **ops**: per-tenant migration, deletion workflow.
+      Nêu trade-off chi phí vs isolation và đường nâng cấp tenant lên silo.
+    followUp: Which single layer would you invest in first if you only had one sprint, and why?
+    tags: [design, isolation, e-commerce]
+  - id: multi-tenancy-034
+    level: senior
+    type: open
+    q: An enterprise prospect demands a dedicated database and customer-managed encryption keys, while your platform is fully pooled. How do you respond architecturally and commercially?
+    hint: |-
+      - Đánh giá yêu cầu thật: compliance nào (data residency, SOC2, ngân hàng)? Nhiều khi RLS + encryption at rest + audit là đủ nếu giải thích được.
+      - Nếu cần: hỗ trợ **tier silo** trong kiến trúc bridge — cùng code, control plane chung, routing theo tenant catalog, migration pipeline đa DB.
+      - CMK: KMS key per tenant (envelope encryption), tenant có thể revoke → hệ thống phải xử lý "key bị thu hồi" (fail closed).
+      - Chi phí vận hành tăng → giá tier enterprise phản ánh chi phí; giới hạn số tenant silo.
+      - Rủi ro: code path khác nhau giữa silo/pool → test cả hai.
+    followUp: How do you prevent silo tenants from drifting to different schema versions over time?
+    tags: [silo, encryption, enterprise, open]
+  - id: multi-tenancy-035
+    level: senior
+    type: design
+    q: Design a background job system where one tenant enqueuing 1 million jobs cannot starve other tenants.
+    hint: |-
+      - Không dùng một FIFO queue toàn cục. Lựa chọn: queue per tenant + scheduler **round-robin / weighted fair queuing** lấy job từ mỗi tenant luân phiên; hoặc giới hạn concurrency per tenant (semaphore trong Redis).
+      - Priority theo tier; tenant vượt quota → delay chứ không reject hết.
+      - Backpressure ở producer (giới hạn số job pending per tenant).
+      - Kafka: partition theo tenant gây hot partition với tenant lớn → sub-partition key (`tenantId:entityId`) hoặc topic riêng cho tenant lớn.
+      - Metrics: queue depth & wait time per tenant (top-N), alert khi wait time tenant nhỏ tăng.
+    followUp: How would you implement per-tenant concurrency limits across 20 worker pods?
+    tags: [queues, fairness, noisy-neighbor, design]
+  - id: multi-tenancy-036
+    level: senior
+    type: open
+    q: RLS in the database versus filtering in the application layer — what is your position, and when would you not use RLS?
+    hint: |-
+      Lập luận cân bằng:
+      - Ủng hộ RLS: defense in depth, bắt được raw SQL/tool nội bộ, đảm bảo ở nguồn.
+      - Chi phí: phải quản lý role/setting mỗi transaction (round-trip, pooler), debug khó hơn ("vì sao query trả 0 row?"), migration/owner role phải cẩn thận, ORM không biết về policy, không bảo vệ cache/search/file.
+      - Không dùng khi: DB-per-tenant (đã cách ly), DB không hỗ trợ tốt, team chưa có kỷ luật role/transaction — khi đó ít nhất có repository bắt buộc + test tự động.
+      Kết luận mạnh: RLS là lớp **bổ sung**, không thay thế authorization ở app.
+    followUp: How would you roll out RLS to an existing large codebase without breaking production?
+    tags: [rls, open, architecture]
+  - id: multi-tenancy-037
+    level: senior
+    type: design
+    q: How do you attribute infrastructure cost and performance to tenants in a pooled system?
+    hint: |-
+      - Gắn `tenant_id` vào log, trace span attribute, message header; metrics theo tenant chỉ cho top-N hoặc qua log-based aggregation để tránh cardinality bùng nổ.
+      - Đo "đơn vị tiêu thụ": request, CPU-ms ước lượng, DB time (`pg_stat_statements` không có tenant → dùng app-side timing hoặc comment SQL `/* tenant=42 */`), storage (row count, bytes ES, S3 prefix size).
+      - Phân bổ chi phí chung theo tỉ lệ usage; dùng cho pricing tier và phát hiện noisy neighbor.
+      - Dashboard theo tenant cho support.
+    followUp: What is sqlcommenter and how could it help here?
+    tags: [observability, cost, design]
+  - id: multi-tenancy-038
+    level: cv
+    type: behavioral
+    q: On your multi-tenant e-commerce platform you implemented tenant-aware data access and authorization. Walk me through how a request for `/orders/:id` is guaranteed to only return data from the caller's tenant.
+    hint: |-
+      Câu trả lời mạnh mô tả đúng đường đi thật trong hệ thống của bạn:
+      - Tenant lấy từ đâu (token claim / domain) và cách check membership.
+      - Context propagate thế nào (middleware, AsyncLocalStorage hay truyền tham số).
+      - Data access: repository/ORM filter bắt buộc; SQL Server RLS (`SESSION_CONTEXT`) nếu có; index `(TenantId, ...)`.
+      - Trả 404 khi resource tồn tại ở tenant khác.
+      - Test tự động đảm bảo (điền cách team bạn làm thật).
+      - Lỗ hổng/bug thật đã gặp và fix (điền ví dụ thật của bạn).
+    followUp: What was the weakest layer in that design, honestly, and what would you add?
+    redFlags:
+      - "We just add WHERE TenantId = @tenant in every query and review carefully"
+    tags: [cv, authorization, data-access]
+  - id: multi-tenancy-039
+    level: cv
+    type: behavioral
+    q: Your Indexer Service transforms products into Elasticsearch. How did you make sure search results never leak products or prices across tenants?
+    hint: |-
+      Nội dung mạnh:
+      - Cách tổ chức index: shared + `tenantId` keyword field / routing / filtered alias, hay index per tenant (và lý do chọn).
+      - Search API luôn chèn filter tenant ở tầng query builder, không để caller tự thêm.
+      - Document id có tenant (`{tenantId}:{productId}`) tránh ghi đè chéo nếu product id trùng giữa tenant.
+      - Giá theo tenant/customer group lưu thế nào (field riêng, hay tính lúc đọc).
+      - Test/kiểm tra đã làm (điền cách làm thật của bạn).
+    followUp: If a tenant is offboarded, how are their documents removed from the index?
+    tags: [cv, elasticsearch, isolation]
+  - id: multi-tenancy-040
+    level: cv
+    type: behavioral
+    q: How did you make Redis caching tenant-aware on that platform, and how did you invalidate a tenant's cache on writes?
+    hint: |-
+      Nội dung mạnh:
+      - Quy ước key (`{tenant}:{entity}:{id}`), ai enforce (wrapper/helper).
+      - Invalidation: delete-on-write, version key per tenant/entity, TTL làm lưới an toàn; event-driven khi service khác ghi.
+      - Tránh stampede cho key nóng của tenant lớn.
+      - Giới hạn memory/eviction ảnh hưởng tenant khác thế nào.
+      - Số liệu hit rate / latency trước-sau (điền số liệu thật của bạn).
+    followUp: What happened when a tenant's catalog update touched 100,000 products at once?
+    tags: [cv, caching, redis]
+  - id: multi-tenancy-041
+    level: cv
+    type: design
+    q: The platform is B2B2C — platform, merchants, and the merchants' end customers. How did your authorization model handle those three levels?
+    hint: |-
+      Nội dung mạnh:
+      - Phân biệt **platform staff** (cross-tenant, audit), **merchant users** (role trong tenant), **end customers** (chỉ dữ liệu của chính mình trong tenant đó).
+      - End customer: ownership check (`order.customerId === ctx.customerId`) **và** tenant check.
+      - Address Management: customer chỉ thấy address của mình; merchant staff thấy theo quyền.
+      - Token/claims khác nhau cho từng loại; không để token customer gọi API admin.
+      - Ví dụ quyết định/bug thật (điền ví dụ thật của bạn).
+    followUp: A merchant support agent needs to edit a customer's address during a phone call. How is that authorized and audited?
+    tags: [cv, authorization, b2b2c]
+  - id: multi-tenancy-042
+    level: cv
+    type: behavioral
+    q: Tell me about a bug or near-miss related to tenant isolation that you found or fixed. How was it caught and what did you change systemically?
+    hint: |-
+      STAR:
+      - **S**: bug gì (thiếu filter, cache key, job chạy sai context...), ở đâu.
+      - **T**: mức độ ảnh hưởng, ai phát hiện (test, review, khách hàng, monitoring).
+      - **A**: fix trước mắt + thay đổi hệ thống (helper bắt buộc, lint rule, test 2 tenant, RLS).
+      - **R**: không tái diễn; số liệu nếu có (điền số liệu thật của bạn).
+      - Reflection: lớp phòng thủ nào lẽ ra nên có từ đầu.
+      Nếu chưa gặp: kể về cách bạn chủ động tìm (audit endpoint) — đừng bịa incident.
+    followUp: How did you verify there were no other instances of the same class of bug?
+    tags: [cv, behavioral, leak]
+  - id: multi-tenancy-043
+    level: medium
+    type: gotcha
+    q: Why can a globally unique constraint leak information across tenants, and what should the constraint be instead?
+    hint: |-
+      `UNIQUE (email)` hoặc `UNIQUE (sku)` toàn cục: tenant A không thể tạo SKU "X" vì tenant B đã có → lỗi "already exists" **lộ** rằng tenant khác có SKU đó (và chặn nghiệp vụ hợp lệ).
+      Đúng: `UNIQUE (tenant_id, sku)`, `UNIQUE (tenant_id, lower(email))`.
+      Ngoại lệ có chủ đích: identity toàn cục của user (login email) nếu một tài khoản dùng cho nhiều tenant — khi đó thông báo lỗi đăng ký cần thiết kế tránh user enumeration.
+      Postgres docs nhắc: unique/FK check không qua RLS → covert channel.
+    followUp: How would you design signup so it does not reveal whether an email already exists?
+    tags: [schema, constraints, leak]
+  - id: multi-tenancy-044
+    level: medium
+    type: concept
+    q: How do you handle per-tenant configuration and feature flags without scattering `if (tenantId === ...)` across the code?
+    hint: |-
+      - Bảng/Service config per tenant (plan, feature, limit, locale, currency, time zone) với default toàn cục + override per tenant; cache theo tenant, invalidate khi đổi.
+      - Feature flag system có targeting theo tenant/plan (LaunchDarkly, Unleash, OpenFeature) thay vì hard-code id.
+      - Load config vào tenant context đầu request (lazy) để mọi lớp dùng chung.
+      - Customization lớn → extension point/strategy pattern theo capability, không fork code theo tenant.
+      - Audit thay đổi config.
+    followUp: How do you roll out a risky feature to 5% of tenants and then roll it back instantly?
+    tags: [configuration, feature-flags]
+  - id: multi-tenancy-045
+    level: medium
+    type: compare
+    q: How do tenant time zones and currencies affect a multi-tenant data model?
+    hint: |-
+      - Lưu instant ở UTC (`timestamptz`); time zone (IANA) là **thuộc tính tenant/store**, dùng khi hiển thị, tính "hôm nay", báo cáo theo ngày, lịch ca.
+      - Báo cáo "doanh thu theo ngày" phải group theo ngày **local của tenant**: `date_trunc('day', created_at AT TIME ZONE tz)`.
+      - Tiền: lưu số nguyên minor unit hoặc `numeric` + mã currency ISO 4217; không float; tenant có thể đa currency.
+      - Cache/aggregate precomputed theo ngày phải biết tz của tenant.
+    example: |-
+      ```sql
+      SELECT (created_at AT TIME ZONE t.time_zone)::date AS local_day, sum(total_minor) AS revenue_minor
+      FROM orders o JOIN tenants t ON t.id = o.tenant_id
+      WHERE o.tenant_id = $1
+      GROUP BY 1 ORDER BY 1;
+      ```
+    followUp: A tenant changes its time zone. What happens to historical daily reports?
+    tags: [time-zones, currency, data-model]

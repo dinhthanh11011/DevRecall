@@ -1,0 +1,777 @@
+id: 00-networking
+slug: networking
+title: Networking Fundamentals
+tier: 0
+status: drafted
+summary: TCP/IP, DNS, HTTP/1.1/2/3, TLS, CDN, load balancer, proxy, VPN, WebSocket/SSE, CORS — nhìn từ góc backend production.
+cvLinked: false
+overview: |-
+  ## TL;DR
+
+  - Mỗi HTTP request đi qua chuỗi **DNS → TCP (hoặc QUIC) → TLS → HTTP**; latency thật nằm ở số **round-trip (RTT)**, không phải băng thông.
+  - Senior interview hỏi networking qua **triệu chứng production**: 502 lẻ tẻ sau load balancer, `ECONNRESET`, DNS đổi mà client vẫn gọi IP cũ, CORS preflight làm chậm, WebSocket rớt khi scale.
+  - Nắm 5 trục: **connection lifecycle & keep-alive**, **HTTP versions & head-of-line blocking**, **TLS handshake & certificate**, **DNS caching/TTL**, **proxy/LB/CDN** (header nào bị đổi, timeout nào đứng trước timeout nào).
+  - CORS là cơ chế **browser nới lỏng Same-Origin Policy** để JS được **đọc** response cross-origin — nó **không** phải cơ chế chống CSRF.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | TCP | Stream tin cậy, có thứ tự, có congestion control; mở bằng 3-way handshake | `SYN → SYN-ACK → ACK` = 1 RTT trước khi gửi byte đầu tiên |
+  | UDP | Datagram không kết nối, không đảm bảo thứ tự/đến nơi | DNS query, QUIC, video call |
+  | DNS | Hệ thống phân giải tên → record (A, AAAA, CNAME, MX, TXT...) có TTL | `api.example.com A 203.0.113.10 TTL 60` |
+  | TLS | Mã hoá + xác thực server (certificate) + toàn vẹn dữ liệu trên TCP | TLS 1.3 handshake = 1 RTT |
+  | HTTP/1.1 | Text protocol, 1 request "đang bay" mỗi connection | Browser mở ~6 connection/origin để song song |
+  | HTTP/2 | Binary framing, **multiplex** nhiều stream trên 1 TCP connection, HPACK | 100 request nhỏ chung 1 connection |
+  | HTTP/3 | HTTP trên **QUIC (UDP)**; loại bỏ TCP head-of-line blocking, 0-RTT/1-RTT | Mạng di động đổi IP vẫn giữ connection (connection ID) |
+  | Reverse proxy / LB | Đứng trước server, terminate TLS, phân phối tải, thêm `X-Forwarded-*` | Nginx, ALB, Envoy |
+  | CDN | Cache ở edge gần user theo `Cache-Control`/`Vary` | `Cache-Control: public, s-maxage=300` |
+  | CORS | Server khai báo origin nào được **đọc** response qua header `Access-Control-*` | Preflight `OPTIONS` cho `Content-Type: application/json` |
+  | WebSocket | Kênh full-duplex nâng cấp từ HTTP (`101 Switching Protocols`) | Chat, realtime dashboard |
+  | SSE | Stream một chiều server → client qua HTTP thường (`text/event-stream`) | Notification, progress bar |
+
+  ## Cơ chế hoạt động
+
+  ### Từ URL tới response
+
+  ```mermaid
+  flowchart TD
+    A["User gõ https://shop.example.com/cart"] --> B{"DNS cache<br/>(browser/OS/resolver)?"}
+    B -- hit --> D
+    B -- miss --> C["Recursive resolver → root → TLD → authoritative"]
+    C --> D["IP address (A/AAAA)"]
+    D --> E{"Có connection<br/>keep-alive sẵn?"}
+    E -- có --> H
+    E -- không --> F["TCP 3-way handshake (1 RTT)<br/>hoặc QUIC"]
+    F --> G["TLS 1.3 handshake (1 RTT)<br/>verify certificate + SNI + ALPN"]
+    G --> H["HTTP request → CDN / LB / reverse proxy"]
+    H --> I{"CDN cache hit?"}
+    I -- hit --> K["Response từ edge"]
+    I -- miss --> J["Origin: LB → app server → DB"]
+    J --> K
+  ```
+
+  ### TLS 1.3 handshake (rút gọn)
+
+  ```mermaid
+  sequenceDiagram
+    participant C as Client
+    participant S as Server
+    C->>S: ClientHello (versions, cipher suites, key_share, SNI, ALPN)
+    S->>C: ServerHello (key_share) + {EncryptedExtensions, Certificate, CertificateVerify, Finished}
+    Note over C: Verify cert chain + hostname,<br/>check CertificateVerify signature
+    C->>S: {Finished} + HTTP request đầu tiên
+    S->>C: {HTTP response}
+  ```
+
+  - Key exchange dùng **(EC)DHE** → forward secrecy; public key trong certificate dùng để **ký** (CertificateVerify), không phải để "mã hoá dữ liệu". RSA key exchange đã bị loại khỏi TLS 1.3.
+  - Dữ liệu thật được mã hoá bằng **symmetric key** (AES-GCM / ChaCha20-Poly1305) suy ra từ shared secret.
+
+  ### Timeout chain qua proxy
+
+  ```mermaid
+  flowchart LR
+    Client -- "idle 60s?" --> LB["Load balancer<br/>idle timeout"]
+    LB -- "keep-alive pool" --> App["Node server<br/>keepAliveTimeout"]
+    App --> DB[(DB)]
+  ```
+
+  Quy tắc vàng: **upstream (app) phải giữ connection idle lâu hơn downstream (LB)**; nếu app đóng trước, LB có thể gửi request vào socket vừa bị đóng → 502 lẻ tẻ.
+
+  ## Trade-offs
+
+  | Lựa chọn | Ưu | Nhược | Khi nào dùng |
+  |---|---|---|---|
+  | HTTP/1.1 | Đơn giản, debug dễ, mọi proxy hỗ trợ | HOL blocking theo connection, nhiều connection | Service nội bộ đơn giản |
+  | HTTP/2 | Multiplex, header compression, 1 connection | TCP HOL khi mất gói; một connection = một điểm nghẽn/LB kém đều | Browser ↔ edge, gRPC |
+  | HTTP/3 (QUIC) | Không TCP HOL, handshake nhanh, connection migration | UDP có thể bị firewall chặn, CPU cao hơn, tooling kém hơn | Mobile, mạng loss cao, edge/CDN |
+  | L4 LB | Nhanh, không hiểu HTTP, pass-through TLS | Không route theo path/header | TCP/gRPC throughput cao |
+  | L7 LB | Route theo host/path, retry, header, TLS termination | Tốn CPU, thêm hop, phải cấu hình timeout | API gateway, web app |
+  | Polling | Dễ, cache được, stateless | Trễ + lãng phí request | Cập nhật hiếm |
+  | SSE | HTTP thường, auto-reconnect, qua proxy dễ | Một chiều, text only | Notification, stream log |
+  | WebSocket | Hai chiều, latency thấp | Stateful, sticky/pub-sub khi scale, proxy phải hỗ trợ Upgrade | Chat, collaboration, game |
+
+  ## Pitfalls
+
+  - Nghĩ CORS chặn request: browser **vẫn gửi** simple request (kể cả cookie nếu `SameSite` cho phép); CORS chỉ quyết định JS có **đọc** được response không.
+  - `Access-Control-Allow-Origin: *` cùng `credentials: 'include'` → browser từ chối. Echo origin động thì **phải** whitelist và thêm `Vary: Origin`.
+  - Node `keepAliveTimeout` (mặc định 5s) nhỏ hơn idle timeout của LB (ALB mặc định 60s) → 502 ngẫu nhiên.
+  - Hạ TTL DNS **ngay lúc** migrate là muộn — phải hạ trước ít nhất một chu kỳ TTL cũ.
+  - Tin `X-Forwarded-For` từ client mà không cấu hình `trust proxy` đúng số hop → IP spoofing, rate limit sai.
+  - Retry tự động request **không idempotent** (POST) khi timeout → tạo đơn trùng.
+  - HTTP/2 Server Push đã bị các browser lớn bỏ — đừng thiết kế dựa vào nó; dùng `103 Early Hints` / preload.
+
+  ## Cheat sheet
+
+  - RTT cold HTTPS (TCP + TLS 1.3): ~2 RTT trước byte response đầu; TLS 1.2 full handshake: ~3 RTT; HTTP/3: ~1 RTT (0-RTT khi resume, có rủi ro replay).
+  - `502` = proxy nhận response lỗi/connection bị đóng từ upstream · `504` = upstream không trả lời kịp · `499` (nginx) = client tự đóng.
+  - Idempotent: `GET, HEAD, PUT, DELETE, OPTIONS`; không idempotent: `POST`, `PATCH` (thường).
+  - Simple CORS request: method `GET/HEAD/POST` + chỉ CORS-safelisted headers + `Content-Type` ∈ `text/plain`, `multipart/form-data`, `application/x-www-form-urlencoded`.
+  - `TIME_WAIT` nằm ở phía **chủ động đóng** connection; nhiều connection ngắn → cạn ephemeral port.
+  - DNS: CNAME không đặt được ở zone apex → dùng ALIAS/ANAME/CNAME flattening của provider.
+  - WebSocket: `Upgrade: websocket` + `101`; proxy phải forward `Upgrade`/`Connection` headers và có idle timeout đủ dài / ping.
+notionRefs:
+  - title: DNS
+    url: https://app.notion.com/p/170ef77f8ab2800fa22dfc822f6b2b53
+  - title: VPN
+    url: https://app.notion.com/p/1bbef77f8ab28078aad2c6c13066a4bd
+  - title: HTTP / HTTPS - SSL/TLS
+    url: https://app.notion.com/p/172ef77f8ab280daa821ead1180ac5df
+  - title: CORS
+    url: https://app.notion.com/p/179ef77f8ab2805f8956cd717b84b9cf
+  - title: Load Balancing
+    url: https://app.notion.com/p/65c2ad75fbaf4b3092577e0e39f541f9
+  - title: Proxy - Reverse proxy
+    url: https://app.notion.com/p/126ef77f8ab280f68727ddb3026f327e
+  - title: Real-time Data
+    url: https://app.notion.com/p/170ef77f8ab28080bdbee83c6af74439
+references:
+  - title: MDN — An overview of HTTP
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Overview
+  - title: MDN — Cross-Origin Resource Sharing (CORS)
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS
+  - title: RFC 9110 — HTTP Semantics
+    url: https://www.rfc-editor.org/rfc/rfc9110
+  - title: RFC 9113 — HTTP/2
+    url: https://www.rfc-editor.org/rfc/rfc9113
+  - title: RFC 9114 — HTTP/3
+    url: https://www.rfc-editor.org/rfc/rfc9114
+  - title: RFC 9000 — QUIC
+    url: https://www.rfc-editor.org/rfc/rfc9000
+  - title: RFC 8446 — TLS 1.3
+    url: https://www.rfc-editor.org/rfc/rfc8446
+  - title: RFC 9293 — TCP
+    url: https://www.rfc-editor.org/rfc/rfc9293
+  - title: RFC 6455 — The WebSocket Protocol
+    url: https://www.rfc-editor.org/rfc/rfc6455
+  - title: Fetch Standard — CORS protocol
+    url: https://fetch.spec.whatwg.org/#http-cors-protocol
+  - title: Node.js — http module
+    url: https://nodejs.org/api/http.html
+  - title: Node.js — dns module
+    url: https://nodejs.org/api/dns.html
+  - title: AWS — Application Load Balancer idle timeout
+    url: https://docs.aws.amazon.com/elasticloadbalancing/latest/application/edit-load-balancer-attributes.html
+questions:
+  - id: networking-001
+    level: easy
+    type: concept
+    q: Walk me through what happens, at the network level, when a browser loads `https://shop.example.com` for the first time.
+    hint: |-
+      1. DNS: browser cache → OS cache → recursive resolver → root → TLD → authoritative, trả về A/AAAA có TTL.
+      2. TCP 3-way handshake (1 RTT) — hoặc QUIC nếu HTTP/3.
+      3. TLS handshake: SNI chọn cert, ALPN chọn `h2`/`http/1.1`, verify certificate chain + hostname (TLS 1.3: 1 RTT).
+      4. Gửi HTTP request → CDN/LB/reverse proxy → app → response; browser parse HTML và mở thêm request cho asset (reuse connection).
+      Điểm senior: đếm RTT, chỉ ra chỗ có thể cache (DNS, TLS session resumption, keep-alive, CDN).
+    followUp: Which of these steps can be skipped or shortened on the second visit, and by what mechanism?
+    redFlags:
+      - Skips DNS or TLS entirely
+      - Cannot say roughly how many round trips happen before the first byte
+    tags: [http, dns, tls, tcp]
+  - id: networking-002
+    level: easy
+    type: compare
+    q: TCP vs UDP — what does each guarantee, and why is HTTP/3 built on UDP?
+    hint: |-
+      - TCP: connection-oriented, reliable, ordered byte stream, flow + congestion control; mất một gói → mọi byte sau phải chờ (head-of-line blocking).
+      - UDP: datagram, không đảm bảo đến/thứ tự, không handshake; ứng dụng tự lo reliability nếu cần.
+      - HTTP/3 dùng QUIC trên UDP vì: tự làm reliability **theo từng stream** (mất gói stream A không chặn stream B), gộp handshake transport + TLS 1.3, connection ID cho phép đổi mạng; và UDP cho phép triển khai ở user space thay vì chờ OS kernel update TCP.
+    followUp: If UDP is unreliable, how does QUIC still deliver reliable, ordered streams?
+    tags: [tcp, udp, http3]
+  - id: networking-003
+    level: easy
+    type: concept
+    q: What's the difference between an A record, a CNAME, and an ALIAS/ANAME record? Why can't you put a CNAME at the zone apex?
+    hint: |-
+      - A/AAAA: tên → IPv4/IPv6.
+      - CNAME: tên → tên khác (alias); resolver tiếp tục phân giải tên đích.
+      - Apex (`example.com`) bắt buộc có SOA + NS records; theo RFC 1034 một tên có CNAME **không được** có record nào khác → không thể CNAME ở apex.
+      - ALIAS/ANAME/"CNAME flattening": tính năng của DNS provider (Route 53 alias, Cloudflare) — provider tự resolve đích và trả về A/AAAA ở apex.
+    followUp: Your apex domain must point to a load balancer whose IPs change. How do you set it up on Route 53 or Cloudflare?
+    tags: [dns]
+  - id: networking-004
+    level: easy
+    type: concept
+    q: What is the Same-Origin Policy, what exactly is an "origin", and what does CORS change about it?
+    hint: |-
+      - Origin = **scheme + host + port**. `https://a.com` và `https://a.com:8443` khác origin; `https://a.com/x` và `https://a.com/y` cùng origin.
+      - SOP: JS của origin A không được **đọc** response/DOM của origin B (vẫn có thể *gửi* nhiều loại request, nhúng `<img>`, `<script>`, submit form).
+      - CORS: server B trả `Access-Control-Allow-Origin` (và các header liên quan) để **nới lỏng** SOP cho origin cụ thể.
+      - CORS do **browser** enforce; curl/Postman/server-to-server không bị ảnh hưởng.
+    followUp: Is `https://app.example.com` same-site with `https://api.example.com`? Same-origin? Why does that distinction matter for cookies?
+    redFlags:
+      - "CORS is a server-side firewall that blocks requests"
+    tags: [cors, browser, security]
+  - id: networking-005
+    level: easy
+    type: concept
+    q: What problem does HTTP keep-alive (persistent connections) solve, and what does it cost the server?
+    hint: |-
+      - Tái sử dụng TCP/TLS connection cho nhiều request → bỏ qua handshake (1–2 RTT) + tránh TCP slow start lại từ đầu.
+      - Chi phí: mỗi connection idle giữ file descriptor + memory; cần timeout idle hợp lý.
+      - HTTP/1.1 mặc định persistent; phía client Node, `http.globalAgent` bật `keepAlive` từ Node 19.
+      - Rủi ro: race khi server đóng idle connection đúng lúc client gửi request → `ECONNRESET`/502.
+    followUp: How do Node's `server.keepAliveTimeout` and a load balancer's idle timeout interact?
+    verify: true
+    tags: [http, keep-alive, node]
+  - id: networking-006
+    level: easy
+    type: compare
+    q: Forward proxy vs reverse proxy — who configures each, and give one production use of each.
+    hint: |-
+      - Forward proxy: đại diện cho **client** (client biết và cấu hình nó) — corporate egress proxy, lọc outbound, che IP client, egress allowlist cho service gọi API bên ngoài.
+      - Reverse proxy: đại diện cho **server** (client tưởng đang nói chuyện với origin) — Nginx/Envoy/ALB: TLS termination, load balancing, compression, caching, rate limit, routing theo path.
+      - Hệ quả: reverse proxy thay đổi IP nguồn → app phải đọc `X-Forwarded-For`/`Forwarded` và cấu hình trust đúng.
+    followUp: How does your Express app know the real client IP behind two proxies?
+    tags: [proxy, load-balancer]
+  - id: networking-007
+    level: easy
+    type: concept
+    q: What do the HTTP status codes 502, 503 and 504 mean when you see them from a reverse proxy?
+    hint: |-
+      - `502 Bad Gateway`: proxy nhận response không hợp lệ hoặc connection tới upstream bị reset/đóng (app crash, keep-alive race, protocol mismatch).
+      - `503 Service Unavailable`: không có upstream khoẻ / overload / maintenance; nên kèm `Retry-After`.
+      - `504 Gateway Timeout`: upstream không trả lời trong timeout của proxy (query DB chậm, deadlock, event loop bị block).
+      Mỗi mã chỉ tới hướng điều tra khác nhau: 502 → log connection/crash; 504 → latency upstream; 503 → health check/capacity.
+    followUp: You see 504s at exactly 60 seconds. What does that number tell you?
+    tags: [http, load-balancer, debugging]
+  - id: networking-008
+    level: easy
+    type: compare
+    q: Short polling, long polling, Server-Sent Events and WebSocket — how do you choose for a live notification feature?
+    hint: |-
+      - Short polling: đơn giản, stateless, trễ = interval, lãng phí request.
+      - Long polling: server giữ request tới khi có data; gần realtime nhưng tốn connection và phức tạp timeout.
+      - SSE: HTTP thường, một chiều server→client, tự reconnect với `Last-Event-ID`; đủ cho notification.
+      - WebSocket: full-duplex, latency thấp; stateful → cần sticky session hoặc pub/sub backplane khi scale.
+      Notification một chiều → SSE thường đủ; chat/collaboration → WebSocket.
+    followUp: With SSE over HTTP/1.1, what browser limit bites you when a user opens 10 tabs?
+    tags: [realtime, websocket, sse]
+  - id: networking-009
+    level: easy
+    type: concept
+    q: Which HTTP methods are idempotent and safe, and why does that matter for retries at the load balancer or client?
+    hint: |-
+      - Safe (không đổi state): `GET`, `HEAD`, `OPTIONS`, `TRACE`.
+      - Idempotent (gọi N lần = gọi 1 lần về mặt state): safe methods + `PUT`, `DELETE`.
+      - `POST` không idempotent; `PATCH` thường không (RFC 9110 không đảm bảo).
+      - Retry tự động (proxy, SDK, `fetch` wrapper) chỉ an toàn với idempotent requests; với POST cần **idempotency key** ở server.
+      Idempotent là về **tác dụng phụ trên server**, không phải response giống nhau.
+    followUp: How would you implement an `Idempotency-Key` header for a checkout endpoint?
+    tags: [http, idempotency]
+  - id: networking-010
+    level: medium
+    type: compare
+    q: Explain head-of-line blocking in HTTP/1.1, HTTP/2 and HTTP/3. Which layer does each version fix it at?
+    hint: |-
+      - HTTP/1.1: một connection xử lý một request/response tại một thời điểm → request chậm chặn các request sau (pipelining gần như không dùng được) → browser mở ~6 connection/origin.
+      - HTTP/2: multiplex nhiều stream trên 1 TCP → hết HOL ở **tầng HTTP**, nhưng mất 1 TCP segment → mọi stream chờ retransmit (HOL ở **tầng TCP**).
+      - HTTP/3/QUIC: loss recovery theo từng stream → mất gói chỉ chặn stream liên quan.
+      Hệ quả: trên mạng loss cao, HTTP/2 một connection có thể tệ hơn HTTP/1.1 nhiều connection.
+    followUp: Why did domain sharding and asset concatenation become anti-patterns with HTTP/2?
+    tags: [http2, http3, performance]
+  - id: networking-011
+    level: medium
+    type: concept
+    q: In TLS, what is the certificate's public key actually used for, and how is the symmetric session key established in TLS 1.3?
+    hint: |-
+      - Session key được tạo bằng **ephemeral (EC)DHE**: hai bên gửi `key_share`, cùng tính shared secret, không ai truyền key qua mạng → **forward secrecy**.
+      - Public key trong certificate dùng để server **chứng minh** sở hữu private key: ký transcript handshake (`CertificateVerify`); client verify chữ ký + chain tới trusted CA + hostname (SAN).
+      - TLS 1.3 đã **loại bỏ RSA key transport** ("client mã hoá pre-master secret bằng public key server") — đó là mô hình TLS 1.2 cũ.
+      - Data sau đó mã hoá bằng AEAD symmetric (AES-GCM, ChaCha20-Poly1305).
+    followUp: Why does forward secrecy matter if the server's private key leaks a year later?
+    redFlags:
+      - "The server's public key encrypts all the data the client sends"
+      - Describes only the TLS 1.2 RSA handshake as if it were current
+    tags: [tls, security]
+  - id: networking-012
+    level: medium
+    type: concept
+    q: What happens during certificate validation, and what are the common reasons a Node.js client throws `UNABLE_TO_VERIFY_LEAF_SIGNATURE` or `CERT_HAS_EXPIRED`?
+    hint: |-
+      - Client xây chain leaf → intermediate → root trong trust store; kiểm tra chữ ký từng mắt xích, hạn (`notBefore`/`notAfter`), hostname khớp SAN, (tuỳ client) revocation.
+      - `UNABLE_TO_VERIFY_LEAF_SIGNATURE` / `unable to get local issuer`: server **không gửi intermediate** cert, hoặc CA nội bộ không có trong trust store của Node.
+      - Fix đúng: server gửi full chain; với CA nội bộ dùng `NODE_EXTRA_CA_CERTS` hoặc option `ca`. **Không** dùng `NODE_TLS_REJECT_UNAUTHORIZED=0` trên production.
+      - `CERT_HAS_EXPIRED`: cert hết hạn hoặc đồng hồ máy client lệch.
+    followUp: Browsers load the site fine but your Node service fails on the same URL. Why can that happen?
+    tags: [tls, node, debugging]
+  - id: networking-013
+    level: medium
+    type: concept
+    q: How does DNS caching work end to end, and why can clients keep hitting an old IP long after you changed a record?
+    hint: |-
+      - Cache nhiều tầng: browser, OS resolver, recursive resolver (ISP/8.8.8.8), đôi khi cả app/runtime (JVM, connection pool).
+      - Mỗi tầng giữ record tới hết **TTL** lúc nó nhận được — đổi record không "đẩy" invalidation xuống.
+      - Nguyên nhân kéo dài: TTL cũ dài (3600s+), resolver không tôn trọng TTL, app giữ **connection keep-alive** tới IP cũ (DNS chỉ được hỏi khi mở connection mới), negative caching (NXDOMAIN) theo SOA.
+      - Migration đúng: hạ TTL trước ≥ 1 TTL cũ, chạy song song cả IP cũ và mới, rồi mới cắt.
+    followUp: Node.js itself doesn't cache DNS by default — so why would a long-lived Node service still talk to the old IP?
+    tags: [dns, migration]
+  - id: networking-014
+    level: medium
+    type: gotcha
+    q: In Node.js, what's the difference between `dns.lookup()` and `dns.resolve()`, and how can `dns.lookup` hurt a high-throughput service?
+    hint: |-
+      - `dns.lookup()` (mặc định cho `http`, `net`, `fetch`) gọi `getaddrinfo` của OS → tôn trọng `/etc/hosts`, nsswitch; chạy trên **libuv threadpool** (mặc định 4 thread).
+      - `dns.resolve*()` dùng c-ares, query DNS server trực tiếp qua network, không dùng threadpool, không đọc `/etc/hosts`.
+      - Rủi ro: DNS chậm + nhiều outbound request → 4 thread bị chiếm → **fs, crypto, zlib** cũng xếp hàng (chung threadpool) → latency lan rộng.
+      - Giảm thiểu: keep-alive agent (ít lookup), cache DNS (`cacheable-lookup`), tăng `UV_THREADPOOL_SIZE`.
+    followUp: How would you prove in production that threadpool saturation from DNS is the cause of latency?
+    verify: true
+    tags: [dns, node, libuv]
+  - id: networking-015
+    level: medium
+    type: concept
+    q: What triggers a CORS preflight request, and what must the server respond with for the real request to proceed?
+    hint: |-
+      - Preflight (`OPTIONS` + `Access-Control-Request-Method`/`-Headers`) khi request **không simple**: method ngoài GET/HEAD/POST, header không safelisted (`Authorization`, `X-Tenant-Id`...), hoặc `Content-Type: application/json`.
+      - Server trả: `Access-Control-Allow-Origin` (origin cụ thể), `Access-Control-Allow-Methods`, `Access-Control-Allow-Headers`, tuỳ chọn `Access-Control-Allow-Credentials: true`, `Access-Control-Max-Age`.
+      - Response thật **cũng** phải có `Access-Control-Allow-Origin` (+ `Allow-Credentials` nếu có cookie).
+      - `Max-Age` giảm số preflight, nhưng browser tự giới hạn (Chromium cap 2 giờ).
+    followUp: Your SPA makes a JSON API call on every keystroke and the network tab shows double requests. How do you reduce the overhead?
+    verify: true
+    tags: [cors, http]
+  - id: networking-016
+    level: medium
+    type: debug
+    q: Login works on localhost but in staging the browser never sends the session cookie to the API. Find the problems in this setup.
+    example: |-
+      ```ts
+      // API: https://api.staging.example.com (Express)
+      app.use(cors({ origin: '*', credentials: true }));
+      res.cookie('sid', token, { httpOnly: true });
+
+      // SPA: https://app.staging.example.io
+      await fetch('https://api.staging.example.com/me');
+      ```
+    hint: |-
+      - `origin: '*'` + credentials: browser **từ chối** `Access-Control-Allow-Origin: *` cho request có credentials → cần echo origin cụ thể từ allowlist + `Vary: Origin`.
+      - `fetch` thiếu `credentials: 'include'` → cookie không được gửi/nhận cross-origin.
+      - `example.io` vs `example.com` là **cross-site** → cookie mặc định `SameSite=Lax` không đi kèm fetch cross-site; cần `SameSite=None; Secure` (và chú ý browser chặn third-party cookie).
+      - Tốt hơn: đặt API cùng site (`api.app.example.io`) hoặc proxy qua cùng origin (`/api` rewrite).
+    followUp: Why is putting the API behind a same-origin `/api` path often the most robust fix?
+    redFlags:
+      - Suggests disabling CORS in the browser or using a browser extension
+    tags: [cors, cookies, debug]
+  - id: networking-017
+    level: medium
+    type: gotcha
+    q: Does CORS protect your API from CSRF? Explain with a concrete request that still goes through.
+    hint: |-
+      **Không.** CORS chỉ quyết định JS có được **đọc** response; nó không ngăn browser **gửi** simple request.
+      - `<form method="POST" action="https://bank.com/transfer">` hoặc `fetch(url, {method:'POST', mode:'no-cors', body: formData})` → không preflight, cookie đi kèm nếu `SameSite` cho phép → side effect đã xảy ra dù attacker không đọc được response.
+      - Chống CSRF: cookie `SameSite=Lax/Strict`, CSRF token (synchronizer / double-submit), kiểm tra `Origin`/`Sec-Fetch-Site`, yêu cầu custom header (buộc preflight) cho API JSON.
+      Preflight chỉ "vô tình" bảo vệ khi API **bắt buộc** `Content-Type: application/json` hoặc custom header và server từ chối form-encoded.
+    example: |-
+      ```html
+      <!-- attacker.com -->
+      <form action="https://shop.example.com/api/address/delete" method="POST">
+        <input name="id" value="123" />
+      </form>
+      <script>document.forms[0].submit()</script>
+      ```
+    followUp: Your API accepts both JSON and `application/x-www-form-urlencoded` for legacy reasons. What does that do to your CSRF posture?
+    redFlags:
+      - "CORS prevents CSRF so we don't need tokens"
+    tags: [cors, csrf, security]
+  - id: networking-018
+    level: medium
+    type: compare
+    q: Layer 4 vs Layer 7 load balancing — what can each see and do, and where does TLS terminate in each?
+    hint: |-
+      - L4 (TCP/UDP, ví dụ AWS NLB): route theo IP/port, không đọc HTTP; có thể pass-through TLS tới backend; throughput cao, latency thấp; sticky theo source IP.
+      - L7 (HTTP, ví dụ ALB/Nginx/Envoy): đọc host/path/header/cookie → routing, retry, rewrite, WAF, auth; thường **terminate TLS** ở LB rồi dùng HTTP hoặc re-encrypt tới backend.
+      - HTTP/2 + L4: một connection dài → toàn bộ request dồn về một backend → tải lệch; L7 cân bằng theo **request**.
+      - gRPC (HTTP/2) cần L7 hoặc client-side LB để phân phối đều.
+    followUp: Your gRPC service behind an L4 load balancer shows one pod at 90% CPU and others idle. Why?
+    tags: [load-balancer, http2]
+  - id: networking-019
+    level: medium
+    type: compare
+    q: Compare round-robin, least-connections, and consistent hashing load-balancing algorithms. When is each the wrong choice?
+    hint: |-
+      - Round-robin: đơn giản, tốt khi request đồng đều; tệ khi request có thời gian xử lý rất khác nhau (một server kẹt nhiều request nặng).
+      - Least-connections / least-outstanding-requests: thích ứng với request dài; cần LB biết trạng thái; có thể "dồn" vào server mới khởi động còn lạnh cache (dùng slow start).
+      - Consistent hashing (theo user/tenant/key): giữ cache locality, sticky; thêm/bớt node chỉ remap ~1/N key; tệ khi có **hot key** (một tenant lớn đè một node).
+      - Kèm health check + outlier detection cho mọi thuật toán.
+    followUp: One huge tenant generates 40% of traffic and you use consistent hashing by tenant. What do you do?
+    tags: [load-balancer, algorithms]
+  - id: networking-020
+    level: medium
+    type: concept
+    q: How do `X-Forwarded-For` and the `Forwarded` header work, and how do you configure Express so `req.ip` is correct and not spoofable?
+    hint: |-
+      - Mỗi proxy **append** IP của peer nó nhận vào `X-Forwarded-For: client, proxy1, proxy2`. Giá trị bên trái có thể do client tự đặt → không tin được.
+      - Cách đúng: tin **N hop từ phải sang** tương ứng số proxy bạn kiểm soát. Express: `app.set('trust proxy', 1)` (một LB) hoặc danh sách subnet của proxy.
+      - `trust proxy = true` → Express lấy IP trái nhất → client giả `X-Forwarded-For` để vượt rate limit/IP allowlist.
+      - `Forwarded` (RFC 7239) là chuẩn hoá, ít proxy dùng.
+    example: |-
+      ```ts
+      // ALB → Nginx → Node: two proxies we control
+      app.set('trust proxy', 2);
+      app.get('/whoami', (req, res) => res.json({ ip: req.ip, ips: req.ips }));
+      ```
+    followUp: How do you rate-limit per client IP when traffic also comes through a CDN?
+    tags: [proxy, express, security]
+  - id: networking-021
+    level: medium
+    type: concept
+    q: Explain `Cache-Control` directives that matter for a CDN in front of an API — `max-age`, `s-maxage`, `private`, `no-cache`, `no-store`, `stale-while-revalidate`.
+    hint: |-
+      - `max-age`: tươi bao lâu với mọi cache; `s-maxage`: override riêng cho **shared cache** (CDN/proxy).
+      - `private`: chỉ browser được cache (dữ liệu theo user); `public`: shared cache được cache kể cả khi có `Authorization`.
+      - `no-cache`: được lưu nhưng **phải revalidate** (ETag/`If-None-Match`) trước khi dùng; `no-store`: không lưu gì — dữ liệu nhạy cảm.
+      - `stale-while-revalidate=N` (RFC 5861): trả bản cũ ngay trong N giây trong khi refresh nền → che latency origin.
+      - `Vary`: key cache theo header (vd `Accept-Encoding`); `Vary: Cookie`/`Authorization` thường làm hit rate về 0.
+    followUp: A per-tenant price list was served to the wrong tenant from the CDN. What header mistakes lead to that?
+    tags: [cdn, caching, http]
+  - id: networking-022
+    level: medium
+    type: concept
+    q: How does the WebSocket handshake work, and what does a reverse proxy need to support it?
+    hint: |-
+      - Client gửi HTTP/1.1 `GET` với `Upgrade: websocket`, `Connection: Upgrade`, `Sec-WebSocket-Key`, `Sec-WebSocket-Version: 13`; server trả `101 Switching Protocols` + `Sec-WebSocket-Accept` (hash của key).
+      - Sau đó cùng TCP connection chuyển sang frame WebSocket (text/binary/ping/pong/close).
+      - Proxy: phải forward `Upgrade`/`Connection` (hop-by-hop headers — Nginx cần `proxy_set_header Upgrade $http_upgrade` + `Connection "upgrade"`), idle timeout đủ dài hoặc app gửi ping định kỳ.
+      - Kiểm tra `Origin` header ở server — WebSocket **không** bị CORS bảo vệ (Cross-Site WebSocket Hijacking).
+    followUp: Why must a WebSocket server check the `Origin` header itself?
+    tags: [websocket, proxy]
+  - id: networking-023
+    level: medium
+    type: concept
+    q: What are TCP TIME_WAIT and ephemeral port exhaustion, and how does a Node service that calls an API without keep-alive trigger it?
+    hint: |-
+      - Bên **chủ động đóng** connection vào `TIME_WAIT` (2×MSL; Linux cố định ~60s) để hấp thụ gói trễ và đảm bảo ACK cuối.
+      - Mỗi connection outbound chiếm một **ephemeral port** (Linux mặc định ~28k port: 32768–60999) cho mỗi tuple (src IP, dst IP, dst port).
+      - Service mở connection mới cho mỗi request (không keep-alive) ở vài trăm RPS tới cùng một đích → hàng chục nghìn socket TIME_WAIT → `EADDRNOTAVAIL`/connect timeout.
+      - Fix: keep-alive agent với connection pool (`maxSockets`), hoặc undici pool; không "tune" bừa `tcp_tw_recycle` (đã bị xoá khỏi Linux).
+    followUp: How do you check this on a Linux host (`ss -s`, `ss -tan state time-wait`)?
+    verify: true
+    tags: [tcp, node, keep-alive]
+  - id: networking-024
+    level: medium
+    type: compare
+    q: TLS termination at the load balancer vs end-to-end TLS to the pod — trade-offs?
+    hint: |-
+      - Terminate ở LB: quản lý cert tập trung (ACM), LB đọc được HTTP → routing/WAF, backend nhẹ CPU; nhưng traffic LB→backend là plaintext trong VPC.
+      - Re-encrypt / end-to-end: đáp ứng compliance (PCI, zero-trust), chống sniff trong mạng nội bộ; tốn CPU, phải phân phối/rotate cert cho backend.
+      - mTLS giữa service (service mesh) cho cả authentication service-to-service.
+      - Pass-through ở L4: backend giữ private key, LB không thấy HTTP.
+    followUp: How do you rotate certificates on 200 pods without downtime?
+    tags: [tls, load-balancer, security]
+  - id: networking-025
+    level: medium
+    type: concept
+    q: What does a VPN actually do at the network layer, and how is it different from a proxy or a zero-trust access gateway?
+    hint: |-
+      - VPN tạo **tunnel mã hoá** (IPsec, WireGuard, OpenVPN) và đưa máy client vào network ảo — route IP (L3) qua tunnel; mọi app đều đi qua, không chỉ HTTP.
+      - Proxy: làm việc ở tầng ứng dụng (HTTP/SOCKS), chỉ app được cấu hình mới đi qua.
+      - Split tunnel: chỉ subnet nội bộ đi qua VPN; full tunnel: mọi traffic.
+      - Zero-trust (ZTNA): xác thực **từng request/ứng dụng** theo identity + device posture thay vì "vào mạng là được tin" — giảm lateral movement.
+    followUp: Your developers need access to a private RDS instance. VPN, bastion host, or SSM port forwarding — which and why?
+    tags: [vpn, security]
+  - id: networking-026
+    level: medium
+    type: gotcha
+    q: After upgrading Node, `fetch('http://localhost:3000')` fails with `ECONNREFUSED ::1:3000` although the server is running. Why?
+    hint: |-
+      - `localhost` resolve ra cả `::1` (IPv6) và `127.0.0.1`. Từ Node 17, `dns.lookup` trả kết quả theo thứ tự OS (**verbatim**) thay vì ưu tiên IPv4 → client thử `::1` trước.
+      - Server chỉ listen `127.0.0.1` (hoặc container chỉ bind IPv4) → IPv6 bị refuse.
+      - Fix: server listen `::` (dual-stack) hoặc gọi `127.0.0.1`, hoặc `dns.setDefaultResultOrder('ipv4first')`; Node mới cũng có Happy Eyeballs (`autoSelectFamily`) giúp thử cả hai.
+    example: |-
+      ```ts
+      server.listen(3000, '127.0.0.1');        // IPv4 only
+      await fetch('http://localhost:3000/health'); // may try ::1 first
+      ```
+    followUp: What is Happy Eyeballs (RFC 8305) and why do clients need it?
+    verify: true
+    tags: [dns, ipv6, node]
+  - id: networking-027
+    level: hard
+    type: scenario
+    q: A Node API behind an AWS ALB returns a small percentage of 502s under moderate load, with no errors in the application logs. What's your hypothesis and fix?
+    hint: |-
+      - Nghi ngay **keep-alive race**: Node `server.keepAliveTimeout` mặc định **5s**, ALB idle timeout mặc định **60s** → Node đóng idle connection, ALB gửi request vào socket vừa đóng → 502, app không log gì vì request chưa từng tới handler.
+      - Fix: `server.keepAliveTimeout` > idle timeout của LB (vd 65s) và `server.headersTimeout` > `keepAliveTimeout`.
+      - Xác minh: ALB access log `elb_status_code=502`, `target_status_code=-`, trùng thời điểm connection idle; metric `HTTPCode_ELB_502_Count`.
+      - Loại trừ khác: app crash/restart (OOM), health check fail, response header quá lớn.
+    example: |-
+      ```ts
+      const server = app.listen(3000);
+      server.keepAliveTimeout = 65_000; // > ALB idle timeout (60s)
+      server.headersTimeout = 66_000;   // must exceed keepAliveTimeout
+      ```
+    followUp: Would the same problem exist between your Node service and an upstream API it calls with a keep-alive agent? Which side should time out first there?
+    redFlags:
+      - Only suggests "add retries at the client"
+      - Blames the ALB without checking timeouts
+    verify: true
+    tags: [load-balancer, keep-alive, node, aws]
+  - id: networking-028
+    level: hard
+    type: scenario
+    q: You are migrating an API to a new cluster by changing its DNS record. One hour after the switch, 20% of traffic still hits the old cluster. Explain why and plan it better next time.
+    hint: |-
+      - Nguyên nhân: TTL cũ dài chưa hết ở resolver; client/SDK/JVM tự cache DNS; **connection keep-alive / pool** đã mở tới IP cũ không bao giờ hỏi lại DNS; resolver không tôn trọng TTL.
+      - Hành động ngay: giữ cluster cũ chạy, cho cluster cũ trả `Connection: close` hoặc giảm max connection age để client reconnect → resolve lại.
+      - Kế hoạch tốt: hạ TTL (vd 60s) **trước** ≥ 1 chu kỳ TTL cũ; weighted DNS / LB-level cutover thay vì DNS; drain cũ khi traffic ~0 (theo metric, không theo đồng hồ).
+      - Tốt nhất: cắt ở tầng LB/proxy (đổi target group) → tức thì, rollback được.
+    followUp: How does a gRPC or HTTP/2 client with long-lived connections change this picture?
+    tags: [dns, migration, keep-alive]
+  - id: networking-029
+    level: hard
+    type: debug
+    q: Uploads larger than ~1 MB fail with `413` behind Nginx, but a colleague "fixed" it and now some large uploads hang forever. Review the config.
+    example: |-
+      ```nginx
+      server {
+        listen 443 ssl;
+        client_max_body_size 0;          # "fix": unlimited
+        proxy_read_timeout 3600s;
+        proxy_request_buffering on;
+        location /upload {
+          proxy_pass http://node_upstream;
+        }
+      }
+      ```
+    hint: |-
+      - `413` gốc: `client_max_body_size` mặc định **1m**. `0` = không giới hạn → mở cửa DoS (upload vô hạn đầy disk/temp).
+      - `proxy_request_buffering on`: Nginx đệm **toàn bộ** body (ra disk nếu lớn) rồi mới gửi upstream → upload lớn chiếm disk tạm, Node không thấy gì cho tới cuối; nếu disk đầy/timeout → treo.
+      - `proxy_read_timeout 3600s` che giấu upstream bị kẹt thay vì fail nhanh.
+      - Fix: giới hạn hợp lý theo endpoint (vd 50m), cân nhắc `proxy_request_buffering off` để stream; tốt nhất upload **thẳng lên object storage bằng presigned URL**, bỏ app khỏi đường dữ liệu.
+    followUp: How do presigned S3 uploads change your security checks (size, content type, virus scan)?
+    tags: [proxy, nginx, debug]
+  - id: networking-030
+    level: hard
+    type: scenario
+    q: After scaling your Socket.IO/WebSocket server from 1 to 4 instances, users randomly miss messages and some clients reconnect in a loop. What's wrong?
+    hint: |-
+      - Socket.IO bắt đầu bằng HTTP long-polling rồi upgrade → các request polling phải tới **cùng instance** (session ID lưu trong memory) → cần **sticky session** ở LB; thiếu thì lỗi `Session ID unknown` và reconnect loop.
+      - Mỗi instance chỉ biết socket của nó → broadcast/room emit phải qua **pub/sub backplane** (Redis adapter, hoặc message broker).
+      - Kiểm tra LB có hỗ trợ Upgrade, idle timeout > ping interval.
+      - Hoặc ép `transports: ['websocket']` để bỏ polling (mất fallback khi proxy chặn WS).
+    followUp: How do you do a rolling deploy of a WebSocket service without dropping 50k connected clients at once?
+    tags: [websocket, realtime, scaling]
+  - id: networking-031
+    level: hard
+    type: concept
+    q: What is TLS 0-RTT (early data) in TLS 1.3/QUIC, and why is it dangerous for non-idempotent requests?
+    hint: |-
+      - Khi client đã có session ticket (PSK) từ lần trước, nó gửi data ứng dụng **ngay trong flight đầu** → tiết kiệm 1 RTT.
+      - Early data **không có bảo vệ chống replay**: attacker bắt gói và phát lại → server xử lý request 2 lần.
+      - Chỉ cho phép 0-RTT với request safe/idempotent (GET); server/CDN có thể từ chối early data hoặc báo cho origin (`Early-Data: 1`, status `425 Too Early`, RFC 8470).
+      - Forward secrecy của early data cũng yếu hơn (dựa vào PSK).
+    followUp: Your CDN enables 0-RTT by default. What should your origin do for `POST /checkout`?
+    verify: true
+    tags: [tls, http3, security]
+  - id: networking-032
+    level: hard
+    type: debug
+    q: A service making outbound HTTPS calls sees latency spikes of ~1s and occasional `ETIMEDOUT` even though the upstream is fast. Review this client code.
+    example: |-
+      ```ts
+      import https from 'node:https';
+
+      export function callPricing(sku: string) {
+        return new Promise((resolve, reject) => {
+          const req = https.request(
+            { host: 'pricing.internal', path: `/p/${sku}`, agent: new https.Agent({ keepAlive: true }) },
+            (res) => { let b = ''; res.on('data', (c) => (b += c)); res.on('end', () => resolve(JSON.parse(b))); },
+          );
+          req.on('error', reject);
+          req.end();
+        });
+      }
+      ```
+    hint: |-
+      - `new https.Agent()` **mỗi lần gọi** → không bao giờ tái sử dụng connection: mỗi request trả DNS lookup + TCP + TLS handshake, và để lại socket keep-alive mồ côi (leak FD).
+      - Không có timeout → request treo tới khi OS timeout.
+      - Fix: một agent dùng chung module-level (`maxSockets`, `keepAlive`), đặt timeout (`AbortSignal.timeout(2000)` với `fetch`/undici hoặc `req.setTimeout`), xử lý status code != 2xx, bắt lỗi `JSON.parse`.
+      - Spike ~1s còn có thể do DNS lookup trên threadpool bận hoặc TCP SYN retransmit (1s initial RTO).
+    followUp: How would you add a circuit breaker so a slow pricing service doesn't take down the checkout API?
+    tags: [node, keep-alive, tls, debug]
+  - id: networking-033
+    level: hard
+    type: scenario
+    q: A mobile client on a flaky network reports that your API is "slow", but server-side p99 latency is 80 ms. How do you investigate and what can you change at the protocol level?
+    hint: |-
+      - Server latency không gồm DNS, TCP/TLS handshake, TCP slow start, retransmit trên mạng loss cao → đo **client-side** (RUM, Resource Timing: `domainLookup`, `connect`, `secureConnection`, `TTFB`).
+      - Giảm RTT: CDN/edge gần user, TLS 1.3 + session resumption, keep-alive, HTTP/2 hoặc **HTTP/3** (tốt với loss, connection migration khi đổi Wi-Fi ↔ 4G).
+      - Giảm payload: compression (br/gzip), bỏ over-fetching, pagination, tránh request waterfall (batch/aggregate endpoint).
+      - Retry có backoff + jitter, timeout hợp lý phía client.
+    followUp: Which Resource Timing fields would prove that the problem is handshake cost rather than server time?
+    tags: [performance, http3, mobile]
+  - id: networking-034
+    level: hard
+    type: gotcha
+    q: Your API sets `Access-Control-Allow-Origin` by echoing the request's `Origin` header when it matches `/example\.com$/`. What's the vulnerability?
+    example: |-
+      ```ts
+      app.use((req, res, next) => {
+        const origin = req.headers.origin ?? '';
+        if (/example\.com$/.test(origin)) {
+          res.setHeader('Access-Control-Allow-Origin', origin);
+          res.setHeader('Access-Control-Allow-Credentials', 'true');
+        }
+        next();
+      });
+      ```
+    hint: |-
+      - Regex chỉ neo cuối, không neo đầu/ranh giới subdomain → `https://evilexample.com` hay `https://attacker-example.com` đều khớp → trang của attacker đọc được response kèm cookie của nạn nhân.
+      - Thiếu `Vary: Origin` → CDN có thể cache response với ACAO của origin khác.
+      - `null` origin (sandboxed iframe, file://) cũng không được whitelist.
+      - Fix: so khớp **chính xác** với Set allowlist (`new URL(origin).origin`), hoặc regex neo đủ `^https://([a-z0-9-]+\.)?example\.com$`, thêm `Vary: Origin`.
+    followUp: Why is reflecting the Origin with credentials effectively the same as disabling SOP for your users?
+    tags: [cors, security, gotcha]
+  - id: networking-035
+    level: hard
+    type: concept
+    q: What is TCP congestion control / slow start, and why does it make "just increase bandwidth" ineffective for many small API calls?
+    hint: |-
+      - Connection mới bắt đầu với congestion window nhỏ (initcwnd thường 10 segment ≈ 14 KB) và tăng gấp đôi mỗi RTT tới khi gặp loss → response lớn trên connection mới cần nhiều RTT.
+      - Latency = RTT × số round-trip; băng thông lớn không giảm RTT.
+      - Loss → cwnd giảm (Reno/CUBIC); BBR ước lượng bandwidth/RTT thay vì dựa vào loss.
+      - Thực tế: reuse connection (keep-alive, HTTP/2), giữ response đầu nhỏ (critical payload < ~14 KB), CDN gần user.
+    followUp: Why can an idle keep-alive connection sometimes still be "slow" on its next request (slow start after idle)?
+    verify: true
+    tags: [tcp, performance]
+  - id: networking-036
+    level: hard
+    type: scenario
+    q: Your SSE notification endpoint works locally but in production clients receive all events in one burst after ~30 seconds. What's buffering, and how do you fix it?
+    hint: |-
+      - Có một tầng đang **buffer response**: Nginx `proxy_buffering on` (mặc định), compression middleware (gzip đợi đủ chunk), CDN không hỗ trợ streaming, hoặc Next.js/serverless runtime không stream.
+      - Fix: `X-Accel-Buffering: no` hoặc `proxy_buffering off` cho location đó; tắt compression cho `text/event-stream` hoặc flush sau mỗi event; `Cache-Control: no-cache`; gửi heartbeat comment (`: ping\n\n`) mỗi ~15s để không bị idle timeout.
+      - "30 giây" thường trùng timeout hoặc buffer size của một proxy — tìm tầng có số đó.
+    example: |-
+      ```ts
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'X-Accel-Buffering': 'no',
+      });
+      const t = setInterval(() => res.write(': ping\n\n'), 15_000);
+      req.on('close', () => clearInterval(t));
+      ```
+    followUp: How does the client resume without missing events after a reconnect?
+    tags: [sse, proxy, realtime]
+  - id: networking-037
+    level: hard
+    type: scenario
+    q: Intermittent `ECONNRESET` errors appear when your service calls a third-party API through a corporate egress proxy/NAT gateway, mostly after quiet periods. Diagnose.
+    hint: |-
+      - Dấu hiệu "sau lúc yên ắng" → **idle connection bị middlebox (NAT gateway, firewall, proxy) xoá khỏi bảng state** mà không báo; client dùng lại socket từ pool → gói đi vào hư không/bị RST.
+      - AWS NAT Gateway timeout idle TCP 350s; firewall thường ngắn hơn.
+      - Fix: đặt idle timeout của client agent < timeout của middlebox (`freeSocketTimeout`/`keepAliveTimeout` của undici), bật TCP keepalive (`socket.setKeepAlive(true, 30_000)`), retry **idempotent** request khi gặp reset trên socket reused.
+      - Xác nhận bằng log thời điểm socket được tạo vs dùng lại, tcpdump thấy RST.
+    followUp: Why is it safe to retry a GET on `ECONNRESET` but not necessarily a POST?
+    verify: true
+    tags: [tcp, keep-alive, node]
+  - id: networking-038
+    level: hard
+    type: compare
+    q: HTTP/2 multiplexing vs a pool of HTTP/1.1 connections for service-to-service calls — which is better, and what can go wrong with HTTP/2 at scale?
+    hint: |-
+      - HTTP/2: ít connection, ít handshake, header compression; tốt cho nhiều request nhỏ song song (gRPC).
+      - Rủi ro: một connection = một TCP → loss ảnh hưởng mọi stream; `SETTINGS_MAX_CONCURRENT_STREAMS` giới hạn (thường 100) → request xếp hàng; LB L4 không cân bằng theo request; một connection "ghim" vào một backend sau khi scale-out.
+      - Bảo mật: "Rapid Reset" (CVE-2023-44487) — client mở và RST stream liên tục → DoS; cần server/proxy đã vá.
+      - HTTP/1.1 pool: đơn giản, cân bằng đều hơn khi có nhiều connection, nhưng nhiều socket.
+    followUp: How do you make long-lived HTTP/2 or gRPC clients pick up new backend pods after a scale-out?
+    verify: true
+    tags: [http2, grpc, load-balancer]
+  - id: networking-039
+    level: hard
+    type: concept
+    q: What is SNI and ALPN, and what breaks when a client doesn't send SNI?
+    hint: |-
+      - **SNI** (Server Name Indication): client gửi hostname trong `ClientHello` (plaintext, trừ khi dùng ECH) → server/LB chọn đúng certificate khi nhiều domain chung một IP.
+      - **ALPN**: client và server thoả thuận protocol trong handshake (`h2`, `http/1.1`) → không tốn thêm RTT để "nâng cấp" lên HTTP/2.
+      - Không có SNI (client cũ, gọi bằng IP, một số tool) → server trả cert mặc định → hostname mismatch; L4 LB route theo SNI cũng không route được.
+      - SNI lộ domain cho middlebox → ECH (Encrypted Client Hello) giải quyết.
+    followUp: You call an internal service by IP with `https://10.0.3.14`. How do you make certificate validation pass correctly?
+    tags: [tls, http2]
+  - id: networking-040
+    level: hard
+    type: debug
+    q: A health check keeps marking healthy pods as unhealthy during traffic spikes, causing cascading restarts. Review the health endpoint.
+    example: |-
+      ```ts
+      app.get('/health', async (_req, res) => {
+        await db.query('SELECT 1');
+        await redis.ping();
+        await fetch('https://payments.partner.com/status');
+        res.send('ok');
+      });
+      // LB: interval 5s, timeout 2s, unhealthy threshold 2
+      ```
+    hint: |-
+      - Health check phụ thuộc **dependency ngoài** (partner API) → partner chậm → tất cả pod "unhealthy" cùng lúc → LB rút hết → outage toàn phần.
+      - Lúc spike, event loop/DB pool bận → `/health` vượt 2s → bị kill đúng lúc cần capacity nhất → cascading failure.
+      - Tách: **liveness** (process còn sống, event loop không kẹt — không gọi dependency) vs **readiness** (có nhận traffic được không — kiểm tra dependency thiết yếu, có cache kết quả).
+      - Không có timeout trên từng check → check treo.
+    followUp: Should readiness fail when Redis (a cache) is down? Argue both sides.
+    tags: [load-balancer, health-check, reliability, debug]
+  - id: networking-041
+    level: senior
+    type: design
+    q: Design the edge and network layout for a multi-tenant e-commerce platform where tenants bring custom domains (`shop.brand.com`) and need HTTPS.
+    hint: |-
+      Hướng trả lời mạnh:
+      - Tenant trỏ CNAME tới `edge.platform.com` (apex → ALIAS/A tới anycast IP); verify quyền sở hữu domain qua TXT record.
+      - TLS: cấp cert tự động (ACME/Let's Encrypt hoặc CDN managed cert) theo SNI, lưu cert tập trung; hoặc SaaS custom hostname của CDN.
+      - Edge (CDN/WAF) → L7 LB → app; tenant resolve từ `Host` header → map tenant ID ở edge, cache key gồm host.
+      - Rate limit và WAF theo tenant, cô lập noisy neighbor; chú ý `Vary` và cache key để không lộ dữ liệu giữa tenant.
+      - Vận hành: theo dõi cert sắp hết hạn, domain tenant bị gỡ DNS (dangling CNAME → subdomain takeover).
+    followUp: A tenant deletes their DNS record but your platform still has the hostname configured. What risk does that create?
+    tags: [design, tls, dns, multi-tenant]
+  - id: networking-042
+    level: senior
+    type: design
+    q: You need realtime order-status updates for 200k concurrent users across web and mobile. Pick the transport and design the backend fan-out.
+    hint: |-
+      Không có đáp án duy nhất; đánh giá lập luận:
+      - Transport: SSE nếu chỉ server→client (qua proxy dễ, HTTP/2 multiplex nhiều stream); WebSocket nếu cần hai chiều; mobile nền → push notification (APNs/FCM).
+      - Gateway giữ connection (stateless với business), subscribe theo user/tenant qua pub/sub (Redis, Kafka → fan-out service).
+      - Capacity: FD limits, memory/connection, heartbeat, LB idle timeout, reconnect có jitter để tránh thundering herd sau deploy.
+      - Delivery: event ID + replay từ store khi reconnect (at-least-once), client idempotent.
+      - Có thể dùng managed service (API Gateway WebSocket, Pusher, Ably) — trade-off cost vs ops.
+    followUp: A deploy disconnects all 200k clients at once. How do you prevent the reconnect storm from overloading your auth service?
+    tags: [realtime, design, scaling]
+  - id: networking-043
+    level: senior
+    type: open
+    q: How do you set a consistent timeout and retry policy across a chain of client → CDN → LB → API → downstream service → DB?
+    hint: |-
+      Điểm senior:
+      - Timeout **giảm dần** từ ngoài vào trong (deadline propagation): mỗi tầng trong phải time out **trước** tầng ngoài để trả lỗi có nghĩa thay vì bị cắt ngang.
+      - Truyền **deadline** (header / gRPC deadline) thay vì timeout cố định từng hop.
+      - Retry chỉ ở **một tầng** (tránh retry nhân lên N^k), chỉ cho idempotent, exponential backoff + jitter, retry budget.
+      - Idle/keep-alive timeout thì ngược lại: server giữ lâu hơn client/LB.
+      - Circuit breaker + fallback để fail nhanh khi downstream chết.
+    followUp: Your API retries 3 times, the SDK retries 3 times, and the LB retries once. What's the worst-case amplification?
+    tags: [reliability, timeouts, design]
+  - id: networking-044
+    level: senior
+    type: open
+    q: Your team debates moving public APIs to HTTP/3. How do you decide, and how do you roll it out safely?
+    hint: |-
+      - Lợi ích phụ thuộc user: mobile/mạng loss cao, xa region → lợi nhiều; client nội bộ/datacenter → gần như không.
+      - Đo trước: RUM theo network type/country; A/B với CDN hỗ trợ HTTP/3.
+      - Rollout: bật ở CDN/edge (không cần app đổi), quảng bá qua `Alt-Svc`/HTTPS DNS record → client tự fallback TCP nếu UDP bị chặn.
+      - Rủi ro: UDP bị chặn ở mạng doanh nghiệp, observability/tcpdump khó hơn, CPU cao hơn ở edge, 0-RTT replay.
+      - Origin vẫn HTTP/1.1 hoặc HTTP/2 sau CDN là bình thường.
+    followUp: Which metrics would you compare before and after to declare the rollout a success?
+    verify: true
+    tags: [http3, performance, rollout]
+  - id: networking-045
+    level: senior
+    type: scenario
+    q: A partner reports your API is unreachable from their network while it works for everyone else. Walk through a structured network investigation.
+    hint: |-
+      Đi từ dưới lên, dùng dữ liệu của cả hai phía:
+      - DNS: họ resolve ra IP nào (`dig +trace`, resolver nội bộ, split-horizon DNS, record cũ trong cache)?
+      - Reachability: `curl -v`, `traceroute`/`mtr`, TCP 443 có mở không; firewall egress của họ có allowlist IP cũ?
+      - TLS: `openssl s_client -connect host:443 -servername host` — chain đầy đủ? TLS version/cipher họ hỗ trợ (client cũ chỉ TLS 1.0/1.1)? Proxy doanh nghiệp làm TLS interception?
+      - HTTP: WAF/geo-block/rate limit của bạn có chặn IP của họ? Xem log edge theo IP.
+      - MTU/PMTUD blackhole: handshake treo khi certificate lớn qua VPN.
+    followUp: They are behind a TLS-intercepting corporate proxy and your API uses certificate pinning in the SDK. What happens?
+    tags: [debugging, dns, tls, scenario]

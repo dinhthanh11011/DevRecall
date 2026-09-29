@@ -1,0 +1,733 @@
+id: 01-os-concurrency
+slug: os-concurrency
+title: OS & Concurrency Basics
+tier: 0
+status: drafted
+summary: Process/thread, concurrency vs parallelism, blocking vs non-blocking I/O, race condition, deadlock, signals, container limits — góc nhìn của một backend Node.js.
+cvLinked: false
+overview: |-
+  ## TL;DR
+
+  - **Process** = không gian địa chỉ + tài nguyên riêng; **thread** = luồng thực thi chia sẻ memory trong process. Node.js chạy JS trên **một thread** nhưng process có thêm libuv threadpool và V8 helper threads.
+  - **Concurrency** là cấu trúc (nhiều việc tiến triển xen kẽ); **parallelism** là thực thi đồng thời trên nhiều core. Event loop cho concurrency, không cho parallelism CPU.
+  - Race condition **vẫn xảy ra trong JS single-threaded** — mọi `await` là một điểm xen kẽ; và luôn xảy ra giữa nhiều instance/pod dùng chung DB/Redis.
+  - Deadlock cần đủ 4 điều kiện Coffman; phá một điều kiện (thường là **thứ tự lock cố định** hoặc timeout) là hết.
+  - Production: hiểu **signals** (SIGTERM → graceful shutdown), **PID 1 trong container**, **file descriptor limit**, **cgroup memory/CPU limit** và OOM killer.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Process | Chương trình đang chạy với virtual memory, FD table, PID riêng | Mỗi `node server.js` là một process |
+  | Thread | Luồng thực thi trong process, chia sẻ heap, có stack riêng | `worker_threads` tạo thread với V8 isolate riêng |
+  | Context switch | OS lưu/khôi phục register để chuyển CPU giữa thread/process | 1000 thread blocking → CPU tốn cho switching |
+  | Blocking I/O | Thread đứng chờ tới khi I/O xong | `fs.readFileSync` chặn event loop |
+  | Non-blocking I/O + multiplexing | Đăng ký nhiều FD, kernel báo khi sẵn sàng (epoll/kqueue/IOCP) | libuv poll phase |
+  | Race condition | Kết quả phụ thuộc thứ tự xen kẽ không kiểm soát | Hai request cùng trừ tồn kho |
+  | Critical section | Đoạn code truy cập shared state cần loại trừ lẫn nhau | `SELECT ... FOR UPDATE` bao đoạn trừ stock |
+  | Mutex / Semaphore | Mutex: 1 holder; semaphore: tối đa N holder | Semaphore 10 = giới hạn 10 call đồng thời |
+  | Deadlock | Các bên chờ nhau mãi mãi | Tx A lock row 1 chờ row 2, Tx B ngược lại |
+  | Atomic / CAS | Thao tác không thể bị chen ngang; compare-and-swap | `UPDATE ... SET v = v + 1 WHERE version = 3` |
+  | Signal | Thông báo bất đồng bộ từ OS tới process | `SIGTERM` khi Kubernetes stop pod |
+
+  ## Cơ chế hoạt động
+
+  ### Blocking vs non-blocking I/O trong một server
+
+  ```mermaid
+  flowchart LR
+    subgraph TPR["Thread-per-request (blocking)"]
+      R1["req 1"] --> T1["thread 1<br/>chờ DB"]
+      R2["req 2"] --> T2["thread 2<br/>chờ DB"]
+      R3["req N"] --> T3["thread N<br/>(stack ~MB mỗi thread)"]
+    end
+    subgraph EL["Event loop (non-blocking)"]
+      Q["N requests"] --> L["1 JS thread"]
+      L -- "register FD" --> K["kernel epoll/kqueue"]
+      K -- "ready events" --> L
+      L -- "fs, dns.lookup, crypto, zlib" --> P["libuv threadpool<br/>(mặc định 4)"]
+      P -- "done callback" --> L
+    end
+  ```
+
+  ### Check-then-act race qua `await`
+
+  ```mermaid
+  sequenceDiagram
+    participant A as Request A
+    participant DB as DB (stock = 1)
+    participant B as Request B
+    A->>DB: SELECT stock → 1
+    B->>DB: SELECT stock → 1
+    A->>DB: UPDATE stock = 0, tạo order
+    B->>DB: UPDATE stock = 0, tạo order
+    Note over DB: Oversell: 2 orders, 1 item
+  ```
+
+  Fix: một câu lệnh atomic `UPDATE products SET stock = stock - 1 WHERE id = $1 AND stock > 0` rồi kiểm tra `rowCount`, hoặc `SELECT ... FOR UPDATE` trong transaction, hoặc optimistic locking theo `version`.
+
+  ### Graceful shutdown khi nhận SIGTERM
+
+  ```mermaid
+  flowchart TD
+    S["SIGTERM (k8s / docker stop)"] --> A["Readiness = false<br/>(ngừng nhận traffic mới)"]
+    A --> B["server.close(): không accept connection mới"]
+    B --> C["Chờ in-flight requests / jobs xong<br/>(có deadline)"]
+    C --> D["Đóng DB pool, Redis, Kafka consumer (commit offset)"]
+    D --> E["process.exit(0)"]
+    C -- "quá deadline" --> F["exit(1) — trước khi bị SIGKILL"]
+  ```
+
+  ## Trade-offs
+
+  | Mô hình | Ưu | Nhược | Hợp với |
+  |---|---|---|---|
+  | Thread-per-request | Code tuần tự dễ đọc, tận dụng nhiều core | Memory/thread, context switch, cần lock shared state | CPU-bound vừa, stack Java/.NET truyền thống |
+  | Event loop (Node) | Hàng chục nghìn connection với ít memory, không lock cho JS state | Một tác vụ CPU chặn tất cả; chỉ 1 core cho JS | I/O-bound API, gateway, realtime |
+  | Multi-process (cluster, nhiều pod) | Tận dụng core, cô lập crash | Không share memory → state phải ra Redis/DB | Scale Node trên máy nhiều core |
+  | worker_threads | Parallel CPU trong cùng process, share `SharedArrayBuffer` | Chi phí khởi tạo isolate, message copy | Parse, nén, hash, image |
+  | Pessimistic lock | Đơn giản, đúng ngay | Giảm throughput, deadlock | Contention cao, xung đột đắt |
+  | Optimistic (version/CAS) | Không giữ lock, throughput cao | Retry khi conflict | Contention thấp |
+
+  ## Pitfalls
+
+  - Tin rằng "Node single-thread nên không có race condition".
+  - Dùng API `*Sync` (`readFileSync`, `bcrypt.hashSync`, `JSON.parse` 50 MB) trong request path.
+  - `CMD npm start` trong Dockerfile: npm là PID 1, có thể không forward SIGTERM → app bị SIGKILL sau grace period, mất request.
+  - `os.cpus().length` trong container trả số core của **host**, không phải CPU quota → spawn quá nhiều worker; dùng `os.availableParallelism()` và vẫn kiểm tra cgroup quota.
+  - Không đặt `--max-old-space-size` phù hợp memory limit của container → OOMKilled thay vì GC sớm.
+  - Lock phân tán (Redis) không có TTL/fencing token → lock "vĩnh viễn" hoặc hai holder cùng lúc.
+  - Unbounded `Promise.all` trên 10k item → cạn connection pool / FD.
+
+  ## Cheat sheet
+
+  - Coffman: **mutual exclusion, hold-and-wait, no preemption, circular wait** → phá circular wait bằng lock ordering.
+  - Deadlock (không ai tiến) · Livelock (bận rộn nhưng không tiến) · Starvation (một bên không bao giờ được chạy).
+  - `SIGTERM` bắt được (graceful) · `SIGKILL`/`SIGSTOP` **không** bắt được · `SIGINT` = Ctrl+C · exit code 137 = 128 + 9 (SIGKILL, thường OOM) · 143 = 128 + 15 (SIGTERM).
+  - libuv threadpool: `fs`, `dns.lookup`, `crypto` (pbkdf2, scrypt, randomBytes async), `zlib`; network socket **không** dùng threadpool. `UV_THREADPOOL_SIZE` mặc định 4.
+  - Zombie = process con đã exit nhưng cha chưa `wait()`; orphan = cha chết trước, được init nhận nuôi.
+  - "EMFILE: too many open files" → FD limit (`ulimit -n`) hoặc leak socket/file.
+notionRefs: []
+references:
+  - title: Node.js — The Node.js Event Loop
+    url: https://nodejs.org/en/learn/asynchronous-work/event-loop-timers-and-nexttick
+  - title: Node.js — Don't Block the Event Loop (or the Worker Pool)
+    url: https://nodejs.org/en/learn/asynchronous-work/dont-block-the-event-loop
+  - title: Node.js — worker_threads
+    url: https://nodejs.org/api/worker_threads.html
+  - title: Node.js — process signal events
+    url: https://nodejs.org/api/process.html#signal-events
+  - title: Node.js — os.availableParallelism()
+    url: https://nodejs.org/api/os.html#osavailableparallelism
+  - title: libuv — Design overview
+    url: https://docs.libuv.org/en/v1.x/design.html
+  - title: MDN — Atomics
+    url: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Atomics
+  - title: Linux man-pages — signal(7)
+    url: https://man7.org/linux/man-pages/man7/signal.7.html
+  - title: Linux man-pages — epoll(7)
+    url: https://man7.org/linux/man-pages/man7/epoll.7.html
+  - title: Kubernetes — Pod termination lifecycle
+    url: https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination
+  - title: PostgreSQL — Explicit locking
+    url: https://www.postgresql.org/docs/current/explicit-locking.html
+questions:
+  - id: os-concurrency-001
+    level: easy
+    type: compare
+    q: Process vs thread — what does each own, and what do threads in the same process share?
+    hint: |-
+      - Process: virtual address space riêng, file descriptor table, PID, environment; crash một process không làm chết process khác.
+      - Thread: stack + register + thread-local storage riêng; **chia sẻ heap, code, FD** với các thread cùng process → giao tiếp nhanh nhưng cần đồng bộ.
+      - Tạo/switch thread rẻ hơn process (không đổi page table), nhưng lỗi một thread (segfault) giết cả process.
+      - Node: `cluster`/`child_process` = nhiều process; `worker_threads` = thread, mỗi cái một V8 isolate + event loop riêng (không share JS object, chỉ share `SharedArrayBuffer`).
+    followUp: Why can't two worker_threads simply share a JavaScript object the way two Java threads can?
+    tags: [process, thread, node]
+  - id: os-concurrency-002
+    level: easy
+    type: compare
+    q: Concurrency vs parallelism — explain with Node.js as the example.
+    hint: |-
+      - **Concurrency**: nhiều tác vụ cùng "đang tiến triển", xen kẽ nhau (có thể trên 1 core). **Parallelism**: nhiều tác vụ chạy **cùng một thời điểm** trên nhiều core.
+      - Node xử lý 10k request đồng thời (concurrency) vì phần lớn thời gian là chờ I/O; JS của bạn vẫn chạy tuần tự trên một thread.
+      - Parallelism trong Node: libuv threadpool, `worker_threads`, `cluster`/nhiều pod, và chính kernel xử lý I/O song song.
+      - Hệ quả: task CPU-bound không nhanh hơn khi thêm `async`.
+    followUp: Your 8-core VM runs one Node process at 100% of one core. What are your options?
+    tags: [concurrency, event-loop]
+  - id: os-concurrency-003
+    level: easy
+    type: concept
+    q: What is a race condition? Give an example that can happen in single-threaded Node.js.
+    hint: |-
+      - Race condition: kết quả đúng/sai phụ thuộc thứ tự thực thi xen kẽ mà ta không kiểm soát.
+      - Trong Node: mỗi `await` trả quyền cho event loop → request khác chen vào giữa "đọc" và "ghi" (check-then-act).
+      - Ví dụ: `if (!(await cache.get(k))) { v = await compute(); await cache.set(k, v) }` → nhiều request cùng compute (cache stampede); hoặc đọc stock rồi trừ.
+      - Giữa nhiều instance/pod thì chắc chắn xảy ra → cần atomic ở tầng dữ liệu (DB constraint, `UPDATE ... WHERE`, Redis `SET NX`, Lua).
+    example: |-
+      ```ts
+      async function redeem(code: string, userId: string) {
+        const c = await db.coupon.find(code);
+        if (c.usedBy) throw new Error('used');
+        await db.coupon.update(code, { usedBy: userId }); // two requests can both pass the check
+      }
+      ```
+    followUp: Rewrite `redeem` so that it is correct across 10 pods.
+    redFlags:
+      - "Node is single-threaded, so race conditions cannot happen"
+    tags: [race-condition, node]
+  - id: os-concurrency-004
+    level: easy
+    type: compare
+    q: Mutex vs semaphore — and what's the JavaScript/Node equivalent of each in practice?
+    hint: |-
+      - Mutex: tối đa **1** holder, có khái niệm owner (ai lock người đó unlock). Semaphore: counter cho phép tối đa **N** holder.
+      - Trong JS không có thread tranh nhau JS state, nhưng vẫn cần "async mutex" để tuần tự hoá một đoạn có `await` (ví dụ refresh token một lần), và semaphore để **giới hạn concurrency** (p-limit, connection pool chính là một semaphore).
+      - Giữa process/pod: lock ở DB (`SELECT FOR UPDATE`, advisory lock) hoặc Redis.
+    followUp: Implement a tiny async semaphore that limits concurrent calls to N.
+    tags: [mutex, semaphore]
+  - id: os-concurrency-005
+    level: easy
+    type: concept
+    q: What are the four Coffman conditions for deadlock, and which one is easiest to break in application code?
+    hint: |-
+      1. Mutual exclusion — tài nguyên không chia sẻ được.
+      2. Hold and wait — giữ một cái, chờ cái khác.
+      3. No preemption — không thể giật tài nguyên.
+      4. Circular wait — A chờ B, B chờ A.
+      Dễ phá nhất: **circular wait** bằng thứ tự lock cố định (vd luôn lock theo id tăng dần), và phá "wait vô hạn" bằng **lock timeout**. DB tự phát hiện deadlock và abort một transaction → app phải retry.
+    followUp: How does PostgreSQL detect deadlocks, and what should your code do when it gets error `40P01`?
+    tags: [deadlock]
+  - id: os-concurrency-006
+    level: easy
+    type: concept
+    q: What's the difference between SIGTERM, SIGINT, SIGKILL and SIGHUP, and which can a Node process handle?
+    hint: |-
+      - `SIGTERM`: yêu cầu kết thúc lịch sự (docker stop, Kubernetes) → bắt được, dùng cho graceful shutdown.
+      - `SIGINT`: Ctrl+C trong terminal → bắt được.
+      - `SIGKILL` (9): kernel giết ngay, **không** bắt/bỏ qua được; `SIGSTOP` cũng vậy.
+      - `SIGHUP`: terminal đóng; daemon truyền thống dùng để reload config.
+      - Node: `process.on('SIGTERM', handler)`. Lưu ý: khi đã đăng ký handler, Node **không tự exit** nữa — bạn phải tự gọi exit.
+    followUp: Your container exits with code 137. What happened?
+    tags: [signals, node]
+  - id: os-concurrency-007
+    level: easy
+    type: compare
+    q: Blocking vs non-blocking vs asynchronous I/O — what's the difference, and which does Node use for sockets vs files?
+    hint: |-
+      - Blocking: syscall trả về khi xong, thread đứng chờ.
+      - Non-blocking: syscall trả ngay (`EAGAIN` nếu chưa sẵn sàng); kết hợp **I/O multiplexing** (epoll/kqueue) để biết FD nào sẵn sàng.
+      - Asynchronous (completion-based): gửi yêu cầu, kernel báo khi **hoàn tất** (IOCP trên Windows, io_uring).
+      - Node/libuv: socket dùng non-blocking + epoll/kqueue/IOCP trên event loop; **file system** trên Linux dùng blocking syscall trong **threadpool** (vì epoll không hỗ trợ regular file).
+    followUp: Why does heavy file I/O in Node compete with `crypto.pbkdf2` for resources?
+    tags: [io, libuv, node]
+  - id: os-concurrency-008
+    level: easy
+    type: concept
+    q: "What is a file descriptor, and what does `EMFILE: too many open files` tell you?"
+    hint: |-
+      - FD: số nguyên index vào bảng tài nguyên đang mở của process — file, **socket**, pipe, eventfd.
+      - Mỗi connection HTTP/DB = một FD. Giới hạn per-process `ulimit -n` (soft/hard), trong container theo runtime.
+      - `EMFILE`: process chạm limit → leak (socket không đóng, file stream không `close`, agent mới mỗi request) hoặc limit quá thấp so với số connection thật.
+      - Kiểm tra: `ls /proc/<pid>/fd | wc -l`, `lsof -p <pid>`.
+    followUp: How would you tell a genuine FD leak from a legitimately high connection count?
+    tags: [fd, linux, debugging]
+  - id: os-concurrency-009
+    level: medium
+    type: concept
+    q: Which Node.js operations run on the libuv threadpool, and what happens when all threads are busy?
+    hint: |-
+      - Threadpool (mặc định **4** thread, `UV_THREADPOOL_SIZE`, tối đa 1024): hầu hết `fs.*` async, `dns.lookup`, `crypto.pbkdf2/scrypt/randomBytes/randomFill` async, `zlib` async, một số native addon (bcrypt).
+      - **Không** dùng threadpool: TCP/UDP socket, HTTP, timer — đi qua event loop + epoll.
+      - Khi 4 thread bận: task mới **xếp hàng** → latency tăng cho mọi thứ dùng threadpool, dù CPU chưa đầy; event loop vẫn chạy nhưng callback tới muộn.
+      - Chữa: tăng `UV_THREADPOOL_SIZE` (đặt trước khi pool khởi tạo), giảm việc nặng (cache hash, dùng worker_threads riêng).
+    followUp: A login endpoint using async bcrypt makes unrelated `fs.readFile` calls slow. Explain the mechanism.
+    verify: true
+    tags: [libuv, threadpool, node]
+  - id: os-concurrency-010
+    level: medium
+    type: compare
+    q: '`cluster` vs `worker_threads` vs running multiple containers — how do you use more CPU cores for a Node API?'
+    hint: |-
+      - `cluster`: fork nhiều process chia sẻ server port (primary phân phối connection); cô lập crash, không share memory.
+      - `worker_threads`: parallel CPU trong cùng process; hợp cho **tác vụ CPU** cụ thể (pool như piscina), không phải để phục vụ HTTP.
+      - Nhiều container/pod, mỗi pod 1 process (thường ~1 CPU): cách phổ biến nhất trên Kubernetes — orchestrator lo restart, scale, health.
+      - PM2 cluster mode trên VM là lựa chọn khi không có orchestrator.
+      Lưu ý chung: state in-memory (session, rate limit, cache) phải ra Redis khi có >1 process.
+    followUp: Why is running `cluster` inside a Kubernetes pod usually discouraged?
+    tags: [cluster, worker-threads, scaling]
+  - id: os-concurrency-011
+    level: medium
+    type: debug
+    q: Kubernetes rolling deploys cause a burst of 502s and dropped requests. Review the Dockerfile and shutdown code.
+    example: |-
+      ```dockerfile
+      FROM node:24-alpine
+      WORKDIR /app
+      COPY . .
+      RUN npm ci --omit=dev
+      CMD ["npm", "start"]
+      ```
+      ```ts
+      process.on('SIGTERM', () => {
+        console.log('bye');
+        process.exit(0);
+      });
+      ```
+    hint: |-
+      - `npm start` làm **PID 1** là npm → tuỳ phiên bản có thể không forward SIGTERM tới node → app không biết, bị SIGKILL sau `terminationGracePeriodSeconds` (30s) → connection bị cắt.
+      - PID 1 trong Linux không có default signal handler → phải tự xử lý; dùng `CMD ["node", "server.js"]` hoặc init nhỏ (`tini`, `docker run --init`).
+      - Handler `exit(0)` ngay → cắt in-flight requests. Đúng: fail readiness, `server.close()`, chờ in-flight có deadline, đóng pool, rồi exit.
+      - Endpoint còn bị gỡ khỏi Service **bất đồng bộ** với SIGTERM → thêm `preStop` sleep vài giây để LB kịp ngừng gửi traffic.
+    followUp: Why can a pod still receive new requests a few seconds after it gets SIGTERM?
+    verify: true
+    tags: [signals, docker, kubernetes, debug]
+  - id: os-concurrency-012
+    level: medium
+    type: concept
+    q: How does I/O multiplexing (select/poll/epoll/kqueue) let one thread serve thousands of connections?
+    hint: |-
+      - Thread đăng ký tập FD với kernel và **chờ một lần** cho bất kỳ FD nào sẵn sàng (readable/writable), thay vì một thread chờ mỗi FD.
+      - `select`/`poll`: truyền cả danh sách mỗi lần gọi → O(n) mỗi lần; `epoll` (Linux)/`kqueue` (BSD/macOS): kernel giữ interest list, trả về chỉ FD sẵn sàng → ~O(số event).
+      - Event loop: `epoll_wait` → chạy callback cho FD sẵn sàng → quay lại chờ.
+      - Giới hạn: chỉ hiệu quả khi callback **ngắn**; một callback CPU nặng làm tất cả connection chờ.
+    followUp: Why doesn't epoll work for regular files, and how do libuv and io_uring deal with that?
+    tags: [io, epoll, event-loop]
+  - id: os-concurrency-013
+    level: medium
+    type: compare
+    q: Pessimistic locking vs optimistic concurrency control — how do you choose for updating an order or inventory row?
+    hint: |-
+      - Pessimistic: `SELECT ... FOR UPDATE` trong transaction → người khác chờ; đơn giản, đúng; giảm throughput, có thể deadlock, giữ lock qua network call là thảm hoạ.
+      - Optimistic: cột `version`/`updated_at`; `UPDATE ... SET ..., version = version + 1 WHERE id = $1 AND version = $2` → `rowCount = 0` nghĩa là conflict → retry hoặc báo user.
+      - Atomic single statement (`stock = stock - 1 WHERE stock > 0`) thường tốt nhất khi logic đơn giản.
+      - Contention cao + xung đột thường xuyên → pessimistic; thấp → optimistic.
+    example: |-
+      ```sql
+      UPDATE orders
+         SET status = 'paid', version = version + 1
+       WHERE id = $1 AND version = $2;
+      -- rowCount = 0 → someone else changed it: reload and decide
+      ```
+    followUp: How do you surface an optimistic-lock conflict to a user editing a form?
+    tags: [locking, database, concurrency]
+  - id: os-concurrency-014
+    level: medium
+    type: concept
+    q: What are `SharedArrayBuffer` and `Atomics` for, and why do most Node apps never need them?
+    hint: |-
+      - `SharedArrayBuffer`: vùng memory **chia sẻ thật** giữa main thread và workers (không copy như `postMessage`).
+      - `Atomics`: thao tác nguyên tử (`add`, `compareExchange`, `load/store`) + `wait/notify` để đồng bộ → tránh data race và vấn đề memory ordering.
+      - Dùng cho: tính toán số lớn song song, ring buffer giữa threads, WASM multithread.
+      - Đa số app chỉ cần gửi message (structured clone / transfer `ArrayBuffer`); shared memory mang lại toàn bộ độ khó của lập trình đa luồng.
+      - Browser yêu cầu cross-origin isolation (COOP/COEP) để dùng `SharedArrayBuffer`.
+    followUp: What's the difference between transferring an ArrayBuffer and sharing a SharedArrayBuffer?
+    tags: [atomics, worker-threads]
+  - id: os-concurrency-015
+    level: medium
+    type: compare
+    q: Deadlock vs livelock vs starvation — give a real backend example of each.
+    hint: |-
+      - Deadlock: Tx1 lock `account A` chờ `B`, Tx2 lock `B` chờ `A` → DB abort một bên.
+      - Livelock: hai worker gặp conflict, cùng retry **ngay lập tức với cùng nhịp** → conflict mãi; chữa bằng backoff **có jitter**.
+      - Starvation: priority queue luôn có job ưu tiên cao → job thấp không bao giờ chạy; hoặc một tenant lớn chiếm hết worker → cần fair queuing/quota.
+    followUp: How does jitter actually break a livelock? Show the math intuition.
+    tags: [deadlock, livelock, starvation]
+  - id: os-concurrency-016
+    level: medium
+    type: debug
+    q: This token-refresh helper is called by many concurrent requests when the access token expires. What goes wrong and how do you fix it?
+    example: |-
+      ```ts
+      let token: string | null = null;
+      let expiresAt = 0;
+
+      export async function getToken() {
+        if (!token || Date.now() > expiresAt) {
+          const r = await fetch('https://auth.internal/token', { method: 'POST' });
+          const body = await r.json();
+          token = body.access_token;
+          expiresAt = Date.now() + body.expires_in * 1000;
+        }
+        return token;
+      }
+      ```
+    hint: |-
+      - Check-then-act qua `await`: 100 request thấy token hết hạn cùng lúc → **100 lần gọi refresh** (thundering herd), có thể bị rate limit hoặc refresh token bị xoay vòng làm các lần sau invalid.
+      - Fix: **single-flight** — lưu `Promise` đang chạy và cho mọi caller `await` cùng promise; xoá promise khi xong (kể cả khi lỗi).
+      - Refresh sớm trước hạn (skew 30–60s) để tránh request fail đúng mép.
+      - Nhiều pod: mỗi pod một refresh là chấp nhận được; nếu cần một cái → lưu token ở Redis + lock.
+    followUp: What happens to waiting callers if the shared refresh promise rejects?
+    tags: [race-condition, async, debug]
+  - id: os-concurrency-017
+    level: medium
+    type: concept
+    q: What is a context switch, and why does a thread-per-request server degrade under 10,000 concurrent slow requests?
+    hint: |-
+      - Context switch: OS lưu state (register, program counter, stack pointer) của thread này, nạp thread khác; kèm cache/TLB bị "nguội" → chi phí gián tiếp lớn hơn trực tiếp.
+      - 10k thread blocking: mỗi thread có stack (thường ~1 MB reserved) → memory lớn; scheduler switch liên tục → CPU tiêu cho overhead, latency tăng.
+      - Event loop / async runtime (Node, Netty, Go goroutine, Java virtual threads) giữ số OS thread nhỏ.
+      - Đó là lý do C10k problem dẫn tới epoll + event-driven server.
+    followUp: How do Go goroutines or Java virtual threads avoid this cost while keeping blocking-style code?
+    tags: [threads, performance]
+  - id: os-concurrency-018
+    level: medium
+    type: gotcha
+    q: In a container limited to 2 CPUs on a 64-core host, what does `os.cpus().length` return, and why does it matter?
+    hint: |-
+      - `os.cpus()` đọc CPU của **host/VM** → trả 64; app spawn 64 worker/cluster process hoặc đặt pool size 64 → tranh nhau quota 2 CPU → CFS **throttling**, latency tăng vọt.
+      - Node có `os.availableParallelism()` (Node 18.14+/19.4+) — dựa trên libuv, tôn trọng CPU affinity; nhưng **CPU quota của cgroup** có thể vẫn không phản ánh đầy đủ tuỳ phiên bản → đọc limit từ env hoặc cgroup (`/sys/fs/cgroup/cpu.max`).
+      - Tương tự memory: `os.totalmem()` là của host.
+    followUp: How do you detect CFS throttling in Kubernetes?
+    verify: true
+    tags: [containers, cgroups, node]
+  - id: os-concurrency-019
+    level: medium
+    type: concept
+    q: How does the Linux OOM killer interact with a Node process in a container, and how do you size `--max-old-space-size`?
+    hint: |-
+      - Container vượt memory limit của cgroup → kernel OOM killer gửi **SIGKILL** → exit code 137, không có log từ app.
+      - V8 heap chỉ là một phần RSS: còn Buffer (off-heap), native addon, code, stack, threadpool.
+      - Đặt `--max-old-space-size` thấp hơn limit (thường ~70–80%) để V8 GC mạnh/throw `heap out of memory` có log, thay vì bị kill im lặng. Node đời mới tự tính heap limit theo memory khả dụng/cgroup, nhưng đặt tường minh vẫn an toàn hơn.
+      - Theo dõi `process.memoryUsage()` (`rss`, `heapUsed`, `external`, `arrayBuffers`).
+    followUp: RSS keeps growing while `heapUsed` is flat. Where do you look?
+    verify: true
+    tags: [memory, containers, node]
+  - id: os-concurrency-020
+    level: medium
+    type: compare
+    q: '`child_process.spawn` vs `exec` vs `fork` — which would you use to run ffmpeg on an uploaded video, and why?'
+    hint: |-
+      - `exec`: chạy qua **shell**, buffer toàn bộ stdout vào memory (`maxBuffer`) → không hợp output lớn, và có rủi ro **command injection** nếu nối chuỗi input user.
+      - `execFile`: không qua shell, vẫn buffer.
+      - `spawn`: không shell mặc định, stream stdout/stderr → hợp ffmpeg (output lớn, chạy lâu), kiểm soát được backpressure và kill.
+      - `fork`: spawn một process **Node** có kênh IPC (`process.send`).
+      - Production: truyền args dạng mảng, timeout + kill, giới hạn số process đồng thời, cân nhắc đẩy sang job queue worker.
+    example: |-
+      ```ts
+      import { spawn } from 'node:child_process';
+      const p = spawn('ffmpeg', ['-i', inputPath, '-vf', 'scale=640:-1', outPath]);
+      p.on('exit', (code, signal) => log.info({ code, signal }, 'ffmpeg done'));
+      ```
+    followUp: If the parent Node process crashes, what happens to the running ffmpeg child?
+    tags: [child-process, node, security]
+  - id: os-concurrency-021
+    level: medium
+    type: concept
+    q: What are zombie and orphan processes, and why do they show up in containers?
+    hint: |-
+      - Zombie: process con đã exit nhưng cha chưa gọi `wait()` để đọc exit status → entry còn trong process table (không tốn CPU/memory, nhưng chiếm PID).
+      - Orphan: cha chết trước → con được **PID 1** nhận nuôi; PID 1 có trách nhiệm reap.
+      - Trong container, app của bạn thường là PID 1 và **không reap** con cháu (ví dụ spawn shell script, headless Chrome) → zombie tích tụ, cạn PID limit.
+      - Fix: dùng init nhỏ (`tini`, `dumb-init`, `docker run --init`, `shareProcessNamespace` trên k8s).
+    followUp: 'Your Puppeteer-based PDF service eventually fails with "fork: resource temporarily unavailable". What''s your first guess?'
+    tags: [process, containers, linux]
+  - id: os-concurrency-022
+    level: medium
+    type: concept
+    q: What does "backpressure" mean, and how do Node streams implement it?
+    hint: |-
+      - Backpressure: consumer chậm hơn producer → phải báo producer **chậm lại**, nếu không dữ liệu dồn trong memory tới OOM.
+      - Node: `writable.write()` trả `false` khi buffer vượt `highWaterMark` → producer dừng tới khi có event `'drain'`. `readable.pipe()`/`stream.pipeline()` làm việc này tự động và xử lý lỗi/cleanup.
+      - Lỗi phổ biến: `readable.on('data', c => writable.write(c))` bỏ qua giá trị trả về.
+      - Cùng khái niệm ở tầng khác: TCP flow control window, Kafka consumer lag, queue có giới hạn.
+    example: |-
+      ```ts
+      import { pipeline } from 'node:stream/promises';
+      await pipeline(fs.createReadStream('big.csv'), parseCsv(), transformRow(), uploadStream);
+      ```
+    followUp: How would you apply backpressure when reading a 5 GB CSV and inserting rows into a database?
+    tags: [streams, backpressure, node]
+  - id: os-concurrency-023
+    level: medium
+    type: compare
+    q: Preemptive vs cooperative scheduling — which does the OS use, which does the JS event loop use, and what's the consequence?
+    hint: |-
+      - OS scheduler **preemptive**: có thể ngắt thread bất kỳ lúc nào theo time slice → một thread vòng lặp vô hạn không chặn cả hệ thống.
+      - Event loop JS **cooperative**: một task chạy tới khi tự trả quyền (kết thúc hoặc `await`); không ai ngắt được → một vòng lặp nặng chặn mọi request, timer, health check.
+      - Hệ quả: chia nhỏ việc (`setImmediate` chunking), đẩy sang worker; và race condition trong JS chỉ xảy ra **tại** điểm `await`/callback → dễ suy luận hơn đa luồng.
+    followUp: Does `await` on an already-resolved promise let a pending `setTimeout` callback run? Why or why not?
+    tags: [scheduling, event-loop]
+  - id: os-concurrency-024
+    level: medium
+    type: concept
+    q: What is a distributed lock with Redis (`SET key value NX PX ttl`), and what are its failure modes?
+    hint: |-
+      - Acquire: `SET lock:order:42 <random-token> NX PX 30000` → chỉ một client thành công; release bằng Lua script so khớp token rồi `DEL` (không xoá lock của người khác).
+      - Failure modes: holder bị GC pause/network chậm vượt TTL → lock hết hạn, người khác lấy → **hai holder**; Redis failover mất key chưa replicate.
+      - An toàn thật cần **fencing token** (số tăng dần) được storage kiểm tra khi ghi.
+      - Thường tốt hơn: dựa vào constraint/transaction của DB, hoặc thiết kế idempotent để lock chỉ là tối ưu hoá.
+    example: |-
+      ```lua
+      -- release.lua
+      if redis.call('GET', KEYS[1]) == ARGV[1] then
+        return redis.call('DEL', KEYS[1])
+      end
+      return 0
+      ```
+    followUp: When would you use a PostgreSQL advisory lock instead of Redis?
+    tags: [distributed-lock, redis]
+  - id: os-concurrency-025
+    level: hard
+    type: scenario
+    q: Your Node API's p99 latency jumps from 50 ms to 2 s whenever a nightly report runs in the same process, though CPU shows only one core busy. Investigate and fix.
+    hint: |-
+      - Một core busy = **event loop bị chiếm** bởi code CPU-bound (build report, JSON lớn, sort mảng lớn, regex nặng) → mọi request khác chờ.
+      - Chứng minh: `perf_hooks.monitorEventLoopDelay()` (event loop lag), `--cpu-prof` / clinic flame, metric ELU (`performance.eventLoopUtilization()`).
+      - Fix theo mức: tách report ra **worker process/job queue** (tốt nhất), `worker_threads` pool, streaming + chunking với `setImmediate`, tối ưu thuật toán/đẩy aggregation xuống DB.
+      - Thêm guard: health check không phụ thuộc event loop nếu không muốn bị kill giữa chừng — hoặc chấp nhận kill và tách process.
+    followUp: How would you alert on event-loop blocking before users notice?
+    tags: [event-loop, performance, scenario]
+  - id: os-concurrency-026
+    level: hard
+    type: debug
+    q: A checkout endpoint sometimes oversells the last item. Explain the race and give two correct fixes at the database level.
+    example: |-
+      ```ts
+      async function reserve(productId: string, qty: number) {
+        const { stock } = await db.one('SELECT stock FROM products WHERE id = $1', [productId]);
+        if (stock < qty) throw new OutOfStock();
+        await db.none('UPDATE products SET stock = $1 WHERE id = $2', [stock - qty, productId]);
+      }
+      ```
+    hint: |-
+      - Read-modify-write không atomic: hai request cùng đọc `stock = 1`, cùng pass check, cùng ghi `0` → **lost update** + oversell. Isolation mặc định `READ COMMITTED` không cứu được.
+      - Fix 1 (tốt nhất): atomic conditional update `UPDATE products SET stock = stock - $1 WHERE id = $2 AND stock >= $1` → kiểm tra `rowCount === 1`.
+      - Fix 2: transaction + `SELECT ... FOR UPDATE` rồi update (serialize theo row).
+      - Thêm: `CHECK (stock >= 0)` làm lưới an toàn; hoặc optimistic version column; hoặc `SERIALIZABLE` + retry khi `40001`.
+    followUp: Stock is also cached in Redis for the product page. How do you keep it from lying under load?
+    redFlags:
+      - Proposes an in-memory JS mutex (breaks with more than one pod)
+    tags: [race-condition, database, debug]
+  - id: os-concurrency-027
+    level: hard
+    type: scenario
+    q: Two background jobs occasionally fail with "deadlock detected" when they update the same set of orders. How do you diagnose and eliminate it?
+    hint: |-
+      - Đọc log DB: PostgreSQL in hai câu lệnh + lock đang giữ/chờ (`log_lock_waits`, `deadlock_timeout`); SQL Server có deadlock graph (Extended Events `system_health`).
+      - Nguyên nhân kinh điển: hai job update cùng tập row **theo thứ tự khác nhau** (một job sort theo `created_at`, một theo `id`) → circular wait.
+      - Fix: lock theo **thứ tự nhất quán** (`ORDER BY id ... FOR UPDATE`), batch nhỏ hơn + transaction ngắn, không gọi network trong transaction, index để UPDATE không scan/lock thừa.
+      - Luôn có **retry với backoff** cho `40P01`/`40001` vì deadlock không thể loại trừ 100%.
+    example: |-
+      ```sql
+      BEGIN;
+      SELECT id FROM orders WHERE id = ANY($1) ORDER BY id FOR UPDATE;
+      UPDATE orders SET status = 'shipped' WHERE id = ANY($1);
+      COMMIT;
+      ```
+    followUp: Why can a missing index turn a row-level lock problem into a much wider locking problem?
+    tags: [deadlock, database, scenario]
+  - id: os-concurrency-028
+    level: hard
+    type: debug
+    q: This graceful-shutdown code still drops requests and sometimes hangs forever on deploy. What's wrong?
+    example: |-
+      ```ts
+      const server = app.listen(3000);
+
+      process.on('SIGTERM', async () => {
+        server.close();
+        await db.end();
+        await redis.quit();
+        process.exit(0);
+      });
+      ```
+    hint: |-
+      - `server.close()` chỉ ngừng accept connection mới và **trả về ngay** (callback khi mọi connection đóng) → code đóng DB **trong khi** in-flight requests còn dùng DB → lỗi.
+      - Keep-alive connection idle giữ server không bao giờ "close xong" → treo; dùng `server.closeIdleConnections()` (Node 18.2+) và/hoặc `closeAllConnections()` sau deadline.
+      - Không có **deadline**: phải `exit(1)` trước khi k8s gửi SIGKILL.
+      - Thiếu bước readiness fail + chờ LB gỡ endpoint (preStop / sleep) → request mới vẫn tới.
+      - Handler async có thể chạy **hai lần** nếu nhận SIGTERM rồi SIGINT → dùng cờ `shuttingDown`.
+    followUp: How would you also drain a Kafka consumer and in-progress background jobs during shutdown?
+    verify: true
+    tags: [signals, graceful-shutdown, node, debug]
+  - id: os-concurrency-029
+    level: hard
+    type: concept
+    q: Why can CPU-heavy work moved to `worker_threads` still be slow or even slower, and when is it the right tool?
+    hint: |-
+      - Chi phí: khởi tạo worker (V8 isolate mới, vài chục ms + memory) → phải dùng **pool** tái sử dụng, không tạo mỗi request.
+      - Dữ liệu qua `postMessage` bị **structured clone** (copy) → object lớn mất thời gian copy ở cả hai phía; dùng transfer `ArrayBuffer` hoặc `SharedArrayBuffer`.
+      - Số worker > số core khả dụng (container quota) → tranh CPU.
+      - Đúng khi: task CPU thuần, input/output nhỏ hơn thời gian tính (hash, nén, resize ảnh, parse), cần giữ event loop responsive.
+      - Sai khi: I/O-bound (đã async sẵn), hoặc nên tách hẳn sang service/job queue để scale độc lập.
+    followUp: How would you size a worker pool on a pod with a 2-CPU limit?
+    tags: [worker-threads, performance]
+  - id: os-concurrency-030
+    level: hard
+    type: scenario
+    q: A service that processes jobs from a queue holds a Redis lock per job. During a GC pause of 40 s, two workers processed the same payment. How do you make this safe?
+    hint: |-
+      - Lock TTL (30s) hết trong lúc holder bị pause → worker B lấy lock; A tỉnh dậy vẫn tưởng mình giữ lock → double processing. Lock phân tán dựa thời gian **không** đảm bảo mutual exclusion.
+      - Fix đúng: **fencing token** (số tăng dần khi lấy lock), storage đích từ chối ghi có token cũ; hoặc làm thao tác **idempotent** (idempotency key unique ở DB / payment provider).
+      - Giảm xác suất: lock renewal (watchdog), GC tuning, nhưng không bao giờ bằng 0.
+      - Payment: dựa vào `idempotency_key` của provider + unique constraint `payments(order_id)`.
+    followUp: Why doesn't Redlock solve this problem by itself?
+    tags: [distributed-lock, idempotency, scenario]
+  - id: os-concurrency-031
+    level: hard
+    type: gotcha
+    q: What is a memory visibility / reordering problem in multithreaded code, and does it apply to JavaScript?
+    hint: |-
+      - Trong đa luồng, CPU và compiler có thể **reorder** lệnh và giữ giá trị trong cache/register → thread B có thể không thấy write của thread A, hoặc thấy theo thứ tự khác → cần memory barrier (`volatile`, atomics, lock).
+      - JS thông thường: mỗi agent (main, worker) có heap riêng → không có vấn đề này với object thường.
+      - Với `SharedArrayBuffer`: có. Đọc/ghi thường là "unordered"; phải dùng `Atomics.load/store/compareExchange` để có sequentially consistent ordering và `Atomics.wait/notify` để đồng bộ.
+    followUp: Why is a busy-wait loop on a shared flag without Atomics broken?
+    tags: [memory-model, atomics]
+  - id: os-concurrency-032
+    level: hard
+    type: scenario
+    q: Your Node API crashes with `EMFILE` a few hours after deploy, only in production. Walk through the investigation.
+    hint: |-
+      - Đếm FD theo thời gian: `ls /proc/<pid>/fd | wc -l` hoặc metric `process_open_fds` → tăng tuyến tính = leak.
+      - Phân loại: `lsof -p <pid>` → socket tới đâu (upstream API? DB? Redis?), file nào.
+      - Nguyên nhân phổ biến: tạo `http.Agent`/DB client **mỗi request**; stream không đóng khi lỗi (không dùng `pipeline`); watcher (`fs.watch`) mỗi request; response không được consume nên socket không trả về pool (undici yêu cầu đọc hoặc cancel body).
+      - Tạm thời tăng `ulimit` chỉ là che triệu chứng.
+    followUp: Why does not consuming a `fetch` response body in Node leak connections?
+    verify: true
+    tags: [fd, node, debugging, scenario]
+  - id: os-concurrency-033
+    level: hard
+    type: compare
+    q: How do Go goroutines, Java virtual threads, and Node's event loop each handle 100k concurrent I/O-bound tasks?
+    hint: |-
+      - Node: một JS thread + epoll; code phải async (callback/promise), không có preemption → CPU task chặn tất cả; rất nhẹ memory.
+      - Go: goroutine (stack nhỏ khởi đầu vài KB, tự tăng) do runtime scheduler M:N map lên OS thread; I/O "trông blocking" nhưng runtime park goroutine; có preemption; nhiều core tự nhiên.
+      - Java virtual threads (Java 21+): tương tự M:N, code blocking style, carrier thread được giải phóng khi block I/O; có lưu ý pinning khi `synchronized` (được cải thiện ở version mới).
+      - Trade-off: Node đơn giản về shared state (không cần lock JS), Go/Java có parallelism CPU nhưng phải lo data race.
+    followUp: Which of these needs locks around an in-memory counter shared by all tasks, and why?
+    verify: true
+    tags: [concurrency, runtime, compare]
+  - id: os-concurrency-034
+    level: hard
+    type: debug
+    q: A batch importer uses this helper to run tasks with limited concurrency, but it sometimes finishes early with missing results and never surfaces errors. Find the bugs.
+    example: |-
+      ```ts
+      async function runLimited<T>(tasks: (() => Promise<T>)[], limit: number) {
+        const results: T[] = [];
+        let i = 0;
+        const worker = async () => {
+          while (i < tasks.length) {
+            results.push(await tasks[i++]());
+          }
+        };
+        Array.from({ length: limit }, worker);
+        return results;
+      }
+      ```
+    hint: |-
+      - `Array.from({length}, worker)` tạo promises nhưng **không await** → hàm return `results` gần như rỗng ngay lập tức; rejection thành unhandled.
+      - `results.push` theo thứ tự **hoàn thành**, không theo index → mất tương ứng input↔output; nên `results[idx] = ...` với `const idx = i++` lấy **trước** `await`.
+      - Một task throw → worker đó dừng, các task còn lại vẫn chạy trên worker khác, lỗi không được gom.
+      - Fix: `await Promise.all(workers)`; bắt lỗi từng task (allSettled-style) hoặc fail-fast có chủ đích.
+    followUp: How would you add cancellation so that the first failure stops scheduling new tasks?
+    tags: [concurrency, async, debug]
+  - id: os-concurrency-035
+    level: hard
+    type: concept
+    q: What is copy-on-write in `fork()`, and why does it matter for memory usage of pre-forked servers or Redis `BGSAVE`?
+    hint: |-
+      - `fork()` không copy memory ngay: cha và con chia sẻ page, đánh dấu read-only; khi một bên **ghi** vào page, kernel mới copy page đó.
+      - Redis `BGSAVE`/AOF rewrite fork process con để ghi snapshot; nếu dataset ghi nhiều trong lúc đó → nhiều page bị copy → memory có thể gần **gấp đôi** → OOM. Cần headroom memory, cân nhắc tắt Transparent Huge Pages (page 2 MB làm COW tốn hơn).
+      - Pre-fork server (Unicorn, Gunicorn) tận dụng COW để share code; GC chạm vào object làm "bẩn" page → mất lợi ích.
+      - Node `cluster.fork()` spawn process Node mới, **không** chia sẻ heap JS kiểu này.
+    followUp: Your Redis instance with 10 GB of data on a 12 GB host gets OOM-killed nightly. Why?
+    verify: true
+    tags: [process, memory, redis]
+  - id: os-concurrency-036
+    level: hard
+    type: scenario
+    q: A cron job scheduled with `node-cron` inside your API sends duplicate emails after you scaled to 3 pods. Fix it properly.
+    hint: |-
+      - Mỗi pod chạy scheduler riêng → job chạy 3 lần. Scheduler in-process + nhiều replica = duplicate.
+      - Cách fix: tách scheduler ra **một nơi** (Kubernetes CronJob, EventBridge Scheduler, một worker deployment replicas=1 — nhưng replica 1 vẫn có thể chồng khi rollout); hoặc leader election/lock (`pg_try_advisory_lock`, Redis lock) trước khi chạy.
+      - Dù sao cũng làm job **idempotent**: bảng `email_sends(user_id, campaign_id) UNIQUE`, outbox pattern.
+      - Xử lý overlap: lần chạy trước chưa xong thì lần sau skip (`concurrencyPolicy: Forbid` trên CronJob).
+    followUp: Kubernetes CronJob can also run a job twice or skip it. What guarantees does it give?
+    verify: true
+    tags: [scheduling, distributed-lock, idempotency]
+  - id: os-concurrency-037
+    level: hard
+    type: gotcha
+    q: Why is `crypto.pbkdf2Sync` or `bcrypt.hashSync` in a login handler a production incident waiting to happen, even at low traffic?
+    hint: |-
+      - Password hashing cố ý chậm (vd ~50–300 ms/lần với cost hợp lý) → bản **Sync** chạy trên JS thread → mỗi login chặn **toàn bộ** event loop trong thời gian đó.
+      - 20 login đồng thời ≈ vài giây mọi request khác đứng chờ; attacker spam login = DoS rẻ.
+      - Dùng bản async (chạy trên threadpool) — nhưng vẫn chiếm 4 thread mặc định → cần rate limit endpoint login, giới hạn concurrency, cân nhắc threadpool size hoặc tách auth service.
+      - Chọn `argon2id`/`scrypt`/`bcrypt` với cost đo trên phần cứng thật.
+    followUp: With the async version, what other operations slow down during a login storm, and why?
+    tags: [event-loop, security, threadpool]
+  - id: os-concurrency-038
+    level: hard
+    type: scenario
+    q: Pods are OOMKilled (exit 137) every few hours, but heap snapshots look small. Where is the memory going?
+    hint: |-
+      - Heap nhỏ nhưng RSS lớn → memory **ngoài V8 heap**: `Buffer`/`ArrayBuffer` (external), native addon (sharp, bcrypt), memory fragmentation của allocator (glibc malloc arenas với nhiều thread), threadpool buffers, large string từ `JSON.stringify` tạm thời.
+      - Đo: `process.memoryUsage()` theo thời gian (`rss` vs `heapTotal` vs `external`/`arrayBuffers`); so với container limit.
+      - Thử: giới hạn `MALLOC_ARENA_MAX`, jemalloc, stream thay vì buffer toàn bộ file/response, giới hạn concurrency của việc xử lý ảnh.
+      - Đảm bảo limit container > max-old-space + overhead.
+    followUp: What does `external` in `process.memoryUsage()` include?
+    verify: true
+    tags: [memory, containers, node]
+  - id: os-concurrency-039
+    level: senior
+    type: design
+    q: Design a per-tenant concurrency limiter so that one large tenant's bulk import cannot starve other tenants' jobs, across 20 worker pods.
+    hint: |-
+      Hướng trả lời mạnh:
+      - Phân tách queue theo tenant (hoặc partition key = tenant) + scheduler **fair** (round-robin/weighted fair queuing) thay vì một FIFO chung.
+      - Semaphore phân tán theo tenant: Redis counter (`INCR` + TTL/lease, Lua atomic) hoặc token bucket; giải phóng khi job xong, lease hết hạn khi worker chết.
+      - Quota/priority theo gói dịch vụ; job lớn tự chia chunk nhỏ để xen kẽ.
+      - Observability: queue depth/tenant, wait time/tenant, alert starvation.
+      - Trade-off: độ chính xác của limiter phân tán vs chi phí round-trip Redis; chấp nhận vượt nhẹ.
+    followUp: A worker crashes while holding 5 of a tenant's slots. How are those slots recovered?
+    tags: [design, multi-tenant, concurrency]
+  - id: os-concurrency-040
+    level: senior
+    type: open
+    q: When would you choose to split CPU-heavy work into a separate service rather than using worker_threads in the API process?
+    hint: |-
+      Tiêu chí đánh giá, không có đáp án duy nhất:
+      - Scale độc lập (API cần 10 pod, image processing cần 50 lúc cao điểm) → service/worker riêng.
+      - Cô lập lỗi & tài nguyên: task nặng memory/native crash không kéo API chết theo.
+      - Latency yêu cầu: user chờ kết quả đồng bộ (vài trăm ms) → worker_threads có thể đủ; không cần chờ → job queue + async notification.
+      - Chi phí vận hành: thêm service = deploy, monitor, contract; nhóm nhỏ có thể chấp nhận worker_threads trước.
+      - Ngôn ngữ phù hợp hơn (Go/Rust) cho task nặng.
+    followUp: How do you return the result to the user if the work becomes asynchronous?
+    tags: [architecture, worker-threads, design]
+  - id: os-concurrency-041
+    level: senior
+    type: open
+    q: How do you decide between database locks, a Redis lock, and designing for idempotency when two actors can modify the same resource?
+    hint: |-
+      - Ưu tiên **đúng đắn ở nơi dữ liệu sống**: constraint, conditional update, transaction trong DB → không có lớp lock thứ hai để hỏng.
+      - Idempotency (unique key, upsert, dedupe table) biến "chạy 2 lần" thành vô hại → tốt nhất cho retry, message at-least-once.
+      - Redis lock hợp khi cần điều phối công việc **ngoài DB** (gọi API bên thứ ba, job dài) và chấp nhận là best-effort; cần TTL + token + fencing nếu quan trọng.
+      - Pessimistic DB lock cho contention cao, transaction ngắn.
+      - Senior: nói rõ guarantee cần có (exactly-once effect hay chỉ giảm trùng?) trước khi chọn cơ chế.
+    followUp: Give one case in your own experience where you picked the wrong mechanism first.
+    tags: [locking, idempotency, design]
+  - id: os-concurrency-042
+    level: senior
+    type: design
+    q: Design the shutdown and startup behaviour of a Node service in Kubernetes that serves HTTP, consumes a Kafka topic, and runs background timers.
+    hint: |-
+      - Startup: readiness chỉ `true` khi DB/Redis kết nối xong, cache warm (nếu cần); startup probe cho khởi động chậm; liveness **không** check dependency.
+      - SIGTERM: đặt `shuttingDown`, readiness fail; `preStop` sleep ngắn để Endpoint gỡ pod; `server.close()` + đóng idle keep-alive; dừng nhận message mới (pause consumer), chờ message đang xử lý xong, **commit offset**, rời consumer group sạch (tránh rebalance chậm); clear timers; đóng pool.
+      - Deadline < `terminationGracePeriodSeconds`; quá hạn → exit(1) có log.
+      - Idempotent processing vì vẫn có thể bị SIGKILL giữa chừng.
+    followUp: How would you test this shutdown path in CI rather than discovering bugs in production?
+    tags: [graceful-shutdown, kubernetes, kafka, design]
+  - id: os-concurrency-043
+    level: senior
+    type: behavioral
+    q: Tell me about a concurrency bug you shipped or debugged in production. How did you find it and what did you change so it wouldn't recur?
+    hint: |-
+      STAR:
+      - **S/T**: triệu chứng khó tái hiện (đơn trùng, số dư sai, job chạy 2 lần) và impact.
+      - **A**: cách thu hẹp — log correlation id + timestamp, dựng lại interleaving, test tái hiện có concurrency (chạy song song N request), đọc DB lock/deadlock log.
+      - Fix gốc (atomic update/constraint/idempotency) + lưới an toàn (monitor, alert, reconciliation job).
+      - **R**: số liệu trước/sau (điền số liệu thật của bạn).
+      - Reflection: bài học thiết kế — ví dụ "check-then-act qua await luôn đáng nghi".
+    followUp: What test would have caught it before production?
+    tags: [behavioral, race-condition]

@@ -1,0 +1,807 @@
+id: 06-express
+slug: express
+title: Express.js
+tier: 2
+status: drafted
+summary: Middleware chain, async error handling (Express 4 vs 5), security middleware, trust proxy, cấu trúc app lớn, graceful shutdown, Express vs Fastify vs NestJS.
+cvLinked: true
+prerequisites: [05-nodejs]
+overview: |-
+  ## TL;DR
+
+  - Express là một **router + chuỗi middleware** mỏng trên `http` của Node. Mọi thứ (body parsing, auth, CORS, logging, error handling) đều là middleware chạy **theo thứ tự đăng ký**.
+  - **Express 5** (5.0 ra 09/2024, thành `latest` trên npm từ 5.1 — verify) thay đổi quan trọng: promise bị reject trong handler/middleware được **tự chuyển tới error handler**; cú pháp path mới (path-to-regexp v8: wildcard phải có tên `/*splat`, optional dùng `{}`); `req.query` chỉ là getter; `req.body` là `undefined` khi chưa có body parser; yêu cầu Node 18+.
+  - Senior interview hỏi: thứ tự middleware, xử lý lỗi async, `trust proxy`, bảo mật (helmet, CORS, rate limit, body size), cấu trúc codebase lớn, graceful shutdown, và khi nào chọn Fastify/NestJS.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Middleware | `(req, res, next) => void`, xử lý rồi gọi `next()` hoặc kết thúc response | `app.use(express.json())` |
+  | Error middleware | 4 tham số `(err, req, res, next)`, chỉ chạy khi có lỗi | `app.use((err, req, res, next) => res.status(500)...)` |
+  | Router | Mini-app có middleware/route riêng, mount theo prefix | `app.use("/orders", ordersRouter)` |
+  | `next(err)` | Bỏ qua middleware thường, nhảy tới error middleware | `next(new NotFoundError())` |
+  | `next("route")` / `next("router")` | Bỏ qua các handler còn lại của route / của router | Feature flag route |
+  | `res.locals` | Dữ liệu sống trong một request | `res.locals.user = user` |
+  | `trust proxy` | Tin header `X-Forwarded-*` từ proxy để tính `req.ip`, `req.protocol` | `app.set("trust proxy", 1)` |
+  | `app.param` | Middleware chạy khi route có param đó | Load `:orderId` một lần |
+
+  ## Cơ chế hoạt động
+
+  ```mermaid
+  flowchart TD
+    REQ["HTTP request"] --> M1["helmet / cors"]
+    M1 --> M2["express.json({ limit })"]
+    M2 --> M3["requestId + logger (AsyncLocalStorage)"]
+    M3 --> M4["auth: verify JWT -> req.user"]
+    M4 --> R{"Router match<br/>method + path?"}
+    R -- "no" --> NF["404 handler"]
+    R -- "yes" --> V["validate(schema)"]
+    V --> P["requirePermission('order:write')"]
+    P --> H["route handler (async)"]
+    H -- "res.json()" --> RES["response"]
+    M4 -- "next(err)" --> EH
+    V -- "next(err)" --> EH
+    H -- "throw / reject<br/>(Express 5 auto; Express 4 needs next(err))" --> EH["error middleware<br/>(err, req, res, next)"]
+    NF --> RES
+    EH --> RES
+  ```
+
+  - Middleware **không match path** thì bị bỏ qua; `app.use("/api", mw)` match theo **prefix**, `app.get("/api")` match chính xác.
+  - Handler phải **hoặc** gửi response, **hoặc** gọi `next()` — không làm cả hai, không làm cái nào (request treo).
+  - Error middleware đặt **cuối cùng**, sau tất cả route.
+
+  ### Express 4 vs 5: async error
+
+  ```mermaid
+  sequenceDiagram
+    participant C as Client
+    participant E4 as Express 4
+    participant E5 as Express 5
+    C->>E4: GET /users/1
+    E4->>E4: async handler rejects
+    Note over E4: Promise ignored -> unhandledRejection,<br/>request hangs until timeout (or process crashes)
+    C->>E5: GET /users/1
+    E5->>E5: async handler rejects
+    E5->>E5: next(err) called automatically
+    E5-->>C: error middleware -> 500 JSON
+  ```
+
+  ## Trade-offs
+
+  | | Express | Fastify | NestJS |
+  |---|---|---|---|
+  | Triết lý | Tối giản, không ý kiến | Hiệu năng, schema-first, plugin encapsulation | Framework đầy đủ, DI, module, decorator |
+  | Hiệu năng overhead | Trung bình | Thấp (JSON schema serialization) | Phụ thuộc adapter (Express/Fastify) + tầng DI |
+  | Validation | Tự chọn (zod, joi) | JSON Schema built-in | Pipes + class-validator / schema |
+  | Async error | Express 5 tự xử lý; 4 cần wrapper | Built-in | Built-in (exception filters) |
+  | Cấu trúc codebase lớn | Tự xây convention | Plugin giúp tách | Có sẵn convention (module/provider) |
+  | Ecosystem middleware | Lớn nhất | Tốt, có `@fastify/express` compat | Dùng lại middleware Express |
+  | Hợp khi | Service nhỏ-vừa, team tự kỷ luật | API throughput cao | Team lớn, domain phức tạp |
+
+  ## Pitfalls
+
+  - Quên `return` sau `res.json()` trong nhánh lỗi → "Cannot set headers after they are sent".
+  - Express 4 + async handler không có wrapper → rejection bị nuốt, request treo.
+  - Error middleware khai báo 3 tham số → Express coi là middleware thường.
+  - Đặt `express.json()` sau router, hoặc CORS sau route → không có tác dụng.
+  - `trust proxy` sai: `req.ip` là IP load balancer → rate limit chặn tất cả user cùng lúc, hoặc cho phép client giả `X-Forwarded-For`.
+  - Không giới hạn body size / upload lưu memory → DoS/OOM.
+  - Trả `err.stack` hoặc lỗi DB thô cho client.
+  - Upgrade lên v5 mà không sửa route pattern (`*`, `?`, regex) → route không match hoặc lỗi lúc khởi động.
+
+  ## Cheat sheet
+
+  - Thứ tự đề xuất: security headers → CORS → body parser (có `limit`) → requestId/logging → auth → routes → 404 → error handler.
+  - `next()` tiếp · `next(err)` tới error handler · `next("route")` bỏ phần còn lại của route · `next("router")` thoát router.
+  - `res.headersSent` để kiểm tra trước khi ghi response trong error handler (nếu đã gửi thì `next(err)` để Express đóng connection).
+  - Express 5 path (verify): `/*splat` (wildcard có tên, không match root), `/{*splat}` (có cả root), `/:file{.:ext}` (optional), không còn regex inline trong string path.
+  - Express 5 xoá: `app.del`, `req.param()`, `res.send(status)`, `res.redirect("back")`, chữ ký `res.json(obj, status)`; `express.urlencoded` mặc định `extended: false`; `express.static` mặc định bỏ qua dotfiles.
+  - `express.json()` mặc định `limit: "100kb"`.
+notionRefs:
+  - title: NodeJS (middleware section)
+    url: https://app.notion.com/p/2a9ef77f8ab280fb85cff3e5f8e84058
+references:
+  - title: Express — Using middleware
+    url: https://expressjs.com/en/guide/using-middleware.html
+  - title: Express — Error handling
+    url: https://expressjs.com/en/guide/error-handling.html
+  - title: Express — Migrating to Express 5
+    url: https://expressjs.com/en/guide/migrating-5.html
+  - title: Express — Routing
+    url: https://expressjs.com/en/guide/routing.html
+  - title: Express — Behind proxies (trust proxy)
+    url: https://expressjs.com/en/guide/behind-proxies.html
+  - title: Express — Security best practices
+    url: https://expressjs.com/en/advanced/best-practice-security.html
+  - title: Express — Performance best practices
+    url: https://expressjs.com/en/advanced/best-practice-performance.html
+  - title: Express — Health checks and graceful shutdown
+    url: https://expressjs.com/en/advanced/healthcheck-graceful-shutdown.html
+  - title: Express 5.x API reference
+    url: https://expressjs.com/en/5x/api.html
+  - title: Node.js API — HTTP server timeouts
+    url: https://nodejs.org/api/http.html
+questions:
+  - id: express-001
+    level: easy
+    type: concept
+    q: What is middleware in Express, and what are the three things a middleware can do with a request?
+    hint: |-
+      - Function `(req, res, next)` nằm trong pipeline xử lý request, chạy **theo thứ tự đăng ký**.
+      - Có thể: (1) đọc/biến đổi `req`/`res` (gắn `req.user`, set header); (2) **kết thúc** request (`res.status(401).json(...)`); (3) chuyển tiếp bằng `next()` hoặc báo lỗi bằng `next(err)`.
+      - Không gọi `next()` và không gửi response → request **treo** đến khi timeout.
+      - Ví dụ thực tế: logging, auth, rate limit, parse body, validate, set CORS header.
+    example: |-
+      ```ts
+      const requestTimer: RequestHandler = (req, res, next) => {
+        const start = process.hrtime.bigint();
+        res.on("finish", () => {
+          const ms = Number(process.hrtime.bigint() - start) / 1e6;
+          logger.info({ method: req.method, path: req.path, status: res.statusCode, ms });
+        });
+        next();
+      };
+      ```
+    followUp: Why does the timer listen to `res.on("finish")` instead of logging right after `next()`?
+    redFlags:
+      - "Middleware can only run before the route handler"
+    tags: [middleware]
+  - id: express-002
+    level: easy
+    type: compare
+    q: "`app.use()` vs `app.get()`/`app.all()` — how do they match paths and methods, and why does registration order matter?"
+    hint: |-
+      - `app.use(path?, mw)`: mọi HTTP method, match theo **prefix** (`/api` match `/api/orders`), và `req.url` bên trong bị cắt prefix (`req.baseUrl` giữ phần mount).
+      - `app.get(path, ...)`: chỉ GET (và HEAD), match **toàn bộ path** theo pattern. `app.all`: mọi method nhưng match đầy đủ.
+      - Express duyệt stack **từ trên xuống**; handler nào gửi response trước thì các handler sau không chạy → auth đặt sau route sẽ không bảo vệ route đó.
+    followUp: You mount `app.use("/admin", requireAdmin)` after `app.use("/admin", adminRouter)`. What happens?
+    tags: [middleware, routing]
+  - id: express-003
+    level: easy
+    type: concept
+    q: How does error-handling middleware work in Express, and where must it be registered?
+    hint: |-
+      - Là middleware có **đúng 4 tham số** `(err, req, res, next)` — Express nhận diện qua `fn.length`.
+      - Được gọi khi: `next(err)`, lỗi `throw` đồng bộ trong handler, hoặc (Express 5) promise bị reject.
+      - Đăng ký **sau** mọi route và router; có thể có nhiều error handler nối tiếp (log → map lỗi → trả response).
+      - Nếu response đã bắt đầu gửi (`res.headersSent`) → gọi `next(err)` để Express default handler đóng connection.
+      - Không có error handler nào → Express default trả HTML stack trace ở dev, message chung ở production (`NODE_ENV`).
+    followUp: Why does the default handler's behavior depend on `NODE_ENV`, and what goes wrong if production forgets to set it?
+    tags: [error-handling]
+  - id: express-004
+    level: easy
+    type: concept
+    q: What is `express.Router`, and what does `mergeParams` do?
+    hint: |-
+      - Router = "mini app" với middleware và route riêng; mount bằng `app.use("/orders", ordersRouter)` → tổ chức theo feature, middleware cục bộ (vd auth chỉ cho `/admin`).
+      - Mặc định router con **không thấy** `req.params` của route cha.
+      - `express.Router({ mergeParams: true })` → router con đọc được `:tenantId` từ `app.use("/tenants/:tenantId/orders", router)`.
+      - Router có thể lồng nhiều cấp; `next("router")` thoát khỏi router hiện tại.
+    example: |-
+      ```ts
+      const orders = express.Router({ mergeParams: true });
+      orders.get("/:orderId", (req, res) => {
+        res.json({ tenantId: req.params.tenantId, orderId: req.params.orderId });
+      });
+      app.use("/tenants/:tenantId/orders", orders);
+      ```
+    followUp: Why is taking `tenantId` from the URL alone not sufficient for authorization?
+    tags: [routing, router]
+  - id: express-005
+    level: easy
+    type: compare
+    q: "`req.params` vs `req.query` vs `req.body` — where does each come from, and what changed for `req.body` and `req.query` in Express 5?"
+    hint: |-
+      - `req.params`: từ path pattern (`/orders/:id`), luôn là string.
+      - `req.query`: từ query string, parse bởi query parser (mặc định "simple" trong v5 — verify); giá trị có thể là string, mảng, hoặc object tuỳ parser.
+      - `req.body`: chỉ có khi có body parser (`express.json()`, `express.urlencoded()`); Express 5 để `undefined` khi chưa parse (v4 là `{}`).
+      - Express 5: `req.query` là **getter**, không gán lại được.
+      - Tất cả đều là **input không tin cậy** → validate + ép kiểu.
+    followUp: A client sends `?status=paid&status=shipped`. What type does your handler receive, and how do you validate it?
+    verify: true
+    tags: [request, express-5]
+  - id: express-006
+    level: easy
+    type: gotcha
+    q: What causes `Error [ERR_HTTP_HEADERS_SENT]` ("Cannot set headers after they are sent"), and how do you avoid it?
+    hint: |-
+      - Gửi response **hai lần** cho cùng request: `res.json()` rồi code tiếp tục chạy tới `res.json()`/`next()` khác.
+      - Nguyên nhân hay gặp: thiếu `return` sau khi trả lỗi; gọi `next()` sau khi đã gửi response; callback/promise chạy xong sau khi timeout middleware đã trả 503; error handler ghi response khi `res.headersSent`.
+      - Fix: `return res.status(400).json(...)`; một đường thoát duy nhất mỗi nhánh; error handler check `res.headersSent`.
+    example: |-
+      ```ts
+      app.get("/orders/:id", async (req, res) => {
+        const order = await repo.find(req.params.id);
+        if (!order) res.status(404).json({ error: "not found" }); // missing return
+        res.json(order); // throws ERR_HTTP_HEADERS_SENT when not found
+      });
+      ```
+    followUp: How can a timeout middleware cause this error even when the handler code is correct?
+    tags: [response, gotcha]
+  - id: express-007
+    level: easy
+    type: concept
+    q: Summarize the most important breaking changes when moving from Express 4 to Express 5.
+    hint: |-
+      - Node **18+**.
+      - Rejected promise trong middleware/handler → tự gọi `next(err)`.
+      - Path matching (path-to-regexp v8): wildcard phải đặt tên (`/*splat`), optional dùng `{}` (`/:file{.:ext}`), không hỗ trợ regex trong string, ký tự `()[]?+!` phải escape.
+      - Xoá API cũ: `app.del`, `req.param()`, `res.sendfile`, `res.send(status)`, `res.json(obj, status)`, `res.redirect("back")`.
+      - `req.body` `undefined` khi không parse; `req.query` getter; `express.urlencoded` `extended: false`; `express.static` bỏ qua dotfiles; `res.status()` chỉ nhận 100–999; `app.listen` truyền lỗi vào callback.
+      - Có codemod hỗ trợ migrate.
+    followUp: Which of these changes would break at startup and which would silently change behavior at runtime?
+    verify: true
+    tags: [express-5, migration]
+  - id: express-008
+    level: easy
+    type: concept
+    q: How do you serve static files safely and efficiently with Express?
+    hint: |-
+      - `express.static(root, options)`: set `maxAge`/`immutable` cho asset có hash trong tên, ETag/Last-Modified tự động, `index: false` nếu không muốn trả `index.html`.
+      - An toàn: chỉ serve thư mục chuyên dụng (không phải project root), v5 mặc định **ignore dotfiles** (`.env`, `.git`).
+      - Production: static/CDN tốt hơn (S3 + CloudFront, Nginx) — không tốn event loop Node cho file.
+      - File do user upload: không serve cùng origin với app nếu có thể (XSS qua HTML/SVG), set `Content-Disposition`, `X-Content-Type-Options: nosniff`.
+    followUp: Why is serving user-uploaded SVGs from your main domain dangerous?
+    tags: [static, security]
+  - id: express-009
+    level: medium
+    type: compare
+    q: How does an async handler that throws behave in Express 4 vs Express 5? Show the Express 4 workaround.
+    hint: |-
+      - Express 4: router gọi handler và **bỏ qua promise trả về** → rejection không tới error middleware → `unhandledRejection` (Node ≥ 15 crash process) hoặc request treo đến timeout.
+      - Workaround v4: wrapper `asyncHandler(fn)` gọi `.catch(next)`, hoặc lib `express-async-errors` (monkey-patch).
+      - Express 5: nếu middleware/handler **trả về promise** bị reject (hoặc throw trong async), router tự gọi `next(err)`.
+      - Vẫn cần cẩn thận ở v5: lỗi trong callback/timer/EventEmitter **không** phải promise trả về → vẫn không được bắt.
+    example: |-
+      ```ts
+      // Express 4
+      const asyncHandler = (fn: (req: Request, res: Response, next: NextFunction) => Promise<unknown>) =>
+        (req: Request, res: Response, next: NextFunction) => { fn(req, res, next).catch(next); };
+      app.get("/users/:id", asyncHandler(async (req, res) => {
+        res.json(await users.get(req.params.id));
+      }));
+      // Express 5: the plain async handler is enough
+      ```
+    followUp: In Express 5, a handler does `setTimeout(() => { throw new Error("x") })`. Is it caught? Why?
+    verify: true
+    tags: [error-handling, async, express-5]
+  - id: express-010
+    level: medium
+    type: concept
+    q: "Explain `next()`, `next(err)`, `next('route')` and `next('router')` with a use case for each."
+    hint: |-
+      - `next()`: chuyển tới middleware/handler kế tiếp khớp.
+      - `next(err)`: bỏ qua mọi middleware thường, tới error middleware đầu tiên.
+      - `next("route")`: bỏ qua các callback còn lại **của route hiện tại** (chỉ trong `app.METHOD`/`router.METHOD`), sang route khớp tiếp theo — vd feature flag chuyển sang handler v2.
+      - `next("router")`: thoát khỏi router hiện tại, quay lại stack của parent.
+      - Truyền giá trị khác (string bất kỳ, object) vào `next` = báo lỗi.
+    example: |-
+      ```ts
+      app.get("/checkout", (req, res, next) => (flags.newCheckout(req) ? next("route") : next()), legacyCheckout);
+      app.get("/checkout", newCheckout);
+      ```
+    followUp: What happens if you call `next()` twice from the same middleware?
+    tags: [middleware, routing]
+  - id: express-011
+    level: medium
+    type: debug
+    q: Users report that CORS fails and `req.body` is undefined on some routes. Review the app setup.
+    example: |-
+      ```ts
+      const app = express();
+      app.use("/api/orders", ordersRouter);
+      app.use(express.json());
+      app.use(cors({ origin: "https://shop.example.com", credentials: true }));
+      app.use(authenticate);
+      app.use("/api/admin", adminRouter);
+      app.use(errorHandler);
+      ```
+    hint: |-
+      - `ordersRouter` mount **trước** `express.json()` → `req.body` undefined (v5) / `{}` (v4) trong mọi route orders.
+      - `cors` đăng ký sau orders → response orders thiếu header CORS; preflight `OPTIONS` tới orders không được trả đúng.
+      - `authenticate` sau orders → **orders không được bảo vệ**.
+      - Fix thứ tự: helmet → cors → json → auth → routers → 404 → errorHandler.
+      - Mẹo: test tích hợp kiểm tra route mới luôn yêu cầu auth (fail nếu trả 200 khi không có token).
+    followUp: How would you make "every route requires auth unless explicitly public" the default in Express?
+    tags: [middleware, cors, debug]
+  - id: express-012
+    level: senior
+    type: design
+    q: How do you structure a large Express codebase (50+ endpoints, several teams) so it stays maintainable?
+    hint: |-
+      Không có đáp án duy nhất — trình bày convention:
+      - Theo **feature/module** (`orders/`, `checkout/`) thay vì theo layer toàn cục; mỗi module: `routes` (HTTP mapping) → `controller` mỏng → `service` (nghiệp vụ, không biết Express) → `repository`.
+      - Composition root: tạo dependency ở một chỗ (factory/DI nhẹ như awilix), truyền vào router factory → dễ test, không `import db` khắp nơi.
+      - Middleware dùng chung: validate(schema), requirePermission, tenant context, error mapping; chuẩn hoá error type + format response.
+      - Tách `app` (Express instance) khỏi `server` (listen) để test bằng supertest; config validate lúc boot.
+      - Ranh giới module rõ (lint rule cấm import chéo nội bộ) → sau này tách service dễ.
+    followUp: At what point would you stop building conventions on Express and adopt NestJS instead?
+    tags: [architecture, design]
+  - id: express-013
+    level: medium
+    type: design
+    q: Write a reusable validation middleware using zod that validates body, query and params and gives handlers typed input.
+    hint: |-
+      - Middleware factory nhận schema → `safeParse` → lỗi thì `next(new ValidationError(issues))` (400 với danh sách field), đúng thì gán kết quả đã parse (đã coerce/strip).
+      - Express 5: `req.query` là getter → **không gán lại**; lưu vào `res.locals.query`/`req.validated` thay thế.
+      - Strip field lạ (`.strict()` hoặc mặc định strip của zod object) → chống mass assignment.
+      - Type: generic handler nhận `z.infer<typeof schema>` để controller không đụng tới `req.body` thô.
+    example: |-
+      ```ts
+      const validate = <S extends z.ZodTypeAny>(schema: S, where: "body" | "query" | "params") =>
+        (req: Request, res: Response, next: NextFunction) => {
+          const r = schema.safeParse(req[where]);
+          if (!r.success) return next(new ValidationError(r.error.issues));
+          res.locals[where] = r.data; // don't reassign req.query in Express 5
+          next();
+        };
+      router.post("/orders", validate(CreateOrder, "body"), createOrder);
+      ```
+    followUp: Should validation errors expose the full zod issue list to clients? What about internal field names?
+    verify: true
+    tags: [validation, zod, middleware]
+  - id: express-014
+    level: medium
+    type: compare
+    q: "`req.user` via declaration merging vs `res.locals` — how do you pass authenticated user data to handlers type-safely?"
+    hint: |-
+      - Declaration merging (`declare global { namespace Express { interface Request { user?: AuthUser } } }`): tiện, nhưng global → route public cũng "có" `user?`, handler phải check hoặc dùng `!`.
+      - `res.locals`: chuẩn Express cho dữ liệu per-request; type được qua generic `Response<Body, Locals>`.
+      - Tốt nhất cho type-safety: wrapper `authed(handler)` tạo `AuthedRequest` với `user` bắt buộc, chỉ dùng sau auth middleware.
+      - Không lưu dữ liệu user ở module-level variable (bị trộn giữa các request đồng thời!).
+    followUp: A colleague stores the current user in a module-level variable in middleware. What bug appears under load?
+    tags: [typescript, auth]
+  - id: express-015
+    level: medium
+    type: concept
+    q: Which security middleware and settings would you put on every public Express API?
+    hint: |-
+      - `helmet`: security headers (HSTS, `X-Content-Type-Options`, CSP cho HTML, bỏ `X-Powered-By` — hoặc `app.disable("x-powered-by")`).
+      - CORS whitelist origin cụ thể (không phản chiếu origin tuỳ ý khi `credentials: true`).
+      - Giới hạn body: `express.json({ limit: "100kb" })` (hoặc nhỏ hơn), upload có `limits` riêng.
+      - Rate limit theo IP/user/tenant (store chung Redis khi nhiều instance); `trust proxy` đúng.
+      - Validate input + output encoding; không lộ stack trace; timeout server (`requestTimeout`, `headersTimeout`).
+      - Cookie: `httpOnly`, `secure`, `sameSite`; CSRF protection nếu auth bằng cookie.
+      - Dependency scanning, không dùng middleware đã bỏ bảo trì.
+    followUp: Which of these protect against a slowloris attack, and which don't?
+    tags: [security, middleware]
+  - id: express-016
+    level: medium
+    type: gotcha
+    q: What does `app.set("trust proxy", ...)` do, and what goes wrong with rate limiting when it's misconfigured?
+    hint: |-
+      - Sau LB/reverse proxy, TCP peer là IP của proxy; IP thật nằm trong `X-Forwarded-For`. `trust proxy` bảo Express tin header này để tính `req.ip`, `req.ips`, `req.protocol` (`https` từ `X-Forwarded-Proto`), `req.hostname`.
+      - Không bật → `req.ip` = IP LB → rate limiter coi mọi user là **một client** → chặn tất cả; redirect sang http sai; cookie `secure` lỗi.
+      - Bật `true` (tin mọi hop) khi app lại **reachable trực tiếp** → client giả `X-Forwarded-For` để bypass rate limit/IP allowlist.
+      - Đúng: số hop cụ thể (`1`) hoặc danh sách subnet của proxy.
+    example: |-
+      ```ts
+      app.set("trust proxy", 1); // exactly one proxy (e.g. ALB) in front
+      app.use(rateLimit({ windowMs: 60_000, limit: 100, keyGenerator: (req) => req.user?.id ?? req.ip! }));
+      ```
+    followUp: Your service sits behind CloudFront and then an ALB. What value do you use, and how do you verify it?
+    tags: [proxy, rate-limit, security]
+  - id: express-017
+    level: medium
+    type: concept
+    q: Explain how CORS works with an Express API, including preflight and credentials. What is the most common misconfiguration?
+    hint: |-
+      - Browser gửi **preflight** `OPTIONS` cho request "không đơn giản" (method khác GET/POST/HEAD, header tuỳ chỉnh như `Authorization`, `Content-Type: application/json`); server phải trả `Access-Control-Allow-Origin/Methods/Headers`.
+      - `credentials: true` (cookie): **không được** dùng `Access-Control-Allow-Origin: *`; phải trả đúng origin + `Access-Control-Allow-Credentials: true`.
+      - Sai phổ biến: phản chiếu `Origin` bất kỳ kèm credentials (= tắt bảo vệ), regex whitelist lỏng (`/example\.com$/` khớp `evilexample.com`), thiếu `Vary: Origin` khi cache.
+      - CORS là cơ chế **của browser** — không phải auth, không chặn curl/server-to-server.
+    followUp: Your CDN caches an API response with `Access-Control-Allow-Origin` for tenant A's domain; tenant B's browser fails. Why?
+    tags: [cors, security]
+  - id: express-018
+    level: medium
+    type: debug
+    q: After upgrading to Express 5, some routes 404 and the app throws at startup on others. Fix these route definitions.
+    example: |-
+      ```ts
+      app.get("*", spaFallback);                     // catch-all
+      app.get("/files/*", serveFile);                // nested path
+      app.get("/export/:id.:format?", exportOrder);   // optional format
+      app.get("/:lang(en|vi)/products", products);    // inline regex
+      ```
+    hint: |-
+      - path-to-regexp v8 (verify cú pháp theo docs):
+      - Wildcard phải có tên: `"/*splat"` (không match `/`), `"/{*splat}"` để match cả root; `req.params.splat` là **mảng** segment.
+      - `"/files/*splat"`.
+      - Optional dùng braces: `"/export/:id{.:format}"`.
+      - Regex inline không hỗ trợ: tách thành nhiều path `["/en/products", "/vi/products"]` hoặc validate `lang` trong handler/`app.param`.
+      - Lý do thay đổi: cú pháp cũ mơ hồ và dễ tạo regex backtracking (ReDoS).
+    followUp: How would you find every route pattern that needs changing in a codebase with 300 routes?
+    verify: true
+    tags: [express-5, routing, debug]
+  - id: express-019
+    level: medium
+    type: compare
+    q: Express vs Fastify vs NestJS — how do you choose for a new service?
+    hint: |-
+      - **Express**: tối giản, ecosystem lớn nhất, ai cũng biết; phải tự xây convention (validation, DI, error format). Hợp service nhỏ/vừa, team kỷ luật.
+      - **Fastify**: throughput cao hơn nhờ JSON schema serialization, hooks lifecycle, plugin encapsulation, logging pino built-in; ecosystem nhỏ hơn.
+      - **NestJS**: framework opinionated (module, DI, decorator, guard/pipe/interceptor), chạy trên adapter Express hoặc Fastify; hợp team lớn, domain phức tạp; đổi lại abstraction + learning curve.
+      - Tiêu chí: kỹ năng team, số service/team, yêu cầu hiệu năng thực tế (thường DB là bottleneck, không phải framework), chuẩn hoá toàn tổ chức.
+    followUp: Your Express API spends 5 ms in framework code and 80 ms in the DB. Is switching to Fastify worth it?
+    tags: [comparison, fastify, nestjs]
+  - id: express-020
+    level: medium
+    type: gotcha
+    q: How do you implement a secure file download endpoint with `res.sendFile` or streams?
+    hint: |-
+      - **Path traversal**: `res.sendFile(req.params.name)` với `../../etc/passwd`. Dùng option `root` (Express chặn `..` ra ngoài root) và **không** dùng tên file từ client — map id → path trên server sau khi check quyền.
+      - Check authorization theo tenant/owner **trước** khi stream.
+      - Header: `Content-Disposition: attachment; filename*=...`, `Content-Type` đúng, `X-Content-Type-Options: nosniff`.
+      - File lớn: stream (`pipeline`), hỗ trợ `Range` (`sendFile` có sẵn); hoặc tốt hơn trả pre-signed URL của S3 để Node không phải proxy bytes.
+      - Lỗi giữa chừng: headers đã gửi → chỉ có thể huỷ connection.
+    example: |-
+      ```ts
+      app.get("/invoices/:id/pdf", async (req, res) => {
+        const inv = await invoices.findForTenant(req.tenantId, req.params.id);
+        if (!inv) return res.sendStatus(404);
+        res.sendFile(inv.storageKey, { root: "/data/invoices", dotfiles: "deny" });
+      });
+      ```
+    followUp: When would you return a pre-signed S3 URL instead of streaming through Express?
+    tags: [security, files]
+  - id: express-021
+    level: medium
+    type: concept
+    q: What timeouts matter for an Express service, and how do you stop work when the client has gone away?
+    hint: |-
+      - Server-level (Node `http`): `requestTimeout` (toàn request, mặc định 300s — verify), `headersTimeout`, `keepAliveTimeout` (5s mặc định, cần > LB idle timeout).
+      - Per-route: middleware timeout (trả 503/504 sau N giây) — nhưng handler vẫn chạy tiếp → phải kết hợp AbortSignal và check `res.headersSent`.
+      - Client disconnect: `res.on("close")` khi `!res.writableFinished` → abort downstream (fetch, DB query có hỗ trợ cancel).
+      - Outbound: mọi call ra ngoài có timeout nhỏ hơn timeout của route (deadline propagation).
+    followUp: Your route timeout is 10s but the DB query timeout is 30s. What happens under load?
+    verify: true
+    tags: [timeouts, resilience]
+  - id: express-022
+    level: medium
+    type: design
+    q: Design centralized error handling for an Express API — error types, HTTP mapping, logging, and what the client sees.
+    hint: |-
+      - Class `AppError` có `code` (máy đọc: `ORDER_NOT_FOUND`), `status`, `expose` (có được hiện message không), `details`, `cause`.
+      - Error middleware: map `ValidationError`→400, `AuthError`→401/403, `NotFoundError`→404, `ConflictError`→409, lỗi DB unique→409, lỗi lạ→500 với message chung.
+      - Response format thống nhất (vd RFC 9457 Problem Details) kèm `requestId` để support tra log.
+      - Log lỗi 5xx với stack + context (requestId, tenantId, route), 4xx log mức thấp hơn; không log body chứa PII/secret.
+      - Không lộ stack/SQL/tên bảng cho client.
+    example: |-
+      ```ts
+      app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+        if (res.headersSent) return next(err);
+        const e = toAppError(err); // maps known libs (zod, DB driver) to AppError
+        if (e.status >= 500) logger.error({ err, requestId: res.locals.requestId }, "unhandled");
+        res.status(e.status).json({ type: e.code, title: e.expose ? e.message : "Internal error", requestId: res.locals.requestId });
+      });
+      ```
+    followUp: How do you make sure a new developer doesn't accidentally return a raw database error message?
+    tags: [error-handling, design]
+  - id: express-023
+    level: medium
+    type: concept
+    q: How do you test Express routes? Why separate `app` from `server.listen()`?
+    hint: |-
+      - Export `app` (hoặc `createApp(deps)`), file khác mới `listen` → test import `app` mà không mở port.
+      - `supertest(app).get("/orders").set("Authorization", ...)` → test tích hợp route + middleware + error handler.
+      - Inject dependency (repo, clock, external client) qua factory → thay bằng fake trong test; DB thật trong container (Testcontainers) cho test repository.
+      - Test những thứ hay vỡ: auth bắt buộc, thứ tự middleware, format lỗi, validation, tenant isolation.
+      - Node có `node:test` built-in; Jest/Vitest phổ biến.
+    followUp: What would a test look like that proves tenant A cannot read tenant B's order?
+    tags: [testing, supertest]
+  - id: express-024
+    level: medium
+    type: concept
+    q: How do compression, ETags and Cache-Control work in Express, and when would you not use `compression` middleware?
+    hint: |-
+      - Express tự tạo **weak ETag** cho `res.send`/`res.json` (`app.set("etag", ...)`) → client gửi `If-None-Match` → 304, tiết kiệm băng thông nhưng **server vẫn tính toàn bộ response**.
+      - `Cache-Control` set explicit theo loại dữ liệu: `private, no-store` cho dữ liệu user; `public, max-age` cho dữ liệu công khai; cẩn thận CDN cache response theo tenant/user.
+      - `compression` middleware nén trên event loop (zlib async dùng thread pool, nhưng vẫn tốn CPU) → ở traffic cao nên để reverse proxy/CDN nén; không nén SSE/stream realtime nếu không flush đúng.
+      - Không nén dữ liệu nhạy cảm trộn với input người dùng qua HTTPS (lớp tấn công kiểu BREACH).
+    followUp: A CDN in front of your API serves tenant A's product prices to tenant B. What headers were missing?
+    tags: [performance, caching, http]
+  - id: express-025
+    level: hard
+    type: debug
+    q: On Express 4, this route sometimes never responds and the process later crashes with an unhandled rejection. Explain and fix.
+    example: |-
+      ```ts
+      // express@4
+      app.get("/orders/:id", async (req, res) => {
+        const order = await orders.get(req.params.id); // throws when DB times out
+        res.json(order);
+      });
+      app.use((err, req, res, next) => res.status(500).json({ error: "internal" }));
+      ```
+    hint: |-
+      - Express 4 không xử lý promise trả về → rejection không tới error middleware; client chờ tới timeout (LB 504), sau đó Node ≥ 15 crash vì `unhandledRejection` → **mọi request khác trên process chết theo**.
+      - Fix: `asyncHandler` wrapper / `express-async-errors`, hoặc nâng lên Express 5.
+      - Phòng ngừa: lint `no-misused-promises` (cấm truyền async function vào chỗ mong đợi callback void), test route lỗi.
+      - Bonus: error handler nên log và check `res.headersSent`.
+    followUp: After upgrading to Express 5, which other places in the codebase can still produce unhandled rejections?
+    tags: [error-handling, async, debug]
+  - id: express-026
+    level: hard
+    type: debug
+    q: This permission middleware causes intermittent `ERR_HTTP_HEADERS_SENT` and some forbidden requests still reach the handler. Why?
+    example: |-
+      ```ts
+      const requirePermission = (perm: string): RequestHandler => (req, res, next) => {
+        permissions.forUser(req.user.id).then((perms) => {
+          if (!perms.includes(perm)) {
+            res.status(403).json({ error: "forbidden" });
+          }
+          next();
+        });
+        next();
+      };
+      ```
+    hint: |-
+      - `next()` ở cuối chạy **ngay lập tức** (đồng bộ) → handler chạy trước khi kiểm tra quyền xong → request bị cấm vẫn được xử lý (**lỗ hổng authorization**).
+      - Trong `.then`: thiếu `return` sau 403 → `next()` được gọi lần nữa → handler chạy lại/ghi response lần 2 → headers sent.
+      - Promise không có `.catch` → lỗi DB thành unhandled rejection.
+      - Fix: `async (req, res, next) => { const perms = await ...; if (!perms.includes(perm)) return next(new ForbiddenError()); next(); }` (Express 5 bắt rejection; v4 cần wrapper).
+    followUp: How would you write a test that would have caught the authorization bypass?
+    tags: [auth, middleware, debug]
+  - id: express-027
+    level: hard
+    type: debug
+    q: Errors from routes return an HTML stack trace instead of your JSON format. What's wrong with this error handler?
+    example: |-
+      ```ts
+      app.use((err: AppError, req: Request, res: Response) => {
+        res.status(err.status ?? 500).json({ code: err.code });
+      });
+      app.use("/api", apiRouter);
+      ```
+    hint: |-
+      - Chỉ có **3 tham số** → Express coi là middleware thường (`req, res, next` với tên khác), không phải error handler. Express dựa vào `fn.length === 4`.
+      - Đăng ký **trước** `apiRouter` → dù đúng chữ ký cũng không bắt lỗi từ router sau nó.
+      - Kết quả: lỗi rơi xuống default handler của Express → HTML stack trace (lộ thông tin nếu `NODE_ENV` không phải production).
+      - Fix: thêm `next` (kể cả không dùng — tắt lint `no-unused-vars` bằng `_next`), đặt cuối cùng.
+      - Gotcha tương tự: wrapper/decorator bọc handler làm mất `length` → không còn là error handler.
+    followUp: Why can wrapping every middleware with a generic tracing wrapper break your error handler?
+    tags: [error-handling, debug]
+  - id: express-028
+    level: hard
+    type: debug
+    q: 'After upgrading to Express 5, a sanitizing middleware throws `TypeError: Cannot set property query of #<IncomingMessage> which has only a getter`. Explain and fix.'
+    example: |-
+      ```ts
+      app.use((req, _res, next) => {
+        req.query = sanitize(req.query);     // worked on Express 4
+        req.body = sanitize(req.body);
+        next();
+      });
+      ```
+    hint: |-
+      - Express 5 định nghĩa `req.query` là **getter** trên prototype (không có setter) → gán lại trong strict mode (ES module/TS output) throw TypeError.
+      - Một số middleware cũ (sanitizer, query normalizer) gán `req.query` → phải nâng version hoặc thay.
+      - Fix: lưu kết quả vào nơi khác (`res.locals.query`), hoặc cấu hình `app.set("query parser", fn)` để parse/sanitize ngay từ đầu; validate bằng schema thay vì "sanitize" chung chung.
+      - `req.body` vẫn gán được (không phải getter).
+    followUp: Why is a generic "sanitize everything" middleware a weaker defense than schema validation?
+    verify: true
+    tags: [express-5, migration, debug]
+  - id: express-029
+    level: hard
+    type: scenario
+    q: Pods running an Express upload endpoint get OOMKilled when users upload large product images in bulk. What's happening and how do you fix it?
+    hint: |-
+      - Thường là `multer({ storage: memoryStorage() })` (hoặc `express.raw()` limit lớn) → mỗi file nằm nguyên trong RAM dưới dạng Buffer; N upload đồng thời × kích thước file > memory limit. Buffer ở ngoài V8 heap nên `--max-old-space-size` không chặn.
+      - Fix: `limits` (fileSize, files), stream thẳng lên S3 (multipart upload) hoặc disk tạm; tốt hơn: **pre-signed URL** để client upload trực tiếp lên S3, API chỉ nhận metadata.
+      - Giới hạn concurrency upload, validate content-type/magic bytes, quét malware nếu cần; xử lý ảnh (resize) bằng job async.
+    followUp: With pre-signed uploads, how do you make sure the file the client uploaded matches what they claimed (type, size, tenant)?
+    tags: [uploads, memory, scenario]
+  - id: express-030
+    level: hard
+    type: scenario
+    q: Behind an AWS ALB, your Express API returns a small percentage of 502 errors with no errors in application logs. What do you investigate?
+    hint: |-
+      - Nguyên nhân kinh điển: Node `keepAliveTimeout` (mặc định 5s — verify) **nhỏ hơn** ALB idle timeout (mặc định 60s) → Node đóng connection idle đúng lúc ALB tái sử dụng → 502 không có log app (request chưa tới Express).
+      - Fix: `server.keepAliveTimeout = 65_000; server.headersTimeout = 66_000;`.
+      - Khác cần kiểm tra: process crash/restart (OOM, unhandled rejection), deploy không graceful (pod nhận traffic khi đang tắt), response header quá lớn, target trả response sai định dạng.
+      - Công cụ: ALB access log (`elb_status_code` 502 vs `target_status_code` rỗng), metric `HTTPCode_ELB_502_Count`, thời điểm trùng deploy?
+    followUp: The 502s correlate exactly with deployments. What's different about that root cause and its fix?
+    verify: true
+    tags: [load-balancer, keep-alive, scenario]
+  - id: express-031
+    level: hard
+    type: scenario
+    q: p99 latency of the whole API jumps whenever a particular admin report endpoint is used. How do you find and fix it?
+    hint: |-
+      - Nghi vấn: handler làm việc CPU/sync nặng trên event loop (build CSV/JSON lớn, `JSON.stringify`, sort, regex, `*Sync` API, bcrypt sync) → block mọi request khác trên cùng process.
+      - Chứng minh: event loop delay p99 tăng cùng lúc; CPU profile (`--cpu-prof`, Clinic flame) khi gọi endpoint; trace cho thấy khoảng trống.
+      - Fix: phân trang/stream từ DB, chuyển report sang **background job** (queue + worker, trả file qua link), worker thread cho phần CPU, hoặc service/replica riêng cho admin.
+      - Tạm thời: rate limit endpoint, giới hạn range dữ liệu.
+    followUp: How would you isolate admin/reporting traffic from customer traffic at the infrastructure level?
+    tags: [performance, event-loop, scenario]
+  - id: express-032
+    level: hard
+    type: gotcha
+    q: How can an Express app become vulnerable to prototype pollution or mass assignment through request bodies and query strings?
+    hint: |-
+      - Body JSON `{"__proto__": {"isAdmin": true}}` → an toàn khi chỉ đọc, nhưng nguy hiểm khi **deep merge** vào object khác (lodash `merge` cũ, merge tự viết) → pollute `Object.prototype`.
+      - Query string nested (`?user[role]=admin`) với parser "extended" → object lồng nhau; qs có bảo vệ `__proto__` mặc định nhưng merge sau đó vẫn nguy hiểm. Express 5 mặc định query parser "simple" và `urlencoded` `extended: false` (verify).
+      - Mass assignment: `repo.update(id, req.body)` cho phép client đổi `role`, `tenantId`, `price`.
+      - Phòng: schema whitelist field, không merge input thô, DTO → entity mapping explicit, cập nhật lib, `Object.create(null)` cho map.
+    example: |-
+      ```ts
+      app.patch("/me", async (req, res) => {
+        await db.user.update({ where: { id: req.user.id }, data: req.body }); // client sends {"role":"admin"}
+        res.sendStatus(204);
+      });
+      ```
+    followUp: How would you detect mass-assignment bugs in code review or with automated tests?
+    verify: true
+    tags: [security, prototype-pollution, mass-assignment]
+  - id: express-033
+    level: hard
+    type: concept
+    q: Explain the 2024 path-to-regexp ReDoS issue and why route patterns can be a denial-of-service vector.
+    hint: |-
+      - Express 4 dùng path-to-regexp 0.1.x; một số pattern có **hai param trong cùng segment** (vd `/:a-:b`) sinh regex backtracking → request URL được craft khiến regex chạy rất lâu, block event loop (CVE-2024-45296 — verify version đã vá).
+      - Fix: nâng Express/path-to-regexp bản vá; Express 5 dùng path-to-regexp v8 với cú pháp giới hạn hơn, bỏ regex inline.
+      - Tổng quát: mọi regex chạy trên input không tin cậy (route, validate header, user-agent) là vector ReDoS; giới hạn độ dài URL/header ở proxy.
+    followUp: How do you keep track of which transitive dependency versions your services actually run in production?
+    verify: true
+    tags: [security, redos, routing]
+  - id: express-034
+    level: hard
+    type: design
+    q: Implement health checks and graceful shutdown for an Express service running on Kubernetes.
+    hint: |-
+      - `/livez`: process còn sống (không check DB — tránh restart dây chuyền khi DB chậm). `/readyz`: sẵn sàng nhận traffic (DB pool ok, warm-up xong, **false khi đang shutdown**).
+      - SIGTERM: readiness=false → chờ vài giây cho endpoint bị gỡ khỏi Service → `server.close()` + đóng idle keep-alive connection → chờ in-flight → đóng DB/Redis → exit; hard timeout < `terminationGracePeriodSeconds`.
+      - Response trong lúc drain có thể set `Connection: close` để client không reuse socket.
+      - Container: `CMD ["node", "server.js"]` để Node nhận signal trực tiếp.
+    example: |-
+      ```ts
+      let ready = true;
+      app.get("/readyz", (_req, res) => res.sendStatus(ready ? 200 : 503));
+      process.once("SIGTERM", async () => {
+        ready = false;
+        await sleep(5_000);
+        server.close(async () => { await db.end(); process.exit(0); });
+        server.closeIdleConnections();
+        setTimeout(() => process.exit(1), 20_000).unref();
+      });
+      ```
+    followUp: Why can a liveness probe that checks the database cause a cascading outage?
+    verify: true
+    tags: [graceful-shutdown, kubernetes, health-checks]
+  - id: express-035
+    level: hard
+    type: gotcha
+    q: You use `AsyncLocalStorage` in middleware for requestId/tenantId, but some log lines lose the context. Why, and how do you fix it?
+    hint: |-
+      - Context gắn với async resource tạo **bên trong** `als.run(...)`; nếu code chạy qua queue/pool khởi tạo **ngoài** request (connection pool callback, EventEmitter singleton, batching lib như DataLoader) → callback chạy trong context của nơi khác/không có.
+      - Middleware gọi `next()` **bên ngoài** `als.run` → handler không có context.
+      - Fix: `als.run(store, next)` đúng cách; `AsyncResource.bind(fn)` cho callback đi qua lib; ưu tiên lib hỗ trợ ALS/OTel; với background job/consumer phải tự tạo context mới.
+      - Không dùng `enterWith` trong middleware (rò context sang request sau trên cùng tick).
+    followUp: Is it safe to use AsyncLocalStorage for the tenant id that your data access layer uses to scope queries? What's the risk?
+    tags: [async-context, logging, gotcha]
+  - id: express-036
+    level: senior
+    type: design
+    q: Design the request pipeline of a multi-tenant Express API — tenant resolution, authentication, authorization, rate limiting and data access.
+    hint: |-
+      - Tenant resolution: từ **token claim** (nguồn tin cậy) hoặc subdomain/header nhưng phải **đối chiếu** với token; không tin `tenantId` trong body/query.
+      - Pipeline: requestId → auth (JWT verify, cache JWKS) → tenant context (ALS + `res.locals`) → rate limit theo tenant/plan (Redis) → validate → permission check (RBAC) → handler → service/repo nhận tenant explicit.
+      - Data: mọi query scope theo tenant (repo bắt buộc tham số, RLS ở DB nếu có), cache key có tenant prefix, ES filter tenant.
+      - Noisy neighbor: quota per tenant, timeout, bulkhead cho tenant lớn.
+      - Audit log hành động admin/cross-tenant.
+    followUp: A support engineer needs to act on behalf of a tenant. How do you design impersonation safely?
+    tags: [multi-tenant, design, auth]
+  - id: express-037
+    level: senior
+    type: open
+    q: Plan the migration of a large Express 4 codebase (hundreds of routes, many middleware packages) to Express 5.
+    hint: |-
+      - Inventory: route pattern dùng `*`, `?`, regex; API bị xoá (`req.param`, `res.send(status)`, `app.del`...); middleware bên thứ ba gán `req.query`/dựa vào hành vi cũ.
+      - Chạy codemod chính thức, sau đó grep/lint cho phần còn lại; test route matching (snapshot danh sách route → path mẫu → handler).
+      - Dọn wrapper async (không bắt buộc nhưng giảm code), kiểm tra error handler chịu được lỗi mới được chuyển tới.
+      - Kiểm tra thay đổi mặc định: `urlencoded extended: false`, query parser, dotfiles, `req.host` có port, `req.body` undefined.
+      - Rollout: canary từng service, so sánh tỉ lệ 404/5xx trước/sau (verify danh sách thay đổi theo docs).
+    followUp: How do you detect in production that a route silently stopped matching after the upgrade?
+    verify: true
+    tags: [express-5, migration, open]
+  - id: express-038
+    level: senior
+    type: design
+    q: While incrementally migrating endpoints from a monolith to new Express services, how do you route traffic and keep backward compatibility?
+    hint: |-
+      - **Strangler fig**: gateway/reverse proxy (hoặc chính monolith) route theo path/feature flag sang service mới; chuyển từng endpoint, rollback bằng config.
+      - Giữ contract: cùng URL, response shape, error format, status code; contract test (consumer-driven) chạy với cả hai implementation; shadow traffic so sánh response.
+      - Dữ liệu: dual-write hay CDC trong giai đoạn chuyển; nguồn sự thật rõ ràng cho từng entity; idempotency.
+      - Auth/session phải dùng chung (token format, permission) giữa monolith và service mới.
+      - Quan sát: metric theo route cho cả hai phía, tỉ lệ lỗi khi chuyển %.
+    followUp: Shadow traffic shows 0.5% of responses differ. How do you decide whether you can cut over?
+    tags: [migration, microservices, design]
+  - id: express-039
+    level: senior
+    type: open
+    q: When would you move an existing Express service to Fastify or NestJS, and when is that a bad idea?
+    hint: |-
+      Không có đáp án duy nhất:
+      - Lý do tốt: nhiều team cùng sửa codebase thiếu convention (Nest), cần DI/testing chuẩn hoá, framework overhead **đo được** là bottleneck (Fastify), chuẩn hoá toàn tổ chức.
+      - Lý do tệ: "framework mới hot", bottleneck thật ở DB/network, service sắp bị thay thế, không có test để đảm bảo hành vi không đổi.
+      - Chi phí: rewrite middleware, học lại, rủi ro regression; có thể di chuyển dần (Nest chạy trên Express adapter, mount router cũ).
+      - Đo lường trước/sau và có tiêu chí dừng.
+    followUp: How would you convince a team lead with numbers rather than preference?
+    tags: [architecture, open]
+  - id: express-040
+    level: cv
+    type: design
+    q: You built RBAC and permission checks on a multi-tenant platform. How did you implement them in Express, and where did the checks live — middleware, service, or query?
+    hint: |-
+      Câu trả lời mạnh có:
+      - Mô hình thật: role → permission (tĩnh trong code hay trong DB theo tenant), cách load/cache permission (điền chi tiết thật của bạn).
+      - Middleware `requirePermission("order:write")` cho check **coarse-grained** ở route; check **resource-level** (order thuộc tenant/user này?) ở service/query — middleware không đủ.
+      - Tenant lấy từ token, mọi query scope theo tenant; test chứng minh không đọc chéo tenant.
+      - Hiệu năng: cache permission (Redis/in-memory TTL), invalidation khi đổi role.
+      - Một bug/lỗ hổng từng gặp hoặc suýt gặp và cách phòng.
+    followUp: A user's role is revoked while they still hold a valid JWT for 15 more minutes. What happens in your system?
+    tags: [cv, rbac, auth]
+  - id: express-041
+    level: cv
+    type: design
+    q: You implemented JWT/OAuth including Google sign-in on an Express backend. Walk me through the flow and how you validated tokens.
+    hint: |-
+      - Flow: Authorization Code (+ PKCE nếu client public) với Google → backend đổi code lấy token → verify **ID token** (chữ ký qua JWKS, `iss`, `aud` = client id, `exp`, `nonce`) → map/tạo user nội bộ → phát hành token/session của hệ thống.
+      - JWT của hệ thống: thuật toán (RS256/ES256 vs HS256), access token ngắn hạn + refresh token (rotation, lưu httpOnly cookie hoặc storage an toàn), revoke/logout.
+      - Middleware verify: cache JWKS, cố định thuật toán (chặn `alg: none`/confusion), clock skew.
+      - Multi-tenant: token mang tenant/role claims — nguồn và cách làm mới khi đổi quyền.
+      - (điền chi tiết thật: nơi lưu token, thời hạn, thư viện)
+    followUp: Why must you check the `aud` claim of the Google ID token, and what attack does that stop?
+    tags: [cv, oauth, jwt]
+  - id: express-042
+    level: cv
+    type: design
+    q: You introduced Redis caching on hot APIs. Did you implement it as Express middleware or in the service layer, and how did you handle keys and invalidation?
+    hint: |-
+      - Middleware cache theo URL: nhanh để làm nhưng dễ sai (quên tenant/user/permission trong key, cache response lỗi, header `Vary`).
+      - Service-layer cache-aside: key có **tenant + entity + version**, TTL + invalidation khi ghi (xoá key sau commit, hoặc event), chống stampede (lock/SWR, TTL jitter).
+      - Cái gì không cache: dữ liệu theo user nhạy cảm, giá có hiệu lực theo thời gian nếu không có invalidation đúng.
+      - Đo: hit ratio, latency p95 trước/sau, tải DB giảm (điền số liệu thật của bạn).
+      - Sự cố: stale data/cache sai tenant nếu có và cách fix.
+    followUp: A product price is updated but some customers see the old price for 10 minutes. Trace the possible causes in your design.
+    tags: [cv, caching, redis]
+  - id: express-043
+    level: cv
+    type: design
+    q: You built the Checkout flow. How did you make the checkout endpoint safe against double submits, partial failures and price changes?
+    hint: |-
+      - **Idempotency key** (header) lưu kèm kết quả → retry/double click trả cùng kết quả, không tạo 2 đơn.
+      - Transaction DB cho order + order items + reserve stock; gọi payment provider **ngoài** transaction dài — dùng state machine (pending → paid → confirmed) + webhook/callback idempotent.
+      - Giá/khuyến mãi: tính lại ở server tại thời điểm checkout, không tin giá từ client; báo lỗi `PRICE_CHANGED` rõ ràng.
+      - Validation địa chỉ (Address Management), tenant rules.
+      - Lỗi giữa chừng: compensation (release stock), job reconcile định kỳ với provider.
+      - (điền chi tiết thật của bạn)
+    followUp: The payment provider times out but actually charged the card. How does your system reach a consistent state?
+    tags: [cv, checkout, idempotency]
+  - id: express-044
+    level: cv
+    type: design
+    q: When migrating a legacy monolith to Node/Express microservices, how did you keep old clients working while endpoints moved?
+    hint: |-
+      - Chiến lược route: gateway/proxy chuyển dần từng endpoint (strangler), feature flag/percentage rollout, rollback nhanh.
+      - Backward compatibility: giữ URL/response shape/error format; adapter layer map giữa model cũ và mới; version API khi buộc phải đổi.
+      - Data transformation giữa schema cũ và mới; đồng bộ dữ liệu qua Kafka trong giai đoạn song song; idempotent consumer.
+      - Memcached TTL + refresh để giảm tải DB trong lúc chuyển (nếu áp dụng) — nói rõ cơ chế refresh.
+      - Chứng minh không vỡ: contract test, so sánh response, metric lỗi theo client (điền chi tiết thật của bạn).
+    followUp: Which endpoint was the hardest to move, and why?
+    tags: [cv, migration, microservices]
+  - id: express-045
+    level: cv
+    type: behavioral
+    q: Tell me about a legacy Express refactor you did. How did you make sure behavior didn't change?
+    hint: |-
+      STAR:
+      - Situation: code cũ (callback hell, logic trộn trong route, không test, error handling rời rạc).
+      - Task: mục tiêu refactor đo được (dễ thêm feature, giảm bug, hiệu năng).
+      - Action: viết **characterization test** (supertest) trước khi sửa; refactor từng bước nhỏ (tách service/repo, async/await, error middleware chung); feature flag/canary; review kỹ phần AI hỗ trợ sinh code.
+      - Result: (điền số liệu thật: số bug giảm, thời gian thêm feature, coverage).
+      - Reflection: điều bạn sẽ làm khác (phạm vi nhỏ hơn, đo sớm hơn).
+    followUp: What did you deliberately not refactor, and why?
+    tags: [cv, refactoring, behavioral]

@@ -1,0 +1,829 @@
+id: 08-api-design
+slug: api-design
+title: API Design
+tier: 2
+status: drafted
+summary: REST semantics, idempotency, pagination, versioning, error format (RFC 9457), rate limiting, webhooks, GraphQL, gRPC — thiết kế API sống được qua nhiều năm và nhiều client.
+cvLinked: true
+prerequisites: []
+overview: |-
+  ## TL;DR
+
+  - API là **contract** lâu dài: một khi client đã phụ thuộc, mọi thay đổi đều có giá. Senior interview hỏi về **evolution** (versioning, backward compatibility, deprecation) nhiều hơn là "REST là gì".
+  - Nắm chắc **HTTP semantics** (RFC 9110): method nào *safe*, method nào *idempotent*, status code nào nói gì — đây là nền cho retry, caching và proxy hoạt động đúng.
+  - Mạng không tin cậy → mọi mutation quan trọng (payment, checkout) cần **idempotency key**; mọi list endpoint cần **pagination ổn định** (cursor/keyset); mọi lỗi cần **format thống nhất** (Problem Details, RFC 9457).
+  - Bảo vệ hệ thống: **rate limiting** (token bucket / sliding window), timeout, quota theo tenant; bảo vệ client: `429` + `Retry-After`.
+  - REST vs GraphQL vs gRPC không phải "cái nào tốt hơn" mà là **ai là client**: public/partner → REST + OpenAPI; nhiều UI cần shape khác nhau → GraphQL/BFF; service-to-service nội bộ, latency thấp, streaming → gRPC.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Safe method | Không thay đổi state phía server (về mặt ngữ nghĩa) | `GET`, `HEAD`, `OPTIONS` |
+  | Idempotent method | Gọi N lần = gọi 1 lần (về state) | `PUT /users/1`, `DELETE /users/1`; `POST` thì **không** |
+  | Idempotency key | Client gửi key duy nhất để server dedupe retry của một `POST` | `Idempotency-Key: 5f1c…` trên `POST /payments` |
+  | Cursor / keyset pagination | Trang kế tiếp dựa trên vị trí (giá trị sort cuối), không dựa trên offset | `?after=eyJpZCI6MTIzfQ&limit=50` |
+  | Problem Details | Format lỗi chuẩn `application/problem+json` (RFC 9457) | `{ "type", "title", "status", "detail", "instance" }` |
+  | Conditional request | Dùng `ETag` + `If-Match` / `If-None-Match` cho cache & optimistic concurrency | `PUT` với `If-Match: "v7"` → `412` nếu đã đổi |
+  | Rate limiting | Giới hạn số request theo key (user, tenant, IP) trong cửa sổ thời gian | `429 Too Many Requests` + `Retry-After: 30` |
+  | Webhook | Server gọi ngược tới client khi có event; cần ký (HMAC) + retry + dedupe | `X-Signature: sha256=…` |
+  | Breaking change | Thay đổi làm client cũ hỏng | Đổi tên field, đổi kiểu, thêm required field vào request |
+
+  ## Cơ chế hoạt động
+
+  ### Idempotency key cho `POST /payments`
+
+  ```mermaid
+  sequenceDiagram
+    participant C as Client
+    participant API as API
+    participant S as Idempotency store
+    participant P as Payment provider
+    C->>API: POST /payments (Idempotency-Key K)
+    API->>S: INSERT K status=processing (unique)
+    alt key mới
+      API->>P: charge
+      P-->>API: ok
+      API->>S: save K -> 201 + body
+      API-->>C: 201 Created
+    else key đã tồn tại và xong
+      S-->>API: stored response
+      API-->>C: replay 201 (same body)
+    else key đang processing
+      API-->>C: 409 Conflict (retry later)
+    end
+    Note over C,API: Client timeout rồi retry với CÙNG key → không charge 2 lần
+  ```
+
+  ### Lựa chọn pagination
+
+  ```mermaid
+  flowchart TD
+    A["List endpoint"] --> B{"Cần nhảy tới trang N<br/>(admin table)?"}
+    B -- yes --> C{"Dataset nhỏ và<br/>ít thay đổi?"}
+    C -- yes --> D["Offset/limit<br/>+ total count"]
+    C -- no --> E["Offset có giới hạn max page<br/>hoặc search engine"]
+    B -- no --> F["Cursor / keyset<br/>(infinite scroll, feed, sync, export)"]
+    F --> G["Sort key UNIQUE & ổn định<br/>(created_at, id)"]
+  ```
+
+  ### Vòng đời một thay đổi API (evolution)
+
+  ```mermaid
+  flowchart LR
+    A["Thêm field optional<br/>(additive)"] --> B["Ship + document"]
+    C["Cần breaking change"] --> D["Version mới / field mới<br/>song song"]
+    D --> E["Deprecation header<br/>+ Sunset date"]
+    E --> F["Đo traffic client cũ"]
+    F --> G{"Traffic ~ 0?"}
+    G -- no --> F
+    G -- yes --> H["Remove"]
+  ```
+
+  ## Trade-offs
+
+  | Tiêu chí | REST (JSON/HTTP) | GraphQL | gRPC |
+  |---|---|---|---|
+  | Client phù hợp | Public, partner, browser, mobile | Nhiều UI cần shape khác nhau | Service-to-service nội bộ |
+  | HTTP caching | Tốt (GET + ETag + CDN) | Khó (thường POST, 1 endpoint) — cần persisted queries | Không dùng HTTP cache |
+  | Over/under-fetching | Có (giải bằng `fields`/`expand`, BFF) | Client chọn field | Schema cố định theo RPC |
+  | Contract | OpenAPI | SDL schema, introspection | `.proto`, codegen mạnh |
+  | Streaming | SSE/WebSocket riêng | Subscriptions | Native (client/server/bidi) |
+  | Rủi ro chính | Endpoint sprawl, versioning | N+1 resolver, query quá phức tạp (DoS) | Browser cần gRPC-Web/proxy; debug khó hơn |
+
+  | Versioning | Ưu | Nhược |
+  |---|---|---|
+  | URL `/v2/orders` | Rõ ràng, dễ route, dễ cache | Nhân đôi routes; "big bang" version |
+  | Header / media type | URL sạch, version theo resource | Khó test bằng browser, dễ quên ở proxy/cache (`Vary`) |
+  | Không version, chỉ additive + deprecation | Ít overhead | Cần kỷ luật contract testing rất cao |
+
+  ## Pitfalls
+
+  - Dùng `200 OK` cho mọi thứ kèm `{ "success": false }` → phá monitoring, retry logic và cache.
+  - Retry `POST` không có idempotency key → charge/đơn hàng trùng.
+  - Offset pagination trên bảng lớn đang được ghi → trùng/mất item, `OFFSET 1000000` quét cả triệu row.
+  - Trả thẳng entity DB ra API → lộ field nội bộ, mỗi đổi schema DB thành breaking change.
+  - `404` vs `403` cho resource của tenant khác: trả `403` làm lộ sự tồn tại (enumeration) — thường trả `404`.
+  - Webhook không ký hoặc so sánh chữ ký bằng `===` (timing attack), không chống replay (timestamp).
+  - GraphQL public không giới hạn depth/complexity → một query có thể hạ DB.
+  - Rate limit in-memory trên nhiều instance → limit thực tế = N × limit.
+
+  ## Cheat sheet
+
+  - Safe: `GET HEAD OPTIONS TRACE` · Idempotent: safe + `PUT DELETE` · Không idempotent: `POST`, (thường) `PATCH`.
+  - `201` + `Location` khi tạo · `202` cho job dài (trả status URL) · `204` không body · `304` Not Modified.
+  - `400` malformed · `401` chưa xác thực (kèm `WWW-Authenticate`) · `403` đã xác thực nhưng không có quyền · `404` · `409` conflict state · `412` precondition failed · `422` validation · `429` rate limit.
+  - Lỗi: `application/problem+json` (RFC 9457 thay RFC 7807).
+  - Pagination: cursor opaque (base64 của sort key), sort key phải unique (`created_at, id`).
+  - Breaking: xoá/đổi tên field, đổi type, thêm required input, đổi ý nghĩa enum, đổi default. Non-breaking: thêm field optional, thêm endpoint — **nhưng** client phải tolerant với field/enum lạ.
+  - Webhook: HMAC-SHA256 trên raw body + timestamp, constant-time compare, at-least-once → consumer dedupe theo event id.
+notionRefs:
+  - title: APIs
+    url: https://app.notion.com/p/179ef77f8ab28063b45ee743e2feb542
+  - title: API Contract
+    url: https://app.notion.com/p/39fef77f8ab280cab404e0ff3cd29004
+  - title: Rate limit
+    url: https://app.notion.com/p/2e8ef77f8ab28055ba79d76d178d397b
+references:
+  - title: RFC 9110 — HTTP Semantics
+    url: https://www.rfc-editor.org/rfc/rfc9110
+  - title: RFC 9457 — Problem Details for HTTP APIs
+    url: https://www.rfc-editor.org/rfc/rfc9457
+  - title: RFC 6585 — Additional HTTP Status Codes (429)
+    url: https://www.rfc-editor.org/rfc/rfc6585
+  - title: RFC 8594 — The Sunset HTTP Header Field
+    url: https://www.rfc-editor.org/rfc/rfc8594
+  - title: RFC 9745 — The Deprecation HTTP Response Header Field
+    url: https://www.rfc-editor.org/rfc/rfc9745
+  - title: IETF draft — The Idempotency-Key HTTP Header Field
+    url: https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/
+  - title: IETF draft — RateLimit header fields for HTTP
+    url: https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/
+  - title: OpenAPI Specification
+    url: https://spec.openapis.org/oas/latest.html
+  - title: GraphQL — Best practices (pagination, caching)
+    url: https://graphql.org/learn/best-practices/
+  - title: gRPC — Core concepts
+    url: https://grpc.io/docs/what-is-grpc/core-concepts/
+  - title: Google API Design Guide
+    url: https://cloud.google.com/apis/design
+  - title: Stripe — Idempotent requests
+    url: https://docs.stripe.com/api/idempotent_requests
+questions:
+  - id: api-design-001
+    level: easy
+    type: concept
+    q: Which HTTP methods are safe and which are idempotent? Why does the distinction matter in practice?
+    hint: |-
+      - **Safe** (không đổi state về ngữ nghĩa): `GET`, `HEAD`, `OPTIONS`, `TRACE`.
+      - **Idempotent** (gọi N lần = 1 lần về state server): mọi safe method + `PUT`, `DELETE`. `POST` không idempotent; `PATCH` không được đảm bảo.
+      - Vì sao quan trọng: client/proxy/load balancer **tự retry** request idempotent khi timeout; crawler/prefetch gọi `GET` thoải mái; CDN chỉ cache safe method.
+      - Idempotent ≠ cùng response: `DELETE` lần 2 có thể trả `404`, nhưng state vẫn như nhau.
+    followUp: Your `GET /orders/export` endpoint triggers an email. What goes wrong?
+    redFlags:
+      - Says PATCH is always idempotent
+      - Confuses idempotent with "returns the same response"
+    tags: [http, rest, idempotency]
+  - id: api-design-002
+    level: easy
+    type: compare
+    q: 401 vs 403 vs 404 — when do you return each, especially for a resource that belongs to another tenant?
+    hint: |-
+      - `401 Unauthorized`: **chưa xác thực** (thiếu/hết hạn token) — kèm `WWW-Authenticate`.
+      - `403 Forbidden`: đã biết bạn là ai nhưng **không có quyền**.
+      - `404`: resource không tồn tại — **hoặc** bạn không được phép biết nó tồn tại.
+      - Resource của tenant khác: thường trả `404` để tránh enumeration (đoán ID để dò dữ liệu tenant khác). `403` hợp lý khi user biết resource tồn tại (VD: cùng tenant nhưng thiếu role).
+    followUp: How do you make sure every endpoint applies the tenant check, rather than relying on each developer remembering?
+    redFlags:
+      - Returns 401 for "logged in but not allowed"
+    tags: [http, status-codes, multi-tenancy, security]
+  - id: api-design-003
+    level: easy
+    type: concept
+    q: What is the difference between `PUT` and `PATCH`? What are JSON Merge Patch and JSON Patch?
+    hint: |-
+      - `PUT`: **thay thế toàn bộ** representation → idempotent; thiếu field = xoá/reset field đó.
+      - `PATCH`: cập nhật **một phần**; ngữ nghĩa tuỳ media type.
+      - **JSON Merge Patch** (RFC 7396, `application/merge-patch+json`): gửi object con, `null` = xoá field. Đơn giản nhưng không set được giá trị `null` thật và không thao tác phần tử mảng.
+      - **JSON Patch** (RFC 6902, `application/json-patch+json`): danh sách operation `add/remove/replace/move/test` — mạnh, `test` giúp optimistic check.
+    followUp: Two clients PATCH the same order concurrently. How do you prevent a lost update?
+    tags: [http, rest]
+  - id: api-design-004
+    level: easy
+    type: concept
+    q: Which status codes do you use for create, async job accepted, validation error, and conflict? Give the response shape for each.
+    hint: |-
+      - Tạo xong: `201 Created` + header `Location: /orders/123` + body resource.
+      - Job dài (export, import): `202 Accepted` + `Location`/body chứa URL status (`/jobs/abc`) để client poll (hoặc webhook).
+      - Validation: `400` cho request malformed (JSON hỏng); `422 Unprocessable Content` cho request đúng cú pháp nhưng sai nghiệp vụ — nhiều team dùng `400` cho cả hai, quan trọng là **nhất quán**.
+      - Conflict state (trùng email, order đã ship không huỷ được): `409 Conflict`.
+      - Body lỗi theo RFC 9457 Problem Details.
+    followUp: 'Why is returning `200` with `{ "success": false }` harmful for operations?'
+    tags: [http, status-codes]
+  - id: api-design-005
+    level: easy
+    type: concept
+    q: What is RFC 9457 Problem Details, and what fields would you include for a validation error?
+    hint: |-
+      - Chuẩn format lỗi HTTP API, media type `application/problem+json`; RFC 9457 **thay thế** RFC 7807.
+      - Field chuẩn: `type` (URI định danh loại lỗi, doc được), `title` (ngắn, không đổi theo instance), `status`, `detail` (cụ thể lần này), `instance` (URI của lần xảy ra).
+      - Cho phép **extension member**: VD `errors: [{ field, code, message }]`, `traceId`.
+      - Lợi ích: client xử lý lỗi theo `type`/`code` ổn định, không parse `message`.
+    example: |-
+      ```json
+      HTTP/1.1 422 Unprocessable Content
+      Content-Type: application/problem+json
+
+      {
+        "type": "https://api.example.com/problems/validation-error",
+        "title": "Request validation failed",
+        "status": 422,
+        "detail": "2 fields are invalid",
+        "instance": "/orders/req-7f3a",
+        "traceId": "4bf92f3577b34da6",
+        "errors": [
+          { "field": "shippingAddress.postalCode", "code": "invalid_format" },
+          { "field": "items[0].quantity", "code": "must_be_positive" }
+        ]
+      }
+      ```
+    followUp: Should the error response include the stack trace or SQL error in production? Where does that information go instead?
+    tags: [errors, rfc9457]
+  - id: api-design-006
+    level: easy
+    type: compare
+    q: Offset pagination vs cursor (keyset) pagination — how does each work and when does offset break?
+    hint: |-
+      - Offset: `LIMIT 50 OFFSET 1000` — đơn giản, nhảy trang được, có total count.
+      - Vấn đề offset: DB vẫn phải **đọc và bỏ** N row (chậm dần theo trang); dữ liệu bị insert/delete giữa 2 lần gọi → **trùng hoặc mất** item.
+      - Keyset: `WHERE (created_at, id) < (:c, :id) ORDER BY created_at DESC, id DESC LIMIT 50` — dùng index, O(limit), ổn định khi có ghi mới.
+      - Cursor trả về dạng **opaque** (base64 của sort key) để server đổi cách encode mà không breaking.
+      - Nhược keyset: không nhảy trang N, sort key phải unique (thêm `id` làm tie-breaker).
+    followUp: How do you support a user-changeable sort (by price, by name) with cursor pagination?
+    tags: [pagination, sql, performance]
+  - id: api-design-007
+    level: easy
+    type: concept
+    q: What is rate limiting, what do you key it on, and what should the client receive when it is limited?
+    hint: |-
+      - Giới hạn số request theo **key** trong khoảng thời gian: IP (anonymous), user/API key, tenant, route (login chặt hơn), hoặc kết hợp.
+      - Khi vượt: `429 Too Many Requests` (RFC 6585) + `Retry-After` (giây hoặc HTTP-date). Có thể thêm header báo quota còn lại (IETF RateLimit headers — vẫn là draft; nhiều API dùng `X-RateLimit-*`).
+      - Đặt ở nhiều tầng: edge/API gateway (rẻ, chặn sớm) + app (logic theo user/tenant/plan).
+      - Nhiều instance → counter phải ở shared store (Redis) hoặc gateway, không phải in-memory.
+    followUp: Your rate limiter is keyed on IP, and one enterprise tenant behind a corporate NAT gets blocked. How do you fix it?
+    verify: true
+    tags: [rate-limiting]
+  - id: api-design-008
+    level: easy
+    type: compare
+    q: REST vs GraphQL vs gRPC — give one situation where each is the right choice.
+    hint: |-
+      - **REST**: public/partner API, cần HTTP caching/CDN, client đa dạng, dễ debug bằng curl. Contract = OpenAPI.
+      - **GraphQL**: nhiều UI (web, mobile) cần shape dữ liệu khác nhau trên cùng domain graph; giảm round-trip. Trả giá: caching khó, N+1 resolver, cần giới hạn complexity.
+      - **gRPC**: service-to-service nội bộ, latency thấp, Protobuf nhị phân, streaming, codegen nhiều ngôn ngữ, deadline propagation. Browser cần gRPC-Web/proxy.
+      - Thực tế hay kết hợp: gRPC nội bộ + REST/GraphQL ở BFF cho client.
+    followUp: Your team wants to replace all REST endpoints with GraphQL "for flexibility". What questions do you ask first?
+    tags: [rest, graphql, grpc]
+  - id: api-design-009
+    level: easy
+    type: concept
+    q: What makes a change to an API "breaking"? List changes that look safe but are not.
+    hint: |-
+      - Rõ ràng breaking: xoá/đổi tên field, đổi kiểu (`id` number → string), thêm **required** field vào request, đổi URL/method, đổi auth.
+      - Trông an toàn nhưng breaking:
+        - Thêm giá trị enum mới → client `switch` exhaustive crash.
+        - Đổi default (page size 50 → 20), đổi thứ tự sort mặc định.
+        - Đổi `null` thành "vắng field" hoặc ngược lại.
+        - Chặt validation hơn (max length nhỏ hơn).
+        - Đổi status code (`200` → `201`), đổi format lỗi.
+      - Nguyên tắc: server **conservative in what you send**, client **tolerant reader** (bỏ qua field lạ, có nhánh `unknown` cho enum).
+    followUp: How would you detect breaking changes automatically in CI?
+    tags: [versioning, contracts]
+  - id: api-design-010
+    level: medium
+    type: design
+    q: Design idempotency for `POST /payments`. Where is the key stored, what is its scope, and what happens on concurrent retries?
+    hint: |-
+      - Client sinh `Idempotency-Key` (UUID) cho **một ý định** thanh toán, gửi lại cùng key khi retry.
+      - Server: bảng/Redis `(tenant_id, key)` **unique**, lưu `request_hash`, `status` (processing/done), `response_code`, `response_body`, TTL (VD 24h).
+      - Luồng: insert-if-absent (atomic) → nếu mới: xử lý, lưu response; nếu đã `done`: **replay** response cũ; nếu `processing`: `409` (hoặc chờ); nếu cùng key nhưng **body khác** hash: `422`.
+      - Scope key theo tenant/user để tránh va chạm và lộ dữ liệu.
+      - Side effect bên ngoài (payment provider) cũng cần idempotency key của provider — truyền key xuống.
+      - Header `Idempotency-Key` đang là IETF draft; Stripe là hình mẫu phổ biến.
+    followUp: The server crashes after charging the provider but before saving the response. What does the retry do?
+    redFlags:
+      - Check-then-insert without a unique constraint (race condition)
+      - Uses the request body hash as the key instead of a client-generated key
+    verify: true
+    tags: [idempotency, payments, design]
+  - id: api-design-011
+    level: medium
+    type: design
+    q: How do you implement cursor pagination correctly? Show the query and the cursor format.
+    hint: |-
+      - Sort key **unique và ổn định**: `(created_at DESC, id DESC)`; index composite đúng thứ tự.
+      - Cursor = base64(JSON của giá trị sort key của item cuối) — **opaque** với client; có thể ký HMAC để chống sửa tay.
+      - Query dùng **row value comparison** (PostgreSQL) hoặc mở rộng `OR` (SQL Server không hỗ trợ row value).
+      - Trả `nextCursor: null` khi hết; lấy `limit + 1` row để biết còn trang không (không cần `COUNT(*)`).
+      - Filter phải được **gắn vào cursor** (hoặc validate lại) để client không đổi filter giữa chừng mà dùng cursor cũ.
+    example: |-
+      ```sql
+      -- PostgreSQL
+      SELECT id, created_at, total
+      FROM orders
+      WHERE tenant_id = $1
+        AND (created_at, id) < ($2, $3)      -- từ cursor
+      ORDER BY created_at DESC, id DESC
+      LIMIT 51;                              -- limit + 1
+
+      -- SQL Server: không có row value comparison
+      -- AND (created_at < @c OR (created_at = @c AND id < @id))
+      ```
+      ```ts
+      const cursor = Buffer.from(JSON.stringify({ c: last.createdAt, id: last.id })).toString('base64url');
+      ```
+    followUp: How does Elasticsearch handle deep pagination, and why is `from + size` limited?
+    tags: [pagination, sql, design]
+  - id: api-design-012
+    level: medium
+    type: compare
+    q: Compare API versioning strategies — URL path, header/media type, and "evolve without versions". Which would you pick for a public API and why?
+    hint: |-
+      - URL (`/v1/…`): dễ thấy, dễ route ở gateway, dễ cache; nhưng version cả API một lúc, dễ thành "v2 big bang".
+      - Header/media type (`Accept: application/vnd.acme.v2+json` hoặc `Api-Version: 2025-06-01`): version theo resource hoặc theo ngày (kiểu Stripe date-based) — linh hoạt, nhưng cần `Vary` cho cache, khó test bằng browser.
+      - Evolve không version: chỉ additive + deprecation; cần contract testing và tolerant client.
+      - Public API: thường URL major version + additive trong major; date-based version nếu có nhiều thay đổi nhỏ và muốn pin client.
+      - Dù chọn gì: **deprecation policy** (thời gian báo trước, `Deprecation`/`Sunset` header, đo traffic theo client).
+    followUp: How do you find out which clients still call the deprecated version before removing it?
+    tags: [versioning, contracts]
+  - id: api-design-013
+    level: medium
+    type: design
+    q: How do you use `ETag` and conditional requests for both caching and optimistic concurrency?
+    hint: |-
+      - Caching: server trả `ETag: "v7"`; client gửi `If-None-Match: "v7"` → `304 Not Modified` không body (tiết kiệm băng thông, vẫn tốn round-trip).
+      - Concurrency: client gửi `PUT/PATCH` với `If-Match: "v7"`; server so với version hiện tại → khác thì `412 Precondition Failed` → client reload & merge. Chống **lost update**.
+      - Có thể bắt buộc precondition: thiếu `If-Match` → `428 Precondition Required`.
+      - Server-side: ETag lấy từ `version`/`rowversion` column; `UPDATE … WHERE id = ? AND version = ?` rồi kiểm tra affected rows.
+      - Strong vs weak ETag (`W/"…"`): weak chỉ cho cache, không dùng cho `If-Match` so sánh strong.
+    followUp: How is this different from a pessimistic lock, and when would you choose the lock?
+    tags: [http, caching, concurrency]
+  - id: api-design-014
+    level: medium
+    type: design
+    q: Design a webhook delivery system. How do receivers verify authenticity, and how do you handle retries and ordering?
+    hint: |-
+      - **Ký**: HMAC-SHA256(secret, `timestamp + "." + rawBody`), gửi header chữ ký + timestamp. Receiver verify trên **raw body** (không phải JSON đã parse), dùng constant-time compare, reject nếu timestamp lệch > vài phút (chống replay). Hỗ trợ 2 secret song song khi rotate.
+      - **Delivery**: outbox table → worker gửi; timeout ngắn; retry exponential backoff + jitter trong nhiều giờ/ngày; sau đó dead-letter + UI cho khách "replay".
+      - **At-least-once** → mỗi event có `id` duy nhất, receiver dedupe.
+      - **Ordering** không đảm bảo → gửi `occurredAt`/version; receiver bỏ qua event cũ hơn state hiện tại, hoặc payload mỏng ("thin event") để receiver gọi API lấy state mới nhất.
+      - Receiver nên trả `2xx` nhanh rồi xử lý async.
+    example: |-
+      ```ts
+      import { createHmac, timingSafeEqual } from 'node:crypto';
+
+      function verify(rawBody: Buffer, ts: string, sig: string, secret: string) {
+        if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false; // replay window
+        const expected = createHmac('sha256', secret).update(`${ts}.${rawBody}`).digest('hex');
+        const a = Buffer.from(expected), b = Buffer.from(sig);
+        return a.length === b.length && timingSafeEqual(a, b);
+      }
+      ```
+    followUp: A customer's endpoint is down for 3 days. What happens to their events and to your queue?
+    redFlags:
+      - Verifies the signature against `JSON.stringify(req.body)`
+      - Assumes webhooks arrive exactly once and in order
+    tags: [webhooks, security, reliability]
+  - id: api-design-015
+    level: medium
+    type: compare
+    q: Compare rate limiting algorithms — fixed window, sliding window log, sliding window counter, token bucket, leaky bucket.
+    hint: |-
+      - **Fixed window**: counter theo phút — đơn giản (Redis `INCR` + `EXPIRE`), nhưng **burst gấp đôi** ở ranh giới cửa sổ.
+      - **Sliding window log**: lưu timestamp từng request (ZSET) — chính xác, tốn bộ nhớ.
+      - **Sliding window counter**: nội suy giữa cửa sổ hiện tại và trước — gần đúng, rẻ; phổ biến.
+      - **Token bucket**: bucket dung lượng B, nạp r token/giây — **cho phép burst có kiểm soát**, trung bình r; phổ biến cho API.
+      - **Leaky bucket**: queue xả đều — làm mượt output, thêm latency.
+      - Distributed: thao tác phải **atomic** (Lua script trong Redis) để tránh race giữa các instance.
+    followUp: Write the Redis logic for a token bucket atomically. Why a Lua script instead of GET then SET?
+    tags: [rate-limiting, redis, algorithms]
+  - id: api-design-016
+    level: medium
+    type: gotcha
+    q: What is the N+1 problem in GraphQL, and how does DataLoader solve it? What does DataLoader NOT solve?
+    hint: |-
+      - Query `orders { customer { name } }`: resolver `customer` chạy **1 lần cho mỗi order** → 1 + N query DB.
+      - DataLoader: gom các `load(id)` trong **cùng tick** event loop thành một `batchLoad(ids)` (`WHERE id IN (...)`) + cache **per request**.
+      - Phải tạo DataLoader **mỗi request** (không global) → tránh leak dữ liệu giữa user/tenant và stale cache.
+      - Batch function phải trả kết quả **đúng thứ tự** với `ids` và cùng độ dài.
+      - Không giải quyết: query quá sâu/rộng (cần depth/complexity limit), pagination lồng nhau, N+1 ở tầng khác (REST downstream không có batch endpoint).
+    followUp: How do you protect a public GraphQL endpoint from a single very expensive query?
+    redFlags:
+      - Creates one global DataLoader instance for the whole server
+    tags: [graphql, performance]
+  - id: api-design-017
+    level: medium
+    type: concept
+    q: How does gRPC handle backward compatibility in Protobuf schemas? What are the rules for evolving a message?
+    hint: |-
+      - Wire format dùng **field number**, không dùng tên → đổi tên field an toàn về wire (nhưng hỏng code/JSON mapping).
+      - Được: thêm field mới với number mới (client cũ bỏ qua), xoá field **và `reserved`** number + name.
+      - Không được: đổi number, đổi type không tương thích, tái sử dụng number đã xoá (dữ liệu cũ bị hiểu sai).
+      - proto3: field thiếu = default value (0, "", false) → không phân biệt "không gửi" với "gửi 0", trừ khi dùng `optional` (có presence).
+      - Enum: giá trị đầu tiên nên là `*_UNSPECIFIED = 0`; client phải chịu được giá trị lạ.
+    example: |-
+      ```proto
+      message Order {
+        reserved 3;            // từng là `string coupon = 3;`
+        reserved "coupon";
+        string id = 1;
+        int64 total_cents = 2;
+        optional string note = 4;  // có presence
+      }
+      ```
+    followUp: Why do gRPC calls need deadlines, and what happens if a service does not propagate them?
+    tags: [grpc, protobuf, versioning]
+  - id: api-design-018
+    level: medium
+    type: design
+    q: How do you design an endpoint for a long-running operation such as "export 2 million orders to CSV"?
+    hint: |-
+      - Không giữ HTTP connection mở (timeout ở LB/gateway, retry tạo job trùng).
+      - `POST /exports` → `202 Accepted` + `Location: /exports/{id}`; body `{ id, status: "queued" }`. Nên nhận `Idempotency-Key`.
+      - Worker xử lý qua queue; stream kết quả ra object storage (S3) theo chunk, không load hết vào RAM.
+      - `GET /exports/{id}` → `status` (queued/running/succeeded/failed), `progress`, `downloadUrl` (presigned, hết hạn) khi xong.
+      - Thông báo: polling có `Retry-After`, hoặc webhook/SSE/email.
+      - Quota/concurrency theo tenant để một khách không chiếm hết worker.
+    followUp: The user cancels. How do you model cancellation, and what happens to the partial file?
+    tags: [design, async, jobs]
+  - id: api-design-019
+    level: medium
+    type: design
+    q: How would you design filtering, sorting and field selection for a list endpoint without making it a security or performance hole?
+    hint: |-
+      - Convention rõ ràng: `?status=paid&createdFrom=2026-01-01&sort=-createdAt,id&fields=id,total&limit=50`.
+      - **Allow-list** field được filter/sort (tránh sort theo cột không có index → full scan, tránh lộ cột nội bộ).
+      - Validate kiểu + giới hạn: `limit` max (VD 100), độ dài `IN` list, range ngày tối đa.
+      - Không nối chuỗi vào SQL; map tên field API → cột DB qua bảng cố định.
+      - Tenant filter **luôn** thêm ở server, không lấy từ query param.
+      - Nếu filter phức tạp/full-text → đẩy sang search engine (Elasticsearch) thay vì SQL `LIKE '%x%'`.
+    followUp: Product asks for "any field, any operator" filtering. How do you push back or support it safely?
+    tags: [design, security, performance]
+  - id: api-design-020
+    level: medium
+    type: concept
+    q: What is contract-first API development with OpenAPI, and what do you get from it beyond documentation?
+    hint: |-
+      - Viết/duyệt spec (OpenAPI) **trước** khi code → FE/BE/QA làm song song trên mock.
+      - Lợi ích: codegen client/types (TS), validate request/response tại runtime (middleware), mock server, contract test, **breaking-change diff trong CI** (VD oasdiff), docs tự sinh.
+      - Rủi ro: spec và code lệch nhau → giải bằng generate một chiều (code → spec hoặc spec → code) và test bắt buộc response khớp schema.
+      - Code-first (decorator NestJS/tsoa/zod-to-openapi) cũng ổn nếu spec được review như code.
+    followUp: Frontend and backend disagree whether a field can be null. How does the contract settle it, and how do you enforce it?
+    tags: [openapi, contracts, process]
+  - id: api-design-021
+    level: medium
+    type: design
+    q: How do you handle file uploads in an API — multipart through your server vs presigned URLs to object storage?
+    hint: |-
+      - Multipart qua server: đơn giản, validate được ngay; nhưng tốn băng thông/CPU/RAM của API, dễ bị DoS bằng file lớn, giữ connection lâu.
+      - **Presigned URL** (S3/GCS): `POST /uploads` → server kiểm tra quyền, trả URL ký có hạn (vài phút), giới hạn `Content-Type`/size (presigned POST policy) → client upload thẳng → server nhận event/confirm (`POST /uploads/{id}/complete`) rồi mới gắn vào entity.
+      - Sau upload: scan virus, kiểm tra magic bytes (không tin `Content-Type`), tạo thumbnail async.
+      - File lớn: multipart upload + resume.
+      - Key object chứa tenant prefix, không cho client tự chọn key.
+    followUp: How do you clean up objects that were uploaded but never confirmed?
+    tags: [design, uploads, s3]
+  - id: api-design-022
+    level: medium
+    type: compare
+    q: What is a Backend-for-Frontend (BFF), and how does it differ from an API gateway?
+    hint: |-
+      - **API gateway**: hạ tầng chung trước các service — routing, TLS, auth token validation, rate limit, logging. Không chứa logic theo UI.
+      - **BFF**: một backend **riêng cho từng loại client** (web, mobile), gom nhiều service thành response đúng shape màn hình, giữ token phía server (cookie session cho SPA), giảm round-trip.
+      - Next.js Route Handlers / Server Components thường đóng vai BFF.
+      - Rủi ro BFF: logic nghiệp vụ bị nhân bản vào nhiều BFF; BFF thành "distributed monolith" nếu gọi tuần tự nhiều service (latency cộng dồn).
+    followUp: Your BFF calls 6 downstream services per page. One is slow. How do you keep the page fast?
+    tags: [bff, gateway, architecture]
+  - id: api-design-023
+    level: medium
+    type: gotcha
+    q: Why is `POST /orders/{id}/cancel` acceptable in a "RESTful" API, and when is a verb in the URL a smell?
+    hint: |-
+      - REST là guideline, không phải tôn giáo: một **state transition có nghiệp vụ riêng** (cancel, refund, approve) có validation, side effect, audit riêng → endpoint action rõ ràng hơn `PATCH { status: "cancelled" }`.
+      - `PATCH status` để client tự set trạng thái dễ cho phép transition sai (shipped → pending).
+      - Smell: verb thay cho CRUD bình thường (`POST /getUsers`, `POST /updateUser`), dùng `GET` cho mutation, mọi thứ đều `POST` (mất cache, mất idempotency semantic).
+      - Action endpoint vẫn nên idempotent-friendly: cancel lần 2 trả state hiện tại (hoặc `409` nhất quán).
+    followUp: How would you model the order state machine so invalid transitions are impossible at the API?
+    tags: [rest, design]
+  - id: api-design-024
+    level: medium
+    type: concept
+    q: What HTTP caching headers matter for an API, and which responses must never be cached by a shared cache?
+    hint: |-
+      - `Cache-Control`: `max-age` (browser), `s-maxage` (shared/CDN), `stale-while-revalidate`, `no-store` (không lưu), `no-cache` (lưu nhưng phải revalidate), `private` (chỉ browser).
+      - Validator: `ETag`/`Last-Modified` → `304`.
+      - `Vary`: response phụ thuộc header nào (`Accept-Language`, `Authorization`…) — thiếu `Vary` → CDN trả nhầm biến thể.
+      - Không bao giờ cache ở shared cache: response theo user/tenant (profile, cart, giá riêng tenant) → `private` hoặc `no-store`. Response có `Set-Cookie`.
+      - Public catalog giống nhau cho mọi người → `public, s-maxage=60, stale-while-revalidate=300`.
+    followUp: A CDN served user A's cart to user B. What header was wrong, and how do you audit for it?
+    tags: [http, caching, cdn]
+  - id: api-design-025
+    level: hard
+    type: scenario
+    q: In production, a mobile client on a flaky network creates duplicate orders about 0.3% of the time. Walk through diagnosis and fix.
+    hint: |-
+      - Xác nhận: log/trace cho thấy 2 `POST /orders` cùng payload, cách nhau vài giây, request đầu **thành công ở server** nhưng client timeout (response mất trên đường về) → client/HTTP lib retry.
+      - Kiểm tra ai retry: app code, OkHttp/axios-retry, gateway, service mesh (retry `POST` là sai cấu hình).
+      - Fix gốc: `Idempotency-Key` sinh **một lần khi user bấm "Place order"**, lưu local, gửi lại khi retry; server dedupe atomic (unique constraint).
+      - Phòng thủ thêm: unique constraint nghiệp vụ (VD `cart_id` chỉ checkout một lần), disable nút khi đang gửi.
+      - Dọn dữ liệu: script tìm cặp trùng, huỷ + refund, báo khách.
+      - Metric: tỷ lệ replay idempotency để theo dõi.
+    followUp: The idempotency record and the order insert live in different databases. How do you keep them consistent?
+    redFlags:
+      - Only disables the button on the client
+      - Dedupes by comparing payloads within a time window
+    tags: [idempotency, production, mobile]
+  - id: api-design-026
+    level: hard
+    type: debug
+    q: This rate limiter works in dev but lets through about 3x the configured limit in production. Why?
+    example: |-
+      ```ts
+      const hits = new Map<string, { count: number; resetAt: number }>();
+
+      export function rateLimit(limit = 100, windowMs = 60_000) {
+        return (req: Request, res: Response, next: NextFunction) => {
+          const key = req.ip;
+          const now = Date.now();
+          const entry = hits.get(key) ?? { count: 0, resetAt: now + windowMs };
+          if (now > entry.resetAt) { entry.count = 0; entry.resetAt = now + windowMs; }
+          entry.count++;
+          hits.set(key, entry);
+          if (entry.count > limit) return res.status(429).end();
+          next();
+        };
+      }
+      ```
+    hint: |-
+      - Counter **in-memory per process**: production chạy 3 pod (hoặc cluster mode) → mỗi pod đếm riêng → limit thực tế = 3 × limit.
+      - `req.ip` sau load balancer: nếu không cấu hình `trust proxy` thì mọi request có IP của LB → **một** key cho tất cả (ngược lại: limit toàn hệ thống); nếu trust sai thì client giả `X-Forwarded-For` để né limit.
+      - Map không bao giờ xoá key cũ → memory leak với nhiều IP.
+      - Fixed window → burst gấp đôi ở ranh giới.
+      - Fix: shared store (Redis + Lua atomic, sliding window/token bucket) hoặc rate limit ở gateway; key theo user/API key/tenant khi đã auth; cấu hình trust proxy đúng số hop; trả `Retry-After`.
+    followUp: Redis goes down. Should the rate limiter fail open or fail closed?
+    tags: [rate-limiting, debug, distributed]
+  - id: api-design-027
+    level: hard
+    type: debug
+    q: Users report that paging through "recent orders" sometimes shows the same order twice and skips others. Find the bug.
+    example: |-
+      ```ts
+      // GET /orders?page=3&size=20
+      const rows = await db.query(
+        `SELECT * FROM orders WHERE tenant_id = $1
+         ORDER BY created_at DESC
+         LIMIT $2 OFFSET $3`,
+        [tenantId, size, (page - 1) * size],
+      );
+      ```
+    hint: |-
+      - **Offset trên dữ liệu đang thay đổi**: order mới được insert ở đầu list giữa lúc user xem trang 2 và 3 → mọi thứ dịch xuống → trang 3 lặp lại item cuối trang 2. Xoá thì ngược lại → bị skip.
+      - **Sort không unique**: nhiều order cùng `created_at` (batch import, độ phân giải giây) → DB không đảm bảo thứ tự giữa các lần query → item nhảy qua lại giữa các trang.
+      - Fix: tie-breaker `ORDER BY created_at DESC, id DESC`; chuyển sang keyset/cursor pagination; index `(tenant_id, created_at DESC, id DESC)`.
+      - Bonus: `SELECT *` trả cả cột nội bộ — chọn cột cụ thể/DTO.
+    followUp: The product team insists on page numbers in the admin UI. What compromise do you offer?
+    tags: [pagination, debug, sql]
+  - id: api-design-028
+    level: hard
+    type: debug
+    q: A webhook receiver rejects every event as "invalid signature" after a framework upgrade, though the secret is correct. What is wrong?
+    example: |-
+      ```ts
+      app.use(express.json());
+
+      app.post('/webhooks/payments', (req, res) => {
+        const signature = req.header('x-signature')!;
+        const expected = crypto
+          .createHmac('sha256', process.env.WEBHOOK_SECRET!)
+          .update(JSON.stringify(req.body))
+          .digest('hex');
+        if (signature !== expected) return res.status(401).end();
+        handle(req.body);
+        res.sendStatus(200);
+      });
+      ```
+    hint: |-
+      - Ký trên **`JSON.stringify(req.body)`** thay vì **raw bytes**: body đã bị parse rồi serialize lại → khác thứ tự key, whitespace, unicode escaping, số (`1.0` → `1`) → hash khác. Upgrade framework/parser đổi cách serialize là đủ làm vỡ.
+      - Fix: lấy raw body cho route này (`express.raw({ type: 'application/json' })` hoặc `verify` callback lưu `req.rawBody`), HMAC trên raw buffer (+ timestamp theo spec của provider).
+      - So sánh bằng `!==` → timing attack; dùng `crypto.timingSafeEqual` (cùng độ dài).
+      - Thiếu kiểm tra timestamp → replay; thiếu dedupe theo event id.
+      - Xử lý đồng bộ `handle()` trước khi trả 200 → provider timeout rồi retry → xử lý trùng.
+    followUp: How do you rotate the webhook secret without dropping events?
+    tags: [webhooks, security, debug]
+  - id: api-design-029
+    level: hard
+    type: scenario
+    q: A partner complains your API returns 429s even though they are "well under the limit". How do you investigate?
+    hint: |-
+      - Xác định **key** đang bị limit: IP (partner đi qua NAT/egress chung với nhiều hệ thống?), API key dùng chung nhiều service của partner, hay tenant.
+      - Xem **tầng nào** trả 429: CDN/WAF, gateway, app, hay downstream (bạn đang forward 429 của dịch vụ thứ ba?).
+      - Window/thuật toán: fixed window + burst đầu phút; partner đo theo giờ còn bạn limit theo giây.
+      - Retry storm: client retry ngay không backoff → tự đẩy mình vượt limit; thiếu `Retry-After` để hướng dẫn.
+      - Lệch clock/nhiều region có counter riêng.
+      - Hành động: trả header quota (limit/remaining/reset), dashboard theo key, limit theo plan/tenant thay vì IP, doc rõ policy, cấp burst hợp lý.
+    followUp: How would you design per-plan quotas (free/pro/enterprise) with monthly limits and per-second limits together?
+    tags: [rate-limiting, production, scenario]
+  - id: api-design-030
+    level: hard
+    type: design
+    q: You need to rename a field used by 40 external clients (`customer_name` → `customer.fullName`). Plan the migration.
+    hint: |-
+      - **Expand**: trả cả hai (`customer_name` và `customer.fullName`), chấp nhận cả hai ở input (field mới thắng nếu cả hai có). Document field mới, đánh dấu field cũ `deprecated` trong OpenAPI.
+      - **Communicate**: changelog, email, header `Deprecation` + `Sunset: <date>` trên response dùng field cũ, link migration guide.
+      - **Measure**: log theo client/API key ai còn **gửi** hoặc **đọc** field cũ (đọc khó đo → dùng sparse fieldsets/`fields=` hoặc version pin để biết).
+      - **Contract**: sau sunset và traffic ~0 → remove (hoặc chỉ remove ở version mới).
+      - Không đổi ngữ nghĩa field cũ trong thời gian chuyển tiếp.
+    followUp: One large client refuses to migrate before the sunset date. What are your options?
+    verify: true
+    tags: [versioning, migration, contracts]
+  - id: api-design-031
+    level: hard
+    type: scenario
+    q: A downstream service your API depends on becomes slow (p99 from 200 ms to 8 s). Your API's thread pool / event loop saturates and everything times out. What should have been in place?
+    hint: |-
+      - **Timeout** ngắn hơn SLA của chính bạn cho mọi outbound call (không dùng default "vô hạn"); deadline propagation (gRPC deadline, header budget).
+      - **Retry có giới hạn** + exponential backoff + jitter, chỉ cho lỗi retryable và request idempotent; retry budget để không khuếch đại tải.
+      - **Circuit breaker**: fail fast khi downstream lỗi liên tục, half-open để thử lại.
+      - **Bulkhead**: giới hạn concurrency riêng cho từng downstream (connection pool riêng) để một dependency chậm không chiếm hết tài nguyên.
+      - **Fallback / degrade**: cache cũ, ẩn widget không thiết yếu, trả partial response.
+      - **Load shedding**: trả `503` + `Retry-After` sớm khi queue quá dài.
+    followUp: How do you choose the timeout value, and why is "p99 of the downstream" not always the answer?
+    tags: [resilience, timeouts, production]
+  - id: api-design-032
+    level: hard
+    type: gotcha
+    q: What goes wrong when you expose GraphQL publicly without limits, and what protections do you add?
+    hint: |-
+      - Query lồng sâu/vòng (`user { friends { friends { … } } }`), alias lặp (`a1: expensive, a2: expensive…`), batch nhiều operation trong một request → một request = hàng nghìn query DB.
+      - Introspection bật ở production giúp attacker map toàn schema.
+      - Bảo vệ: depth limit, **query cost/complexity analysis** (field cost × list size), giới hạn `first/limit` bắt buộc cho list, timeout per request, rate limit theo **cost** chứ không theo số request.
+      - **Persisted queries / trusted documents**: client chỉ gửi hash của query đã được duyệt — chặn query tuỳ ý, và cho phép GET + CDN cache.
+      - Authorization ở **resolver/field level**, không chỉ ở endpoint.
+      - Error message không lộ stack trace.
+    followUp: How do you do HTTP caching for GraphQL queries?
+    tags: [graphql, security, performance]
+  - id: api-design-033
+    level: hard
+    type: design
+    q: Design the API for a bulk operation — "update prices for up to 10,000 products". How do you report partial failure?
+    hint: |-
+      - Tách hai chế độ: nhỏ (≤ ~100) đồng bộ; lớn → async job (`202` + status resource).
+      - Semantics phải chọn rõ: **all-or-nothing** (một transaction, lỗi một → rollback, trả `422` với danh sách lỗi) hay **best-effort** (xử lý từng item).
+      - Best-effort: response `200`/`207`-style body liệt kê từng item `{ index/id, status, error }`; tổng hợp `succeeded/failed`. Không trả `200` "OK" chung chung che lỗi.
+      - Idempotency cho cả batch (key) và từng item (id) để retry phần lỗi an toàn.
+      - Giới hạn kích thước, validate toàn bộ trước khi ghi, chunk ghi DB để không lock bảng lâu, bắn event/revalidate cache sau cùng.
+    followUp: Half of the batch succeeded when the worker crashed. How does the client resume without re-applying the first half?
+    tags: [design, bulk, errors]
+  - id: api-design-034
+    level: hard
+    type: compare
+    q: Server-Sent Events vs WebSocket vs long polling vs webhooks — how do you choose for pushing order status updates?
+    hint: |-
+      - **Long polling**: đơn giản, qua mọi proxy; tốn connection và latency cao hơn.
+      - **SSE**: một chiều server → browser trên HTTP, auto-reconnect với `Last-Event-ID`, text only; hợp cho status/notification. Cần proxy không buffer.
+      - **WebSocket**: hai chiều, latency thấp (chat, collaborative, trading); phải tự xử lý reconnect, heartbeat, auth khi upgrade, sticky session hoặc pub/sub (Redis) khi scale ngang.
+      - **Webhooks**: server → **server** của đối tác; không dùng cho browser.
+      - Order status (một chiều, tần suất thấp) → SSE hoặc polling có `ETag`; chỉ chọn WebSocket khi cần hai chiều.
+    followUp: You scale WebSocket servers to 10 pods. How does an event produced on pod 3 reach a user connected to pod 7?
+    tags: [realtime, sse, websocket]
+  - id: api-design-035
+    level: hard
+    type: gotcha
+    q: 'Your API returns money as a JSON number (`"total": 19.99`) and some clients show `19.990000000000002`. What are the correct conventions for money, time and IDs in JSON?'
+    hint: |-
+      - Money: **không** dùng float. Dùng integer minor units (`totalCents: 1999`) hoặc string decimal (`"19.99"`) + `currency` ISO 4217 riêng. Lưu ý đơn vị nhỏ nhất khác nhau theo currency (JPY 0 chữ số, BHD 3).
+      - Time: ISO 8601/RFC 3339 có timezone (`2026-09-29T08:30:00Z`), lưu UTC; ngày thuần (sinh nhật) là `YYYY-MM-DD` không timezone.
+      - ID 64-bit: JS `Number` mất chính xác trên 2^53 → trả **string**.
+      - Enum là string, không phải số ma thuật; client tolerant với giá trị mới.
+    followUp: Tax is computed per line then summed vs on the total — how does that affect rounding and your API contract?
+    tags: [contracts, json, money]
+  - id: api-design-036
+    level: senior
+    type: design
+    q: Design the public API strategy for a multi-tenant commerce platform used by retailers (admin integrations) and their customers (storefront apps). What differs between the two audiences?
+    hint: |-
+      Không có đáp án duy nhất — đánh giá tư duy:
+      - Hai audience, hai surface: **Admin API** (server-to-server, OAuth client credentials/API key theo tenant, scope chi tiết, rate limit theo plan, webhooks) và **Storefront API** (public-ish, token theo storefront, cache mạnh ở CDN, chỉ read catalog + cart/checkout).
+      - Tenant resolution: từ token (không tin path/header client tự set); mọi query scoped theo tenant ở tầng data access.
+      - Versioning + deprecation policy công khai; changelog; sandbox tenant.
+      - Idempotency cho checkout/payment; pagination cursor; Problem Details.
+      - Noisy neighbour: quota theo tenant, bulkhead, cost-based limit cho export/search.
+      - Observability theo tenant/client để hỗ trợ và để biết ai dùng field deprecated.
+    followUp: A large retailer wants a custom field on orders that no other tenant needs. How do you support it without forking the API?
+    tags: [design, multi-tenancy, strategy]
+  - id: api-design-037
+    level: senior
+    type: open
+    q: Your company has 30 internal services each with its own error format, pagination style and auth header. How do you standardize API conventions across teams without blocking delivery?
+    hint: |-
+      Đo độ trưởng thành, không có một đáp án:
+      - Viết **API guidelines** ngắn (tham khảo Google/Zalando/Microsoft guidelines), ADR cho quyết định lớn: Problem Details, cursor pagination, naming, versioning, idempotency.
+      - Enforce bằng tooling thay vì review thủ công: linter OpenAPI (Spectral ruleset), breaking-change check trong CI, shared middleware/SDK (error handler, pagination helper).
+      - Áp dụng cho **API mới** trước; API cũ chuyển dần khi có lý do chạm vào (không big-bang).
+      - API review nhẹ (async, checklist) cho endpoint public; đo adoption bằng lint score.
+      - Chấp nhận ngoại lệ có ghi lý do.
+    followUp: A senior engineer on another team argues the guidelines slow them down. How do you handle it?
+    tags: [leadership, standards, process]
+  - id: api-design-038
+    level: senior
+    type: design
+    q: When would you choose GraphQL federation, a BFF, or plain REST aggregation for a platform with 8 domain services and 3 frontends?
+    hint: |-
+      Trade-off, không đáp án cứng:
+      - **REST + BFF per frontend**: đơn giản, team FE sở hữu BFF, dễ cache; nhược: logic gom trùng lặp, nhiều BFF phải bảo trì.
+      - **GraphQL gateway (một schema)**: FE tự chọn field, một graph; cần team platform sở hữu schema, xử lý N+1, cost limit, caching.
+      - **Federation**: mỗi domain team sở hữu subgraph, gateway compose → scale về tổ chức; nhược: độ phức tạp vận hành cao (query planning, entity resolution, versioning schema, tracing xuyên subgraph).
+      - Tiêu chí: số team & ownership, mức độ khác nhau về data shape giữa các frontend, yêu cầu caching/CDN, kỹ năng hiện có, latency budget.
+    followUp: How do you prevent one subgraph's slowness from degrading every query that touches it?
+    tags: [graphql, bff, architecture]
+  - id: api-design-039
+    level: senior
+    type: open
+    q: How do you decide the SLOs and limits for a new public API (latency, availability, payload size, rate limits)? What would you put in the contract?
+    hint: |-
+      - Bắt đầu từ **use case của client** (checkout cần p99 thấp; export chấp nhận async), không phải từ khả năng hiện tại của hệ thống.
+      - SLI rõ ràng: availability theo tỷ lệ request non-5xx, latency p95/p99 theo endpoint class; SLO nội bộ chặt hơn SLA công bố.
+      - Limit công khai: payload max, page size max, rate limit theo plan, timeout, retention của idempotency key, số webhook retry.
+      - Error budget quyết định tốc độ ship vs ổn định.
+      - Đo trước khi hứa: load test, dữ liệu beta.
+    followUp: Your p99 SLO is breached only for one tenant with huge catalogs. Is that an SLO breach?
+    tags: [slo, reliability, design]
+  - id: api-design-040
+    level: senior
+    type: design
+    q: Design authorization for a REST API where users can have different roles in different tenants and some resources are shared across tenants.
+    hint: |-
+      - Model: user ↔ membership(tenant, role) ↔ permissions; token chứa user + **tenant đang hoạt động** (hoặc gửi tenant rồi server verify membership), không nhồi toàn bộ permission vào JWT nếu thay đổi thường xuyên.
+      - Check hai lớp: **coarse** ở middleware (có quyền `orders:read` trong tenant này không) + **fine-grained** ở data layer (resource thuộc tenant/owner) để chống IDOR.
+      - Resource chia sẻ (catalog chung, marketplace): bảng grant/ACL rõ ràng, hoặc ReBAC (quan hệ) thay vì hack `tenant_id IS NULL`.
+      - Trả `404` cho resource tenant khác; audit log mọi hành động admin.
+      - Cân nhắc policy engine (OPA/Cedar/OpenFGA) khi rule phức tạp; test authorization bằng ma trận role × endpoint.
+    followUp: A user's role is revoked but their JWT is valid for 30 more minutes. What is your strategy?
+    tags: [authorization, multi-tenancy, security]
+  - id: api-design-041
+    level: cv
+    type: design
+    q: On a multi-tenant B2B2C commerce platform you built Checkout. Walk me through the checkout API — how did you make "place order" safe against retries and double-submits?
+    hint: |-
+      Câu trả lời mạnh có cấu trúc:
+      - Luồng endpoint: tạo/validate cart → tính giá (tax, shipping, promotion) phía server → `POST` place order → payment → xác nhận.
+      - Chống trùng: idempotency key (hoặc unique theo `cart_id`/checkout session), transaction + unique constraint, xử lý trường hợp payment thành công nhưng lưu order lỗi (reconciliation).
+      - Tenant-aware: giá/tax/phương thức thanh toán theo retailer, token scoped tenant.
+      - Lỗi trả về cho FE: mã lỗi ổn định (hết hàng, giá đổi, coupon hết hạn) để UI xử lý.
+      - Kết quả/incident thật (điền số liệu thật của bạn: tỷ lệ đơn trùng trước/sau, p95 latency).
+    followUp: The price of an item changed between "view cart" and "place order". What did your API return, and why?
+    tags: [cv, checkout, idempotency]
+  - id: api-design-042
+    level: cv
+    type: scenario
+    q: You owned high-traffic APIs on that platform. Which endpoints were hottest, what limits or caching did you put in front of them, and how did you measure the effect?
+    hint: |-
+      Gợi ý nội dung mạnh:
+      - Nêu cụ thể endpoint nóng (catalog/search/product detail/cart) và traffic pattern (peak, campaign).
+      - Biện pháp: Redis cache (key có tenant), HTTP cache headers/CDN cho dữ liệu public, pagination bắt buộc, rate limit theo tenant/client, đẩy search sang Elasticsearch.
+      - Cách đo: p95/p99 latency, DB CPU, cache hit ratio, error rate trước/sau (điền số liệu thật của bạn).
+      - Nói luôn điều **không** hiệu quả hoặc trade-off (stale data, invalidation phức tạp).
+    followUp: How did you invalidate cached catalog data when a retailer updated a product?
+    tags: [cv, performance, caching]
+  - id: api-design-043
+    level: cv
+    type: design
+    q: You worked on tenant-aware authorization with RBAC and Google OAuth. How was the tenant resolved on each API request, and where exactly was the authorization check enforced?
+    hint: |-
+      Câu trả lời mạnh cần nói rõ:
+      - Nguồn tenant: subdomain/host, claim trong JWT, hay header — và **server verify** membership thay vì tin client.
+      - Luồng Google OAuth → tạo/ghép user nội bộ → phát token của hệ thống (không dùng thẳng Google token cho API nội bộ).
+      - RBAC: role theo tenant, permission check ở middleware/guard + filter theo tenant ở data layer (repository/ORM scope).
+      - Case khó: user thuộc nhiều tenant, retailer vs customer, admin nội bộ "impersonate".
+      - Một bug/incident authorization thật đã fix và test đã thêm (điền chi tiết thật của bạn).
+    followUp: How did you test that no endpoint leaks data across tenants?
+    tags: [cv, authorization, multi-tenancy, oauth]
+  - id: api-design-044
+    level: cv
+    type: scenario
+    q: When splitting a back-office monolith into microservices, how did you keep the existing API contracts backward compatible for clients that could not change?
+    hint: |-
+      Nội dung mạnh:
+      - Pattern: strangler fig — gateway/route giữ URL cũ, chuyển dần từng endpoint sang service mới.
+      - Contract giữ nguyên: adapter/anti-corruption layer map response mới về shape cũ; contract test (consumer-driven) so response cũ vs mới; shadow traffic/dual-run để so sánh.
+      - Event (Kafka) schema cũng là contract: versioning, chỉ thêm field optional.
+      - Rollback plan khi service mới lỗi.
+      - Nêu một breaking change suýt lọt và cách bạn bắt được (điền ví dụ thật của bạn).
+    followUp: How did you handle a field whose meaning differed between the monolith and the new service?
+    tags: [cv, microservices, backward-compatibility]
+  - id: api-design-045
+    level: cv
+    type: design
+    q: For the Address Management feature, how did you design the API — validation, default address handling, and concurrent edits from multiple devices?
+    hint: |-
+      Gợi ý câu trả lời mạnh:
+      - Resource design: `/customers/{id}/addresses` CRUD, action/field cho default (`PATCH isDefault` hay `POST …/default`), đảm bảo **đúng một** default (transaction hoặc partial unique index).
+      - Validation: server-side theo quốc gia (postal code format), chuẩn hoá; lỗi trả theo field.
+      - Concurrency: `ETag/If-Match` hoặc version column; hành vi khi xoá address đang được dùng bởi order (snapshot address vào order, không reference).
+      - Tenant: format/quốc gia hỗ trợ khác nhau theo retailer.
+      - Nêu quyết định bạn đã cân nhắc và vì sao (điền chi tiết thật của bạn).
+    followUp: Why should an order store a copy of the shipping address instead of a foreign key to the address book?
+    tags: [cv, design, concurrency]
+  - id: api-design-046
+    level: cv
+    type: design
+    q: You built a data enrichment and indexer service feeding Elasticsearch. What does the search API in front of it look like — pagination, filtering, and consistency with the source database?
+    hint: |-
+      Câu trả lời mạnh nêu:
+      - Pagination: `search_after` + PIT (point in time) cho deep paging thay vì `from + size` (bị giới hạn bởi `index.max_result_window`, mặc định 10,000).
+      - Filter/facet allow-list, tenant filter bắt buộc ở query builder (hoặc index/alias theo tenant).
+      - Consistency: index là **eventually consistent** — pipeline (CDC/outbox/Kafka) → indexer; API nói rõ độ trễ; đọc-sau-ghi dùng DB cho màn hình vừa sửa.
+      - Reindex không downtime: index mới + alias swap.
+      - Số liệu thật: độ trễ index, p95 search, kích thước index (điền số liệu thật của bạn).
+    followUp: A product was deleted in SQL but still appears in search for 10 minutes. Where do you look?
+    verify: true
+    tags: [cv, elasticsearch, search, pagination]

@@ -1,0 +1,1041 @@
+id: 24-aws
+slug: aws
+title: AWS for Full-stack Engineers
+tier: 7
+status: drafted
+summary: IAM, VPC, compute (EC2/ECS/Lambda), ALB/API Gateway, S3/CloudFront, RDS/Aurora, SQS/SNS, observability — theo tình huống phỏng vấn cho một app Node/Next.js.
+cvLinked: false
+prerequisites: []
+overview: |-
+  ## TL;DR
+
+  - Phỏng vấn AWS cho full-stack **không phải đề thi chứng chỉ**: interviewer muốn nghe bạn deploy một app Node/Next.js thật — traffic đi qua đâu, secret nằm ở đâu, cái gì chết thì hệ thống sống sót thế nào, và hoá đơn cuối tháng bao nhiêu.
+  - 5 trục phải nói trôi chảy: **IAM** (ai được gọi API nào — role + STS, least privilege, thứ tự evaluate policy), **VPC** (public/private subnet, NAT, SG vs NACL, VPC endpoint), **compute** (ECS/Fargate vs Lambda vs EKS vs EC2), **data** (RDS/Aurora Multi-AZ vs read replica, DynamoDB, ElastiCache, S3), **integration** (SQS/SNS/EventBridge, visibility timeout, DLQ).
+  - Mọi câu trả lời tốt đều có 3 lớp: **cơ chế** (nó hoạt động thế nào) → **failure mode** (nó hỏng thế nào) → **cost/ops** (nó tốn bao nhiêu, ai vận hành).
+  - Con số (limit, giá, quota) **thay đổi liên tục** — nói con số kèm "khoảng / theo docs hiện tại", và luôn kiểm tra Service Quotas trước khi thiết kế.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | IAM role + STS | Identity không có long-term key; ai được phép `AssumeRole` sẽ nhận **temporary credentials** | ECS task role cho phép task đọc đúng 1 bucket, không cần access key trong `.env` |
+  | Policy evaluation | Mặc định deny → explicit **Deny thắng tất cả** → cần ít nhất một Allow, và mọi "trần" (SCP, permission boundary, session policy) đều phải cho phép | SCP chặn `ap-southeast-1` thì admin cũng không tạo được EC2 ở region đó |
+  | Public vs private subnet | Public = route table có `0.0.0.0/0 → IGW`; private thì không | ALB ở public subnet, ECS task + RDS ở private subnet |
+  | NAT Gateway | Cho private subnet gọi **ra** internet, không cho gọi **vào**; tính tiền theo giờ **và** theo GB | Task gọi Stripe API qua NAT; kéo image ECR qua NAT → hoá đơn data processing tăng vọt |
+  | Security Group vs NACL | SG: stateful, chỉ allow, gắn ENI, reference được SG khác. NACL: stateless, có deny, gắn subnet, rule có thứ tự | RDS SG chỉ allow 5432 từ `sg-app` |
+  | VPC endpoint | Đi tới AWS service bằng mạng nội bộ; Gateway endpoint (S3, DynamoDB) miễn phí, Interface endpoint (PrivateLink) tính theo giờ + GB | S3 gateway endpoint cắt phí NAT cho upload/download |
+  | Lambda cold start | Lần đầu (hoặc khi scale out) phải tạo execution environment + chạy init code | Next.js SSR trên Lambda: request đầu sau khi idle chậm hơn vài trăm ms tới vài giây |
+  | Multi-AZ vs read replica | Multi-AZ = **availability** (standby đồng bộ, failover tự động). Read replica = **scale đọc** (async, có lag) | Aurora: replica vừa là failover target vừa phục vụ đọc |
+  | SQS visibility timeout | Message đang được xử lý bị ẩn trong khoảng này; hết giờ mà chưa delete → message hiện lại → xử lý **lần hai** | Lambda timeout 60s nhưng visibility 30s → duplicate |
+  | Presigned URL | URL tạm thời ký bằng credential của bạn, cho client upload/download S3 trực tiếp | Browser `PUT` ảnh 20 MB thẳng lên S3, API server không phải stream file |
+
+  ## Cơ chế hoạt động — một app Next.js + Node API trên AWS
+
+  ```mermaid
+  flowchart LR
+    U["User"] --> R53["Route 53"]
+    R53 --> CF["CloudFront + WAF"]
+    CF -- "/_next/static, images" --> S3[("S3 bucket<br/>OAC, private")]
+    CF -- "dynamic" --> ALB["ALB<br/>(public subnets, 2+ AZ)"]
+    subgraph VPC["VPC"]
+      ALB --> ECS["ECS Fargate tasks<br/>Next.js + API<br/>(private subnets)"]
+      ECS --> RDSP["RDS Proxy"] --> AUR[("Aurora PostgreSQL<br/>writer + reader")]
+      ECS --> REDIS[("ElastiCache")]
+      ECS --> SQS[["SQS queue"]]
+      SQS --> WRK["Worker (Lambda/ECS)"]
+      WRK --> DLQ[["DLQ"]]
+      ECS -- "gateway endpoint" --> S3
+      ECS -- "egress" --> NAT["NAT Gateway"] --> EXT["3rd-party APIs"]
+    end
+    ECS -. "task role (STS)" .-> SM["Secrets Manager / KMS"]
+    ECS -. "logs, metrics, traces" .-> CW["CloudWatch / X-Ray (OTel)"]
+  ```
+
+  **IAM policy evaluation (trong một account, rút gọn):**
+
+  ```mermaid
+  flowchart TD
+    A["Request: principal + action + resource"] --> B{"Explicit Deny ở bất kỳ policy nào?"}
+    B -- "có" --> DENY["DENY"]
+    B -- "không" --> C{"SCP / RCP của Organization cho phép?"}
+    C -- "không" --> DENY
+    C -- "có" --> D{"Resource-based policy Allow?"}
+    D -- "có (cùng account)" --> ALLOW["ALLOW"]
+    D -- "không" --> E{"Identity-based policy Allow?"}
+    E -- "không" --> DENY
+    E -- "có" --> F{"Permission boundary + session policy cũng cho phép?"}
+    F -- "không" --> DENY
+    F -- "có" --> ALLOW
+  ```
+
+  > Cross-account: cần **cả hai phía** cho phép — identity policy ở account gọi **và** resource policy (hoặc trust policy của role) ở account đích. Chi tiết edge case (resource policy grant trực tiếp cho role session, permission boundary) xem docs "Policy evaluation logic".
+
+  ## Trade-offs
+
+  | Lựa chọn | Hợp khi | Không hợp khi | Chi phí vận hành |
+  |---|---|---|---|
+  | **Lambda** | Traffic đột biến / thưa, event-driven (S3, SQS), job ngắn | Request dài (> 15 phút), WebSocket giữ lâu, cần connection pool ổn định, latency p99 nhạy cold start | Thấp nhất; nhưng debug phân tán, quota concurrency |
+  | **ECS Fargate** | Web/API container chạy liên tục, Socket.IO, team không muốn quản node | Cần GPU/daemonset/tuỳ biến kernel; workload rất lớn thì EC2 rẻ hơn | Thấp–vừa |
+  | **EKS** | Đã có chuẩn Kubernetes, multi-cloud, nhiều team, cần ecosystem (Argo, operators) | Team nhỏ, 3–5 service | Cao (upgrade cluster, add-on, networking) |
+  | **EC2 + ASG** | Cần kiểm soát OS, workload ổn định dùng Savings Plans | Muốn deploy nhanh, ít ops | Cao nhất (patch, AMI) |
+  | **ALB** | HTTP/HTTPS, route theo host/path, WebSocket, OIDC auth | Non-HTTP, cần IP tĩnh | Theo giờ + LCU |
+  | **NLB** | TCP/UDP/TLS, IP tĩnh, latency thấp, PrivateLink | Cần route L7 | Theo giờ + NLCU |
+  | **API Gateway** | API cho Lambda, cần throttling/usage plan/API key, auth tích hợp | Payload lớn, request dài, traffic rất cao ổn định (giá per-request) | Theo request |
+  | **RDS/Aurora** | Dữ liệu quan hệ, transaction, query linh hoạt | Access pattern key-value ở quy mô cực lớn | Vừa |
+  | **DynamoDB** | Access pattern biết trước, key-value, scale gần như vô hạn | Ad-hoc query, join, báo cáo | Thấp |
+  | **SQS** | Work queue, buffer, retry + DLQ | Cần replay, nhiều consumer đọc cùng stream | Rất thấp |
+  | **SNS / EventBridge** | Fan-out (SNS) / route theo nội dung event, SaaS integration, scheduler (EventBridge) | Cần ordering nghiêm ngặt + replay dài hạn (→ Kinesis/MSK) | Thấp |
+
+  ## Pitfalls
+
+  - Nhét **access key** vào `.env` của container thay vì dùng task role / instance profile / IRSA / Pod Identity.
+  - Policy `"Resource": "*"` và `"Action": "s3:*"` "cho chạy được đã" — rồi không bao giờ siết lại.
+  - Đặt RDS ở public subnet với `0.0.0.0/0:5432` để "debug nhanh".
+  - Quên **NAT Gateway data processing**: kéo image ECR, gọi S3 qua NAT thay vì VPC endpoint → hoá đơn lớn bất ngờ. NAT Gateway nên có **một cái mỗi AZ** nếu cần HA (và traffic cross-AZ cũng tốn tiền).
+  - Lambda mở DB connection trong handler → connection storm khi scale; không dùng RDS Proxy.
+  - SQS visibility timeout ngắn hơn thời gian xử lý → duplicate; không có DLQ → poison message lặp vô hạn.
+  - Nghĩ "Multi-AZ = scale đọc" (sai với RDS Multi-AZ instance: standby không phục vụ đọc).
+  - Bucket S3 public để CloudFront đọc — dùng **OAC** và bucket private.
+  - Không đặt **budget alarm** và không tag tài nguyên → không biết tiền đi đâu.
+
+  ## Cheat sheet
+
+  - Người/CI dùng **Identity Center / OIDC federation** (GitHub Actions → `AssumeRoleWithWebIdentity`), workload dùng **role**. Không có long-term key.
+  - Explicit Deny > mọi thứ. SCP không *cấp* quyền, chỉ đặt trần.
+  - Private subnet đi ra: NAT GW (tốn tiền) hoặc VPC endpoint (S3/DynamoDB gateway: miễn phí).
+  - SG reference SG: `sg-rds` allow 5432 từ `sg-app` — không dùng CIDR.
+  - S3: strong read-after-write consistency (từ 12/2020). Upload lớn → presigned URL + multipart.
+  - CloudFront → S3: **OAC** (OAI là legacy).
+  - Lambda + RDS → **RDS Proxy**; tạo client **ngoài** handler.
+  - SQS: visibility timeout ≥ ~6× function timeout khi dùng Lambda event source (khuyến nghị của AWS); DLQ với `maxReceiveCount`; consumer phải **idempotent** (at-least-once).
+  - Multi-AZ = HA; read replica = scale đọc; Aurora Global Database / cross-region replica = DR.
+  - DR theo chi phí tăng dần: backup & restore → pilot light → warm standby → multi-site active/active.
+  - Well-Architected: 6 pillars — Operational Excellence, Security, Reliability, Performance Efficiency, Cost Optimization, Sustainability.
+notionRefs:
+  - title: AWS
+    url: https://app.notion.com/p/3b4ef77f8ab280739589e251ccecfc37
+references:
+  - title: IAM — Policy evaluation logic
+    url: https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic.html
+  - title: IAM — Security best practices
+    url: https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html
+  - title: Amazon VPC — How Amazon VPC works
+    url: https://docs.aws.amazon.com/vpc/latest/userguide/how-it-works.html
+  - title: AWS Lambda — Quotas
+    url: https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html
+  - title: AWS Lambda — Understanding the execution environment lifecycle
+    url: https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtime-environment.html
+  - title: Amazon SQS — Visibility timeout
+    url: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html
+  - title: Amazon S3 — Data consistency model
+    url: https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel
+  - title: Amazon CloudFront — Restricting access to an Amazon S3 origin (OAC)
+    url: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html
+  - title: Amazon RDS — Multi-AZ deployments
+    url: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZ.html
+  - title: Amazon RDS Proxy
+    url: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.html
+  - title: AWS Well-Architected Framework
+    url: https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html
+  - title: Disaster recovery of workloads on AWS (whitepaper)
+    url: https://docs.aws.amazon.com/whitepapers/latest/disaster-recovery-workloads-on-aws/disaster-recovery-options-in-the-cloud.html
+questions:
+  - id: aws-001
+    level: easy
+    type: compare
+    q: What is the difference between an IAM user, an IAM role and an IAM group? Which one should your Node API running on ECS use?
+    hint: |-
+      - **User**: identity lâu dài, có password/access key dài hạn. **Group**: tập hợp user để gắn policy chung (group không phải principal, không assume được).
+      - **Role**: identity không có credential dài hạn; ai được **trust policy** cho phép thì `sts:AssumeRole` để nhận **temporary credentials** (tự hết hạn).
+      - Node API trên ECS dùng **task role** (quyền của app) — SDK tự lấy credential từ container credential endpoint. Tách biệt với **task execution role** (quyền để ECS agent kéo image ECR, đọc secret, ghi log).
+      - Best practice hiện nay: người dùng thật đăng nhập qua **IAM Identity Center** (SSO), hạn chế tối đa IAM user.
+    followUp: What is the difference between the ECS task role and the task execution role, and which one needs `secretsmanager:GetSecretValue` if you inject a secret as an env var?
+    redFlags:
+      - "Create an IAM user for the app and put the access key in .env"
+      - Does not know roles give temporary credentials
+    tags: [iam, ecs]
+  - id: aws-002
+    level: easy
+    type: concept
+    q: Explain the principle of least privilege with a concrete IAM policy for a service that only uploads user avatars to one S3 prefix.
+    hint: |-
+      Least privilege = cấp **đúng action, đúng resource, đúng điều kiện** cần thiết, không hơn.
+      Với upload avatar: chỉ `s3:PutObject` trên `arn:aws:s3:::my-bucket/avatars/*` — không `s3:*`, không `Resource: "*"`, không `s3:DeleteObject` nếu không cần.
+      Có thể siết thêm bằng `Condition` (ví dụ bắt buộc SSE-KMS, hoặc `aws:SourceVpce`).
+      Công cụ hỗ trợ: **IAM Access Analyzer** (generate policy từ CloudTrail, tìm unused access), last-accessed data.
+    example: |-
+      ```json
+      {
+        "Version": "2012-10-17",
+        "Statement": [{
+          "Effect": "Allow",
+          "Action": "s3:PutObject",
+          "Resource": "arn:aws:s3:::acme-uploads/avatars/*"
+        }]
+      }
+      ```
+    followUp: How would you make sure a tenant can only write under their own prefix (`avatars/<tenantId>/`)?
+    redFlags:
+      - "Use AmazonS3FullAccess to be safe, tighten later"
+    tags: [iam, s3, least-privilege]
+  - id: aws-003
+    level: easy
+    type: concept
+    q: What makes a subnet "public" versus "private" in a VPC?
+    hint: |-
+      Không có checkbox "public" — subnet là public khi **route table** gắn với nó có route `0.0.0.0/0 → Internet Gateway` (IGW). Instance còn cần **public IP** (hoặc Elastic IP) để nhận traffic từ internet.
+      Private subnet không có route tới IGW; muốn gọi ra ngoài thì route `0.0.0.0/0 → NAT Gateway` (NAT GW nằm ở **public** subnet).
+      Mỗi subnet thuộc **đúng 1 AZ**.
+      Layout chuẩn: ALB (public) → app (private) → DB (private, thường là subnet riêng không có route ra internet).
+    followUp: Your ECS task in a private subnet can't reach the internet. Walk me through what you check, in order.
+    redFlags:
+      - "A public subnet is one with a public IP range"
+    tags: [vpc, networking]
+  - id: aws-004
+    level: easy
+    type: compare
+    q: Security Group vs Network ACL — what is the difference and which one do you use day to day?
+    hint: |-
+      - **Security Group**: stateful (response tự động được phép), **chỉ có allow**, gắn vào **ENI** (instance, task, RDS, Lambda trong VPC), có thể reference SG khác làm nguồn.
+      - **NACL**: stateless (phải mở cả chiều về, gồm **ephemeral ports** 1024–65535), có **allow và deny**, gắn vào **subnet**, rule đánh số và evaluate theo thứ tự tăng dần, match đầu tiên thắng.
+      - Day-to-day dùng **SG** (SG-to-SG reference: `sg-rds` allow 5432 từ `sg-app`). NACL để chặn thô ở tầng subnet (ví dụ deny một dải IP), thường để default allow-all.
+    followUp: You add a NACL inbound rule allowing 443 but responses still fail. Why?
+    redFlags:
+      - "Security groups can deny specific IPs"
+    tags: [vpc, security-group, nacl]
+  - id: aws-005
+    level: easy
+    type: concept
+    q: What is an S3 presigned URL and why would a Next.js app use one for file uploads?
+    hint: |-
+      Presigned URL = URL chứa chữ ký SigV4 được tạo bằng credential của **server** (role của app), cho phép client làm **đúng một thao tác** (`PUT`/`GET` một key) trong thời gian giới hạn.
+      Lợi ích: browser upload **thẳng lên S3** → API server không phải stream file (không tốn bandwidth/memory, không vướng giới hạn payload của API Gateway/Lambda).
+      Quyền thực tế = quyền của credential đã ký; nếu ký bằng temporary credentials (role) thì URL hết hạn **sớm hơn** khi session hết hạn.
+      Nên: server validate (auth, tenant, content-type, size) trước khi ký; key do server sinh (không nhận path từ client); thời hạn ngắn.
+    example: |-
+      ```ts
+      import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+      import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+
+      const s3 = new S3Client({});
+      export async function createUploadUrl(tenantId: string, fileType: string) {
+        const key = `uploads/${tenantId}/${crypto.randomUUID()}`;
+        const cmd = new PutObjectCommand({ Bucket: process.env.BUCKET!, Key: key, ContentType: fileType });
+        return { key, url: await getSignedUrl(s3, cmd, { expiresIn: 300 }) };
+      }
+      ```
+    followUp: How do you enforce a maximum file size with presigned uploads? (Hint — compare presigned PUT vs presigned POST policy.)
+    redFlags:
+      - "Make the bucket public-write for uploads"
+      - Lets the client choose the object key freely
+    tags: [s3, presigned-url, upload]
+  - id: aws-006
+    level: easy
+    type: concept
+    q: What does "S3 is strongly consistent" mean today, and what changed?
+    hint: |-
+      Từ **12/2020**, S3 có **strong read-after-write consistency** cho mọi PUT/DELETE object và LIST, ở mọi region, không tốn thêm chi phí: ghi xong thì GET/LIST ngay sau đó thấy phiên bản mới.
+      Trước đó overwrite/delete là eventual consistency — nhiều tài liệu/khoá học cũ vẫn dạy sai điều này.
+      Lưu ý: vẫn **không có locking** giữa các writer đồng thời (last writer wins) — cần conditional writes (`If-None-Match` / `If-Match`) nếu muốn tránh ghi đè.
+      Bucket configuration (policy, versioning bật/tắt) có thể vẫn propagate chậm.
+    followUp: Two workers write the same key at the same time. What happens and how do you prevent a lost update?
+    verify: true
+    tags: [s3, consistency]
+  - id: aws-007
+    level: easy
+    type: compare
+    q: RDS Multi-AZ vs read replicas — what problem does each solve?
+    hint: |-
+      - **Multi-AZ (DB instance)**: standby **đồng bộ** ở AZ khác, **không** phục vụ đọc; khi primary chết, DNS endpoint trỏ sang standby (failover thường vài chục giây tới ~1–2 phút). Mục đích: **availability**.
+      - **Multi-AZ DB cluster** (MySQL/PostgreSQL): 1 writer + 2 **readable** standby — ngoại lệ của câu "standby không đọc được".
+      - **Read replica**: replication **bất đồng bộ**, có **replica lag**, dùng để **scale đọc**; có thể cross-region (DR) và promote thủ công.
+      - **Aurora**: storage chia sẻ 6 bản copy trên 3 AZ; Aurora Replica vừa đọc được vừa là failover target.
+    followUp: After moving reports to a read replica, users say "I just saved it but it's not there". Why and how do you fix it?
+    redFlags:
+      - "Multi-AZ doubles read capacity"
+    verify: true
+    tags: [rds, aurora, availability]
+  - id: aws-008
+    level: easy
+    type: concept
+    q: What is the SQS visibility timeout?
+    hint: |-
+      Khi consumer `ReceiveMessage`, message **không bị xoá** mà bị **ẩn** khỏi consumer khác trong khoảng visibility timeout (default 30s, max 12 giờ).
+      Consumer xử lý xong phải `DeleteMessage`. Nếu hết timeout mà chưa delete (crash, chậm), message hiện lại → xử lý **lần nữa**.
+      Có thể kéo dài bằng `ChangeMessageVisibility` (heartbeat cho job dài).
+      Đây là lý do SQS standard là **at-least-once** → consumer phải idempotent.
+    followUp: What is `maxReceiveCount` and how does it relate to a dead-letter queue?
+    verify: true
+    tags: [sqs, messaging]
+  - id: aws-009
+    level: easy
+    type: compare
+    q: SQS vs SNS vs EventBridge — one sentence each, and when would you pick each?
+    hint: |-
+      - **SQS**: queue kéo (pull), mỗi message được một consumer xử lý, buffer + retry + DLQ → work queue, làm mịn traffic.
+      - **SNS**: pub/sub đẩy (push) tới nhiều subscriber (SQS, Lambda, HTTP, email/SMS) → fan-out đơn giản; thường ghép **SNS → nhiều SQS**.
+      - **EventBridge**: event bus route theo **nội dung** event (pattern matching), tích hợp AWS/SaaS event, archive & replay, có **Scheduler** → event-driven giữa các domain.
+      - Cần ordering + replay dài hạn + nhiều consumer group độc lập → Kinesis / MSK (Kafka).
+    followUp: When would you choose MSK (Kafka) over SNS+SQS for a microservices migration?
+    tags: [sqs, sns, eventbridge, messaging]
+  - id: aws-010
+    level: easy
+    type: concept
+    q: What is a Lambda cold start, and what contributes to its duration for a Node.js function?
+    hint: |-
+      Cold start = request tới khi **không có execution environment rảnh** → Lambda phải tạo môi trường mới: tải code/layer, khởi động runtime, chạy **init code** (code ngoài handler: import, tạo SDK client, đọc config).
+      Với Node: bundle size (import cả `aws-sdk` v2, ORM nặng), số module phải `require`, gọi mạng lúc init (lấy secret), bật VPC (hiện nay dùng Hyperplane ENI nên nhẹ hơn trước nhiều), memory (CPU tỉ lệ với memory).
+      Giảm: bundle + tree-shake (esbuild), import SDK v3 theo client, lazy-load, tăng memory, **provisioned concurrency** cho đường nhạy latency.
+      Warm start tái sử dụng môi trường — biến global (DB client) vẫn còn.
+    followUp: Provisioned concurrency vs keeping functions warm with a scheduled ping — which is better and why?
+    verify: true
+    tags: [lambda, cold-start, performance]
+  - id: aws-011
+    level: easy
+    type: compare
+    q: ALB vs NLB — which would you put in front of a Next.js app and why?
+    hint: |-
+      - **ALB** (L7): HTTP/HTTPS/gRPC, route theo host/path/header, WebSocket, sticky session, redirect, fixed response, OIDC/Cognito authentication, WAF gắn trực tiếp.
+      - **NLB** (L4): TCP/UDP/TLS, rất nhiều connection, latency thấp, **IP tĩnh** mỗi AZ (hoặc Elastic IP), preserve client IP, dùng cho PrivateLink.
+      - Next.js/REST API → **ALB** (thường đứng sau CloudFront). NLB khi: protocol không phải HTTP, khách hàng cần whitelist IP tĩnh, hoặc expose service qua PrivateLink.
+    followUp: A customer insists on whitelisting a fixed IP for your API, which is behind an ALB. What are your options?
+    tags: [alb, nlb, load-balancing]
+  - id: aws-012
+    level: easy
+    type: compare
+    q: Secrets Manager vs SSM Parameter Store — how do you choose where to keep your DB password and feature config?
+    hint: |-
+      - **Secrets Manager**: dành cho secret; có **rotation tự động** (Lambda rotation, tích hợp sẵn cho RDS), cross-account qua resource policy, replicate multi-region; **tính phí mỗi secret/tháng + per API call**.
+      - **Parameter Store**: config + secret đơn giản (`SecureString` mã hoá bằng KMS); standard tier miễn phí, giới hạn kích thước nhỏ hơn; không có rotation built-in.
+      - Thực tế: DB credential → Secrets Manager (hoặc RDS-managed master password); config/feature toggle không nhạy cảm → Parameter Store (hoặc AppConfig).
+      - App nên **cache** secret trong memory và refresh định kỳ, không gọi API mỗi request.
+    followUp: How does your app pick up a rotated DB password without a restart or a spike of auth failures?
+    verify: true
+    tags: [secrets-manager, parameter-store, secrets]
+  - id: aws-013
+    level: easy
+    type: concept
+    q: What does KMS do, and what is envelope encryption?
+    hint: |-
+      **KMS** quản lý key (KMS key không bao giờ rời HSM dưới dạng plaintext), mọi thao tác dùng key đều qua API có IAM + key policy + CloudTrail log.
+      `Encrypt` trực tiếp chỉ dành cho payload nhỏ (vài KB). Với dữ liệu lớn dùng **envelope encryption**: `GenerateDataKey` → nhận data key **plaintext + bản mã hoá**; mã hoá dữ liệu local bằng plaintext data key (AES-GCM), vứt plaintext, lưu bản mã hoá cạnh dữ liệu. Giải mã: `Decrypt` data key rồi giải dữ liệu.
+      S3 SSE-KMS, EBS, RDS đều làm vậy dưới nền.
+      Key policy là "cửa chính": nếu key policy không cho phép, IAM policy của bạn cũng vô dụng.
+    followUp: Your Lambda gets `AccessDeniedException` on `kms:Decrypt` although its role has `kms:*`. Where do you look?
+    verify: true
+    tags: [kms, encryption]
+  - id: aws-014
+    level: medium
+    type: debug
+    q: This policy is attached to your worker's role, yet `ListObjectsV2` on the bucket fails with AccessDenied while `GetObject` works. Why?
+    example: |-
+      ```json
+      {
+        "Version": "2012-10-17",
+        "Statement": [{
+          "Effect": "Allow",
+          "Action": ["s3:GetObject", "s3:ListBucket"],
+          "Resource": "arn:aws:s3:::acme-reports/*"
+        }]
+      }
+      ```
+    hint: |-
+      `s3:ListBucket` là action trên **bucket** (`arn:aws:s3:::acme-reports`), còn `s3:GetObject` là action trên **object** (`arn:aws:s3:::acme-reports/*`). ARN `.../*` không match bucket → List bị deny ngầm.
+      Fix: tách 2 statement — `ListBucket` với resource là bucket ARN (có thể giới hạn `Condition: StringLike s3:prefix`), `GetObject` với `bucket/*`.
+      Bài học chung: mỗi action có **resource type** riêng — xem bảng "Actions, resources, and condition keys" của service. IAM Policy Simulator / Access Analyzer policy validation bắt được lỗi này.
+    followUp: How would you restrict `ListBucket` to only the `reports/<tenantId>/` prefix?
+    redFlags:
+      - "Just change the resource to *"
+    tags: [iam, s3, debugging]
+  - id: aws-015
+    level: medium
+    type: concept
+    q: Walk me through how IAM decides whether a request is allowed when identity policies, resource policies, SCPs and permission boundaries are all involved.
+    hint: |-
+      1. Mặc định **implicit deny**.
+      2. Có **explicit Deny** ở bất kỳ đâu → deny (thắng tất cả).
+      3. **SCP / RCP** (Organizations) phải cho phép — chúng là trần, **không cấp quyền**.
+      4. Cần ít nhất một **Allow** từ identity-based hoặc resource-based policy.
+      5. Nếu có **permission boundary** / **session policy** → quyền hiệu lực = giao của chúng với identity policy.
+      Cross-account: cần Allow ở **cả hai** account (identity policy bên gọi + resource/trust policy bên đích).
+      Ví dụ: developer có `AdministratorAccess` nhưng permission boundary chỉ cho `s3:*` → không tạo được IAM role.
+    followUp: Why do platform teams give developers the right to create roles only if a specific permission boundary is attached?
+    redFlags:
+      - "SCPs grant permissions to accounts"
+      - "Allow in one policy overrides a deny in another"
+    verify: true
+    tags: [iam, policy-evaluation, organizations]
+  - id: aws-016
+    level: medium
+    type: concept
+    q: How does `sts:AssumeRole` work end to end, and what is the difference between the trust policy and the permissions policy of a role?
+    hint: |-
+      - **Trust policy** (resource policy của role): **ai** được assume role (principal: account, service như `ecs-tasks.amazonaws.com`, OIDC provider…), kèm condition (`sts:ExternalId`, `aws:PrincipalOrgID`, `token.actions.githubusercontent.com:sub`).
+      - **Permissions policy**: assume xong thì **được làm gì**.
+      - Caller cần quyền `sts:AssumeRole` trên role ARN (identity policy của caller) **và** trust policy cho phép → STS trả `AccessKeyId/SecretAccessKey/SessionToken` có hạn (default 1h, tối đa theo `MaxSessionDuration` của role; role chaining bị giới hạn 1h).
+      - CloudTrail ghi lại session name → audit được "ai" đứng sau role.
+    followUp: What is the confused deputy problem and how does `sts:ExternalId` (or `aws:SourceArn`) prevent it?
+    verify: true
+    tags: [iam, sts, assume-role]
+  - id: aws-017
+    level: medium
+    type: scenario
+    q: Your GitHub Actions pipeline deploys to AWS using an access key stored as a repository secret. How would you remove that long-lived key?
+    hint: |-
+      Dùng **OIDC federation**: tạo IAM OIDC identity provider cho `token.actions.githubusercontent.com`, tạo role có trust policy cho phép `sts:AssumeRoleWithWebIdentity` với condition trên `aud` (`sts.amazonaws.com`) và **`sub`** (ví dụ `repo:acme/shop:ref:refs/heads/main` hoặc `environment:prod`).
+      Workflow cần `permissions: id-token: write` và action `aws-actions/configure-aws-credentials` với `role-to-assume`.
+      Lợi ích: không còn secret dài hạn, credential ngắn hạn theo từng job, giới hạn theo repo/branch/environment.
+      Pitfall nguy hiểm: condition `sub` quá rộng (`repo:acme/*` hoặc thiếu hẳn) → **bất kỳ repo nào** cũng assume được.
+    followUp: How do you give the prod deploy role different permissions from the PR preview role?
+    redFlags:
+      - Rotating the access key every 90 days as the final answer
+    tags: [iam, oidc, ci-cd, github-actions]
+  - id: aws-018
+    level: medium
+    type: scenario
+    q: Your NAT Gateway bill is suddenly the biggest line in the AWS invoice. How do you investigate and reduce it?
+    hint: |-
+      NAT GW tính **theo giờ (mỗi AZ)** + **mỗi GB xử lý**; traffic cross-AZ tới NAT còn thêm phí data transfer.
+      Điều tra: **VPC Flow Logs** (hoặc CloudWatch metric `BytesOutToDestination` của NAT) + Cost Explorer theo usage type → xem ai đang đẩy GB nào tới đâu.
+      Thủ phạm hay gặp: kéo **image ECR**, upload/download **S3**, gửi log/metric ra ngoài, gọi DynamoDB — tất cả qua NAT.
+      Giảm: **S3/DynamoDB gateway endpoint** (miễn phí), **interface endpoint** cho ECR (api + dkr), CloudWatch Logs, STS, Secrets Manager (so sánh giá endpoint/giờ vs GB tiết kiệm); NAT GW mỗi AZ và route theo AZ để tránh cross-AZ; cache image.
+    followUp: What's the trade-off of adding 6 interface endpoints across 3 AZs versus paying NAT processing?
+    verify: true
+    tags: [vpc, nat-gateway, cost]
+  - id: aws-019
+    level: medium
+    type: compare
+    q: Gateway VPC endpoint vs interface VPC endpoint (PrivateLink) — how do they differ?
+    hint: |-
+      - **Gateway endpoint**: chỉ cho **S3 và DynamoDB**, là một **target trong route table** (prefix list), **không tốn phí**, không dùng được từ on-prem/VPC peering.
+      - **Interface endpoint**: tạo **ENI có private IP** trong subnet, hầu hết AWS service (và service của bên thứ ba qua PrivateLink); **tính theo giờ mỗi AZ + mỗi GB**; bảo vệ bằng security group; dùng private DNS để SDK tự đi qua endpoint.
+      - Cả hai hỗ trợ **endpoint policy** — ví dụ chỉ cho phép truy cập bucket của công ty (chống data exfiltration).
+      - S3 cũng có interface endpoint (khi cần truy cập từ on-prem qua VPN/Direct Connect).
+    followUp: How would you write a bucket policy that only allows access through your VPC endpoint?
+    tags: [vpc, endpoints, privatelink]
+  - id: aws-020
+    level: medium
+    type: compare
+    q: For a Next.js + Node API product, compare ECS Fargate, Lambda and EKS. Which would you start with?
+    hint: |-
+      - **ECS Fargate**: chạy container liên tục, không quản node, deploy rolling/blue-green, hợp Next.js SSR, Socket.IO, connection pool ổn định. Ít khái niệm hơn K8s.
+      - **Lambda**: trả tiền theo invocation, scale về 0, hợp traffic thưa/đột biến và job event-driven; đổi lại cold start, giới hạn thời gian 15 phút, payload, connection storm với DB, WebSocket phải qua API Gateway.
+      - **EKS**: chuẩn Kubernetes, portable, ecosystem mạnh; đổi lại tốn công vận hành (upgrade version, add-on, networking, phí control plane).
+      - Mặc định cho team nhỏ-vừa: **ECS Fargate** cho web/API + **Lambda** cho job event-driven (S3 trigger, SQS worker, cron). EKS khi tổ chức đã có platform team và chuẩn K8s.
+    followUp: At what point would Fargate cost push you to ECS on EC2 capacity providers?
+    redFlags:
+      - "Kubernetes is always the professional choice"
+    tags: [ecs, fargate, lambda, eks, compute]
+  - id: aws-021
+    level: medium
+    type: concept
+    q: How does Lambda concurrency work, and what are reserved and provisioned concurrency?
+    hint: |-
+      Concurrency = số execution environment đang xử lý đồng thời ≈ `RPS × average duration (s)`.
+      Account có quota concurrency **mỗi region** (mặc định 1,000, xin tăng được) chia chung cho mọi function; vượt → **throttle** (429 với sync, retry với async/SQS).
+      - **Reserved concurrency**: dành riêng *và* đặt **trần** cho một function (bảo vệ DB downstream; đặt 0 để "tắt" function).
+      - **Provisioned concurrency**: giữ sẵn N môi trường đã init → không cold start cho N đó; tính phí kể cả khi không dùng; có thể auto-scale theo lịch.
+      Tốc độ scale-out cũng có giới hạn riêng theo từng function.
+    example: |-
+      ```text
+      500 RPS × 0.2 s = 100 concurrent environments
+      500 RPS × 3 s (DB slow!) = 1,500 → vượt quota 1,000 mặc định → throttling
+      ```
+    followUp: A slow database makes Lambda duration jump from 200 ms to 3 s. What happens to concurrency, cost and the database?
+    verify: true
+    tags: [lambda, concurrency, scaling]
+  - id: aws-022
+    level: medium
+    type: debug
+    q: This Lambda (behind API Gateway) works in testing, but under load the Postgres instance hits "too many connections". What's wrong and how do you fix it?
+    example: |-
+      ```ts
+      import { Pool } from "pg";
+
+      export const handler = async (event: any) => {
+        const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 10 });
+        const { rows } = await pool.query("SELECT * FROM products WHERE id = $1", [event.pathParameters.id]);
+        return { statusCode: 200, body: JSON.stringify(rows[0]) };
+      };
+      ```
+    hint: |-
+      - Pool tạo **trong handler** → mỗi invocation mở connection mới và **không bao giờ đóng** (pool không `end()`), connection rò rỉ trong môi trường warm.
+      - `max: 10` × mỗi execution environment × hàng trăm environment khi scale → vượt `max_connections`.
+      Fix: tạo client **ngoài handler** (reuse khi warm), `max: 1–2` mỗi environment; đặt **RDS Proxy** giữa Lambda và DB (multiplex/pool connection, failover nhanh hơn, IAM auth); giới hạn **reserved concurrency** để bảo vệ DB.
+      Cân nhắc: nếu workload thực sự nặng về DB, ECS với pool cố định có thể hợp hơn Lambda.
+    followUp: What is "connection pinning" in RDS Proxy and which client behaviour causes it?
+    redFlags:
+      - Only answering "increase max_connections on the database"
+    tags: [lambda, rds-proxy, postgres, debugging]
+  - id: aws-023
+    level: medium
+    type: debug
+    q: An SQS-triggered Lambda sometimes charges customers twice. Look at the configuration — what's the bug?
+    example: |-
+      ```yaml
+      # serverless / SAM-ish config
+      ChargeWorker:
+        Timeout: 60            # seconds
+        Events:
+          Queue:
+            Type: SQS
+            BatchSize: 10
+      PaymentsQueue:
+        VisibilityTimeout: 30  # seconds
+        # no RedrivePolicy
+      ```
+    hint: |-
+      - Visibility timeout (30s) **< function timeout (60s)**: batch đang xử lý chưa xong thì message đã hiện lại → Lambda khác nhận → **charge lần 2**. AWS khuyến nghị visibility timeout ≥ khoảng **6× function timeout** cho SQS event source.
+      - Batch 10: một message lỗi → cả batch retry → 9 message đã thành công bị xử lý lại. Bật **`ReportBatchItemFailures`** và trả `batchItemFailures`.
+      - Không có **DLQ** (`RedrivePolicy` + `maxReceiveCount`) → poison message lặp mãi.
+      - Quan trọng nhất: SQS là at-least-once → **idempotency key** (ví dụ `paymentIntentId` + unique constraint / idempotency table, và idempotency key của payment provider).
+    followUp: How would you implement idempotency for this worker — what's the key and where is it stored?
+    redFlags:
+      - "Switch to FIFO, then there are no duplicates"
+    verify: true
+    tags: [sqs, lambda, idempotency, debugging]
+  - id: aws-024
+    level: medium
+    type: compare
+    q: SQS standard vs FIFO queues — what do you gain and what do you pay?
+    hint: |-
+      - **Standard**: throughput gần như không giới hạn, **at-least-once**, thứ tự **best-effort**.
+      - **FIFO**: thứ tự **trong mỗi `MessageGroupId`**, **deduplication** trong cửa sổ 5 phút (`MessageDeduplicationId` hoặc content-based), throughput có quota (cao hơn khi batch / bật high-throughput mode).
+      - Cái giá: một message kẹt trong group sẽ **block** cả group đó (head-of-line); group ID chọn sai (một group cho mọi thứ) → mất parallelism.
+      - FIFO dedup **không** thay thế idempotency ở consumer — consumer vẫn có thể xử lý lại khi visibility timeout hết.
+    followUp: You need per-order ordering for 1M orders/day. How do you choose `MessageGroupId`?
+    verify: true
+    tags: [sqs, fifo, ordering]
+  - id: aws-025
+    level: medium
+    type: scenario
+    q: You deploy a Next.js app with static assets in S3 and dynamic routes on ECS. How do you set up CloudFront?
+    hint: |-
+      - Một distribution, nhiều **behavior**: `/_next/static/*` và ảnh public → origin **S3** (bucket private, **OAC**), cache dài (asset có hash trong tên file); default `/*` → origin **ALB**, cache policy theo header `Cache-Control` của app, forward cookie/header cần thiết qua **origin request policy**.
+      - **OAC** thay OAI (legacy): bucket policy chỉ cho phép `cloudfront.amazonaws.com` với `aws:SourceArn` = ARN distribution.
+      - Bảo vệ ALB khỏi bị gọi thẳng: custom header bí mật hoặc **CloudFront managed prefix list** trong SG của ALB (hoặc VPC origin).
+      - TLS: ACM cert ở **us-east-1** cho CloudFront; WAF gắn vào distribution.
+    followUp: After a deploy, some users get HTML referencing JS chunks that return 404. Why, and how do you deploy to avoid it?
+    verify: true
+    tags: [cloudfront, s3, nextjs, oac]
+  - id: aws-026
+    level: medium
+    type: debug
+    q: CloudFront returns 403 AccessDenied for every object after you switched from OAI to OAC. Here is the bucket policy — what's wrong?
+    example: |-
+      ```json
+      {
+        "Version": "2012-10-17",
+        "Statement": [{
+          "Effect": "Allow",
+          "Principal": { "Service": "cloudfront.amazonaws.com" },
+          "Action": "s3:GetObject",
+          "Resource": "arn:aws:s3:::acme-web",
+          "Condition": {
+            "StringEquals": {
+              "AWS:SourceArn": "arn:aws:cloudfront::111122223333:distribution/EDFDVBD6EXAMPLE"
+            }
+          }
+        }]
+      }
+      ```
+    hint: |-
+      - `Resource` là **bucket ARN**, nhưng `s3:GetObject` cần **object ARN** → phải là `arn:aws:s3:::acme-web/*`.
+      - Kiểm tra thêm: distribution ID trong `AWS:SourceArn` đúng distribution; origin đã gắn OAC (và origin là S3 REST endpoint, **không phải** website endpoint); nếu object mã hoá **SSE-KMS** thì key policy phải cho `cloudfront.amazonaws.com` `kms:Decrypt`.
+      - Object không tồn tại mà thiếu `s3:ListBucket` → S3 trả **403 thay vì 404** (tránh lộ key tồn tại) — dễ nhầm với lỗi quyền.
+    followUp: Why does a missing object return 403 instead of 404, and when would you grant `s3:ListBucket` to CloudFront?
+    tags: [cloudfront, oac, s3, debugging]
+  - id: aws-027
+    level: medium
+    type: compare
+    q: ALB vs API Gateway (REST and HTTP APIs) in front of a Node backend — how do you decide?
+    hint: |-
+      - **API Gateway**: request-based pricing, native Lambda integration, throttling / usage plans / API keys (REST), JWT/Cognito/Lambda authorizer, request validation, WebSocket API. Giới hạn: payload tối đa khoảng **10 MB**, integration timeout mặc định **~29–30s** (REST có thể xin tăng cho Regional/private API), giá per-request cao khi traffic lớn.
+      - **HTTP API**: rẻ hơn, nhanh hơn, ít tính năng hơn REST API (không có usage plans, request validation hạn chế).
+      - **ALB**: giá theo giờ + LCU → rẻ hơn với traffic lớn ổn định; target là container/EC2/IP/Lambda; không có throttling per-client built-in (dùng WAF rate-based rule).
+      - Container chạy liên tục → ALB. API serverless, cần quản lý consumer bên ngoài (partner API key, quota) → API Gateway.
+    followUp: You need per-tenant rate limits for a public partner API. Where do you enforce them?
+    verify: true
+    tags: [api-gateway, alb]
+  - id: aws-028
+    level: medium
+    type: concept
+    q: How does an Auto Scaling Group decide to add or replace instances, and what are health checks and target tracking?
+    hint: |-
+      - ASG duy trì số instance trong `[min, max]`, thay instance **unhealthy**: mặc định dùng EC2 status check; nên bật **ELB health check** để instance "sống nhưng app chết" cũng bị thay.
+      - **Target tracking**: giữ một metric ở mục tiêu (CPU 50%, `ALBRequestCountPerTarget` = 1000) — như thermostat. **Step scaling** theo ngưỡng alarm. **Scheduled** cho giờ cao điểm biết trước. **Predictive** dựa trên lịch sử.
+      - Health check grace period / warm-up: tránh kill instance đang boot.
+      - Launch template + instance refresh để rollout AMI mới.
+      - ECS service auto scaling hoạt động tương tự (Application Auto Scaling trên desired count).
+    followUp: Why can CPU-based scaling be the wrong metric for a Node API that is mostly waiting on I/O?
+    tags: [ec2, asg, autoscaling]
+  - id: aws-029
+    level: medium
+    type: compare
+    q: DynamoDB vs Aurora PostgreSQL for a new service — how do you reason about the choice?
+    hint: |-
+      - **DynamoDB**: key-value/document, latency ms ổn định ở mọi quy mô, serverless (on-demand hoặc provisioned), phải **thiết kế theo access pattern** trước (partition key, sort key, GSI). Không join, query ad-hoc khó, item tối đa **400 KB**, transaction có giới hạn số item.
+      - **Aurora Postgres**: SQL, join, constraint, transaction linh hoạt, query ad-hoc/báo cáo; scale ghi dọc (một writer), scale đọc bằng replica; phải quản connection.
+      - Chọn DynamoDB khi: access pattern rõ, cần scale khủng/serverless (session, cart, idempotency key, event store). Chọn Aurora khi domain quan hệ nhiều (order, invoice, tenant config) và query thay đổi.
+      - Hot partition: partition key cardinality thấp (ví dụ `tenantId` với 1 tenant khổng lồ) → throttle.
+    followUp: Design a DynamoDB key schema for "get all orders of a customer, newest first" and "get an order by id".
+    verify: true
+    tags: [dynamodb, aurora, data-modeling]
+  - id: aws-030
+    level: medium
+    type: concept
+    q: What is ElastiCache used for in a Node/Next.js app on AWS, and what deployment choices matter?
+    hint: |-
+      - Dùng cho cache-aside (product, session), rate limiting, distributed lock, pub/sub cho Socket.IO adapter, leaderboard.
+      - Engine: **Valkey / Redis OSS** (cấu trúc dữ liệu, replication, persistence tuỳ chọn) hoặc **Memcached** (đơn giản, multi-threaded, không replication). Có cả **ElastiCache Serverless**.
+      - Lựa chọn quan trọng: **cluster mode** (sharding → client phải hỗ trợ cluster, multi-key command phải cùng hash slot), **Multi-AZ với automatic failover** (replica ở AZ khác), encryption in-transit (TLS) + AUTH/RBAC, đặt trong private subnet.
+      - Cache không phải source of truth: failover có thể mất vài write gần nhất (replication async).
+    followUp: During a primary failover, your app throws errors for ~30 seconds. What should the client do?
+    verify: true
+    tags: [elasticache, redis, caching]
+  - id: aws-031
+    level: medium
+    type: compare
+    q: Cognito user pool vs identity pool — what does each give you, and would you use Cognito for a B2B2C platform?
+    hint: |-
+      - **User pool**: directory + authentication (sign-up/sign-in, MFA, hosted UI / managed login, federation với Google/SAML/OIDC) → cấp **JWT** (ID/access/refresh token) theo OIDC.
+      - **Identity pool**: đổi identity (từ user pool hoặc IdP khác) lấy **temporary AWS credentials** qua STS để client gọi thẳng AWS (upload S3, IoT).
+      - B2B2C multi-tenant: cân nhắc per-tenant federation (SAML/OIDC của doanh nghiệp), custom claim `tenant_id` (pre-token-generation Lambda), giới hạn quota/customization của hosted UI, lock-in, khó migrate password hash. So sánh với Auth0/Keycloak/tự host.
+      - API verify JWT: kiểm `iss`, `aud`/`client_id`, `token_use`, `exp`, chữ ký qua JWKS.
+    followUp: How would you carry the tenant id in the token and enforce it in the API?
+    verify: true
+    tags: [cognito, auth, multi-tenancy]
+  - id: aws-032
+    level: medium
+    type: concept
+    q: What does CloudWatch give you for a Node service on ECS, and where does X-Ray (or OpenTelemetry) fit in?
+    hint: |-
+      - **CloudWatch Logs**: stdout của container (awslogs / FireLens) → log group; **Logs Insights** để query JSON log.
+      - **Metrics**: metric có sẵn (CPU/memory của service, ALB `TargetResponseTime`, `HTTPCode_Target_5XX_Count`), custom metric qua `PutMetricData` hoặc **Embedded Metric Format** (log JSON tự thành metric, rẻ và không block). **Container Insights** cho task-level.
+      - **Alarms** → SNS → PagerDuty/Slack; composite alarm giảm noise.
+      - **Tracing**: X-Ray hoặc **AWS Distro for OpenTelemetry (ADOT)** — AWS đang hướng về OpenTelemetry làm chuẩn instrument; trace hiển thị trong CloudWatch (Application Signals / X-Ray trace map).
+      - Luôn log `traceId`/`requestId` để nhảy từ log sang trace.
+    followUp: Custom metric with a `userId` dimension — why is that a bad idea?
+    verify: true
+    tags: [cloudwatch, x-ray, observability]
+  - id: aws-033
+    level: medium
+    type: compare
+    q: Route 53 routing policies — which would you use for failover to a DR region, for a gradual migration, and for lowest latency?
+    hint: |-
+      - **Failover**: primary/secondary + **health check** → DR active-passive.
+      - **Weighted**: chia % traffic (10/90) → migrate dần, canary ở tầng DNS.
+      - **Latency-based**: trả record của region có latency thấp nhất tới user.
+      - Khác: simple, geolocation (theo quốc gia — compliance/nội dung), geoproximity, multivalue answer, IP-based.
+      - Nhớ: DNS bị **cache theo TTL** (và resolver có thể giữ lâu hơn) → failover qua DNS không tức thì; hạ TTL trước khi migrate. **Alias record** trỏ tới ALB/CloudFront/S3 (miễn phí query, dùng được ở zone apex).
+    followUp: Why is DNS-based failover slower than it looks on paper, and what can you do about it?
+    verify: true
+    tags: [route53, dns, dr]
+  - id: aws-034
+    level: medium
+    type: concept
+    q: What are S3 storage classes and lifecycle rules, and how would you set them for user uploads and logs?
+    hint: |-
+      - **Standard** (truy cập thường xuyên), **Intelligent-Tiering** (tự chuyển tier theo pattern truy cập, phí monitoring per object — hợp khi không đoán được pattern), **Standard-IA / One Zone-IA** (ít truy cập, phí retrieval, thời gian lưu tối thiểu), **Glacier Instant / Flexible / Deep Archive** (lưu trữ lâu dài, retrieve chậm dần và rẻ dần).
+      - Lifecycle: transition theo tuổi object, expire version cũ (`NoncurrentVersionExpiration`), abort **incomplete multipart upload** (rác ẩn tốn tiền).
+      - User uploads: Standard → Intelligent-Tiering; logs: Standard 30 ngày → Glacier → xoá sau N ngày theo policy lưu trữ.
+      - Bẫy: object nhỏ (< 128 KB) và thời gian lưu tối thiểu làm IA/Glacier **đắt hơn** Standard.
+    followUp: Versioning is on and the bill keeps growing although you "deleted" files. Why?
+    verify: true
+    tags: [s3, storage-classes, cost]
+  - id: aws-035
+    level: medium
+    type: concept
+    q: Explain the AWS shared responsibility model with examples for EC2, Fargate and Lambda.
+    hint: |-
+      AWS chịu trách nhiệm **"security OF the cloud"** (hạ tầng vật lý, hypervisor, dịch vụ managed); bạn chịu **"security IN the cloud"** (IAM, cấu hình, dữ liệu, code, mã hoá, network rules).
+      Ranh giới dịch lên khi dịch vụ càng managed:
+      - **EC2**: bạn patch OS, cài agent, harden SSH.
+      - **Fargate**: AWS lo host/OS; bạn lo image (CVE trong base image, dependency), task role, SG.
+      - **Lambda**: AWS lo runtime patch (managed runtime); bạn lo code, dependency, quyền, secret.
+      Mọi mô hình: **IAM, dữ liệu, cấu hình public access** luôn là của bạn.
+    followUp: Who is responsible when a public S3 bucket leaks customer data?
+    tags: [security, shared-responsibility]
+  - id: aws-036
+    level: medium
+    type: compare
+    q: Compare EventBridge rules with SNS fan-out for publishing an "OrderPlaced" event to several services.
+    hint: |-
+      - **SNS**: topic → subscriber; filter policy trên message attribute hoặc body; throughput rất cao, latency thấp; không có replay (trừ FIFO topic archive).
+      - **EventBridge**: event có schema (source, detail-type, detail), rule pattern matching trên **nội dung**, nhiều target (Lambda, SQS, Step Functions, API destination HTTP), **archive & replay**, schema registry, cross-account bus; có quota throughput theo region và latency thường cao hơn SNS một chút.
+      - Pattern bền: publisher → EventBridge/SNS → **SQS riêng mỗi consumer** (buffer, DLQ, retry độc lập).
+      - Cả hai đều at-least-once; consumer idempotent.
+    followUp: How do you version the event schema without breaking consumers?
+    verify: true
+    tags: [eventbridge, sns, event-driven]
+  - id: aws-037
+    level: hard
+    type: scenario
+    q: "Production: after a deploy, ECS tasks start, fail the ALB health check, get killed and restart in a loop. How do you debug it?"
+    hint: |-
+      1. **ECS service events** + **stopped task reason** (exit code 137 = OOM/SIGKILL, 1 = crash, `Essential container exited`, `CannotPullContainerError`, `ResourceInitializationError` khi không lấy được secret).
+      2. **Container logs** trong CloudWatch: app có listen đúng `PORT`/`0.0.0.0` không? (Next.js/Express bind `localhost` → ALB không vào được.)
+      3. **Target group**: health check path trả 200? matcher đúng? port khớp container port? SG của task allow từ SG của ALB?
+      4. **Timing**: app khởi động (migration, warm cache) lâu hơn `healthCheckGracePeriodSeconds` → bị kill trước khi sẵn sàng.
+      5. Health check endpoint gọi DB/Redis → DB chậm làm **tất cả** task fail cùng lúc.
+      Rollback bằng **deployment circuit breaker** (tự rollback khi deploy fail).
+    followUp: Should the ALB health check hit an endpoint that checks the database? Why or why not?
+    redFlags:
+      - Only says "check the logs" with no ordered hypothesis
+    tags: [ecs, alb, debugging, health-check]
+  - id: aws-038
+    level: hard
+    type: scenario
+    q: "Your Aurora writer fails over during peak traffic. The Node API throws errors for several minutes, not seconds. What happened and how do you make recovery faster?"
+    hint: |-
+      - Failover ở DB có thể chỉ mất vài chục giây, nhưng app lỗi lâu hơn vì: **DNS cache** (JVM/Node resolver/pool giữ IP cũ của cluster endpoint), connection pool giữ **connection chết** (không có TCP keepalive/timeout → treo tới khi OS timeout), retry không có backoff → thundering herd.
+      - Fix: dùng **RDS Proxy** (giữ connection từ client, failover nhanh hơn, không phụ thuộc DNS TTL), hoặc driver/wrapper nhận biết topology (AWS Advanced JDBC/Python/NodeJS Wrapper); cấu hình pool: `connectionTimeoutMillis`, `idleTimeoutMillis`, validate connection, statement timeout, keepalive; retry có jitter cho lỗi transient; đọc từ reader endpoint.
+      - Test bằng **failover thủ công** trong staging (hoặc AWS FIS) thay vì chờ sự cố thật.
+    followUp: Which requests are safe to retry automatically after a failover, and which aren't?
+    verify: true
+    tags: [aurora, failover, rds-proxy, resilience]
+  - id: aws-039
+    level: hard
+    type: debug
+    q: A Lambda attached to your VPC times out whenever it calls Stripe, but works when detached from the VPC. Diagnose it from this setup.
+    example: |-
+      ```text
+      Lambda: VpcConfig subnets = [subnet-pub-a, subnet-pub-b]   # route 0.0.0.0/0 -> igw-123
+              SecurityGroup sg-lambda: outbound all
+      No NAT Gateway in the VPC.
+      ```
+    hint: |-
+      - Lambda trong VPC **không bao giờ có public IP**, kể cả khi đặt ở public subnet → route tới IGW vô dụng → gọi internet bị treo tới timeout.
+      - Fix: đặt Lambda ở **private subnet** có route `0.0.0.0/0 → NAT Gateway` (NAT ở public subnet), mỗi AZ một NAT nếu cần HA; hoặc **không** gắn VPC nếu function không cần truy cập tài nguyên private.
+      - Gọi AWS service (S3, DynamoDB, Secrets Manager) thì dùng **VPC endpoint** thay vì NAT.
+      - Kiểm tra thêm: NACL, SG outbound, DNS resolution trong VPC (`enableDnsSupport`).
+    followUp: How would you give this function a stable egress IP that Stripe or a partner can whitelist?
+    redFlags:
+      - "Put the Lambda in a public subnet"
+    tags: [lambda, vpc, nat-gateway, debugging]
+  - id: aws-040
+    level: hard
+    type: scenario
+    q: "An SQS queue backlog is growing (ApproximateAgeOfOldestMessage keeps rising) and the Lambda consumer is throttled. What are the possible causes and fixes?"
+    hint: |-
+      - Nguyên nhân: consumer chậm (downstream DB/API chậm → duration tăng → concurrency tăng → chạm **reserved concurrency** hoặc account quota); **poison message** lặp lại liên tục (không có DLQ); lỗi transient làm cả batch retry; `maximum concurrency` của event source mapping đặt thấp.
+      - Chẩn đoán: `ApproximateNumberOfMessagesVisible`, `ApproximateAgeOfOldestMessage`, Lambda `Throttles`, `Duration`, `Errors`, `ConcurrentExecutions`; log lỗi theo message ID.
+      - Fix: DLQ + `maxReceiveCount`; `ReportBatchItemFailures`; tăng concurrency **chỉ khi downstream chịu được**; batch lớn hơn + batching window; tối ưu handler; circuit breaker khi downstream chết (dừng poll thay vì đốt retry).
+      - Alarm trên **age of oldest message** (triệu chứng user thấy) thay vì chỉ độ dài queue.
+    followUp: If the downstream database is the bottleneck, why is "just raise Lambda concurrency" dangerous?
+    verify: true
+    tags: [sqs, lambda, backpressure, scaling]
+  - id: aws-041
+    level: hard
+    type: design
+    q: Design the VPC for a production Node/Next.js platform across 3 AZs. Walk me through subnets, routing, and what lives where.
+    hint: |-
+      - CIDR đủ lớn và không trùng mạng khác (ví dụ `/16`, chừa chỗ cho peering/TGW/on-prem).
+      - Mỗi AZ: **public subnet** (ALB, NAT GW), **private app subnet** (ECS task/Lambda), **private data subnet** (RDS/Aurora, ElastiCache — không route ra internet).
+      - Route: public → IGW; app → NAT **cùng AZ**; data → local only.
+      - Endpoint: S3/DynamoDB gateway; interface cho ECR, Logs, Secrets Manager, STS nếu cost hợp lý.
+      - SG theo tầng: `sg-alb` (443 từ CloudFront prefix list), `sg-app` (port app từ `sg-alb`), `sg-db` (5432 từ `sg-app`).
+      - Flow logs, không SSH (dùng **SSM Session Manager**), tách account dev/staging/prod (Organizations).
+      - Trade-off: 3 NAT GW = HA nhưng tốn gấp 3; dev có thể dùng 1.
+    followUp: Your Fargate subnets run out of IP addresses during a scale-out. Why can that happen and how do you fix it?
+    tags: [vpc, design, networking]
+  - id: aws-042
+    level: hard
+    type: gotcha
+    q: Your Next.js server on ECS behind an ALB drops a fraction of requests with 502 during every deploy. What are the likely causes?
+    hint: |-
+      - **Graceful shutdown**: ECS gửi SIGTERM → app phải ngừng nhận request mới, xử lý xong request đang chạy rồi thoát trước `stopTimeout`. Node chạy PID 1 không bắt SIGTERM, hoặc `npm start` không forward signal → bị SIGKILL giữa chừng.
+      - **Deregistration delay** của target group ngắn hơn thời gian request dài; hoặc app tắt **trước** khi ALB ngừng gửi traffic.
+      - **Keep-alive mismatch**: ALB idle timeout (mặc định 60s) **lớn hơn** keep-alive timeout của Node (`server.keepAliveTimeout` mặc định 5s) → ALB tái dùng connection Node đã đóng → 502. Đặt `keepAliveTimeout` > ALB idle timeout (và `headersTimeout` lớn hơn nữa).
+      - Health check grace period ngắn → task mới bị đánh dấu unhealthy.
+    example: |-
+      ```ts
+      const server = app.listen(3000);
+      server.keepAliveTimeout = 65_000; // > ALB idle timeout (60s)
+      server.headersTimeout = 66_000;
+      process.on("SIGTERM", () => server.close(() => process.exit(0)));
+      ```
+    followUp: How do you verify a fix like this before production?
+    verify: true
+    tags: [alb, ecs, nodejs, graceful-shutdown]
+  - id: aws-043
+    level: hard
+    type: scenario
+    q: A developer accidentally committed an access key with admin rights to a public GitHub repo. What do you do in the first hour?
+    hint: |-
+      1. **Vô hiệu hoá / xoá key ngay** (không chờ điều tra). Nếu có session tạm đã sinh từ key đó → revoke (policy deny theo `aws:TokenIssueTime` / "Revoke active sessions" cho role).
+      2. **CloudTrail**: tìm mọi API call bằng access key ID đó (region nào, tạo user/role/key mới? chạy EC2 đào coin? đọc S3?).
+      3. Gỡ persistence kẻ tấn công tạo (IAM user, key, role, Lambda, EC2), kiểm tra billing, GuardDuty findings.
+      4. Xoá secret khỏi git history không đủ — coi như đã lộ vĩnh viễn.
+      5. Postmortem: vì sao có long-lived admin key? → SSO/Identity Center, OIDC cho CI, secret scanning (push protection), SCP chặn tạo access key.
+      AWS cũng có thể tự gắn quarantine policy khi phát hiện key lộ công khai — đừng dựa vào điều đó.
+    followUp: How would you prevent humans from ever having long-lived access keys in the organization?
+    tags: [iam, incident-response, security]
+  - id: aws-044
+    level: hard
+    type: design
+    q: Design a secure, scalable user-upload pipeline (images up to 50 MB) that generates thumbnails for a multi-tenant app.
+    hint: |-
+      - API (đã auth) tạo **presigned POST** với policy giới hạn `content-length-range`, content-type, key `uploads/<tenantId>/<uuid>` → client upload thẳng S3 (multipart nếu lớn).
+      - S3 event → **SQS** (buffer, retry, DLQ) hoặc EventBridge → Lambda/ECS worker tạo thumbnail (sharp), ghi vào prefix/bucket khác (tránh **vòng lặp trigger** nếu ghi cùng bucket/prefix).
+      - Validate file thật (magic bytes, không tin extension), scan malware nếu cần, strip EXIF (vị trí GPS).
+      - Serve qua CloudFront + OAC; ảnh private dùng **CloudFront signed URL/cookie**.
+      - Tenant isolation: key prefix + IAM condition hoặc kiểm tra ở API; bucket block public access; SSE-KMS.
+      - Metadata (status: pending → ready) trong DB, client poll/websocket.
+    followUp: The thumbnail Lambda occasionally processes the same object twice. Is that a problem, and how do you make it safe?
+    tags: [s3, lambda, sqs, design, upload]
+  - id: aws-045
+    level: hard
+    type: gotcha
+    q: What are the main Lambda limits that bite a Node/Next.js app, and how do you design around them?
+    hint: |-
+      - **Timeout tối đa 15 phút** → job dài chuyển sang Step Functions / ECS task.
+      - **Payload**: sync invoke khoảng 6 MB request/response (qua API Gateway còn bị giới hạn của API Gateway và timeout ~29s) → upload/download qua S3 presigned URL, response lớn dùng streaming.
+      - **Memory 128 MB – 10,240 MB** (CPU tỉ lệ theo), `/tmp` ephemeral có thể cấu hình tới 10 GB.
+      - **Deployment package** (zip unzipped ~250 MB; container image tới 10 GB) → Next.js bundle phải gọn.
+      - **Concurrency** quota per region; không giữ WebSocket lâu (dùng API Gateway WebSocket).
+      - Không có state giữa invocation ngoài những gì còn trong môi trường warm.
+    followUp: Would you run a Socket.IO real-time service on Lambda? Why or why not?
+    verify: true
+    tags: [lambda, limits]
+  - id: aws-046
+    level: hard
+    type: scenario
+    q: "Your monthly AWS bill doubled without a traffic increase. Walk me through how you find the cause."
+    hint: |-
+      1. **Cost Explorer** group by service → usage type → linked account/region; so sánh theo ngày để tìm **ngày bắt đầu**.
+      2. Thủ phạm hay gặp: NAT GW data processing, data transfer cross-AZ/Internet, CloudWatch Logs ingestion (log debug bật ở prod), public IPv4 address, EBS snapshot/volume mồ côi, RDS storage/IOPS, instance quên tắt ở region khác, S3 version cũ + incomplete multipart upload, Lambda chạy vòng lặp (S3 trigger ghi lại cùng bucket).
+      3. **Cost allocation tags** (team, service, env) và **Cost and Usage Report (CUR)** + Athena để truy tới resource ID.
+      4. Phòng ngừa: **AWS Budgets** alert, **Cost Anomaly Detection**, tag bắt buộc (tag policy/SCP), review hằng tháng.
+    followUp: What would you put in place so the team notices cost regressions within a day, not at month end?
+    tags: [cost-optimization, finops]
+  - id: aws-047
+    level: hard
+    type: compare
+    q: Explain the four DR strategies on AWS and choose one for an e-commerce platform with RTO 1 hour and RPO 5 minutes.
+    hint: |-
+      - **Backup & restore** (RPO/RTO giờ–ngày, rẻ nhất), **Pilot light** (data replicate liên tục, compute tối thiểu/tắt — bật khi cần; RTO hàng chục phút), **Warm standby** (bản thu nhỏ chạy sẵn, scale lên khi failover; RTO phút), **Multi-site active/active** (RTO/RPO gần 0, đắt và phức tạp nhất — conflict ghi).
+      - RTO 1h, RPO 5 phút → **pilot light hoặc warm standby**: Aurora Global Database / cross-region read replica (replication lag thường dưới vài giây), S3 CRR, image ECR replicate, IaC dựng compute ở region DR, Route 53 failover.
+      - Quan trọng hơn chọn chiến lược: **diễn tập failover định kỳ**, runbook, secret/config cũng phải có ở region DR, và quyết định ai bấm nút.
+      - Backup riêng (AWS Backup, cross-account) để chống xoá nhầm/ransomware — replication **nhân bản cả lỗi**.
+    followUp: Replication protects against a region outage. What protects you against a bad migration that deletes data in both regions?
+    verify: true
+    tags: [dr, reliability, aurora, route53]
+  - id: aws-048
+    level: hard
+    type: gotcha
+    q: Why does a Lambda triggered by S3 `ObjectCreated` sometimes run in an infinite loop and burn money, and how do you prevent it?
+    hint: |-
+      Function đọc object, xử lý rồi **ghi output vào cùng bucket/prefix** → event `ObjectCreated` mới → gọi lại chính nó → vòng lặp vô hạn (scale theo concurrency, tốn tiền rất nhanh).
+      Phòng: ghi sang **bucket khác** hoặc prefix không nằm trong filter của notification; filter prefix/suffix chặt; kiểm tra metadata/tag "processed"; reserved concurrency làm trần; alarm trên `Invocations` bất thường.
+      Lambda có **recursive loop detection** cho một số nguồn (SQS, SNS, và S3 theo docs mới) — không nên phụ thuộc hoàn toàn.
+    followUp: What other event-driven setups can create a similar loop?
+    verify: true
+    tags: [lambda, s3, cost, gotcha]
+  - id: aws-049
+    level: hard
+    type: scenario
+    q: "Load test shows p99 latency spikes to 3 s on your Lambda-based Next.js SSR routes every few minutes. How do you analyse and fix it?"
+    hint: |-
+      - Tách **cold start** khỏi chậm do code: xem log `REPORT` có `Init Duration`, trace (X-Ray/OTel) phân biệt init vs handler vs downstream.
+      - Spike định kỳ thường do scale-out (môi trường mới) hoặc môi trường bị thu hồi sau idle.
+      - Fix cold start: giảm bundle (Next.js standalone output, bỏ dependency nặng), lazy import, tăng memory (CPU), **provisioned concurrency** cho route nóng (có thể theo lịch), cache ở CloudFront (ISR/static) để request không chạm Lambda.
+      - Nếu chậm do downstream (DB connection mới mỗi môi trường, lấy secret khi init) → RDS Proxy, cache secret, connection reuse.
+      - Nếu p99 vẫn quan trọng và traffic ổn định → cân nhắc chạy SSR trên container (Fargate) thay vì Lambda.
+      - Lưu ý chi phí: AWS bắt đầu tính tiền cả **INIT phase** cho on-demand function → cold start giờ cũng là chi phí.
+    followUp: How would you decide between provisioned concurrency and moving SSR to ECS, in cost terms?
+    verify: true
+    tags: [lambda, nextjs, cold-start, performance]
+  - id: aws-050
+    level: hard
+    type: gotcha
+    q: A pod on EKS (or a task on ECS) needs to read one S3 bucket. What are the right and wrong ways to give it credentials?
+    hint: |-
+      - Sai: access key trong env/Secret; dùng **instance profile của node** (mọi pod trên node đều có quyền đó); chặn IMDS không đúng cách để pod vẫn đọc được credential của node.
+      - Đúng trên EKS: **EKS Pod Identity** hoặc **IRSA** (IAM Roles for Service Accounts — OIDC, `AssumeRoleWithWebIdentity`) → mỗi service account một role.
+      - Đúng trên ECS: **task role** (container credential endpoint).
+      - EC2: instance profile với **IMDSv2** bắt buộc (session token, hop limit 1 để container không với tới) — chống SSRF lấy credential.
+      - Policy least privilege: đúng bucket/prefix, có thể thêm `aws:SourceVpce`.
+    followUp: How does IMDSv2 mitigate SSRF attacks that steal instance credentials?
+    verify: true
+    tags: [iam, eks, ecs, imds]
+  - id: aws-051
+    level: hard
+    type: concept
+    q: How does Aurora differ architecturally from standard RDS PostgreSQL, and when is it worth the price?
+    hint: |-
+      - Aurora tách **compute và storage**: storage phân tán, tự mở rộng, **6 bản copy trên 3 AZ**; writer chỉ gửi log record xuống storage → replica đọc cùng volume (replica lag thường rất thấp, ms), tối đa **15 Aurora Replicas**, failover nhanh hơn RDS Multi-AZ instance.
+      - Tính năng: Global Database (cross-region, RPO khoảng giây), fast clone, backtrack (MySQL), **Aurora Serverless v2** (scale ACU theo tải), I/O-Optimized pricing.
+      - Đáng giá khi: cần nhiều replica đọc, failover nhanh, storage lớn tăng dần, DR cross-region. RDS thường rẻ hơn cho DB nhỏ, tải ổn định, hoặc khi cần extension/version Aurora chưa hỗ trợ.
+      - Serverless v2 không phải "free when idle" như Lambda — kiểm tra min ACU hiện tại.
+    followUp: When does Aurora I/O-Optimized become cheaper than Standard?
+    verify: true
+    tags: [aurora, rds, database]
+  - id: aws-052
+    level: hard
+    type: scenario
+    q: "You need to run the database migration for a new release on ECS without downtime. How do you do it in the pipeline?"
+    hint: |-
+      - Chạy migration như **one-off ECS task** (`aws ecs run-task` với cùng image, command `migrate`) **trước** khi cập nhật service, trong private subnet, với role có quyền đọc secret DB; pipeline chờ exit code 0.
+      - Không chạy migration trong entrypoint của mỗi task (N task cùng chạy migration → race/lock).
+      - Migration phải **backward compatible** (expand/contract): thêm cột nullable → deploy code ghi cả hai → backfill → đổi đọc → xoá cột cũ ở release sau. Rolling deploy nghĩa là code cũ và mới chạy **cùng lúc** với cùng schema.
+      - Lock timeout / statement timeout để migration không khoá bảng production; index tạo `CONCURRENTLY` (Postgres).
+      - Rollback: code rollback được nhờ schema tương thích; migration down hiếm khi an toàn với dữ liệu.
+    followUp: How do you rename a column used by the running version without downtime?
+    tags: [ecs, migrations, deployment, ci-cd]
+  - id: aws-053
+    level: hard
+    type: gotcha
+    q: What changed about public IPv4 pricing on AWS, and how does it affect a VPC design?
+    hint: |-
+      Từ **02/2024**, AWS tính phí **mọi public IPv4 address** (khoảng $0.005/giờ mỗi IP), dù đang gắn vào resource hay không — trước đây chỉ Elastic IP **không gắn** mới bị tính.
+      Ảnh hưởng: task/instance ở public subnet có public IP, ALB (mỗi node một IP), NAT GW, EIP… đều cộng tiền.
+      Hướng xử lý: đặt workload ở **private subnet**, tắt auto-assign public IP, dùng VPC endpoint, cân nhắc **IPv6/dual-stack** (egress-only IGW), dùng **Public IP Insights** trong VPC IPAM để đếm.
+    followUp: Your Fargate tasks run in public subnets with public IPs "to avoid paying for NAT". Is that still a good trade?
+    verify: true
+    tags: [vpc, cost, ipv4]
+  - id: aws-054
+    level: senior
+    type: design
+    q: Design the AWS architecture for a multi-tenant B2B2C e-commerce platform (Next.js storefront, Node APIs, SQL database, search, cache, async jobs). Justify the main choices.
+    hint: |-
+      - Edge: Route 53 → CloudFront (static, ISR/cache theo tenant domain) + WAF + ACM; tenant custom domain.
+      - Compute: ECS Fargate cho storefront + API (service riêng theo domain), Lambda cho job event-driven; autoscaling theo request/latency.
+      - Data: Aurora PostgreSQL (tenant_id + RLS hoặc schema-per-tenant cho tenant lớn), RDS Proxy nếu có Lambda; ElastiCache (key có prefix tenant); OpenSearch cho catalog search; S3 cho media.
+      - Async: EventBridge/SNS → SQS per consumer (+DLQ); MSK nếu đã có Kafka và cần replay.
+      - Security: account per env (Organizations + SCP), task role least privilege, Secrets Manager, KMS; noisy-neighbor controls (rate limit per tenant).
+      - Ops: IaC (CDK/Terraform), CI OIDC, blue/green hoặc rolling + circuit breaker, OTel + CloudWatch, cost tags theo tenant tier.
+      Nói rõ trade-off: pooled vs siloed tenant, cost vs isolation.
+    followUp: A large enterprise tenant requires data isolation and its own region. How does the architecture change?
+    tags: [design, multi-tenancy, architecture]
+  - id: aws-055
+    level: senior
+    type: design
+    q: Design a multi-account AWS setup (Organizations) for a company of 30 engineers. What guardrails would you put in place?
+    hint: |-
+      - OU theo môi trường/chức năng: Security (log archive, audit), Infrastructure (shared network, CI), Workloads (dev, staging, prod), Sandbox. **Control Tower** / landing zone để bootstrap.
+      - Identity: **IAM Identity Center** với IdP công ty, permission set theo vai trò; không IAM user; break-glass account.
+      - Guardrails: SCP (chặn region không dùng, chặn tắt CloudTrail/GuardDuty/Config, chặn tạo access key, chặn rời Organization), RCP cho resource, tag policy, budget per account.
+      - Logging tập trung: org CloudTrail → log archive account (immutable/Object Lock), Security Hub, GuardDuty delegated admin.
+      - Network: shared VPC / Transit Gateway hoặc tách hoàn toàn; CI deploy bằng role cross-account qua OIDC.
+      Trade-off: nhiều account = blast radius nhỏ, billing rõ, nhưng thêm độ phức tạp networking và cross-account access.
+    followUp: A developer needs temporary admin in prod to fix an incident. How does that work in your design?
+    verify: true
+    tags: [organizations, governance, iam, design]
+  - id: aws-056
+    level: senior
+    type: open
+    q: How would you apply the Well-Architected Framework to review an existing Node/Next.js workload? What would you look at first?
+    hint: |-
+      6 pillar: **Operational Excellence, Security, Reliability, Performance Efficiency, Cost Optimization, Sustainability**. Dùng **Well-Architected Tool** + lens (Serverless, SaaS) làm checklist, nhưng ưu tiên theo **rủi ro nghiệp vụ**.
+      Thứ tự thực tế thường là:
+      1. Security: long-lived key, public resource, secret trong code, MFA, encryption, logging.
+      2. Reliability: single-AZ, không có backup đã **test restore**, không có health check/autoscaling, không có DLQ.
+      3. Operational: không có alarm theo triệu chứng, không có runbook, deploy thủ công.
+      4. Cost: tài nguyên idle, NAT/data transfer, right-sizing, Savings Plans.
+      Output: danh sách high-risk issue có owner + deadline, không phải báo cáo PDF.
+    followUp: Which one finding would you escalate immediately, even if it delays the roadmap?
+    tags: [well-architected, review, open]
+  - id: aws-057
+    level: senior
+    type: design
+    q: You're migrating a Node monolith with Kafka-based microservices to AWS. Would you choose MSK, MSK Serverless, or rewrite to SNS/SQS/EventBridge? Defend your choice.
+    hint: |-
+      - **MSK (provisioned)**: giữ nguyên semantics Kafka (partition, ordering theo key, consumer group, replay, retention dài) → migrate ít rủi ro nhất cho code có sẵn; phải tự sizing broker, storage, partition, upgrade version.
+      - **MSK Serverless**: ít vận hành hơn, có quota (throughput, partition, retention) và giới hạn cấu hình → kiểm tra quota trước.
+      - **SNS/SQS/EventBridge**: rẻ và ít ops với traffic vừa, nhưng **mất** replay theo offset (EventBridge archive chỉ phần nào), ordering khác (FIFO group), phải viết lại producer/consumer và idempotency → migration hai lần rủi ro.
+      - Khuyến nghị điển hình: migrate "lift" sang MSK trước (hoặc Confluent Cloud), ổn định, rồi mới cân nhắc service nào đáng chuyển sang SQS. Đo: throughput, số partition, retention, số consumer group.
+    followUp: How do you run old and new consumers side by side during the migration without double-processing?
+    verify: true
+    tags: [msk, kafka, migration, design]
+  - id: aws-058
+    level: senior
+    type: open
+    q: Your CTO asks you to cut the AWS bill by 30% without hurting reliability. What's your plan?
+    hint: |-
+      1. **Visibility trước**: tag, CUR, cost per service/tenant/env; tìm top 5 line item (thường chiếm >70%).
+      2. **Quick wins**: xoá tài nguyên idle (EBS/snapshot mồ côi, env dev chạy 24/7 → lịch tắt), log retention, S3 lifecycle, VPC endpoint thay NAT, bỏ public IPv4 không cần.
+      3. **Right-size**: CPU/memory thực tế của task/RDS; Graviton (ARM) cho Node thường rẻ hơn với cùng hiệu năng.
+      4. **Commitment**: Savings Plans (Compute SP cho Fargate/Lambda/EC2) / RDS Reserved cho baseline ổn định; Spot cho worker chịu gián đoạn.
+      5. **Kiến trúc**: cache ở CloudFront, giảm chatty cross-AZ, batch job.
+      Guardrail: đo SLO trước và sau mỗi thay đổi; không cắt Multi-AZ/backup của prod để lấy số.
+    followUp: How do you decide the Savings Plan commitment amount without over-committing?
+    tags: [cost-optimization, finops, open]
+  - id: aws-059
+    level: senior
+    type: design
+    q: Design secret and configuration management for 15 services across dev, staging and prod on AWS.
+    hint: |-
+      - Tách **config** (không nhạy cảm: feature toggle, URL) và **secret** (DB password, API key). Config: Parameter Store / AppConfig (rollout có validation + rollback); secret: Secrets Manager (rotation, cross-account).
+      - Đặt tên theo hierarchy `/<env>/<service>/<key>`; IAM policy của mỗi task role chỉ đọc đúng path của nó; KMS key riêng theo env.
+      - Inject: ECS `secrets` (lúc start task) **hoặc** app fetch runtime + cache (để nhận rotation không cần restart). Không log secret, không bake vào image.
+      - Rotation: dual-credential (hai user DB luân phiên) để không có khoảng lỗi; alarm khi rotation fail.
+      - Local dev: secret riêng cho dev, không bao giờ dùng secret prod.
+      - Audit qua CloudTrail; phát hiện secret lộ bằng secret scanning.
+    followUp: How do you rotate a third-party API key that has no "two active keys" feature?
+    tags: [secrets-manager, parameter-store, design, security]
+  - id: aws-060
+    level: senior
+    type: open
+    q: When would you tell a team NOT to go serverless-first on AWS?
+    hint: |-
+      - Tải cao và ổn định (Lambda per-invocation đắt hơn container chạy liên tục), latency p99 nhạy cảm cold start, job dài, WebSocket/real-time nhiều connection (Socket.IO), workload nặng DB connection.
+      - Team chưa có năng lực observability phân tán: debug hàng chục function + queue khó hơn một service.
+      - Lock-in và local dev/test phức tạp (emulator không giống thật).
+      - Ngược lại serverless rất hợp: traffic thưa/đột biến, glue event-driven, cron, prototype nhanh, team nhỏ không muốn vận hành server.
+      Câu trả lời senior: không "tôn giáo" — chọn theo workload, hỗn hợp container + Lambda là bình thường; xét tổng chi phí (tiền + công vận hành + thời gian ra thị trường).
+    followUp: Estimate the break-even point between Lambda and Fargate for an API at 200 RPS with 100 ms average duration.
+    tags: [lambda, serverless, open]
+  - id: aws-061
+    level: senior
+    type: design
+    q: Design the real-time layer (Socket.IO notifications, ~50k concurrent connections) for the platform on AWS.
+    hint: |-
+      - Socket.IO trên **ECS Fargate** sau **ALB** (hỗ trợ WebSocket; nếu dùng polling fallback thì cần sticky session), hoặc chỉ dùng transport websocket để bỏ sticky.
+      - Nhiều node → **Redis adapter** (ElastiCache) hoặc Streams adapter để broadcast giữa các instance; room theo tenant/user.
+      - Scale theo **số connection/memory**, không phải CPU; kiểm tra ALB idle timeout và heartbeat (ping) của Socket.IO; graceful shutdown → client reconnect có backoff + jitter (tránh reconnect storm sau deploy).
+      - Nguồn event: service publish lên SNS/EventBridge/Kafka → gateway real-time tiêu thụ và đẩy tới client.
+      - Lựa chọn thay thế managed: **API Gateway WebSocket API** (per-connection/message pricing, connection tối đa 2 giờ) hoặc AppSync Events / IoT Core.
+      - Auth khi handshake (JWT), re-validate khi token hết hạn.
+    followUp: After every deploy, 50k clients reconnect at once and Redis CPU spikes. How do you smooth that?
+    verify: true
+    tags: [socketio, websocket, ecs, design]
+  - id: aws-062
+    level: cv
+    type: design
+    q: You haven't run AWS in production yet. Take the multi-tenant e-commerce platform you built (Node/Express, Next.js, SQL Server, Redis, Elasticsearch) and explain how you would deploy it on AWS.
+    hint: |-
+      Câu trả lời mạnh map **từng thành phần bạn đã vận hành** sang dịch vụ AWS và nói lý do:
+      - Next.js + Express → ECS Fargate sau ALB + CloudFront; SQL Server → **RDS for SQL Server** (Multi-AZ; lưu ý license cost và edition) hoặc lý do cân nhắc migrate sang Aurora PostgreSQL; Redis → ElastiCache; Elasticsearch → **Amazon OpenSearch Service** (lưu ý khác biệt version/license).
+      - Network: VPC 3 tầng, SG theo tầng; secret trong Secrets Manager; CI/CD OIDC.
+      - Nói **thẳng** phần bạn chưa làm thật và cách bạn giảm rủi ro (staging, IaC, load test, runbook).
+      - Nêu 1–2 điều bạn đã học khi dựng lab (ví dụ NAT cost, OAC) — (điền trải nghiệm thật của bạn).
+    followUp: What is the first thing you'd expect to go wrong in production, based on your experience with this platform on its current hosting?
+    redFlags:
+      - Pretends to have production AWS experience
+      - Lists services without mapping them to real components and constraints
+    tags: [cv, migration, design]
+  - id: aws-063
+    level: cv
+    type: scenario
+    q: You're studying for the AWS certifications. Which AWS concept most changed how you'd design the platform you built, compared with how it's deployed today?
+    hint: |-
+      Interviewer muốn thấy bạn **nối kiến thức học với thực tế**, không đọc thuộc đề thi.
+      Ý tưởng tốt để nói: IAM role thay cho secret dài hạn; multi-AZ & graceful failover (so với cách hệ thống hiện tại xử lý DB restart); SQS/DLQ để tách job nặng khỏi request path; VPC endpoint/NAT cost; Well-Architected review.
+      Cấu trúc: "Hiện tại hệ thống làm X → vấn đề đã gặp (sự cố/giới hạn thật) → trên AWS tôi sẽ làm Y → trade-off".
+      (điền ví dụ và sự cố thật của bạn — không bịa số liệu)
+    followUp: What would you still do the same way, even with AWS available?
+    tags: [cv, learning, behavioral]
+  - id: aws-064
+    level: cv
+    type: design
+    q: In the microservices migration you did (monolith to Node services with Kafka), how would you have used AWS to do the incremental migration more safely?
+    hint: |-
+      - **Strangler fig** ở tầng routing: ALB listener rule (path/host) hoặc API Gateway route chuyển dần endpoint từ monolith sang service mới; weighted target group để canary theo %.
+      - Kafka → MSK (giữ semantics), hoặc bridge sang EventBridge/SQS cho consumer mới.
+      - Mỗi service một ECS service + task role + log group riêng; distributed tracing (OTel) để so sánh latency cũ/mới.
+      - Rollback nhanh bằng cách đổi rule/weight, không cần redeploy.
+      - Dữ liệu: bắt đầu với DB chung (read-only), CDC (DMS/Debezium) để tách dần.
+      Gắn với trải nghiệm thật: bạn đã giữ ổn định thế nào khi migrate — (điền cách làm và số liệu thật của bạn).
+    followUp: How did you (or would you) detect that the new service behaves differently from the monolith for the same request?
+    tags: [cv, microservices, migration, kafka]

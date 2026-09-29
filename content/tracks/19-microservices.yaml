@@ -1,0 +1,678 @@
+id: 19-microservices
+slug: microservices
+title: Monolith → Microservices
+tier: 5
+status: drafted
+summary: Monolith vs modular monolith vs microservices, DDD bounded contexts, strangler fig, backward compatibility & contract testing, database-per-service, sync vs async, API gateway/BFF, service mesh, tracing, distributed monolith.
+cvLinked: true
+overview: |-
+  ## TL;DR
+
+  - Microservices là cách tổ chức hệ thống quanh **khả năng deploy và sở hữu độc lập** của từng team — không phải mục tiêu tự thân. Cái giá: mọi function call thành network call, transaction thành saga, debug cần tracing.
+  - Thứ tự hợp lý thường là **monolith → modular monolith → tách service** khi có lý do rõ (scale khác nhau, team độc lập, release cadence, isolation lỗi/compliance).
+  - Ranh giới service đến từ **bounded context** (DDD) và dữ liệu mà service **sở hữu** (database-per-service). Ranh giới sai → **distributed monolith**: tất cả nhược điểm của cả hai.
+  - Migration an toàn = **strangler fig** (facade route dần), **anti-corruption layer**, đồng bộ dữ liệu (CDC/outbox), **backward compatibility** (expand/contract, tolerant reader, contract test), đo parity trước khi cắt.
+  - Hạ tầng tối thiểu trước khi tách: CI/CD mỗi service, observability (log có correlation id, metrics, distributed tracing), config/secrets, service discovery, gateway.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Modular monolith | Một deploy unit, module có ranh giới cứng (API nội bộ, không truy cập DB của nhau) | `orders/`, `catalog/` chỉ gọi nhau qua interface |
+  | Bounded context | Ranh giới nơi một model/ngôn ngữ có nghĩa nhất quán | "Product" ở Catalog ≠ "Product" ở Warehouse |
+  | Database per service | Mỗi service sở hữu dữ liệu; service khác chỉ qua API/event | Order service không `JOIN` bảng của Customer |
+  | Strangler fig | Facade phía trước legacy, chuyển dần từng route sang service mới | `/api/invoices/*` → Billing service |
+  | Anti-corruption layer | Lớp dịch giữa model legacy và model mới | Map `CUST_TP=3` → `CustomerTier.Gold` |
+  | API gateway | Điểm vào chung: routing, auth, rate limit, TLS | Kong, AWS API Gateway, NGINX |
+  | BFF | Backend riêng cho từng loại client | `mobile-bff` gom 5 call thành 1 |
+  | Service discovery | Tìm địa chỉ instance động | K8s Service DNS, Consul |
+  | Service mesh | Sidecar/proxy lo mTLS, retry, traffic shifting, telemetry | Istio, Linkerd |
+  | Contract testing | Kiểm tra provider thoả mãn kỳ vọng của consumer | Pact |
+  | Distributed tracing | Theo dõi một request qua nhiều service bằng trace id | W3C `traceparent`, OpenTelemetry |
+  | Expand / contract | Thay đổi schema/API theo 2 pha tương thích | Thêm cột mới → migrate → bỏ cột cũ |
+
+  ## Cơ chế hoạt động
+
+  ### Strangler fig migration
+
+  ```mermaid
+  flowchart LR
+    U["Clients"] --> F["Facade / API gateway<br/>(routing rules, feature flags)"]
+    F -->|"/orders/* (legacy)"| M["Legacy monolith"]
+    F -->|"/invoices/* (migrated)"| B["Billing service"]
+    B --> ACL["Anti-corruption layer"]
+    ACL --> M
+    M -->|"CDC / outbox events"| K["Kafka"]
+    K --> B
+    B --> BDB[("Billing DB")]
+    M --> MDB[("Legacy DB")]
+  ```
+
+  ### Các bước cắt một capability
+
+  ```mermaid
+  flowchart TD
+    A["Chọn capability: ít coupling,<br/>giá trị rõ, team sở hữu"] --> B["Vẽ ranh giới: dữ liệu nào sở hữu,<br/>ai đọc/ghi"]
+    B --> C["Modularize trong monolith trước<br/>(interface + cấm truy cập chéo)"]
+    C --> D["Dựng service mới + ACL<br/>+ đồng bộ dữ liệu (CDC/outbox)"]
+    D --> E["Shadow / dark launch:<br/>so sánh kết quả với legacy"]
+    E --> F["Chuyển traffic dần (1% → 100%)<br/>qua facade, có rollback"]
+    F --> G["Đổi source of truth,<br/>xoá code + bảng legacy (contract)"]
+  ```
+
+  ## Trade-offs
+
+  | | Monolith | Modular monolith | Microservices |
+  |---|---|---|---|
+  | Deploy | Một đơn vị | Một đơn vị | Độc lập từng service |
+  | Transaction | ACID dễ | ACID dễ | Saga, eventual consistency |
+  | Scale team | Kém khi > vài team | Tốt vừa | Tốt nếu ranh giới đúng |
+  | Vận hành | Đơn giản | Đơn giản | Nặng: CI/CD, observability, network, on-call |
+  | Isolation lỗi | Thấp | Thấp | Cao (nếu có timeout/bulkhead) |
+  | Latency | Function call | Function call | Network hop mỗi call |
+  | Refactor ranh giới | Dễ | Dễ vừa | Đắt (API/data migration) |
+
+  | Giao tiếp | Ưu | Nhược | Dùng khi |
+  |---|---|---|---|
+  | Sync (REST/gRPC) | Đơn giản, có kết quả ngay | Temporal coupling, cascading failure, latency cộng dồn | Query cần trả lời ngay, validate |
+  | Async (event/queue) | Loose coupling, chịu lỗi, fan-out | Eventual consistency, debug khó, cần idempotency | Thông báo thay đổi, workflow dài, đồng bộ read model |
+
+  ## Pitfalls
+
+  - Tách theo **layer kỹ thuật** (auth-service, db-service, validation-service) thay vì theo capability nghiệp vụ.
+  - **Shared database** giữa service → không deploy/đổi schema độc lập được.
+  - Một user action cần **gọi đồng bộ 5 service nối tiếp** → availability = tích (0.99^5 ≈ 95%), latency cộng dồn.
+  - Deploy phải theo thứ tự ("B trước rồi mới A") → dấu hiệu distributed monolith.
+  - Shared library chứa domain model dùng chung → mọi service phải nâng version cùng lúc.
+  - Breaking API/event change không có versioning, không contract test.
+  - Tách service trước khi có CI/CD, tracing, dashboard → không biết lỗi ở đâu.
+  - Big-bang rewrite: đóng băng feature nhiều tháng rồi cắt một lần.
+
+  ## Cheat sheet
+
+  - Bắt đầu: modular monolith; tách khi có lý do đo được (team, scale, release, compliance).
+  - Ranh giới: bounded context + dữ liệu sở hữu + tần suất thay đổi cùng nhau (change coupling từ git log).
+  - Migration: strangler fig + ACL + CDC/outbox + shadow traffic + chuyển dần + rollback bằng routing.
+  - Tương thích: thêm field optional, không đổi nghĩa/xoá field khi còn consumer; tolerant reader; expand/contract; version khi buộc phải breaking; consumer-driven contract test trong CI.
+  - Data: database-per-service; query xuyên service bằng API composition hoặc read model (CQRS) cập nhật qua event.
+  - Mỗi call: timeout, retry có budget, circuit breaker, correlation/trace id (`traceparent`).
+  - Gateway: cross-cutting (auth, rate limit, routing), **không** chứa business logic; BFF cho nhu cầu riêng từng client.
+  - Distributed monolith smell: lockstep deploy, shared DB, chatty sync call, một thay đổi chạm nhiều service.
+notionRefs:
+  - title: Micro-Services
+    url: https://app.notion.com/p/2ceef77f8ab2804aa53dc229f54539a9
+  - title: 13. Interview Questions (Comprehensive)
+    url: https://app.notion.com/p/380ef77f8ab281f8b526ef9b21a55cef
+references:
+  - title: Martin Fowler & James Lewis — Microservices
+    url: https://martinfowler.com/articles/microservices.html
+  - title: Martin Fowler — MonolithFirst
+    url: https://martinfowler.com/bliki/MonolithFirst.html
+  - title: Martin Fowler — Strangler Fig Application
+    url: https://martinfowler.com/bliki/StranglerFigApplication.html
+  - title: Martin Fowler — Bounded Context
+    url: https://martinfowler.com/bliki/BoundedContext.html
+  - title: Martin Fowler — Consumer-Driven Contracts
+    url: https://martinfowler.com/articles/consumerDrivenContracts.html
+  - title: Martin Fowler — Tolerant Reader
+    url: https://martinfowler.com/bliki/TolerantReader.html
+  - title: microservices.io — Database per service
+    url: https://microservices.io/patterns/data/database-per-service.html
+  - title: microservices.io — API gateway / Backends for Frontends
+    url: https://microservices.io/patterns/apigateway.html
+  - title: microservices.io — Strangler application
+    url: https://microservices.io/patterns/refactoring/strangler-application.html
+  - title: Sam Newman — Backends For Frontends
+    url: https://samnewman.io/patterns/architectural/bff/
+  - title: W3C Trace Context
+    url: https://www.w3.org/TR/trace-context/
+  - title: OpenTelemetry documentation
+    url: https://opentelemetry.io/docs/
+  - title: Pact documentation
+    url: https://docs.pact.io/
+  - title: AWS Prescriptive Guidance — Strangler fig pattern
+    url: https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/strangler-fig.html
+questions:
+  - id: microservices-001
+    level: easy
+    type: compare
+    q: Compare a monolith, a modular monolith and microservices. What problem does each one solve?
+    hint: |-
+      - **Monolith**: một codebase, một deploy, thường một DB — đơn giản, nhanh lúc đầu; lớn dần thì coupling, build/deploy chậm, nhiều team dẫm chân.
+      - **Modular monolith**: vẫn một deploy nhưng module có ranh giới cứng (interface, không đọc bảng của nhau) — giữ ACID và vận hành đơn giản, giải quyết coupling trong code.
+      - **Microservices**: service deploy độc lập, sở hữu dữ liệu — giải quyết **tự chủ team, scale và release độc lập, cô lập lỗi**, đổi lại độ phức tạp phân tán.
+    followUp: What signals would tell you it is time to extract the first service from a modular monolith?
+    tags: [architecture]
+  - id: microservices-002
+    level: easy
+    type: concept
+    q: What is a bounded context in DDD, and how does it relate to service boundaries?
+    hint: |-
+      Bounded context = ranh giới trong đó một model và **ubiquitous language** có nghĩa nhất quán. Cùng từ "Customer" ở Sales (lead, deal) khác ở Billing (payment method, invoice).
+      Service boundary tốt thường trùng **một bounded context** (hoặc một phần của nó) — không nhỏ hơn đến mức chia đôi một aggregate/transaction nghiệp vụ.
+      Giữa các context: context map (ACL, shared kernel, customer/supplier, published language).
+    followUp: How do you discover bounded contexts in an existing legacy system?
+    tags: [ddd, boundaries]
+  - id: microservices-003
+    level: easy
+    type: concept
+    q: What does database-per-service mean, and why is a shared database considered an anti-pattern?
+    hint: |-
+      Mỗi service sở hữu schema/DB của mình; service khác chỉ truy cập qua **API hoặc event** (có thể cùng DB server nhưng khác schema, quyền riêng).
+      Shared DB: schema là API ngầm → đổi cột phá service khác, không deploy độc lập, lock/tải lẫn nhau, không rõ ai sở hữu dữ liệu.
+      Cái giá của per-service: không JOIN xuyên service, không ACID xuyên service → API composition, read model, saga.
+    followUp: How do you build a report that needs data from five services?
+    tags: [data, database-per-service]
+  - id: microservices-004
+    level: easy
+    type: concept
+    q: What does an API gateway do, and what should it not do?
+    hint: |-
+      Làm: điểm vào duy nhất, routing theo path/host, TLS termination, xác thực token, rate limit/quota, request size limit, CORS, logging/tracing, canary routing.
+      Không nên: chứa **business logic**, orchestration phức tạp, biến đổi dữ liệu nghiệp vụ — gateway trở thành "ESB" mới mà mọi team phải sửa.
+      Rủi ro: single point of failure/bottleneck → HA, và coi gateway là hạ tầng được quản lý bằng config-as-code.
+    followUp: Where does authorization belong — the gateway or each service?
+    tags: [gateway]
+  - id: microservices-005
+    level: easy
+    type: concept
+    q: What is the Backend-for-Frontend (BFF) pattern and when is it worth it?
+    hint: |-
+      BFF = backend riêng cho **từng loại client** (web, mobile, partner), thường do team frontend sở hữu: gom/ghép nhiều call downstream, định dạng payload theo màn hình, xử lý auth phía client đó.
+      Đáng khi: client có nhu cầu rất khác nhau (mobile cần payload nhỏ), UI cần gọi nhiều service cho một màn hình. Không đáng khi chỉ có một client đơn giản.
+      Rủi ro: logic nghiệp vụ trôi vào BFF, trùng lặp giữa các BFF. Next.js Route Handlers/Server Components thường đóng vai BFF.
+    followUp: How do you stop domain logic from leaking into several BFFs?
+    tags: [bff]
+  - id: microservices-006
+    level: easy
+    type: concept
+    q: What is the strangler fig pattern?
+    hint: |-
+      Đặt một **facade** (gateway/proxy/router) trước hệ legacy; lần lượt xây chức năng mới hoặc chuyển chức năng cũ sang service mới, rồi **chuyển route** tương ứng sang service mới; lặp lại tới khi legacy "chết dần" và gỡ bỏ.
+      Ưu: không big-bang, rollback bằng đổi routing, giao giá trị từng bước. Nhược: chạy song song hai hệ trong thời gian dài, đồng bộ dữ liệu phức tạp.
+    followUp: How do you handle data that both the old and new system still write during the transition?
+    tags: [migration, strangler-fig]
+  - id: microservices-007
+    level: easy
+    type: compare
+    q: Synchronous vs asynchronous communication between services — give one good use for each.
+    hint: |-
+      Sync (REST/gRPC): caller cần kết quả ngay để trả lời user (kiểm tra giá, validate voucher). Nhược: caller phụ thuộc availability + latency của callee.
+      Async (event/queue qua Kafka/SQS): thông báo "đã xảy ra" và để service khác phản ứng (OrderPlaced → email, analytics, read model), workflow dài. Nhược: eventual consistency, cần idempotency, khó debug hơn.
+      Nguyên tắc: giảm chuỗi sync dài trên đường request của user.
+    followUp: A sync call chain is Gateway → A → B → C. What is the availability if each is 99.9%?
+    tags: [communication]
+  - id: microservices-008
+    level: easy
+    type: concept
+    q: What is service discovery, and how does Kubernetes provide it?
+    hint: |-
+      Service discovery = tìm địa chỉ instance đang sống của service khi IP thay đổi liên tục (autoscale, redeploy).
+      Client-side (client hỏi registry như Consul/Eureka rồi tự load balance) vs server-side (gọi qua LB/DNS).
+      K8s: `Service` có DNS ổn định (`billing.payments.svc.cluster.local`) → kube-proxy/IPVS (hoặc eBPF) cân bằng tới Pod **ready** (theo readiness probe). Headless service trả trực tiếp IP pod.
+    followUp: Why do long-lived gRPC connections defeat Kubernetes Service load balancing?
+    tags: [discovery, kubernetes]
+  - id: microservices-009
+    level: medium
+    type: design
+    q: How do you find good service boundaries in a legacy monolith?
+    hint: |-
+      - Domain: event storming với domain expert → domain events, aggregate, bounded context.
+      - Dữ liệu: bảng nào được ghi bởi module nào; cụm bảng có ít foreign key ra ngoài.
+      - **Change coupling**: file nào hay đổi cùng nhau (git log) → nên ở cùng service.
+      - Tổ chức: team nào sở hữu (Conway's law), tần suất release khác nhau, yêu cầu scale/compliance khác nhau.
+      Tránh chia theo layer kỹ thuật; ưu tiên ranh giới mà **transaction nghiệp vụ nằm gọn trong một service**.
+    followUp: Two candidate services share an entity that both write. What do you do?
+    tags: [boundaries, ddd]
+  - id: microservices-010
+    level: medium
+    type: concept
+    q: What is an anti-corruption layer, and why is it essential during a migration?
+    hint: |-
+      ACL = lớp dịch (adapter/translator/facade) giữa model của service mới và model/protocol của legacy hoặc hệ bên ngoài.
+      Nó ngăn khái niệm, tên cột, mã trạng thái, quirks của legacy "rò" vào domain mới; khi legacy bị thay thế, chỉ phải sửa ACL.
+      Ví dụ: legacy trả `STATUS='X9'` → ACL map thành `OrderStatus.Cancelled`; legacy SOAP → ACL expose interface TypeScript sạch.
+    example: |-
+      ```ts
+      // acl/legacyCustomer.ts
+      export function toCustomer(row: LegacyCustRow): Customer {
+        return {
+          id: row.CUST_ID.trim(),
+          tier: ({ "1": "standard", "3": "gold" } as const)[row.CUST_TP] ?? "standard",
+          email: row.EMAIL_ADDR?.toLowerCase() ?? null,
+        };
+      }
+      ```
+    followUp: Where should the ACL live — in the new service, the legacy system, or a separate component?
+    tags: [acl, migration, ddd]
+  - id: microservices-011
+    level: medium
+    type: concept
+    q: What rules keep an HTTP or event API backward compatible?
+    hint: |-
+      An toàn: **thêm** field optional/endpoint mới, thêm giá trị enum (nếu consumer chịu được giá trị lạ), nới lỏng validation đầu vào.
+      Breaking: xoá/đổi tên field, đổi kiểu, đổi nghĩa, thêm field **bắt buộc** ở request, siết validation, đổi status code/format lỗi, đổi thứ tự/pagination mặc định.
+      Consumer phải là **tolerant reader** (bỏ qua field lạ, không phụ thuộc thứ tự). Breaking bắt buộc → version mới (`/v2`, event `v2`) chạy song song + deprecate có hạn + đo ai còn dùng.
+    followUp: Is adding a new enum value a breaking change? When?
+    tags: [compatibility, api]
+  - id: microservices-012
+    level: medium
+    type: concept
+    q: What is consumer-driven contract testing, and how does it differ from end-to-end tests?
+    hint: |-
+      Consumer viết **contract** (request mong gửi + phần response nó thực sự dùng) → publish lên broker (Pact Broker); CI của provider **verify** contract với code thật. Provider biết ngay thay đổi nào phá consumer nào; `can-i-deploy` chặn deploy.
+      So với E2E: nhanh, ổn định, không cần dựng toàn bộ hệ thống, chỉ ra đúng cặp service lỗi; nhưng không kiểm tra hành vi xuyên nhiều hop hay config môi trường → vẫn giữ vài E2E smoke test.
+      Áp dụng được cho message/event (Pact message contracts).
+    followUp: Who owns a contract when the provider has 15 consumers?
+    tags: [testing, contracts]
+  - id: microservices-013
+    level: medium
+    type: concept
+    q: How does distributed tracing work across services, including through Kafka?
+    hint: |-
+      Mỗi request có **trace id**; mỗi đơn vị công việc là **span** (id, parent id, thời gian, attributes). Context truyền qua header **W3C `traceparent`** (`00-<trace-id>-<span-id>-<flags>`) ở HTTP/gRPC; qua Kafka bằng **record headers**.
+      OpenTelemetry SDK tự instrument HTTP/Express/DB/Kafka client, export tới collector → backend (Jaeger, Tempo, X-Ray...). Sampling (head vs tail) để kiểm soát chi phí.
+      Node: context giữ bằng AsyncLocalStorage — code tự tạo promise ngoài context có thể làm đứt trace.
+    followUp: Head-based vs tail-based sampling — which catches rare errors better and at what cost?
+    tags: [tracing, observability]
+  - id: microservices-014
+    level: medium
+    type: compare
+    q: What is a service mesh, and when is it worth the complexity?
+    hint: |-
+      Mesh = data plane (proxy sidecar như Envoy, hoặc mô hình không sidecar/ambient) + control plane → lo **mTLS**, retry/timeout, circuit breaking, traffic shifting (canary), telemetry đồng nhất mà không sửa code.
+      Đáng khi: nhiều service, nhiều ngôn ngữ, yêu cầu zero-trust/mTLS, cần canary tinh vi. Không đáng khi: vài service một ngôn ngữ — library + gateway là đủ.
+      Chi phí: thêm latency/tài nguyên, độ phức tạp vận hành, debug thêm một tầng; retry ở mesh **cộng** với retry ở code.
+    followUp: Your app already retries and so does the mesh. What happens during an outage?
+    tags: [service-mesh]
+  - id: microservices-015
+    level: medium
+    type: compare
+    q: How do you query data owned by several services? Compare API composition and a CQRS read model.
+    hint: |-
+      - **API composition**: một service/BFF gọi các service rồi ghép trong memory. Đơn giản, dữ liệu tươi; nhưng latency cộng dồn, availability giảm, khó filter/sort/paginate trên dữ liệu ghép.
+      - **CQRS read model**: một service consume event từ các service khác, dựng **view đã denormalize** (DB/Elasticsearch) tối ưu cho query. Nhanh, query mạnh; nhưng eventual consistency, phải xử lý replay/ordering, thêm hạ tầng.
+      Chọn theo độ tươi cần thiết và độ phức tạp của query.
+    followUp: The read model is 30 seconds behind. How does the UI avoid confusing a user who just made a change?
+    tags: [data, cqrs]
+  - id: microservices-016
+    level: medium
+    type: gotcha
+    q: Teams want a shared npm library for domain models used by all services. What are the risks, and what should shared libraries contain?
+    hint: |-
+      Rủi ro: coupling qua version — đổi model buộc mọi service nâng cấp cùng lúc (lockstep); model chung làm mờ bounded context (mỗi service lẽ ra có model riêng); lỗi trong lib lan ra mọi nơi.
+      Nên chia sẻ: **hạ tầng/cross-cutting** (logger, tracing setup, HTTP client có timeout/retry, auth middleware), type **sinh từ contract** (OpenAPI/Avro/Protobuf) có version.
+      Không nên chia sẻ: entity domain, logic nghiệp vụ. "Duplication is cheaper than the wrong abstraction" giữa các service.
+    followUp: How do you roll out a security fix in a shared library to 30 services quickly?
+    tags: [coupling, shared-library]
+  - id: microservices-017
+    level: medium
+    type: compare
+    q: Compare API versioning strategies (URL, header, no versioning with evolution). What do you default to?
+    hint: |-
+      - URL `/v1/...`: rõ ràng, dễ route/cache, nhưng khuyến khích tạo version lớn; hai version chạy song song tốn công.
+      - Header/media type (`Accept: application/vnd.x.v2+json`): URL sạch, khó debug/cache hơn.
+      - **Evolution không version**: chỉ thay đổi additive, tolerant reader, deprecate từng field — phổ biến cho API nội bộ.
+      Mặc định hợp lý: nội bộ → evolution + contract test; public → URL major version + chính sách deprecation (header `Deprecation`/`Sunset`).
+    followUp: How do you know when it is safe to remove v1?
+    tags: [versioning, api]
+  - id: microservices-018
+    level: medium
+    type: concept
+    q: Explain the expand/contract (parallel change) approach for database and API changes.
+    hint: |-
+      Thay vì đổi trực tiếp (breaking), chia 3 pha, mỗi pha deploy độc lập và tương thích ngược:
+      1. **Expand**: thêm cột/field/endpoint mới; code ghi cả cũ lẫn mới (hoặc backfill).
+      2. **Migrate**: chuyển reader/consumer sang cái mới; backfill dữ liệu cũ; kiểm tra.
+      3. **Contract**: ngừng ghi cái cũ, xoá cột/field khi không còn ai dùng.
+      Cho phép rollback ở mọi bước và rolling deploy (bản cũ và mới chạy cùng lúc).
+    example: |-
+      ```text
+      rename customers.fullname -> display_name
+      v1: add display_name (nullable); write both; backfill
+      v2: read display_name; still write both
+      v3: stop writing fullname
+      v4: drop fullname
+      ```
+    followUp: Why does a rolling deployment make "rename column in one migration" unsafe?
+    tags: [compatibility, migrations]
+  - id: microservices-019
+    level: medium
+    type: concept
+    q: What is Conway's law, and what is the inverse Conway maneuver?
+    hint: |-
+      Conway's law: hệ thống được thiết kế sẽ phản ánh **cấu trúc giao tiếp** của tổ chức tạo ra nó.
+      Hệ quả: một team sở hữu 5 service sẽ làm chúng dính nhau; 3 team cùng sửa một service → service đó thành nút cổ chai.
+      Inverse Conway: **tổ chức team theo kiến trúc mong muốn** (team theo bounded context, sở hữu end-to-end) để kiến trúc tự nhiên đi theo. Kiến trúc microservices mà không đổi ownership thường thất bại.
+    followUp: How many services should one team of five own?
+    tags: [organization]
+  - id: microservices-020
+    level: medium
+    type: open
+    q: When should you not use microservices?
+    hint: |-
+      - Sản phẩm mới, domain chưa rõ → ranh giới sẽ sai (Fowler: MonolithFirst).
+      - Team nhỏ (một hai team) → overhead vận hành lớn hơn lợi ích tự chủ.
+      - Chưa có CI/CD tự động, observability, on-call trưởng thành.
+      - Nghiệp vụ cần nhiều transaction ACID xuyên các phần.
+      - Latency cực thấp giữa các thành phần.
+      Thay thế: modular monolith với ranh giới cứng, sau này tách được.
+    followUp: Your CTO wants microservices for a three-person startup. How do you respond?
+    tags: [architecture, open]
+  - id: microservices-021
+    level: medium
+    type: compare
+    q: Liveness vs readiness vs startup probes — how do they affect traffic and restarts?
+    hint: |-
+      - **Readiness**: fail → pod bị **rút khỏi Service endpoints** (không nhận traffic), không restart. Dùng cho: đang warm cache, dependency thiết yếu không sẵn sàng, đang shutdown.
+      - **Liveness**: fail → kubelet **restart** container. Chỉ kiểm tra process có kẹt/deadlock không — **không** check DB/dependency (nếu không DB chậm làm restart toàn bộ fleet).
+      - **Startup**: bảo vệ app khởi động chậm; liveness/readiness chỉ chạy sau khi startup thành công.
+    followUp: Your liveness probe checks the database. What happens during a 30-second DB failover?
+    tags: [kubernetes, health-checks]
+  - id: microservices-022
+    level: medium
+    type: concept
+    q: What do the Twelve-Factor principles on config, statelessness and logs mean for a Node microservice?
+    hint: |-
+      - **Config** qua environment (không hard-code theo môi trường), secret từ secret manager.
+      - **Stateless processes**: không lưu session/file/upload cục bộ — dùng Redis/S3/DB → scale ngang và restart tự do.
+      - **Logs** là stream ra stdout (JSON có correlation/trace id), platform thu thập.
+      - **Disposability**: khởi động nhanh, shutdown gracefully khi SIGTERM (ngừng nhận, xử lý nốt, đóng pool).
+      - Dev/prod parity, backing services là tài nguyên gắn qua config.
+    followUp: What does graceful shutdown look like for an Express service behind Kubernetes?
+    tags: [twelve-factor, nodejs]
+  - id: microservices-023
+    level: medium
+    type: design
+    q: How do you keep a new service's data in sync with the legacy database during a strangler migration?
+    hint: |-
+      Lựa chọn:
+      - **CDC** từ legacy DB (Debezium/SQL Server CDC) → event → service mới dựng dữ liệu của nó (không cần sửa legacy code).
+      - Legacy phát event qua **outbox** (cần sửa legacy).
+      - **Dual write** từ app — tránh (không atomic).
+      - Batch sync định kỳ cho dữ liệu ít thay đổi.
+      Quan trọng: xác định **source of truth** từng giai đoạn (legacy → cả hai với một bên chính → service mới), reconciliation job so sánh hai bên, và kế hoạch đảo chiều sync khi service mới trở thành owner.
+    followUp: After cutover, legacy screens still read the old tables. How do you keep them working?
+    tags: [migration, data, cdc]
+  - id: microservices-024
+    level: medium
+    type: design
+    q: How do you decide whether a new capability goes into the monolith or becomes a new service?
+    hint: |-
+      Tiêu chí: có bounded context rõ và ít phụ thuộc dữ liệu monolith? team riêng sở hữu? nhu cầu scale/release/stack khác? yêu cầu isolation (compliance, lỗi)? có hạ tầng deploy/observe sẵn?
+      Nếu cần đọc/ghi rất nhiều bảng của monolith trong cùng transaction → để trong monolith (dạng module mới có ranh giới) sẽ rẻ hơn.
+      Cách an toàn: xây như module độc lập trong monolith, tách khi thật cần.
+    followUp: Give an example of a capability that is a natural first service.
+    tags: [boundaries, decision]
+  - id: microservices-025
+    level: hard
+    type: concept
+    q: What is a distributed monolith? List concrete symptoms and how you would get out of one.
+    hint: |-
+      Nhiều service nhưng **không độc lập**: có chi phí phân tán mà không có lợi ích.
+      Triệu chứng: phải deploy nhiều service **cùng lúc/theo thứ tự**; shared DB; một feature sửa 4–5 service; chuỗi sync call dài trên mỗi request; shared domain library khoá version; một service chết kéo sập tất cả; không test được service riêng lẻ.
+      Thoát: gộp service quá mịn lại, tách DB/ownership, chuyển call sync sang event/read model, contract test + backward compatibility để deploy độc lập, sắp team theo boundary.
+    followUp: Would you ever merge two services back together? What would convince you?
+    tags: [anti-pattern, distributed-monolith]
+  - id: microservices-026
+    level: hard
+    type: scenario
+    q: During migration, the new Orders service and the legacy monolith both write order status. Statuses start disagreeing. What went wrong and how do you fix it?
+    hint: |-
+      Hai writer cho cùng một dữ liệu mà không có **owner duy nhất** → race, ghi đè, sync hai chiều tạo vòng lặp/ghi đè bản mới bằng bản cũ.
+      Fix: mỗi thời điểm chỉ **một source of truth** cho mỗi field/entity; bên còn lại gửi **command** tới owner thay vì tự ghi; sync một chiều (owner → bên kia) qua CDC/event có version; cắt theo **nhóm entity** (tenant/region) thay vì theo field; reconciliation job phát hiện lệch và alert.
+    followUp: How would you migrate ownership of orders tenant by tenant?
+    tags: [migration, data-ownership, incident]
+  - id: microservices-027
+    level: hard
+    type: scenario
+    q: A provider team renamed a JSON field in a response, and three consumer services broke in production. What process failures allowed this, and what do you put in place?
+    hint: |-
+      Thiếu: quy tắc backward compatibility, contract test (provider không biết consumer dùng field đó), versioning/deprecation, canary + theo dõi lỗi consumer.
+      Sửa ngay: rollback hoặc trả **cả hai** field. Lâu dài: consumer-driven contracts trong CI (`can-i-deploy`), OpenAPI diff check (breaking change detector) trong PR, expand/contract, tolerant reader ở consumer, deprecation policy + đo usage theo consumer (header `User-Agent`/client-id).
+    followUp: How do you find out which consumers use a particular field today?
+    tags: [compatibility, contracts, incident]
+  - id: microservices-028
+    level: hard
+    type: debug
+    q: This Express handler calls another service. Under load, the whole service stops responding and traces are broken. Find the problems.
+    example: |-
+      ```ts
+      app.get("/orders/:id", async (req, res) => {
+        const order = await db.order.findUnique({ where: { id: req.params.id } });
+        const customer = await fetch(`${CUSTOMER_URL}/customers/${order!.customerId}`)
+          .then((r) => r.json());
+        const pricing = await fetch(`${PRICING_URL}/quote`, {
+          method: "POST",
+          body: JSON.stringify(order),
+        }).then((r) => r.json());
+        res.json({ ...order, customer, pricing });
+      });
+      ```
+    hint: |-
+      - `fetch` **không có timeout** (không `AbortSignal.timeout`) → dependency chậm làm request treo, socket/memory cạn → cả service ngừng phản hồi.
+      - Không kiểm tra `r.ok` → lỗi 500 của dependency bị parse như dữ liệu, `order!` null → crash 500 không rõ ràng.
+      - Hai call độc lập chạy **tuần tự** → latency cộng dồn (dùng `Promise.all`/`allSettled`).
+      - Không propagate `traceparent`/correlation id (nếu không dùng OTel auto-instrumentation) → trace đứt.
+      - Không fallback/circuit breaker; POST thiếu `content-type`.
+    followUp: Which of these calls could degrade gracefully, and what would you return instead?
+    tags: [debug, resilience, nodejs]
+  - id: microservices-029
+    level: hard
+    type: debug
+    q: A BFF endpoint for an order list page takes four seconds. Find the performance bug.
+    example: |-
+      ```ts
+      app.get("/bff/orders", async (req, res) => {
+        const orders = await ordersApi.list({ userId: req.user.id, limit: 50 });
+        const result = [];
+        for (const o of orders) {
+          const product = await catalogApi.get(o.productId);
+          const shipment = await shippingApi.get(o.id);
+          result.push({ ...o, product, shipment });
+        }
+        res.json(result);
+      });
+      ```
+    hint: |-
+      **N+1 qua network**, tuần tự: 1 + 50 × 2 = 101 call nối tiếp, mỗi call ~20–40ms → vài giây.
+      Fix: **batch endpoint** (`catalogApi.getMany(ids)`, `shippingApi.byOrderIds(ids)`), gọi song song hai batch với `Promise.all`, dedupe productId, cache catalog (dữ liệu ít đổi), hoặc read model đã join sẵn cho màn hình này. Giới hạn concurrency nếu buộc phải gọi từng cái.
+    followUp: The catalog team refuses to add a batch endpoint. What are your options?
+    tags: [debug, performance, bff]
+  - id: microservices-030
+    level: hard
+    type: scenario
+    q: After extracting a service from the monolith, p99 latency of a key page doubled. How do you investigate and what are likely causes?
+    hint: |-
+      Dùng distributed tracing để xem span nào tăng. Nguyên nhân thường gặp: function call thành **network call** (nhiều call chatty, N+1), serialization JSON lớn, không keep-alive (TLS handshake mỗi call), DNS lookup, service mới đọc dữ liệu qua API thay vì JOIN, cold cache, cross-AZ hop, pool connection nhỏ.
+      Fix: batch/aggregate API, keep-alive agent, co-locate, cache, read model, hoặc nhận ra ranh giới sai (dữ liệu dùng cùng nhau bị tách ra).
+    followUp: How do you decide whether the boundary itself is wrong?
+    tags: [latency, migration]
+  - id: microservices-031
+    level: hard
+    type: debug
+    q: A consumer of `CustomerUpdated` events started failing after the producer's latest release. Compare the two payloads and the consumer code.
+    example: |-
+      ```ts
+      // before: { "id": "c1", "email": "a@x.io", "tier": "gold" }
+      // after:  { "id": "c1", "contact": { "email": "a@x.io" }, "tier": "GOLD", "segment": "b2b" }
+      const Customer = z.object({
+        id: z.string(),
+        email: z.string().email(),
+        tier: z.enum(["standard", "gold"]),
+      }).strict();
+      consumer.on("CustomerUpdated", (msg) => repo.upsert(Customer.parse(msg)));
+      ```
+    hint: |-
+      Producer đã **breaking** 3 chỗ: di chuyển `email` vào `contact` (xoá field cũ), đổi giá trị enum (`gold` → `GOLD`), thêm field mới.
+      Consumer cũng không **tolerant**: `.strict()` từ chối field lạ (`segment`, `contact`) → cả event hợp lệ theo hướng additive cũng fail.
+      Fix: producer dùng expand/contract (giữ `email` cũ, thêm `contact.email`), không đổi giá trị enum hiện có, schema registry/contract test; consumer bỏ `.strict()` (dùng mặc định strip), xử lý enum lạ có fallback, message lỗi vào DLQ thay vì crash.
+    followUp: How would a schema registry with BACKWARD compatibility have caught this?
+    tags: [debug, compatibility, events]
+  - id: microservices-032
+    level: hard
+    type: design
+    q: What testing strategy do you use for a system of 20 microservices?
+    hint: |-
+      - Unit test cho domain logic (nhiều nhất).
+      - **Component/service test**: chạy một service thật với DB thật (Testcontainers), stub dependency ngoài.
+      - **Contract test** (Pact/OpenAPI/schema registry) giữa từng cặp consumer/provider — thay phần lớn E2E.
+      - Vài **E2E smoke** cho luồng tiền/đăng nhập quan trọng trên môi trường gần production.
+      - Trong production: canary + synthetic monitoring + feature flag.
+      Tránh: E2E khổng lồ, flaky, chạy 1 giờ, cần deploy cả 20 service mới test được.
+    followUp: How do you test an async flow that crosses three services via Kafka?
+    tags: [testing]
+  - id: microservices-033
+    level: hard
+    type: scenario
+    q: You need to split a `customers` table that both the Billing and CRM modules read and write heavily. How do you do it without downtime?
+    hint: |-
+      1. Phân định field nào thuộc context nào (billing info vs CRM profile); field thực sự dùng chung → một owner, bên kia đọc qua API/event.
+      2. Trong monolith: gom mọi truy cập vào **repository/module interface** (ngừng SQL trực tiếp từ nơi khác).
+      3. Tạo bảng/DB mới cho owner; expand: ghi cả hai (trong một transaction khi vẫn chung DB) hoặc CDC; backfill; so sánh.
+      4. Chuyển reader dần; bên không sở hữu dùng bản sao read-only cập nhật qua event.
+      5. Contract: bỏ cột cũ. Mỗi bước có rollback và metric lệch dữ liệu.
+    followUp: A report joins customers with invoices in one SQL query. What happens to it?
+    tags: [data, migration]
+  - id: microservices-034
+    level: hard
+    type: scenario
+    q: A new version of one service is deployed and a small percentage of requests fail only when they hit certain pods. How do you use deployment strategies and observability to limit and debug this?
+    hint: |-
+      Nguyên nhân hay gặp khi rolling deploy: **bản cũ và mới chạy song song** không tương thích (schema DB, format cache/event, session), config/secret khác pod, pod mới chưa warm.
+      Giới hạn: canary (1–5%) với auto-rollback theo error rate/latency, blue-green, feature flag tách deploy khỏi release, readiness probe đúng.
+      Debug: lọc lỗi theo **version/pod label** trong metrics/traces/logs, so sánh config, kiểm tra khả năng tương thích hai phiên bản.
+    followUp: Why must a new version be able to read data written by the next version too?
+    tags: [deployment, observability]
+  - id: microservices-035
+    level: hard
+    type: concept
+    q: Where should authentication and authorization happen in a microservices system?
+    hint: |-
+      - **Authentication** ở edge (gateway/BFF) xác thực token của user; truyền xuống bằng token (JWT đã ký, hoặc token exchange cho từng hop) — **không** chỉ bằng header `x-user-id` tin tưởng mù quáng.
+      - Mỗi service vẫn **verify** token (chữ ký, audience, expiry) và làm **authorization** theo nghiệp vụ của nó (object-level: user có quyền với order này không) — gateway không biết đủ domain.
+      - Service-to-service: mTLS hoặc client credentials; nguyên tắc zero-trust (mạng nội bộ không phải vùng tin cậy).
+    followUp: What is BOLA and why can't the gateway prevent it?
+    tags: [security, auth]
+  - id: microservices-036
+    level: senior
+    type: design
+    q: You inherit a 10-year-old monolith with ongoing feature work. Plan the migration to services. How do you choose the first service?
+    hint: |-
+      - Trước tiên: **tại sao** migrate (deploy chậm, team dẫm chân, scale một phần) → mục tiêu đo được (lead time, tần suất deploy, MTTR).
+      - Nền tảng: CI/CD, observability, gateway/facade, cách deploy service mới.
+      - Chọn service đầu: **giá trị rõ + coupling thấp + rủi ro thấp** (vd notifications, reporting, search/indexer, một capability mới), không phải lõi phức tạp nhất.
+      - Strangler fig + ACL + CDC; modularize trong monolith trước; chuyển traffic dần có rollback; vẫn cho phép feature work.
+      - Review sau mỗi service: có nhanh hơn không? Có dừng lại ở modular monolith được không?
+    followUp: Which metrics would you report to leadership each quarter?
+    tags: [migration, strategy]
+  - id: microservices-037
+    level: senior
+    type: open
+    q: How would you organize teams and ownership for a microservices architecture of about 25 services and 5 teams?
+    hint: |-
+      Team theo **stream-aligned** domain (Team Topologies), mỗi team sở hữu vài service trong **cùng** bounded context end-to-end (code, deploy, on-call, dữ liệu).
+      Một **platform team** cung cấp "paved road" (template service, CI/CD, observability, gateway) như sản phẩm nội bộ.
+      Ranh giới team ≈ ranh giới service (Conway); tránh service không có owner hoặc nhiều owner. Service catalog ghi owner, SLO, runbook.
+    followUp: How do you handle a service that every team needs to change regularly?
+    tags: [organization]
+  - id: microservices-038
+    level: senior
+    type: open
+    q: What platform capabilities must exist before a company should run many microservices?
+    hint: |-
+      - CI/CD tự động cho từng service (build, test, contract test, deploy canary, rollback).
+      - Observability: log tập trung có correlation id, metrics RED/USE, distributed tracing, alert theo SLO.
+      - Runtime: container orchestration, service discovery, config/secrets, autoscaling.
+      - Traffic: gateway, mTLS/service auth, rate limit.
+      - Template/scaffold chuẩn (health check, graceful shutdown, logging), service catalog, runbook, on-call.
+      Thiếu những thứ này → mỗi service mới nhân chi phí vận hành.
+    followUp: Which of these would you build first with limited time?
+    tags: [platform, devops]
+  - id: microservices-039
+    level: senior
+    type: open
+    q: When would you merge microservices back together?
+    hint: |-
+      Khi: hai service luôn **deploy cùng nhau**, thay đổi cùng nhau, gọi nhau chatty trên mọi request, chia một transaction nghiệp vụ (saga không cần thiết), cùng một team sở hữu, hoặc overhead vận hành lớn hơn lợi ích.
+      Cách: gộp code thành module trong một service, giữ ranh giới module; hợp nhất DB theo expand/contract; giữ API ngoài ổn định.
+      Senior: coi ranh giới là quyết định có thể đảo ngược; đo change coupling định kỳ.
+    followUp: How do you convince a team that merging is not a failure?
+    tags: [architecture, open]
+  - id: microservices-040
+    level: senior
+    type: open
+    q: How do you establish API and event standards across teams without becoming a central bottleneck?
+    hint: |-
+      Viết **guideline ngắn + tự động hoá kiểm tra**: lint OpenAPI (Spectral), breaking-change check trong CI, schema registry compatibility, template service có sẵn tracing/error format.
+      Quyết định kiến trúc qua **ADR** và nhóm review nhẹ (guild) cho thay đổi xuyên team; team tự quyết trong phạm vi của mình.
+      Paved road dễ đi hơn đường khác → tuân thủ tự nhiên; đo mức tuân thủ thay vì gác cổng từng PR.
+    followUp: A team wants to use GraphQL while everyone else uses REST. How do you decide?
+    tags: [governance]
+  - id: microservices-041
+    level: senior
+    type: open
+    q: How do you measure whether a microservices migration is actually paying off?
+    hint: |-
+      Chỉ số DORA: tần suất deploy, lead time for changes, change failure rate, MTTR — theo từng service/team, so với baseline trước migration.
+      Thêm: số lần deploy phải phối hợp nhiều team, thời gian build/test, chi phí hạ tầng, incident do network/dependency, developer satisfaction.
+      Nếu các chỉ số không cải thiện sau vài service → dừng lại, xem xét modular monolith. Không báo cáo "số service đã tách" như thành tích.
+    followUp: Deploy frequency went up but so did change failure rate. What do you do?
+    tags: [metrics, strategy]
+  - id: microservices-042
+    level: cv
+    type: behavioral
+    q: You migrated a legacy back-office monolith to Node/Express microservices incrementally. How did you decide the decomposition, and which service came first?
+    hint: |-
+      Câu trả lời mạnh: vì sao migrate (pain cụ thể), cách tìm ranh giới (domain, dữ liệu, team), vì sao chọn service đầu tiên (coupling thấp, giá trị rõ), cách chuyển traffic, và **điều bạn sẽ làm khác**.
+      Tránh nói "chia theo bảng DB" hay "mỗi entity một service". **(điền tên capability và số service thật của bạn — không nêu tên khách hàng)**
+    followUp: Which boundary turned out to be wrong, and how did you notice?
+    redFlags:
+      - "Each table became a service"
+      - "Cannot explain why that service was first"
+    tags: [cv, migration, boundaries]
+  - id: microservices-043
+    level: cv
+    type: design
+    q: You were responsible for backward compatibility and stability during that migration. Which concrete techniques did you use so that existing clients and the legacy system kept working?
+    hint: |-
+      Kỳ vọng nêu cụ thể: facade/proxy giữ nguyên contract API cũ, ACL map dữ liệu, expand/contract cho schema, thay đổi additive cho API/event, feature flag/canary khi chuyển route, so sánh kết quả (shadow traffic hoặc đối chiếu dữ liệu), rollback bằng routing, monitoring lỗi theo route.
+      Kể một lần suýt/đã phá tương thích và cách xử lý. **(điền chi tiết thật của bạn)**
+    followUp: How did you verify the new service returned the same results as the legacy code?
+    tags: [cv, compatibility]
+  - id: microservices-044
+    level: cv
+    type: scenario
+    q: How was traffic routed between the legacy system and the new services during the migration, and how would you have rolled back a bad cutover?
+    hint: |-
+      Nêu cơ chế thật: gateway/NGINX route theo path, feature flag trong monolith gọi service mới, hoặc tỉ lệ traffic; cách rollback (đổi route/flag, không cần deploy), và cách xử lý **dữ liệu đã ghi** bởi service mới khi rollback (sync ngược, hoặc chỉ rollback khi dữ liệu còn tương thích).
+      Nếu không có rollback plan rõ, nói thật và nêu cách nên làm. **(điền chi tiết thật của bạn)**
+    followUp: Rollback of routing is easy, but what about data written by the new service?
+    tags: [cv, strangler-fig, rollback]
+  - id: microservices-045
+    level: cv
+    type: design
+    q: Your migration included data transformation between the legacy model and the new services. Where did that transformation live, and how did you handle bad or inconsistent legacy data?
+    hint: |-
+      Kỳ vọng: transformation tập trung ở ACL/adapter (không rải khắp service), mapping có test (fixture từ dữ liệu thật đã ẩn danh), xử lý dữ liệu xấu: validate, quarantine/DLQ thay vì làm hỏng dữ liệu mới, báo cáo cho owner nghiệp vụ, idempotent re-run.
+      Nêu ví dụ quirk cụ thể của legacy (mã trạng thái, encoding, null, timezone) **(điền ví dụ thật của bạn)**.
+    followUp: How did you handle timezones or date formats that differed between the systems?
+    tags: [cv, acl, data-transformation]
+  - id: microservices-046
+    level: cv
+    type: behavioral
+    q: What was the hardest production issue during the migration, and what did it teach you about distributed systems?
+    hint: |-
+      STAR: triệu chứng, cách khoanh vùng (tracing/log correlation id giữa service), root cause (thường là: timeout/retry, dữ liệu không đồng bộ, thứ tự event, tương thích version), fix, thay đổi lâu dài (alert, contract test, runbook).
+      Reflection: một nguyên tắc bạn giờ luôn áp dụng. **(điền câu chuyện thật của bạn — không bịa số liệu)**
+    followUp: What monitoring did you add afterwards?
+    tags: [cv, behavioral, incident]
+  - id: microservices-047
+    level: cv
+    type: open
+    q: Looking back at that migration, what would you do differently, and would you still choose microservices?
+    hint: |-
+      Senior answer: nêu cả điều tốt và điều sai một cách trung thực — vd nên dựng observability/contract test sớm hơn, nên modularize trong monolith trước, một số service nên gộp, nên dùng outbox từ đầu.
+      Trả lời "có chọn lại không" bằng **tiêu chí** (team size, tần suất release, domain), không bằng cảm tính. **(điền suy nghĩ thật của bạn)**
+    followUp: If the team had been half the size, what architecture would you have chosen?
+    tags: [cv, reflection]

@@ -1,0 +1,791 @@
+id: 27-testing
+slug: testing
+title: Testing Strategy
+tier: 7
+status: drafted
+summary: Test pyramid vs trophy, unit/integration/e2e/contract (Pact), Jest/Vitest, Supertest, React Testing Library, Playwright, test doubles, testcontainers, flaky tests, TDD, coverage, test auth & tenant isolation, test Kafka consumer, mutation testing.
+cvLinked: true
+prerequisites: []
+overview: |-
+  ## TL;DR
+
+  - Mục tiêu của test không phải coverage mà là **tự tin để thay đổi code và deploy** — test tốt bắt bug thật, chạy nhanh, ít flaky, và **không vỡ khi refactor** (test hành vi, không test implementation).
+  - Pyramid (nhiều unit, ít e2e) vs **trophy** (static + nhiều **integration**) — với backend Node gọi DB và frontend React, integration test với **dependency thật** (testcontainers, RTL render component thật) thường cho tỉ lệ tự tin/chi phí tốt nhất.
+  - Senior interview xoáy vào: **mock cái gì và không mock cái gì**, test với **DB thật**, **flaky test**, **contract test** giữa microservices, test **auth & tenant isolation**, test **consumer Kafka** (idempotency, retry), giới hạn của coverage.
+  - Công cụ cần nói được: Jest/Vitest, Supertest, React Testing Library (+ user-event, MSW), Playwright, Testcontainers, Pact, Stryker, k6 (xem track Observability).
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Unit test | Test một đơn vị logic cô lập, nhanh (ms) | `calculateDiscount(cart, coupon)` |
+  | Integration test | Test nhiều thành phần thật phối hợp (HTTP + service + DB) | Supertest `POST /orders` → Postgres thật trong container |
+  | E2E test | Test cả hệ thống qua UI/API như người dùng | Playwright: đăng nhập → thêm giỏ → checkout |
+  | Contract test | Xác minh consumer và provider đồng ý về API/message | Pact: consumer sinh contract, provider verify trong CI |
+  | Test double | Thứ thay thế dependency thật trong test | dummy, stub, spy, mock, fake (Meszaros) |
+  | Fake | Implementation thật nhưng đơn giản | `InMemoryOrderRepository` |
+  | Flaky test | Kết quả khác nhau với cùng code | Pass local, fail CI 1/10 lần do race timer |
+  | Testcontainers | Khởi động dependency thật (Postgres, Kafka, Redis) bằng Docker trong test | `new PostgreSqlContainer("postgres:16").start()` |
+  | Mutation testing | Sửa code có chủ đích (mutant) xem test có bắt được không | Đổi `>=` thành `>` mà test vẫn xanh → test yếu |
+  | Coverage | % code được **chạy** bởi test — không phải % được **kiểm tra** | 100% line coverage với test không có assertion |
+
+  ## Cơ chế hoạt động
+
+  **Chọn loại test cho một thay đổi:**
+
+  ```mermaid
+  flowchart TD
+    A["Thay đổi cần test"] --> B{"Logic thuần<br/>(tính toán, parse, rule)?"}
+    B -- "có" --> U["Unit test<br/>table-driven, edge cases"]
+    B -- "không" --> C{"Chạm DB / queue / HTTP?"}
+    C -- "có" --> I["Integration test<br/>Supertest + testcontainers<br/>(DB thật, mock chỉ 3rd-party)"]
+    C -- "không" --> D{"UI component?"}
+    D -- "có" --> R["RTL: render + user-event<br/>MSW cho network"]
+    D -- "không" --> E{"Ranh giới giữa 2 service/team?"}
+    E -- "có" --> P["Contract test (Pact)"]
+    A --> F{"Journey quan trọng<br/>(login, checkout)?"}
+    F -- "có" --> E2E["Vài Playwright e2e<br/>smoke trên staging/prod"]
+  ```
+
+  **Consumer-driven contract testing (Pact):**
+
+  ```mermaid
+  sequenceDiagram
+    participant C as Consumer CI (web / order-service)
+    participant B as Pact Broker
+    participant P as Provider CI (catalog-service)
+    C->>C: test với Pact mock server → sinh pact (contract)
+    C->>B: publish pact (version = git SHA)
+    B->>P: webhook: có contract mới
+    P->>P: replay request trong pact vào provider thật (provider states)
+    P->>B: publish verification result
+    C->>B: can-i-deploy? (consumer SHA vs provider đang ở prod)
+    B-->>C: yes / no
+  ```
+
+  ## Trade-offs
+
+  | Loại test | Tốc độ | Độ tự tin | Chi phí bảo trì | Hay vỡ vì |
+  |---|---|---|---|---|
+  | Unit (mock nhiều) | Rất nhanh | Thấp–vừa | Cao nếu mock implementation | Refactor |
+  | Unit (logic thuần) | Rất nhanh | Vừa | Thấp | Đổi requirement |
+  | Integration (DB thật) | Vừa (giây) | Cao | Vừa | Schema/fixture |
+  | Contract | Nhanh | Cao cho ranh giới API | Vừa (cần broker, quy trình) | Đổi API |
+  | E2E UI | Chậm | Cao nhất cho journey | Cao | Selector, timing, dữ liệu, môi trường |
+
+  | Công cụ | Chọn khi | Lưu ý |
+  |---|---|---|
+  | Jest | Codebase CJS có sẵn, ecosystem lớn | ESM/TS cần cấu hình transform |
+  | Vitest | Dự án Vite/ESM/TS mới, muốn nhanh | API gần Jest (`vi` thay `jest`), migrate dễ |
+  | Playwright | E2E nhiều browser, auto-wait, trace | Cần quản lý dữ liệu test/auth state |
+  | Cypress | Team đã quen, DX debug tốt | Mô hình chạy trong browser, hạn chế multi-tab/origin |
+
+  ## Pitfalls
+
+  - Mock mọi thứ (kể cả DB/ORM) → test xanh nhưng query SQL sai, migration sai, constraint không được test.
+  - Test implementation (gọi hàm private, assert số lần gọi nội bộ) → vỡ khi refactor, không bắt bug.
+  - `setTimeout`/`sleep` cố định trong test async → flaky; dùng `findBy*`, `waitFor`, web-first assertions.
+  - Test chia sẻ state (DB không reset, biến module) → phụ thuộc thứ tự chạy.
+  - Coverage là KPI → test không có assertion để đạt số.
+  - E2E cho mọi case → pipeline 1 giờ, flaky, bị bỏ qua.
+  - Không test đường lỗi: timeout, retry, 401/403, tenant khác, message trùng.
+  - Retry flaky test tự động mà không bao giờ fix → che giấu race condition thật trong code.
+
+  ## Cheat sheet
+
+  - Query RTL theo ưu tiên: `getByRole` > `getByLabelText` > `getByText` > `getByTestId`. Async: `findBy*`. User action: `userEvent.setup()`.
+  - Network ở FE/Node test: **MSW** thay vì mock `fetch` bằng tay.
+  - API test: `supertest(app)` không cần `listen()`; DB thật qua testcontainers; mỗi test tự tạo dữ liệu, reset bằng transaction rollback hoặc truncate.
+  - Double: stub (trả giá trị), spy (ghi nhận lời gọi), mock (kỳ vọng lời gọi), fake (implementation nhẹ). Chỉ mock **ranh giới** bạn không sở hữu (payment, email, clock).
+  - Thời gian: fake timers / inject clock; ngẫu nhiên: seed; ID: inject generator.
+  - Flaky: đo flaky rate, quarantine có owner + hạn, fix gốc (race, order, time, shared state, network).
+  - Contract test cho ranh giới giữa service/team; e2e chỉ cho vài journey trọng yếu.
+  - Auth/tenant: test ma trận **role × resource × tenant** ở tầng API; test "tenant A không đọc được data tenant B" cho **mọi** endpoint list/get/update/delete.
+  - Kafka consumer: tách handler thuần để unit test; integration với Kafka/Redpanda container; test duplicate, out-of-order, poison message → DLQ.
+  - Mutation score (Stryker) đo chất lượng test tốt hơn line coverage.
+notionRefs: []
+references:
+  - title: Jest — Getting started
+    url: https://jestjs.io/docs/getting-started
+  - title: Jest — Timer mocks
+    url: https://jestjs.io/docs/timer-mocks
+  - title: Vitest — Guide
+    url: https://vitest.dev/guide/
+  - title: Vitest — Mocking
+    url: https://vitest.dev/guide/mocking.html
+  - title: Testing Library — Guiding principles
+    url: https://testing-library.com/docs/guiding-principles
+  - title: Testing Library — Which query should I use?
+    url: https://testing-library.com/docs/queries/about/#priority
+  - title: Testing Library — user-event
+    url: https://testing-library.com/docs/user-event/intro
+  - title: Playwright — Best practices
+    url: https://playwright.dev/docs/best-practices
+  - title: Playwright — Authentication
+    url: https://playwright.dev/docs/auth
+  - title: Testcontainers for Node.js
+    url: https://node.testcontainers.org/
+  - title: Pact — Introduction to contract testing
+    url: https://docs.pact.io/
+  - title: Stryker Mutator — JS/TS
+    url: https://stryker-mutator.io/docs/stryker-js/introduction/
+  - title: Mock Service Worker (MSW)
+    url: https://mswjs.io/docs/
+  - title: Martin Fowler — Test doubles (Mocks Aren't Stubs)
+    url: https://martinfowler.com/articles/mocksArentStubs.html
+  - title: Next.js — Testing
+    url: https://nextjs.org/docs/app/guides/testing
+questions:
+  - id: testing-001
+    level: easy
+    type: compare
+    q: What is the test pyramid, what is the testing trophy, and why do they disagree?
+    hint: |-
+      - **Pyramid** (Mike Cohn): nhiều unit (nhanh, rẻ), ít integration, rất ít e2e (chậm, flaky).
+      - **Trophy** (Kent C. Dodds): nền **static analysis** (TypeScript, ESLint), unit vừa phải, **integration nhiều nhất**, e2e ít — vì integration cho độ tự tin gần e2e với chi phí gần unit.
+      - Bất đồng xuất phát từ bối cảnh: pyramid ra đời khi integration/e2e rất đắt; ngày nay có testcontainers, RTL, MSW → integration rẻ hơn nhiều.
+      - Cả hai đồng ý: **e2e ít**, chọn loại test theo độ tự tin/chi phí, không theo hình dạng.
+    followUp: For a Node API that is mostly CRUD over SQL, what ratio would you aim for and why?
+    tags: [test-pyramid, testing-trophy, strategy]
+  - id: testing-002
+    level: easy
+    type: compare
+    q: Unit, integration, end-to-end and contract tests — define each with an example from an e-commerce backend.
+    hint: |-
+      - **Unit**: một hàm/class cô lập — `applyCoupon(cart, coupon)` trả tổng đúng, edge case hết hạn/không đủ điều kiện.
+      - **Integration**: nhiều thành phần thật — `POST /orders` qua Express → service → Postgres thật, kiểm tra response + row trong DB + event được publish.
+      - **E2E**: cả hệ thống qua UI — Playwright đăng nhập, thêm vào giỏ, thanh toán sandbox.
+      - **Contract**: order-service (consumer) và catalog-service (provider) thống nhất shape của `GET /products/:id`; verify độc lập, không cần dựng cả hai cùng lúc.
+    followUp: Where do you draw the line between an integration test and an e2e test?
+    tags: [unit, integration, e2e, contract]
+  - id: testing-003
+    level: easy
+    type: compare
+    q: Explain the types of test doubles — dummy, stub, spy, mock, fake — with a Node example.
+    hint: |-
+      - **Dummy**: truyền cho đủ tham số, không dùng.
+      - **Stub**: trả giá trị định sẵn — `paymentGateway.charge` luôn trả `{ status: "succeeded" }`.
+      - **Spy**: ghi nhận lời gọi để assert sau — `emailSender.send` được gọi với địa chỉ đúng.
+      - **Mock**: object có **kỳ vọng** về lời gọi (verify hành vi).
+      - **Fake**: implementation hoạt động thật nhưng đơn giản — `InMemoryOrderRepo`, SMTP fake.
+      Trong Jest/Vitest, `jest.fn()`/`vi.fn()` vừa là stub vừa là spy → người ta gọi chung là "mock".
+      Nguyên tắc: chỉ double **ranh giới bạn không sở hữu** hoặc không deterministic (payment, email, clock, random).
+    followUp: When is a fake better than a mock?
+    tags: [test-doubles, mocking]
+  - id: testing-004
+    level: easy
+    type: compare
+    q: Jest vs Vitest — how do they differ, and which would you choose for a new TypeScript/ESM project?
+    hint: |-
+      - **Jest**: lâu đời, ecosystem lớn, mặc định hướng CJS; TS/ESM cần transform (babel-jest, ts-jest, hoặc SWC) và cấu hình ESM còn rườm rà.
+      - **Vitest**: chạy trên Vite (esbuild/Rollup pipeline), **ESM + TS native**, watch mode rất nhanh, API tương thích Jest (`describe/it/expect`, `vi.fn`, `vi.mock`), dùng chung config với Vite; có browser mode.
+      - Dự án mới TS/ESM hoặc đã dùng Vite → Vitest. Codebase lớn đang dùng Jest ổn định → không nhất thiết migrate.
+      - Cả hai: mock module được **hoist** lên đầu file.
+    followUp: What breaks most often when migrating a Jest suite to Vitest?
+    verify: true
+    tags: [jest, vitest, tooling]
+  - id: testing-005
+    level: easy
+    type: concept
+    q: What is React Testing Library's guiding principle, and which queries should you prefer?
+    hint: |-
+      "The more your tests resemble the way your software is used, the more confidence they can give you." → test **thứ người dùng thấy và làm**, không test state/props/implementation của component.
+      Ưu tiên query: `getByRole` (kèm `name`) → `getByLabelText` → `getByPlaceholderText` → `getByText` → `getByDisplayValue` → `getByAltText`/`getByTitle` → cuối cùng `getByTestId`.
+      `getBy` (throw nếu không có), `queryBy` (trả null — để assert **không** tồn tại), `findBy` (async, chờ xuất hiện).
+      Hành động: `@testing-library/user-event` (`userEvent.setup()`) mô phỏng thật hơn `fireEvent`.
+    example: |-
+      ```tsx
+      const user = userEvent.setup();
+      render(<LoginForm onSubmit={onSubmit} />);
+      await user.type(screen.getByLabelText(/email/i), "a@b.com");
+      await user.click(screen.getByRole("button", { name: /sign in/i }));
+      expect(onSubmit).toHaveBeenCalledWith({ email: "a@b.com" });
+      ```
+    followUp: Why is `getByRole` also an accessibility check?
+    tags: [react-testing-library, frontend]
+  - id: testing-006
+    level: easy
+    type: concept
+    q: How do you test an Express API endpoint with Supertest?
+    hint: |-
+      Export `app` (không gọi `listen` trong module đó) → `request(app)` tự bind port tạm thời.
+      Assert status, header, body; chạy cùng middleware thật (auth, validation, error handler).
+      Kết hợp DB thật (testcontainers) để test cả query; mock chỉ third-party (payment, email) bằng MSW/nock hoặc inject dependency.
+      Auth: tạo token test hợp lệ (ký bằng key test) thay vì tắt middleware auth.
+    example: |-
+      ```ts
+      import request from "supertest";
+      import { app } from "../src/app";
+
+      it("rejects an order without items", async () => {
+        const res = await request(app)
+          .post("/orders")
+          .set("Authorization", `Bearer ${await tokenFor({ tenantId: "t1", role: "buyer" })}`)
+          .send({ items: [] });
+        expect(res.status).toBe(400);
+        expect(res.body.error.code).toBe("ORDER_EMPTY");
+      });
+      ```
+    followUp: Why is disabling the auth middleware in tests a bad idea?
+    tags: [supertest, express, api-testing]
+  - id: testing-007
+    level: easy
+    type: concept
+    q: What is a flaky test, and what are the most common causes?
+    hint: |-
+      Flaky = cùng code, kết quả lúc pass lúc fail.
+      Nguyên nhân hay gặp:
+      - **Timing/async**: `sleep` cố định, không await promise, race giữa UI và assertion, animation.
+      - **Shared state**: DB không reset, biến module/global, thứ tự test.
+      - **Thời gian thật / timezone / ngày**: test fail lúc nửa đêm hoặc cuối tháng.
+      - **Randomness** không seed, ID/order không xác định (`SELECT` không `ORDER BY`).
+      - **Network/external service** thật, port cố định bị chiếm.
+      - Tài nguyên CI yếu hơn local (timeout).
+      Flaky test làm mất niềm tin → mọi người retry/ignore → bug thật lọt qua.
+    followUp: How do you find which of 2,000 tests is flaky and why?
+    tags: [flaky-tests]
+  - id: testing-008
+    level: easy
+    type: concept
+    q: What does code coverage measure, and what doesn't it tell you?
+    hint: |-
+      Coverage đo code **được thực thi** khi chạy test: line, statement, branch, function.
+      Không cho biết: test có **assert** đúng không, có test edge case/input xấu không, requirement có đúng không, code **thiếu** (không thể cover dòng chưa viết), tích hợp giữa các phần.
+      Dùng tốt: tìm vùng **chưa test** (đặc biệt branch lỗi), gate trên **diff coverage** của PR thay vì con số tổng.
+      Dùng tệ: KPI 90% → test vô nghĩa để đạt số. Mutation testing đo chất lượng test tốt hơn.
+    followUp: Your team mandates 90% coverage. What behaviour does that encourage?
+    tags: [coverage, quality]
+  - id: testing-009
+    level: medium
+    type: debug
+    q: This test passes, but the feature is broken in production. What's wrong with the test?
+    example: |-
+      ```ts
+      jest.mock("../src/db", () => ({
+        query: jest.fn().mockResolvedValue({ rows: [{ id: 1, total: 100 }] }),
+      }));
+      import { query } from "../src/db";
+      import { getOrdersForTenant } from "../src/orders";
+
+      it("returns orders for tenant", async () => {
+        const orders = await getOrdersForTenant("t1");
+        expect(query).toHaveBeenCalled();
+        expect(orders).toHaveLength(1);
+      });
+      ```
+    hint: |-
+      - DB bị mock → **SQL không bao giờ chạy**: lỗi cú pháp, sai tên cột, thiếu `WHERE tenant_id = $1` (rò rỉ dữ liệu tenant!) đều không bị bắt.
+      - `toHaveBeenCalled()` không kiểm tra **tham số** (tenant id có được truyền không).
+      - Mock trả đúng thứ test mong đợi → test chỉ kiểm tra rằng mock hoạt động (tautology).
+      Fix: integration test với **Postgres thật** (testcontainers), seed dữ liệu cho **hai tenant**, assert chỉ nhận order của `t1`. Giữ unit test cho logic thuần (tính toán trên kết quả), không cho query.
+    followUp: When is mocking the repository layer actually the right call?
+    redFlags:
+      - Suggests adding `toHaveBeenCalledWith` as the only fix
+    tags: [mocking, integration, multi-tenancy, debugging]
+  - id: testing-010
+    level: medium
+    type: concept
+    q: How do you run integration tests against a real database using Testcontainers, and how do you keep them fast and isolated?
+    hint: |-
+      - `globalSetup`: khởi động container (Postgres/SQL Server/Redis/Kafka) **một lần** cho cả suite, chạy migration thật, truyền connection string qua env.
+      - Cô lập giữa test: bọc mỗi test trong **transaction rồi rollback** (nhanh, nhưng không hợp nếu code tự commit/dùng nhiều connection); hoặc **truncate** các bảng giữa test; hoặc DB/schema riêng mỗi worker song song.
+      - Dữ liệu: mỗi test tự tạo dữ liệu cần (factory/builder), không phụ thuộc seed chung.
+      - Tốc độ: reuse container giữa lần chạy local (`withReuse`), template database, tmpfs, chạy song song theo worker.
+      - CI cần Docker (hoặc service container của CI).
+    example: |-
+      ```ts
+      import { PostgreSqlContainer, StartedPostgreSqlContainer } from "@testcontainers/postgresql";
+
+      let pg: StartedPostgreSqlContainer;
+      beforeAll(async () => {
+        pg = await new PostgreSqlContainer("postgres:16-alpine").start();
+        process.env.DATABASE_URL = pg.getConnectionUri();
+        await runMigrations(process.env.DATABASE_URL);
+      }, 60_000);
+      afterAll(() => pg.stop());
+      ```
+    followUp: Transaction-rollback isolation breaks for one test. What kind of code causes that?
+    verify: true
+    tags: [testcontainers, integration, database]
+  - id: testing-011
+    level: medium
+    type: compare
+    q: Mock the database, use an in-memory database (SQLite/pg-mem), or use the real engine in a container — trade-offs?
+    hint: |-
+      - **Mock repository**: nhanh nhất, cô lập logic; không test SQL, constraint, transaction.
+      - **In-memory khác engine** (SQLite thay Postgres, pg-mem): nhanh, không cần Docker; nhưng **khác dialect**: JSONB, `ON CONFLICT`, locking, isolation level, collation, trigger, RLS → test xanh, prod đỏ. SQL Server càng khác.
+      - **Engine thật trong container**: chậm hơn (giây để start, ms mỗi test), cần Docker; đổi lại test đúng thứ chạy production (migration, index, constraint, RLS).
+      - Khuyến nghị: logic thuần → unit; repository/query → engine thật; không dùng engine khác để "giả" engine production.
+    followUp: Tests with a real DB take 12 minutes in CI. How do you speed them up without going back to mocks?
+    tags: [database, testing-strategy, testcontainers]
+  - id: testing-012
+    level: medium
+    type: debug
+    q: This React test is flaky — it fails about 1 in 10 runs on CI. Why, and how do you fix it?
+    example: |-
+      ```tsx
+      it("shows search results", async () => {
+        render(<ProductSearch />);
+        fireEvent.change(screen.getByRole("searchbox"), { target: { value: "shoe" } });
+        await new Promise((r) => setTimeout(r, 500)); // wait for debounce + fetch
+        expect(screen.getByText("Running Shoe")).toBeInTheDocument();
+      });
+      ```
+    hint: |-
+      - Chờ **thời gian cố định** 500ms cho debounce + fetch → CI chậm hơn là fail; nhanh hơn thì phí thời gian.
+      - Gọi network thật hoặc mock fetch không kiểm soát được.
+      Fix: mock network bằng **MSW** (response xác định); dùng `await screen.findByText("Running Shoe")` (retry tới khi xuất hiện, có timeout) hoặc `waitFor`; debounce thì dùng fake timers (`vi.useFakeTimers({ shouldAdvanceTime: true })` + `userEvent.setup({ advanceTimers: vi.advanceTimersByTime })`) hoặc chấp nhận chờ bằng `findBy`.
+      Dùng `userEvent.type` thay `fireEvent.change` để mô phỏng gõ thật.
+    followUp: What does the "not wrapped in act(...)" warning mean and how should you respond to it?
+    tags: [react-testing-library, flaky-tests, async, debugging]
+  - id: testing-013
+    level: medium
+    type: concept
+    q: How does Playwright reduce flakiness compared with older e2e tools, and what practices still matter?
+    hint: |-
+      - **Auto-waiting**: action (`click`, `fill`) chờ element attached, visible, stable, enabled, nhận event.
+      - **Web-first assertions**: `await expect(locator).toHaveText(...)` retry tới timeout thay vì kiểm tra một lần.
+      - **Locator** theo role/text/label (`getByRole`) thay vì CSS/XPath dễ vỡ.
+      - Cô lập: mỗi test một **browser context** mới; đăng nhập một lần rồi dùng `storageState`.
+      - Debug: **trace viewer** (DOM snapshot, network, console theo từng bước), video, screenshot khi fail.
+      Vẫn phải làm: dữ liệu test độc lập (tạo qua API, không phụ thuộc thứ tự), không `waitForTimeout`, mock third-party khi cần (`page.route`), chạy song song an toàn.
+    followUp: How do you handle login in 200 Playwright tests without logging in through the UI every time?
+    verify: true
+    tags: [playwright, e2e, flaky-tests]
+  - id: testing-014
+    level: medium
+    type: concept
+    q: What is consumer-driven contract testing with Pact, and what problem does it solve that e2e tests don't?
+    hint: |-
+      - Consumer viết test với **Pact mock provider** → mô tả request nó gửi và **phần response nó thực sự dùng** → sinh file pact (contract).
+      - Contract được publish lên **Pact Broker**; provider CI **replay** các interaction vào provider thật (với **provider states** để chuẩn bị dữ liệu) và publish kết quả verify.
+      - **`can-i-deploy`** kiểm tra version consumer/provider có tương thích với những gì đang chạy ở môi trường đích không.
+      - Giải quyết: phát hiện breaking change **trước khi deploy** mà không cần dựng toàn bộ hệ thống để e2e; mỗi service deploy độc lập; biết chính xác consumer nào dùng field nào → provider dám xoá field không ai dùng.
+      - Hỗ trợ cả message (Kafka event) contracts.
+      Không thay thế functional test của provider.
+    followUp: Provider team says "Pact is too much process". What's a lighter alternative and what do you lose?
+    tags: [pact, contract-testing, microservices]
+  - id: testing-015
+    level: medium
+    type: concept
+    q: How do you test code that depends on time — expiring tokens, scheduled jobs, "orders older than 30 days"?
+    hint: |-
+      - **Inject clock** (`now: () => Date`) vào service → test truyền thời điểm cố định; dễ hiểu và không phụ thuộc framework.
+      - **Fake timers** (`jest.useFakeTimers()`, `vi.useFakeTimers()`, `setSystemTime`) cho `setTimeout`/`setInterval`/`Date` → `advanceTimersByTime`.
+      - Test biên: đúng 30 ngày, 30 ngày − 1ms, qua DST, cuối tháng, năm nhuận, timezone của tenant; lưu UTC.
+      - DB: `now()` trong SQL không bị fake timers ảnh hưởng → truyền timestamp từ app hoặc seed dữ liệu tương đối.
+      - Cẩn thận fake timers với promise/async I/O (có thể treo test).
+    followUp: A test using fake timers hangs forever when the code awaits a DB call. Why?
+    tags: [time, fake-timers, test-design]
+  - id: testing-016
+    level: medium
+    type: concept
+    q: What is TDD, and when is it worth it versus when does it slow you down?
+    hint: |-
+      TDD: **red** (viết test fail) → **green** (code tối thiểu cho pass) → **refactor**, lặp nhỏ.
+      Đáng giá: logic nghiệp vụ phức tạp, rule nhiều nhánh (pricing, discount, permission), bug fix (viết test tái hiện bug trước), API design (test làm người dùng đầu tiên).
+      Kém hiệu quả: prototype/khám phá khi chưa rõ yêu cầu, UI thay đổi liên tục, code glue mỏng quanh framework.
+      Lợi ích thật: thiết kế dễ test (dependency injection, hàm nhỏ), phản hồi nhanh; rủi ro: test gắn implementation nếu bước quá nhỏ và mock nhiều.
+      Senior: dùng có chọn lọc, không "tôn giáo".
+    followUp: How do you apply TDD to a bug report from production?
+    tags: [tdd, practices]
+  - id: testing-017
+    level: medium
+    type: concept
+    q: How do you test authentication and authorization in an API?
+    hint: |-
+      - **AuthN**: không token → 401; token hết hạn / sai chữ ký / sai `aud`/`iss` → 401; token hợp lệ → pass. Dùng key test để ký token thật, **không tắt middleware**.
+      - **AuthZ**: ma trận **role × action × resource**: buyer không gọi được admin endpoint (403); user chỉ sửa được resource của mình (IDOR: đổi id sang của người khác → 403/404).
+      - Table-driven test để phủ ma trận; một test "mọi route đều có auth" (duyệt router, gọi không token, mong đợi 401 trừ allowlist public).
+      - Test cả đường refresh token, logout/revoke nếu có.
+      - E2E: vài journey đăng nhập thật (SSO sandbox) — còn lại dùng `storageState`/token trực tiếp.
+    example: |-
+      ```ts
+      it.each([
+        ["buyer", "GET", "/admin/tenants", 403],
+        ["merchant_admin", "GET", "/admin/tenants", 403],
+        ["platform_admin", "GET", "/admin/tenants", 200],
+      ])("%s %s %s -> %i", async (role, method, path, status) => {
+        const token = await tokenFor({ role, tenantId: "t1" });
+        const res = await request(app)[method.toLowerCase() as "get"](path).set("Authorization", `Bearer ${token}`);
+        expect(res.status).toBe(status);
+      });
+      ```
+    followUp: How would you catch a newly added endpoint that forgot the auth middleware?
+    tags: [auth, authorization, api-testing, security]
+  - id: testing-018
+    level: medium
+    type: concept
+    q: How do you unit test a Kafka consumer in Node, and what behaviours must be covered?
+    hint: |-
+      - Tách **handler thuần** (`handleOrderPlaced(event, deps)`) khỏi code kafkajs (subscribe, commit) → unit test handler với deps là fake/stub.
+      - Hành vi phải test: xử lý đúng event hợp lệ; **duplicate** event (at-least-once) không tạo tác dụng phụ lần hai (idempotency); event **out-of-order** (update tới trước create); payload sai schema/poison → không crash loop, đẩy DLQ; lỗi transient → retry có giới hạn; version schema cũ vẫn đọc được.
+      - Integration: Kafka/Redpanda trong container, produce thật, assert kết quả trong DB, kiểm tra commit offset sau khi xử lý (không mất message khi crash giữa chừng).
+      - Chờ kết quả bất đồng bộ bằng polling có timeout, không `sleep`.
+    followUp: How do you test that offsets are committed only after the database write succeeds?
+    tags: [kafka, consumer, idempotency]
+  - id: testing-019
+    level: medium
+    type: concept
+    q: How do you mock HTTP calls to third-party services in Node and frontend tests? Compare MSW, nock and dependency injection.
+    hint: |-
+      - **MSW** (Mock Service Worker): chặn request ở tầng network (Service Worker trong browser, interceptor trong Node) → code dùng `fetch`/axios thật; cùng handler dùng cho unit, RTL, Storybook, dev.
+      - **nock**: chặn `http` module của Node; mạnh cho Node cũ, ít hợp với `fetch` native tuỳ version.
+      - **Dependency injection**: truyền `PaymentClient` interface → test truyền fake; rõ ràng nhất, không phụ thuộc thư viện chặn network.
+      - Nguyên tắc: mock ở **ranh giới** (HTTP), không mock module nội bộ; test cả **đường lỗi** (timeout, 500, 429, response sai shape); dùng contract test/sandbox để biết mock còn đúng với API thật.
+    followUp: Your mocks say the payment API returns `status`, but production returns `state`. How would you have caught that?
+    verify: true
+    tags: [msw, nock, mocking, http]
+  - id: testing-020
+    level: medium
+    type: gotcha
+    q: What are the gotchas of `jest.mock` / `vi.mock` module mocking?
+    hint: |-
+      - Được **hoist** lên đầu file → không dùng được biến khai báo bên dưới trong factory (trừ biến có tiền tố `mock` ở Jest, hoặc `vi.hoisted`).
+      - Mock thay thế **cả module** → quên implement một export → `undefined is not a function`; dùng `requireActual`/`importOriginal` để mock một phần.
+      - State của mock rò giữa test → `clearMocks`/`restoreMocks` trong config, hoặc `vi.restoreAllMocks()`.
+      - ESM: mock phải xảy ra trước khi module được import; với Jest ESM cần `jest.unstable_mockModule` + dynamic import.
+      - Mock module nội bộ quá nhiều = test gắn cấu trúc file → refactor vỡ test. Ưu tiên DI hoặc mock ở ranh giới.
+    followUp: When would you use `jest.spyOn` instead of `jest.mock`?
+    verify: true
+    tags: [jest, vitest, mocking, gotcha]
+  - id: testing-021
+    level: medium
+    type: concept
+    q: How do you test Next.js App Router code — Server Components, Server Actions, route handlers?
+    hint: |-
+      - **Route handlers / Server Actions**: tách logic ra hàm thuần/service → unit/integration test trực tiếp (với DB thật); handler chỉ mỏng (parse input, gọi service, trả response).
+      - **Client Components**: RTL + Vitest/Jest như React thường.
+      - **Async Server Components**: công cụ unit (RTL/Jest) hỗ trợ hạn chế → docs Next.js khuyến nghị **e2e** (Playwright) cho async Server Components; hoặc test phần logic data-fetching tách riêng.
+      - E2E chạy trên `next build && next start` (không phải dev mode) để gần production (caching, bundling).
+      - Mock network/server: MSW, hoặc môi trường test có backend thật.
+    followUp: Why can a Playwright test pass against `next dev` but fail against `next start`?
+    verify: true
+    tags: [nextjs, server-components, e2e]
+  - id: testing-022
+    level: medium
+    type: design
+    q: How do you manage test data for integration and e2e tests so tests are independent and readable?
+    hint: |-
+      - **Factory/builder** (`buildOrder({ status: "paid" })`) với default hợp lý, override field quan trọng → test đọc được ý đồ.
+      - Mỗi test **tự tạo dữ liệu** nó cần, ID/email duy nhất (tránh va chạm khi chạy song song), không phụ thuộc test khác.
+      - Reset: transaction rollback / truncate / DB per worker; e2e: tạo dữ liệu qua **API** (nhanh) thay vì qua UI, dọn theo prefix.
+      - Tránh fixture khổng lồ dùng chung (thay một field → 50 test vỡ).
+      - Không dùng dữ liệu production thật (PII); nếu cần dữ liệu cỡ thật cho performance → anonymize.
+    followUp: Your e2e suite can't run in parallel because tests share one admin account. How do you fix it?
+    tags: [test-data, factories, isolation]
+  - id: testing-023
+    level: medium
+    type: debug
+    q: This Supertest suite passes when run alone but fails when the whole suite runs. What's going on?
+    example: |-
+      ```ts
+      import { app } from "../src/app";
+      import { cache } from "../src/cache"; // module-level Map
+
+      describe("GET /products/:id", () => {
+        it("returns 404 for unknown product", async () => {
+          const res = await request(app).get("/products/999");
+          expect(res.status).toBe(404);
+        });
+      });
+
+      // another file, runs earlier in the same worker:
+      it("caches product 999 after creating it", async () => {
+        await request(app).post("/products").send({ id: 999, name: "Tmp" });
+        await request(app).get("/products/999");
+        expect(cache.has("product:999")).toBe(true);
+      });
+      ```
+    hint: |-
+      - **Shared state rò giữa test**: cache module-level (Map) và DB không được reset → test sau thấy product 999 do test trước tạo → nhận 200 thay vì 404. Kết quả phụ thuộc **thứ tự** và cách chia worker.
+      - Fix: reset state trong `beforeEach` (clear cache, truncate/rollback DB); tạo app qua **factory** `createApp({ cache: new Map() })` để mỗi test có instance riêng; dùng ID duy nhất; không assert vào internal cache (test hành vi: request thứ hai không chạm DB — nếu thật cần).
+      - Phát hiện: chạy test ngẫu nhiên thứ tự (`--randomize` / `sequence.shuffle` của Vitest), chạy một file riêng lẻ.
+    followUp: How would you detect order-dependent tests automatically in CI?
+    tags: [flaky-tests, shared-state, supertest, debugging]
+  - id: testing-024
+    level: hard
+    type: design
+    q: How do you test tenant isolation in a multi-tenant API thoroughly, and keep it tested as new endpoints are added?
+    hint: |-
+      - Seed ít nhất **hai tenant** với dữ liệu trùng dạng (cùng tên product, cùng ID dạng số nếu có) để lỗi rò rỉ lộ ra.
+      - Với mỗi resource: list/get/update/delete/search/export bằng token tenant A trên ID của tenant B → 404 (không lộ tồn tại) hoặc 403; list của A không chứa item của B.
+      - **Test sinh tự động từ route table**: duyệt router/OpenAPI, cho mọi endpoint có path param → chạy kiểm tra cross-tenant; endpoint mới không cần ai nhớ viết test.
+      - Tầng DB: nếu dùng Postgres **RLS**, test với role app thật (không superuser — superuser bỏ qua RLS); test `SET app.tenant_id` bị reset giữa request trong pool.
+      - Kênh phụ: cache key có tenant, Elasticsearch filter tenant, file S3 prefix, background job, Kafka consumer mang tenant context.
+    followUp: Your RLS tests pass but production leaks data through a connection pool. How is that possible?
+    tags: [multi-tenancy, security, integration, design]
+  - id: testing-025
+    level: hard
+    type: scenario
+    q: "Your CI has a 15% failure rate from flaky tests and developers just click 're-run'. How do you fix the situation?"
+    hint: |-
+      1. **Đo**: thu kết quả mỗi test qua nhiều lần chạy (JUnit report, test analytics), tính flaky rate per test → danh sách top offender.
+      2. **Quarantine** có kỷ luật: test flaky chuyển sang job không chặn merge, **có owner và hạn fix**; không để quarantine thành nghĩa địa.
+      3. **Fix gốc** theo nhóm nguyên nhân: sleep cố định → wait theo điều kiện; shared state → reset/cô lập; thời gian → fake clock; network thật → mock ở ranh giới; tài nguyên CI → song song hợp lý, timeout.
+      4. Phòng ngừa: chạy test mới nhiều lần trước khi merge (`--repeat-each` của Playwright), shuffle thứ tự, lint cấm `waitForTimeout`/`sleep`.
+      5. Retry tự động chỉ như lưới an toàn **có báo cáo** — flaky đôi khi là race condition thật trong code production.
+    followUp: A test is flaky because of a real race condition in production code. How did you tell?
+    tags: [flaky-tests, ci, scenario]
+  - id: testing-026
+    level: hard
+    type: concept
+    q: What is mutation testing, and how would you use it without making CI unbearably slow?
+    hint: |-
+      Công cụ (JS/TS: **Stryker**) tạo **mutant** bằng cách sửa code (đổi `>` thành `>=`, `&&` thành `||`, xoá lời gọi, đổi return) rồi chạy test: test fail = mutant bị **killed** (tốt); test vẫn pass = **survived** → test yếu (chạy code nhưng không assert đúng).
+      Mutation score đo **chất lượng assertion**, điều coverage không làm được.
+      Chi phí: chạy suite hàng trăm/nghìn lần → dùng **incremental mode** (chỉ mutate code thay đổi), giới hạn vào module nghiệp vụ quan trọng (pricing, permission), chạy nightly thay vì mỗi PR, test runner nhanh (Vitest/Jest với per-test coverage analysis).
+      Có mutant "equivalent" (không đổi hành vi) → không cần 100%.
+    followUp: A mutant that removes the tenant filter survived. What does that tell you?
+    verify: true
+    tags: [mutation-testing, stryker, quality]
+  - id: testing-027
+    level: hard
+    type: debug
+    q: This Kafka consumer test never fails, even when the handler is broken. Why?
+    example: |-
+      ```ts
+      it("stores the order when OrderPlaced is consumed", async () => {
+        await producer.send({ topic: "orders", messages: [{ value: JSON.stringify(event) }] });
+        setTimeout(async () => {
+          const row = await db.query("SELECT * FROM orders WHERE id = $1", [event.id]);
+          expect(row.rows).toHaveLength(1);
+        }, 2000);
+      });
+      ```
+    hint: |-
+      - Assertion nằm trong `setTimeout` **không được await** → test kết thúc (pass) trước khi callback chạy; lỗi trong callback (nếu có) xảy ra sau khi test xong hoặc làm crash suite khác.
+      - Chờ cố định 2s → nếu dùng đúng cách cũng flaky.
+      Fix: **poll có timeout** (`await waitFor(async () => expect(await count()).toBe(1), { timeout: 10_000 })`, hoặc `expect.poll` của Playwright/Vitest); đảm bảo consumer đã **join group và được assign partition** trước khi produce (hoặc `fromBeginning`); topic/consumer group riêng cho mỗi test run.
+      - Thêm test cho duplicate event: produce hai lần, vẫn chỉ 1 row.
+      - Bật `expect.assertions(n)`/`expect.hasAssertions()` để bắt test không assert gì.
+    followUp: How do you make sure the consumer is ready before producing in the test?
+    tags: [kafka, async, testing, debugging]
+  - id: testing-028
+    level: hard
+    type: scenario
+    q: "The e2e suite takes 70 minutes and blocks every merge. How do you bring it under 15 minutes without losing confidence?"
+    hint: |-
+      - Phân tích: test nào chậm nhất, test nào **trùng lặp** thứ integration/contract đã phủ, test nào chưa từng bắt bug.
+      - **Đẩy xuống tầng dưới**: validation, permission matrix, edge case → API integration test; component behaviour → RTL. E2E giữ **vài journey trọng yếu** (smoke).
+      - Tăng tốc phần còn lại: **shard/parallel** (Playwright `--shard`, workers), đăng nhập bằng `storageState`, tạo dữ liệu qua API, chặn tài nguyên không cần (analytics, ảnh lớn), chạy trên build production.
+      - Chia tầng pipeline: smoke e2e chặn merge; full e2e chạy sau merge/nightly + trên staging trước release.
+      - Theo dõi: thời gian suite và flaky rate như metric.
+    followUp: Which e2e tests would you never move down the pyramid, and why?
+    tags: [e2e, ci, performance, scenario]
+  - id: testing-029
+    level: hard
+    type: gotcha
+    q: Why can a test suite with 95% coverage still miss critical bugs? Give concrete examples.
+    hint: |-
+      - Chạy qua dòng code mà **không assert** kết quả (hoặc assert yếu: `toBeDefined`, `toHaveBeenCalled`).
+      - Chỉ test happy path; branch lỗi được "cover" bởi một test với input không thực tế.
+      - Mock khiến code thật không chạy (SQL, serialization, config), hoặc mock sai hành vi dependency thật.
+      - Bug nằm ở **tương tác**: race condition, transaction isolation, retry + duplicate, timezone, cache stale.
+      - Code **thiếu** (không kiểm tra quyền tenant) — coverage không đo được dòng không tồn tại.
+      - Cấu hình/infra (env var sai, migration, IAM) ngoài phạm vi test.
+      Bổ sung: mutation testing, property-based test, integration với dependency thật, test đường lỗi, contract test.
+    followUp: What is property-based testing and where would it catch bugs that example-based tests miss?
+    tags: [coverage, quality, gotcha]
+  - id: testing-030
+    level: hard
+    type: design
+    q: How do you test retry, timeout and idempotency behaviour of a payment integration?
+    hint: |-
+      - Inject HTTP client/fake provider có thể lập trình: trả 500 rồi 200, trả **timeout** (không phản hồi), trả 429 với `Retry-After`, trả thành công nhưng **mất response** (timeout sau khi provider đã charge).
+      - Assert: số lần retry, backoff (fake timers), **cùng idempotency key** được gửi ở mọi lần retry, không retry lỗi 4xx nghiệp vụ, circuit breaker mở sau N lỗi.
+      - Idempotency phía mình: gọi endpoint `POST /payments` hai lần cùng `Idempotency-Key` → một charge, response giống nhau; hai request **đồng thời** cùng key → chỉ một thực thi (test concurrency với DB thật + unique constraint).
+      - Webhook: event trùng / tới trước response / tới sai thứ tự.
+      - Sandbox của provider cho một vài test integration thật (không chặn merge).
+    followUp: How do you test two concurrent requests with the same idempotency key deterministically?
+    tags: [payments, idempotency, retries, design]
+  - id: testing-031
+    level: hard
+    type: compare
+    q: Snapshot testing — when is it useful and when does it become harmful?
+    hint: |-
+      Hữu ích: output lớn, ổn định và khó assert tay — serializer, thông báo lỗi CLI, cấu hình sinh ra (CDK template), email HTML; inline snapshot nhỏ cho object shape.
+      Có hại: snapshot cả component React lớn → thay đổi CSS/markup vô hại làm vỡ hàng loạt → mọi người `-u` không đọc → test không còn kiểm tra gì. Snapshot không thể hiện **ý đồ** (cái gì quan trọng).
+      Thực hành: snapshot nhỏ, có mục tiêu, review diff trong PR như code; ưu tiên assertion rõ ràng cho hành vi; visual regression (Playwright `toHaveScreenshot`) cho UI thay vì DOM snapshot, với ngưỡng và môi trường render ổn định.
+    followUp: Visual regression tests fail on CI but not locally. What's usually different?
+    tags: [snapshot-testing, frontend, gotcha]
+  - id: testing-032
+    level: hard
+    type: scenario
+    q: "A provider team changed a field in their API response and broke your service in production, even though both teams' tests were green. How do you stop this from happening again?"
+    hint: |-
+      - Cả hai test đều xanh vì consumer **mock** response theo hiểu biết cũ, provider test không biết consumer dùng field nào → không ai kiểm tra **ranh giới**.
+      - Giải pháp: **consumer-driven contract** (Pact) + `can-i-deploy` trong pipeline của **cả hai** bên; hoặc tối thiểu: schema (OpenAPI/JSON Schema) versioned + kiểm tra breaking change tự động (oasdiff) trong CI provider.
+      - Quy trình: API versioning / deprecation window, expand/contract cho field (thêm mới, giữ cũ, rồi mới xoá).
+      - Consumer bền vững hơn: validate response ở ranh giới (zod) → lỗi rõ ràng, "tolerant reader" (bỏ qua field thừa).
+    followUp: How do you roll out contract testing when 10 teams have never used it?
+    tags: [contract-testing, pact, microservices, scenario]
+  - id: testing-033
+    level: hard
+    type: design
+    q: How would you test a Socket.IO real-time feature end to end, including reconnection and multi-instance broadcast?
+    hint: |-
+      - Integration: dựng server thật trên port ngẫu nhiên, nhiều `socket.io-client` trong test; assert event nhận đúng room/tenant, **không** nhận event của tenant khác; auth khi handshake (token sai → `connect_error`).
+      - Multi-instance: hai server dùng **Redis adapter** (Redis trong container) → emit từ server A, client kết nối server B nhận được.
+      - Reconnection: kill server/ngắt kết nối → client reconnect với backoff, nhận lại state/missed message (nếu có cơ chế), không duplicate xử lý.
+      - Chờ event bằng promise có timeout (`once` wrapped), không sleep.
+      - Load: k6/Artillery WebSocket test cho số connection, latency emit→receive, memory per connection.
+    followUp: How do you test that a user who lost connection for 30 seconds doesn't miss a balance update?
+    tags: [socketio, websocket, integration, design]
+  - id: testing-034
+    level: hard
+    type: gotcha
+    q: What goes wrong when you run tests in parallel against shared resources, and how do you design for parallelism?
+    hint: |-
+      - Va chạm dữ liệu: cùng email/ID unique, cùng tenant, cùng queue/topic → test lẫn kết quả của nhau.
+      - Reset toàn cục (truncate tất cả bảng) của worker này xoá dữ liệu worker khác đang dùng.
+      - Port cố định, file tạm cùng tên, env var toàn cục.
+      - Thiết kế: DB/schema **riêng mỗi worker** (dùng `JEST_WORKER_ID`/`VITEST_POOL_ID`), tenant/ID sinh ngẫu nhiên mỗi test, topic/consumer group có hậu tố run ID, port 0 (OS chọn), không phụ thuộc thứ tự.
+      - Kiểm tra: chạy suite nhiều lần với số worker khác nhau.
+    followUp: How do you give each Jest worker its own Postgres database cheaply?
+    tags: [parallelism, isolation, flaky-tests]
+  - id: testing-035
+    level: hard
+    type: concept
+    q: How do you test database migrations themselves?
+    hint: |-
+      - CI chạy toàn bộ migration từ đầu trên DB trống (engine thật) → phát hiện migration hỏng/thứ tự sai.
+      - Test **nâng cấp từ schema production hiện tại**: restore snapshot đã anonymize (hoặc schema dump) → chạy migration mới → chạy test suite.
+      - Tương thích ngược: chạy test của **phiên bản code trước** trên schema mới (bắt thay đổi không expand/contract).
+      - Thời gian & lock: đo thời gian migration trên dữ liệu cỡ thật; lint migration nguy hiểm (thêm cột NOT NULL không default, index không concurrently).
+      - Migration dữ liệu (backfill): test với dữ liệu bẩn (null, trùng, encoding).
+    followUp: Would you write down-migrations and test them? Why or why not?
+    tags: [migrations, database, ci]
+  - id: testing-036
+    level: senior
+    type: design
+    q: Design the testing strategy for a multi-tenant B2B2C e-commerce platform (Next.js storefront, Node APIs, SQL DB, Redis, Elasticsearch, Kafka).
+    hint: |-
+      - **Static**: TypeScript strict, ESLint, schema validation (zod) ở ranh giới.
+      - **Unit**: pricing, promotion, tax, permission rules — table-driven, property-based cho tính tiền.
+      - **Integration** (xương sống): API + DB thật (testcontainers) + Redis + Elasticsearch container; tenant isolation tự động cho mọi endpoint; Kafka consumer với container.
+      - **Contract**: giữa storefront ↔ API, giữa service qua Pact (HTTP + message).
+      - **E2E**: 5–10 journey (search → cart → checkout, merchant tạo product) trên staging; smoke trên production sau deploy.
+      - **Non-functional**: load test luồng checkout/search trước sự kiện lớn, security test (auth matrix, DAST), accessibility (axe trong Playwright).
+      - Quy trình: test chạy theo tầng trong pipeline, flaky rate và thời gian suite là metric, test là một phần Definition of Done.
+    followUp: Budget allows only one of contract tests or a larger e2e suite this quarter. Which and why?
+    tags: [testing-strategy, multi-tenancy, design]
+  - id: testing-037
+    level: senior
+    type: open
+    q: Your team has almost no tests on a legacy Express codebase that everyone is afraid to change. Where do you start?
+    hint: |-
+      - Không viết unit test cho mọi thứ trước — bắt đầu bằng **characterization tests** (golden master) ở tầng **HTTP**: ghi lại hành vi hiện tại của các endpoint quan trọng (Supertest + DB thật) → lưới an toàn cho refactor.
+      - Ưu tiên theo **rủi ro × tần suất thay đổi**: module hay sửa + hay lỗi (checkout, pricing).
+      - Mỗi bug fix đi kèm test tái hiện; mỗi PR chạm code cũ thêm test cho phần chạm (boy scout rule).
+      - Tách dần seam (dependency injection) để có thể unit test logic.
+      - Đưa test vào CI chặn merge ngay từ ngày đầu, dù ít.
+      - Đo tiến bộ bằng **change failure rate** và sự tự tin khi deploy, không chỉ coverage.
+    followUp: A characterization test captures a behaviour that is actually a bug. What do you do?
+    tags: [legacy, strategy, open]
+  - id: testing-038
+    level: senior
+    type: open
+    q: How do you decide how much testing is "enough" for a feature?
+    hint: |-
+      Không có con số chung — cân nhắc:
+      - **Rủi ro**: tiền, dữ liệu, bảo mật, tenant isolation → test dày ở mọi tầng; trang admin nội bộ ít dùng → mỏng hơn.
+      - **Chi phí khi lỗi lọt** và khả năng phát hiện/rollback nhanh (feature flag, canary, monitoring tốt giảm nhu cầu test e2e).
+      - **Tần suất thay đổi**: code hay sửa cần lưới an toàn tốt.
+      - Độ phức tạp logic (nhiều nhánh → unit/property test).
+      "Đủ" khi: bạn dám refactor và deploy giờ hành chính mà không lo; bug lọt ra prod ít và thuộc loại không test được hợp lý.
+      Senior: nói rõ trade-off với product (thời gian vs rủi ro), không mặc định "càng nhiều càng tốt".
+    followUp: Product wants to ship tomorrow and tests aren't done. What do you negotiate?
+    tags: [strategy, risk, open]
+  - id: testing-039
+    level: senior
+    type: design
+    q: How do you test an incremental monolith-to-microservices migration to be sure behaviour doesn't change?
+    hint: |-
+      - **Characterization tests** trên API của monolith trước khi tách → chạy cùng bộ test đó với service mới (qua gateway) — cùng input, cùng output.
+      - **Shadow/dark traffic**: gửi bản sao request production tới service mới, so sánh response (diffing, bỏ qua field không xác định như timestamp), không trả cho user.
+      - **Contract tests** giữa monolith và service mới, và cho Kafka event (message pact / schema registry compatibility).
+      - Kiểm tra **dữ liệu**: reconciliation job so sánh dữ liệu hai bên khi dual-write/CDC.
+      - Canary theo tenant với tiêu chí so sánh metric; rollback bằng route/flag.
+      - Test chế độ lỗi mới: network giữa service, Kafka lag, eventual consistency.
+    followUp: Shadow traffic for write endpoints could double-charge or double-email. How do you handle writes?
+    tags: [microservices, migration, testing-strategy, design]
+  - id: testing-040
+    level: senior
+    type: open
+    q: How do you get a team that sees tests as a chore to write good tests?
+    hint: |-
+      - Làm test **dễ viết**: factory/builder, helper auth, testcontainers setup sẵn, ví dụ mẫu tốt trong repo — hạ chi phí ma sát.
+      - Làm test **nhanh và đáng tin**: suite chậm/flaky → mọi người ghét; fix đó trước.
+      - Review test như review code: hỏi "test này bắt được bug gì?", không hỏi "coverage bao nhiêu?".
+      - Cho thấy giá trị: bug lọt prod → postmortem chỉ ra test nào sẽ bắt được; refactor lớn thành công nhờ test.
+      - Đặt vào Definition of Done, không phải "nếu còn thời gian".
+      - Dẫn dắt bằng ví dụ: senior viết test tốt cho code của mình trước.
+    followUp: A senior engineer on the team refuses to write tests. How do you handle it?
+    tags: [culture, leadership, open]
+  - id: testing-041
+    level: cv
+    type: behavioral
+    q: On the financial platform you implemented unit tests. What did you test, with which tools, and what bug did those tests actually catch?
+    hint: |-
+      Câu trả lời mạnh nêu **cụ thể**: framework (Jest? Vitest? Mocha?), loại logic được test (tính toán tiền, làm tròn, rule giao dịch), cách xử lý dependency (mock gì, không mock gì), cách chạy trong CI.
+      Một ví dụ bug được test bắt trước khi lên production — hoặc một bug **lọt qua** và bạn đã thêm test gì sau đó.
+      Tài chính: số tiền dùng số nguyên/decimal (không float), làm tròn, idempotency, timezone cut-off.
+      (điền tên công cụ, số lượng test và ví dụ thật của bạn — không bịa số liệu)
+    followUp: Did you test money calculations with floating point numbers anywhere? How did you guard against rounding errors?
+    redFlags:
+      - Cannot name the test framework or a concrete test
+    tags: [cv, unit-testing, fintech]
+  - id: testing-042
+    level: cv
+    type: scenario
+    q: You owned features end to end including testing on a multi-tenant platform. How did you test that one tenant could never see another tenant's data?
+    hint: |-
+      Interviewer muốn nghe: có test **cross-tenant** thật không (seed hai tenant, gọi bằng token A với ID của B), ở tầng nào (API integration? chỉ unit?), phủ những kênh nào (SQL, Redis cache key, Elasticsearch filter, file storage, background job).
+      Nếu chưa có test tự động cho việc này: thừa nhận và nói bạn sẽ thêm thế nào (test sinh từ route table, RLS nếu Postgres).
+      Kể một lần suýt rò/rò dữ liệu tenant (nếu có) và bài học.
+      (điền cách làm và ví dụ thật của bạn)
+    followUp: How would you test tenant isolation in the Elasticsearch layer specifically?
+    tags: [cv, multi-tenancy, security-testing]
+  - id: testing-043
+    level: cv
+    type: behavioral
+    q: What did your testing pyramid actually look like on the e-commerce platform — roughly how many unit, integration and e2e tests, and how long did CI take?
+    hint: |-
+      Nói thật cấu trúc hiện tại: tỉ lệ các loại test, công cụ (Jest/Mocha/Supertest/Playwright/Cypress…), test chạy ở đâu và mất bao lâu, cái gì chặn merge.
+      Sau đó đánh giá: điểm mạnh, điểm yếu (thiếu integration với DB thật? e2e flaky? không có contract test giữa service?) và thứ tự bạn sẽ cải thiện.
+      (điền con số và công cụ thật của bạn — không bịa; nếu không nhớ chính xác, nói ước lượng và ghi rõ là ước lượng)
+    followUp: What's one bug that reached production that a different kind of test would have caught?
+    tags: [cv, testing-strategy]
+  - id: testing-044
+    level: cv
+    type: scenario
+    q: During the migration to Node microservices with Kafka, how did you test the new consumers and producers before going live?
+    hint: |-
+      Nội dung mạnh: unit test handler tách khỏi Kafka client; integration với Kafka thật (container hoặc môi trường staging); test duplicate/out-of-order/poison message; test schema tương thích với producer cũ (monolith); so sánh kết quả với monolith (shadow consume, reconciliation).
+      Kể một bug chỉ lộ ra khi chạy với Kafka thật (rebalance, offset commit, ordering theo partition key).
+      (điền cách làm và ví dụ thật của bạn — không bịa số liệu)
+    followUp: How did you test what happens when a consumer crashes after writing to the DB but before committing the offset?
+    tags: [cv, kafka, microservices, testing]
+  - id: testing-045
+    level: cv
+    type: behavioral
+    q: Tell me about a time a test suite gave you false confidence — everything was green, but production broke.
+    hint: |-
+      STAR: test nào xanh, production hỏng vì gì (mock lệch thực tế, dữ liệu production khác, config/infra, concurrency, tenant đặc biệt).
+      Phân tích: vì sao test không bắt được — **lớp test sai** chứ không chỉ "thiếu test".
+      Thay đổi sau đó: loại test mới (integration với DB thật, contract, e2e smoke sau deploy), monitoring bổ sung.
+      Reflection: bạn thay đổi cách đánh giá "test này có đáng tin không" thế nào.
+      (điền câu chuyện thật của bạn)
+    followUp: How do you now decide whether a mock is trustworthy?
+    tags: [cv, behavioral, quality]
+  - id: testing-046
+    level: cv
+    type: scenario
+    q: How did you test the Socket.IO real-time features on the financial platform, and did you load test them?
+    hint: |-
+      Nêu: test tích hợp với client thật (socket.io-client) hay chỉ test thủ công; test auth handshake, room/tenant scoping, reconnect; có load test số connection/message rate không, bằng công cụ gì, phát hiện gì (memory, event loop, Redis adapter).
+      Nếu phần này từng test thủ công: thừa nhận và mô tả bạn sẽ tự động hoá thế nào.
+      (điền công cụ và kết quả thật của bạn — không bịa số liệu)
+    followUp: How would you assert that a price update reaches all subscribed clients within 500 ms under load?
+    tags: [cv, socketio, load-testing]

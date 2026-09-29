@@ -1,0 +1,725 @@
+id: 29-engineering-practices
+slug: engineering-practices
+title: Engineering Practices & Leadership
+tier: 8
+status: drafted
+summary: "Git workflow, code review, tech debt, estimation, design doc/RFC/ADR, mentoring, làm việc với PO/QA/Design trong team phân tán, on-call và deprecation."
+cvLinked: false
+overview: |-
+  ## TL;DR
+
+  - Ở level senior, interviewer đánh giá **cách bạn làm việc với người và hệ thống**, không chỉ code: bạn chia task thế nào, review ra sao, xử lý bất đồng, quản lý tech debt, viết design doc.
+  - Git: hiểu **trunk-based vs GitFlow**, **rebase vs merge**, và công cụ cứu hộ (`reflog`, `bisect`, `revert`) — đủ để nói "tại sao team chọn cách này".
+  - Code review là **cơ chế chia sẻ kiến thức và giảm rủi ro**, không phải gatekeeping; PR nhỏ, review nhanh, comment có mức độ (blocking vs nit).
+  - Estimation là **giao tiếp về bất định**: chia nhỏ, nêu giả định và rủi ro, cập nhật sớm khi sai — không phải hứa một con số.
+  - Quyết định kỹ thuật quan trọng → **design doc/RFC** trước khi làm, **ADR** ghi lại sau khi chốt; "disagree and commit" khi đã quyết.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Trunk-based development | Mọi người merge vào `main` thường xuyên (≤1–2 ngày), branch ngắn, feature flag che phần chưa xong | Checkout mới sau flag `checkout_v2` |
+  | GitFlow | Nhánh `develop`, `release/*`, `hotfix/*`, `feature/*` dài hơn; hợp với release theo đợt | App mobile phát hành 2 tuần một lần |
+  | Rebase vs merge | Rebase viết lại lịch sử cho thẳng; merge giữ lịch sử thật với merge commit | `git rebase main` trên branch cá nhân trước khi mở PR |
+  | `git bisect` | Binary search qua commit để tìm commit gây lỗi | 1.000 commit → ~10 bước |
+  | Feature flag | Tách **deploy** khỏi **release** | Bật cho 5% tenant trước |
+  | Tech debt | Chi phí tương lai do lựa chọn hiện tại; có loại cố ý và vô ý | Hard-code tỷ giá để kịp demo |
+  | Design doc / RFC | Tài liệu đề xuất trước khi build: vấn đề, phương án, trade-off | RFC "Chuyển search sang Elasticsearch" |
+  | ADR | Bản ghi ngắn một quyết định kiến trúc: context, decision, consequences | `ADR-012: Dùng outbox cho event đơn hàng` |
+  | Definition of Done | Tiêu chí chung để coi một task là xong | Code + test + review + docs + deployed + monitored |
+  | Blameless postmortem | Phân tích sự cố tập trung vào hệ thống, không đổ lỗi cá nhân | "Tại sao hệ thống cho phép deploy migration chưa test?" |
+
+  ## Cơ chế hoạt động
+
+  ### Vòng đời một thay đổi (trunk-based)
+
+  ```mermaid
+  flowchart LR
+    A["Ticket + acceptance criteria"] --> B["Breakdown thành PR nhỏ"]
+    B --> C["Branch ngắn từ main"]
+    C --> D["Commit + test local"]
+    D --> E["PR: description, screenshots, test plan"]
+    E --> F["CI: lint, type, test, build"]
+    F --> G{"Review"}
+    G -- "changes requested" --> D
+    G -- approve --> H["Squash/rebase merge vào main"]
+    H --> I["Deploy tự động (sau feature flag)"]
+    I --> J["Bật flag dần + monitor"]
+    J --> K["Dọn flag"]
+  ```
+
+  ### Code review flow
+
+  ```mermaid
+  sequenceDiagram
+    participant A as Author
+    participant CI
+    participant R as Reviewer
+    A->>A: Self-review diff, viết description + test plan
+    A->>CI: Push
+    CI-->>A: Lint/test fail? sửa trước khi nhờ review
+    A->>R: Request review (PR nhỏ, context rõ)
+    R->>R: Đọc description → design → correctness → tests → style
+    R-->>A: Comment: blocking / suggestion / nit / question
+    A->>R: Trả lời hoặc sửa, resolve thread
+    R-->>A: Approve (trong SLA, vd. < 1 ngày làm việc)
+  ```
+
+  ### Quyết định kỹ thuật
+
+  ```mermaid
+  flowchart TD
+    P["Vấn đề / đề xuất"] --> Q{"Đảo ngược dễ không?<br/>(two-way door)"}
+    Q -- "dễ" --> R["Quyết nhanh trong team, ghi chú ngắn"]
+    Q -- "khó / ảnh hưởng nhiều team" --> S["Design doc / RFC"]
+    S --> T["Review async + meeting ngắn"]
+    T --> U{"Đồng thuận?"}
+    U -- no --> V["Decision owner quyết, ghi dissent"]
+    U -- yes --> W["ADR"]
+    V --> W
+    W --> X["Implement + review lại khi context đổi"]
+  ```
+
+  ## Trade-offs
+
+  | Chủ đề | Lựa chọn A | Lựa chọn B | Khi nào chọn |
+  |---|---|---|---|
+  | Branching | Trunk-based: integrate liên tục, ít merge conflict, cần CI + flag tốt | GitFlow: kiểm soát release, nhiều nhánh sống lâu, merge hell | Web/SaaS deploy liên tục → trunk; release theo version/cần hỗ trợ nhiều version → GitFlow-ish |
+  | Integrate | Rebase: lịch sử thẳng, dễ bisect | Merge: giữ lịch sử thật, an toàn với branch chung | Rebase branch cá nhân; không rebase branch người khác đang dùng |
+  | Merge PR | Squash: 1 commit/PR, main sạch | Merge commit: giữ từng commit | Squash cho PR nhỏ; giữ commit khi mỗi commit có ý nghĩa riêng |
+  | Estimation | Story points: tương đối, team-level | Time-based: dễ hiểu với business | Nói bằng range + độ tự tin, không một con số |
+  | Tech debt | Trả dần (boy-scout, % capacity mỗi sprint) | Dự án trả nợ riêng | Nợ lan tỏa → trả dần; nợ tập trung, rủi ro cao → dự án riêng có mục tiêu đo được |
+  | Docs | Design doc dài, review kỹ | ADR ngắn | Quyết định khó đảo ngược → doc; mọi quyết định đáng nhớ → ADR |
+
+  ## Pitfalls
+
+  - PR 1.500 dòng, description trống, "please review ASAP".
+  - Review chỉ soi style (việc của linter) mà bỏ qua design/correctness; hoặc ngược lại dùng review để áp đặt sở thích cá nhân.
+  - `git push --force` lên branch chung; rebase branch đã share.
+  - Estimate một con số rồi im lặng tới deadline mới báo trễ.
+  - Gọi mọi thứ là "tech debt" để xin viết lại — không nêu được tác động kinh doanh.
+  - Bất đồng kéo dài trong comment PR thay vì gọi 15 phút.
+  - Trong team phân tán: quyết định trong call không ghi lại; người ở timezone khác bị loại khỏi quyết định.
+  - Deprecate API mà không có timeline, không đo ai còn dùng.
+
+  ## Cheat sheet
+
+  - **Git cứu hộ**: `git reflog` (tìm lại commit mất) · `git revert <sha>` (undo trên branch chung) · `git bisect start/bad/good/run` · `git push --force-with-lease` thay `--force`.
+  - **PR tốt**: < ~400 dòng thay đổi logic, một mục đích, description = what/why/how tested/risk, screenshots cho UI.
+  - **Comment tốt**: nêu mức độ (`blocking:`, `nit:`, `question:`), giải thích why, đề xuất cụ thể.
+  - **Estimate**: breakdown → spike cho phần chưa rõ → range (best/likely/worst) → nêu giả định → cập nhật sớm.
+  - **Tech debt**: ghi vào backlog với tác động (thời gian mất/incident/rủi ro), ưu tiên theo "lãi suất".
+  - **Design doc**: context, goals/non-goals, options + trade-offs, decision, rollout, rollback, open questions.
+  - **Bất đồng**: data > opinion, hiểu lý do bên kia, đề xuất thử nghiệm nhỏ, escalate có văn bản, disagree & commit.
+  - **Distributed team**: async-first, viết quyết định, overlap hours, demo/record, rõ owner.
+notionRefs: []
+references:
+  - title: Google Engineering Practices — Code Review
+    url: https://google.github.io/eng-practices/review/
+  - title: Trunk Based Development
+    url: https://trunkbaseddevelopment.com/
+  - title: Martin Fowler — Patterns for Managing Source Code Branches
+    url: https://martinfowler.com/articles/branching-patterns.html
+  - title: Git documentation — git-bisect
+    url: https://git-scm.com/docs/git-bisect
+  - title: Pro Git — Rewriting History / Rebasing
+    url: https://git-scm.com/book/en/v2/Git-Branching-Rebasing
+  - title: Architecture Decision Records (adr.github.io)
+    url: https://adr.github.io/
+  - title: Martin Fowler — Technical Debt Quadrant
+    url: https://martinfowler.com/bliki/TechnicalDebtQuadrant.html
+  - title: Google SRE Book — Postmortem Culture
+    url: https://sre.google/sre-book/postmortem-culture/
+  - title: Conventional Commits
+    url: https://www.conventionalcommits.org/en/v1.0.0/
+  - title: Martin Fowler — Feature Toggles (Pete Hodgson)
+    url: https://martinfowler.com/articles/feature-toggles.html
+questions:
+  - id: engineering-practices-001
+    level: easy
+    type: compare
+    q: What is the difference between git merge and git rebase, and when do you use each?
+    hint: |-
+      - **Merge**: tạo merge commit nối hai lịch sử; không viết lại commit cũ → an toàn cho branch đã share.
+      - **Rebase**: "phát lại" commit của bạn lên đầu base mới → lịch sử thẳng, commit có SHA mới.
+      Quy tắc: rebase branch **cá nhân** lên `main` trước khi mở/cập nhật PR; **không rebase branch người khác đang dùng**; merge (hoặc squash) khi đưa vào `main` theo quy ước team.
+      Sau rebase phải `push --force-with-lease`.
+    followUp: You rebased a shared branch and a teammate's commits disappeared. How do you recover?
+    redFlags:
+      - "Rebase is always better because history is clean"
+    tags: [git]
+  - id: engineering-practices-002
+    level: easy
+    type: compare
+    q: Compare trunk-based development with GitFlow.
+    hint: |-
+      - **Trunk-based**: branch ngắn (giờ–1–2 ngày), merge vào `main` liên tục, feature flag cho phần chưa xong, CI mạnh; ít merge conflict, hỗ trợ continuous delivery.
+      - **GitFlow**: `develop`, `feature/*`, `release/*`, `hotfix/*`; hợp khi release theo version, phải duy trì nhiều version song song; chi phí: branch sống lâu, merge hell, feedback chậm.
+      Web SaaS hiện đại thường trunk-based; DORA research liên kết trunk-based với hiệu suất delivery cao.
+    followUp: What must be in place before a team can safely switch from GitFlow to trunk-based?
+    tags: [git, branching]
+    verify: true
+  - id: engineering-practices-003
+    level: easy
+    type: concept
+    q: What makes a good pull request description?
+    hint: |-
+      - **What**: thay đổi gì (1–3 câu), link ticket.
+      - **Why**: vấn đề/động lực, quyết định thiết kế chính và phương án đã loại.
+      - **How to test**: bước kiểm, test đã thêm, screenshot/video cho UI.
+      - **Risk & rollout**: migration, feature flag, backward compatibility, cách rollback.
+      - Chỗ muốn reviewer chú ý.
+      PR nhỏ + description tốt = review nhanh và đúng trọng tâm.
+    followUp: How small is "small enough" for a PR, and how do you split a feature that can't ship in pieces?
+    tags: [code-review, pr]
+  - id: engineering-practices-004
+    level: easy
+    type: concept
+    q: What is git bisect and when would you use it?
+    hint: |-
+      Binary search trên lịch sử commit để tìm commit **đầu tiên** gây lỗi: đánh dấu một commit `good`, một commit `bad`, git checkout điểm giữa, bạn (hoặc script) báo good/bad → ~log2(N) bước.
+      `git bisect run <script>` tự động hoá nếu có test tái hiện lỗi (exit 0 = good, khác 0 = bad, 125 = skip).
+      Hiệu quả nhất khi commit nhỏ và mỗi commit build được — lý do nên giữ lịch sử sạch.
+    example: |-
+      ```bash
+      git bisect start
+      git bisect bad HEAD
+      git bisect good v2.3.0
+      git bisect run npx vitest run tests/checkout-total.test.ts
+      git bisect reset
+      ```
+    followUp: Bisect lands on a huge squashed commit. What now?
+    tags: [git, debugging]
+  - id: engineering-practices-005
+    level: easy
+    type: concept
+    q: What is technical debt, and is it always bad?
+    hint: |-
+      Tech debt = chi phí tương lai (thời gian, rủi ro) do lựa chọn hiện tại; "lãi" là sự chậm lại mỗi khi đụng vào vùng đó.
+      Không luôn xấu: nợ **cố ý, thận trọng** (ship nhanh để kiểm chứng thị trường, có kế hoạch trả) là quyết định kinh doanh hợp lý. Xấu là nợ **vô ý/liều lĩnh** và nợ không ai ghi lại.
+      Fowler's Tech Debt Quadrant: deliberate/inadvertent × reckless/prudent.
+    followUp: How do you convince a PO to allocate time for paying down debt?
+    tags: [tech-debt]
+  - id: engineering-practices-006
+    level: easy
+    type: concept
+    q: What is an Architecture Decision Record (ADR), and what does one contain?
+    hint: |-
+      Bản ghi **ngắn** (1 trang) cho một quyết định kiến trúc quan trọng, lưu cạnh code (vd. `docs/adr/0007-use-outbox.md`), bất biến — quyết định mới thì viết ADR mới "supersedes".
+      Nội dung: **Title, Status** (proposed/accepted/superseded), **Context** (ràng buộc, lực tác động), **Decision**, **Consequences** (được gì, mất gì, việc phải làm).
+      Giá trị: người mới hiểu "tại sao", tránh tranh luận lại cùng vấn đề.
+    followUp: How is an ADR different from a design doc or RFC?
+    tags: [adr, documentation]
+  - id: engineering-practices-007
+    level: easy
+    type: concept
+    q: What is a feature flag, and how does it relate to trunk-based development?
+    hint: |-
+      Flag cho phép **deploy code mà chưa release tính năng** — bật/tắt runtime theo user/tenant/%.
+      Trunk-based cần flag để merge code chưa xong vào `main` mà không ảnh hưởng user.
+      Loại: release toggle (ngắn hạn), experiment (A/B), ops/kill switch, permission.
+      Chi phí: tăng số nhánh logic cần test, **flag debt** nếu không dọn → đặt owner + ngày hết hạn.
+    followUp: A feature flag has been at 100% for eight months. What's the risk and what do you do?
+    tags: [feature-flags, branching]
+  - id: engineering-practices-008
+    level: easy
+    type: concept
+    q: What is a blameless postmortem, and what should it produce?
+    hint: |-
+      Phân tích sự cố tập trung vào **hệ thống và quy trình** cho phép lỗi xảy ra, không đổ lỗi cá nhân — để mọi người dám kể thật.
+      Nội dung: tóm tắt, impact (user, thời gian, tiền), timeline, root cause + contributing factors, cái gì làm tốt, **action items có owner + deadline** (phòng ngừa, phát hiện sớm, giảm impact).
+      Kết quả tốt: action item được làm thật và theo dõi.
+    followUp: The same type of incident happens again despite a postmortem. What went wrong?
+    tags: [incident, postmortem]
+  - id: engineering-practices-009
+    level: medium
+    type: concept
+    q: What do you look for when reviewing someone else's code, and in what order?
+    hint: |-
+      Theo thứ tự tác động (tham khảo Google eng-practices):
+      1. **Design**: thay đổi có nên tồn tại, đặt đúng chỗ, phù hợp kiến trúc?
+      2. **Correctness**: logic, edge case, concurrency, error handling, security (authz, injection, tenant).
+      3. **Tests**: có test cho hành vi mới và case lỗi, assertion có ý nghĩa.
+      4. **Readability & naming**, complexity.
+      5. **Operability**: log, metric, migration, backward compat.
+      6. Style → để linter lo.
+      Comment gắn nhãn mức độ; khen chỗ tốt; review trong SLA của team.
+    followUp: How do you review a PR in an area of the codebase you don't know well?
+    redFlags:
+      - "Mostly comments on formatting and naming"
+    tags: [code-review]
+  - id: engineering-practices-010
+    level: medium
+    type: scenario
+    q: A reviewer and an author have gone back and forth 15 comments on a PR about an approach. How do you resolve it?
+    hint: |-
+      - Dừng thread async: **gọi 15 phút** (hoặc huddle); tranh luận text dễ leo thang, nhất là khác timezone/văn hoá.
+      - Tách: đây là **correctness/rủi ro** (phải giải quyết) hay **sở thích** (author quyết)?
+      - Dùng dữ liệu: benchmark, ví dụ lỗi, guideline của team.
+      - Nếu vẫn bế tắc: người có quyền quyết (tech lead/code owner) chốt; ghi lại lý do trong PR; tạo ticket follow-up nếu cần.
+      - Sau đó: nếu là vấn đề lặp lại → bổ sung guideline/ADR.
+    followUp: What if you are the author and you believe the reviewer is simply wrong?
+    tags: [code-review, conflict]
+  - id: engineering-practices-011
+    level: medium
+    type: concept
+    q: How do you break down a large feature into tasks?
+    hint: |-
+      - Hiểu mục tiêu + acceptance criteria với PO; liệt kê non-goals.
+      - Chia **theo lát dọc** (vertical slice) giao được giá trị/đo được, không chia theo layer (BE rồi FE) nếu tránh được.
+      - Tách phần rủi ro/chưa rõ thành **spike** có timebox.
+      - Xác định dependency (API contract, migration, team khác) và thứ tự; contract trước để FE/BE song song.
+      - Mỗi task ≤ 1–2 ngày, có DoD; migration/flag/cleanup là task riêng.
+    example: |-
+      ```text
+      Feature: Address Management
+      1. Spike: provider validate địa chỉ (timebox 1 ngày)
+      2. Migration: bảng addresses (expand) + index (tenant_id, user_id)
+      3. API: CRUD + default address, tenant-scoped, test cross-tenant
+      4. FE: list + form (flag address_v2)
+      5. Checkout đọc default address
+      6. Rollout theo tenant, monitor, dọn flag
+      ```
+    followUp: How do you handle a task that turns out to be three times bigger once you start?
+    tags: [estimation, planning]
+  - id: engineering-practices-012
+    level: medium
+    type: concept
+    q: How do you estimate work, and how do you communicate an estimate to a PO?
+    hint: |-
+      - Breakdown trước; so sánh với việc tương tự đã làm (dữ liệu quá khứ).
+      - Đưa **range + độ tự tin** ("3–5 ngày, 70% nếu API provider đúng như docs") thay vì một con số.
+      - Nêu **giả định và rủi ro** rõ ràng; phần chưa rõ → spike trước khi cam kết.
+      - Tính cả review, test, QA, deploy, không chỉ thời gian code.
+      - Cập nhật **ngay khi** thấy lệch, kèm phương án (cắt scope, thêm người, dời ngày).
+    followUp: The PO says "that's too long, can you do it in half?" What do you say?
+    redFlags:
+      - "Pads everything by 3x and doesn't explain"
+    tags: [estimation, communication]
+  - id: engineering-practices-013
+    level: medium
+    type: debug
+    q: Look at this git history on the main branch. What problems do you see and how should the team change its workflow?
+    example: |-
+      ```text
+      *   a91f2c3 Merge branch 'main' into feature/checkout
+      |\
+      | * 77be0d1 fix
+      | * 4c1e9aa fix again
+      * | 2d0b8f1 Merge branch 'main' into feature/checkout
+      |\|
+      | * 9e3a712 wip
+      | * 18fd4c0 asdf
+      * | c0ffee1 Merge pull request #412 from feature/checkout-v2-final-FINAL
+      * | 5b6d2e9 revert "revert 'add voucher logic'"
+      ```
+    hint: |-
+      Vấn đề: commit message vô nghĩa (`fix`, `asdf`, `wip`) → không biết thay đổi gì; nhiều merge `main` → feature làm rối lịch sử; branch sống lâu (tên "final-FINAL"); revert của revert → không rõ trạng thái; `bisect` gần như vô dụng vì commit trung gian không build.
+      Đề xuất: branch ngắn; **rebase** branch cá nhân lên main thay vì merge main vào; **squash merge** PR với message có nghĩa (Conventional Commits: `feat(checkout): apply voucher`); branch protection (PR + CI bắt buộc, cấm push thẳng); interactive rebase để dọn commit trước khi mở PR.
+    followUp: When would you NOT want squash merges?
+    tags: [git, debug]
+  - id: engineering-practices-014
+    level: medium
+    type: debug
+    q: A teammate ran these commands and now says "my last two days of work are gone". What happened, and how do you recover it?
+    example: |-
+      ```bash
+      git checkout feature/shift-management
+      git fetch origin
+      git reset --hard origin/feature/shift-management
+      # "the remote had the latest version, I just wanted to sync"
+      ```
+    hint: |-
+      `reset --hard` đưa branch local về đúng trạng thái remote → mọi commit **local chưa push** bị bỏ khỏi branch (và thay đổi chưa commit mất hẳn).
+      Commit đã commit vẫn còn trong **reflog** (mặc định giữ ~90 ngày cho reachable, ~30 cho unreachable): `git reflog` → tìm SHA trước reset → `git branch rescue <sha>` hoặc `git reset --hard <sha>`.
+      Thay đổi **chưa commit** (không stash) thì không cứu được bằng git (thử IDE local history).
+      Phòng: commit + push thường xuyên; dùng `git pull --rebase` thay vì reset; `git status`/`git log origin/x..x` trước khi reset.
+    followUp: How would you check which local commits would be lost before running the reset?
+    tags: [git, debug]
+    verify: true
+  - id: engineering-practices-015
+    level: medium
+    type: debug
+    q: Review this PR diff and comment as you would in a real code review. What would you flag as blocking versus non-blocking?
+    example: |-
+      ```diff
+      + // TODO: temporary, remove after demo
+      + const DISCOUNT_RATE = 0.15;
+      +
+      + export async function applyDiscount(orderId) {
+      +   const order = await db.query(`SELECT * FROM orders WHERE id = ${orderId}`);
+      +   order.total = order.total - order.total * DISCOUNT_RATE;
+      +   await db.query(`UPDATE orders SET total = ${order.total} WHERE id = ${orderId}`);
+      +   return order
+      + }
+      ```
+    hint: |-
+      **Blocking**: SQL injection (interpolate `orderId`) → parameterized query; không kiểm tenant/quyền; floating-point cho tiền → dùng integer minor units/decimal; read-modify-write không transaction (race, áp discount 2 lần nếu gọi lại → không idempotent); không có test.
+      **Non-blocking/nit**: `SELECT *`; thiếu type cho `orderId`; thiếu `;`; hard-code rate → config/feature flag.
+      **Question**: "TODO sau demo" — ticket nào theo dõi? Có cần merge vào main không hay để sau flag?
+      Viết comment lịch sự, giải thích why, gợi ý cụ thể; một comment tổng kết.
+    followUp: The author says "it's just for the demo tomorrow". How do you respond?
+    tags: [code-review, debug, security]
+  - id: engineering-practices-016
+    level: medium
+    type: concept
+    q: How do you manage technical debt in a team that is always under feature pressure?
+    hint: |-
+      - **Hữu hình hoá**: ghi debt vào backlog với tác động đo được (thời gian mất mỗi lần đụng, incident, rủi ro bảo mật), không chỉ "code xấu".
+      - **Ưu tiên theo lãi suất**: vùng hay sửa + hay lỗi trước; vùng không ai đụng thì để yên.
+      - Cơ chế: % capacity mỗi sprint (vd. 10–20%), boy-scout rule khi chạm vào, gắn trả nợ vào feature liên quan ("để làm X nhanh cần refactor Y").
+      - Nợ lớn → đề xuất có mục tiêu, milestone, đo trước/sau.
+      - Nói bằng ngôn ngữ business với PO: tốc độ, rủi ro, chi phí.
+    followUp: Give an example of tech debt you chose NOT to fix. Why?
+    redFlags:
+      - "Says 'we need a rewrite' with no incremental plan"
+    tags: [tech-debt, prioritization]
+  - id: engineering-practices-017
+    level: medium
+    type: concept
+    q: What goes into a good design doc or RFC?
+    hint: |-
+      - **Context & problem**: vấn đề, tại sao bây giờ, ai bị ảnh hưởng.
+      - **Goals / non-goals**: phạm vi rõ.
+      - **Proposed design**: kiến trúc, data model, API, luồng (diagram).
+      - **Alternatives considered** + trade-off — phần quan trọng nhất để reviewer tin.
+      - **Rollout & migration**, backward compatibility, rollback plan.
+      - **Risks, security, observability**, cost.
+      - **Open questions**.
+      Viết ngắn đủ đọc trong 15–20 phút; review async trước meeting.
+    followUp: How do you decide whether something needs a design doc at all?
+    tags: [design-doc, rfc]
+  - id: engineering-practices-018
+    level: medium
+    type: scenario
+    q: QA reports a bug the day before release, and the PO says it is not important. You think it is serious. What do you do?
+    hint: |-
+      - Làm rõ **impact** bằng dữ liệu: bao nhiêu user/tenant, có mất tiền/dữ liệu/bảo mật không, có workaround không, tần suất.
+      - Trình bày cho PO dưới dạng rủi ro kinh doanh, kèm phương án: fix nhanh (ước lượng + rủi ro), ship sau flag tắt phần lỗi, ship kèm known issue + hotfix plan.
+      - PO quyết về ưu tiên sản phẩm; nếu là **bảo mật/mất dữ liệu** → escalate lên tech lead, không im lặng.
+      - Ghi lại quyết định và lý do.
+    followUp: The PO decides to ship anyway, and the bug causes an incident. What do you do afterwards?
+    tags: [po, qa, communication]
+  - id: engineering-practices-019
+    level: medium
+    type: concept
+    q: How do you work effectively with QA engineers rather than "throwing code over the wall"?
+    hint: |-
+      - Kéo QA vào **sớm**: refinement, acceptance criteria, edge case; thống nhất test plan trước khi code.
+      - Dev tự test kỹ trước khi chuyển (unit/integration, happy + error path); đừng dùng QA làm lưới an toàn đầu tiên.
+      - Cung cấp môi trường, dữ liệu test, feature flag, ghi chú "cách test" trong ticket/PR.
+      - Bug report → reproduce, root cause, thêm test regression.
+      - Chia trách nhiệm automation (dev viết unit/integration, QA E2E/exploratory).
+    followUp: QA keeps finding bugs in the same area. What do you change?
+    tags: [qa, collaboration]
+  - id: engineering-practices-020
+    level: medium
+    type: concept
+    q: How do you collaborate with designers when a design is expensive or impossible to implement as specified?
+    hint: |-
+      - Hỏi **mục tiêu UX** đằng sau thiết kế (vấn đề gì của user), không chỉ pixel.
+      - Đưa phương án: đạt 90% trải nghiệm với 30% chi phí (dùng component có sẵn, bỏ animation phức tạp), kèm prototype nhanh.
+      - Nêu ràng buộc thật: performance, accessibility, responsive, design system.
+      - Thống nhất sớm (trước khi code), ghi lại quyết định.
+    followUp: The designer insists on a custom component that breaks accessibility. How do you handle it?
+    tags: [design, collaboration]
+  - id: engineering-practices-021
+    level: medium
+    type: concept
+    q: What practices make a distributed, multi-timezone engineering team work well?
+    hint: |-
+      - **Async-first**: viết rõ (ticket, PR, design doc), quyết định ghi lại ở nơi tìm được, không chỉ trong call.
+      - Tận dụng **overlap hours** cho việc cần đồng bộ (refinement, bất đồng); record demo.
+      - Handoff rõ cuối ngày: trạng thái, blocker, câu hỏi cụ thể — để người timezone kia làm được ngay.
+      - Hỏi sớm, hỏi kèm context ("tôi đã thử X, Y; câu hỏi là Z").
+      - Nhạy cảm văn hoá và ngôn ngữ: nói thẳng nhưng lịch sự, xác nhận hiểu ("để tôi tóm tắt lại…").
+    followUp: A decision was made in a call you couldn't attend and it affects your work badly. What do you do?
+    tags: [distributed, communication]
+  - id: engineering-practices-022
+    level: medium
+    type: compare
+    q: Squash merge, rebase merge, or merge commit for pull requests — what are the trade-offs?
+    hint: |-
+      - **Squash**: 1 commit/PR, main gọn, dễ revert cả PR; mất lịch sử từng bước (bisect kém chi tiết nếu PR to).
+      - **Rebase merge**: giữ từng commit, lịch sử thẳng; yêu cầu mỗi commit sạch và build được.
+      - **Merge commit**: giữ nguyên lịch sử + điểm merge; lịch sử rẽ nhánh khó đọc.
+      Team nhỏ, PR nhỏ → squash phổ biến nhất. Điều quan trọng là **nhất quán** + branch protection.
+    followUp: How does your choice affect git bisect and git revert?
+    tags: [git]
+  - id: engineering-practices-023
+    level: medium
+    type: concept
+    q: How do you give code review feedback that is direct but not demoralizing, especially across cultures?
+    hint: |-
+      - Nhận xét **code, không phải người** ("hàm này có thể race" thay vì "bạn viết sai").
+      - Gắn nhãn: `blocking:`, `suggestion:`, `nit:`, `question:` — tránh để mọi comment trông như bắt buộc.
+      - Giải thích **why** + đề xuất cụ thể hoặc link guideline.
+      - Hỏi thay vì phán khi không chắc ("có lý do gì để không dùng transaction ở đây không?").
+      - Khen chỗ làm tốt; vấn đề lớn → nói riêng/gọi call.
+    followUp: A senior colleague's reviews are consistently harsh and juniors are afraid to open PRs. What do you do?
+    tags: [code-review, communication]
+  - id: engineering-practices-024
+    level: medium
+    type: concept
+    q: How do you run an effective on-call rotation from an engineer's point of view?
+    hint: |-
+      - **Runbook** cho alert phổ biến; alert phải actionable (không alert cho thứ không cần làm gì).
+      - Quy trình: acknowledge → đánh giá severity → **mitigate trước** (rollback, flag off, scale) → root cause sau.
+      - Giao tiếp: kênh incident, update định kỳ cho stakeholder, gọi thêm người sớm.
+      - Handoff giữa ca; ghi timeline.
+      - Sau sự cố: postmortem + giảm toil (tự động hoá, sửa alert ồn).
+    followUp: You get paged at 3 a.m. for an alert you don't understand. Walk me through the first 15 minutes.
+    tags: [on-call, incident]
+  - id: engineering-practices-025
+    level: medium
+    type: scenario
+    q: You need to deprecate an internal API endpoint that several teams depend on. How do you do it?
+    hint: |-
+      - **Đo** ai đang dùng: log/metric theo client, header, API key.
+      - Công bố deprecation: lý do, thay thế, **timeline** cụ thể, migration guide; header `Deprecation`/`Sunset` nếu HTTP API.
+      - Hỗ trợ migrate: ví dụ, adapter, office hours; theo dõi danh sách consumer còn lại.
+      - Brownout (tắt tạm thời có báo trước) để phát hiện consumer ẩn.
+      - Xoá khi traffic = 0 (hoặc có sign-off); giữ khả năng rollback ngắn hạn.
+    followUp: One team says they can't migrate before your deadline. What now?
+    tags: [deprecation, api]
+  - id: engineering-practices-026
+    level: hard
+    type: scenario
+    q: A regression appeared sometime in the last 400 commits and no one knows which change caused it. Walk me through finding it.
+    hint: |-
+      - Viết **reproduction** tự động (test hoặc script) trả exit code rõ ràng.
+      - `git bisect start; bad HEAD; good <tag cũ đã chắc tốt>`; `git bisect run ./repro.sh` → ~9 bước.
+      - Commit không build → `exit 125` để skip; merge commit phức tạp → `--first-parent` để bisect theo PR.
+      - Lỗi phụ thuộc data/config/env (không phải code) → bisect không giúp; kiểm deploy log, config change, dependency (lockfile diff), infra.
+      - Tìm được commit → hiểu *tại sao*, thêm regression test, revert nếu cần gấp.
+    followUp: The regression only happens in production under load. How does your approach change?
+    tags: [git, debugging]
+  - id: engineering-practices-027
+    level: hard
+    type: scenario
+    q: Someone force-pushed to main and overwrote a day of merged work from three developers. How do you recover and prevent it?
+    hint: |-
+      - Recovery: tìm SHA cũ của `main` — từ **reflog** trên máy ai đó vừa pull, CI log (SHA đã build), PR merge commit trên GitHub/GitLab (UI giữ ref), hoặc máy của các dev bị mất. Tạo branch rescue, so sánh, khôi phục `main` (cần tạm mở protection hoặc admin), thông báo mọi người `fetch` + reset branch local.
+      - Không hoảng loạn force-push chồng thêm; phối hợp một người làm.
+      - Phòng: **branch protection** (cấm force push, bắt PR + CI), `--force-with-lease` cho branch cá nhân, quyền admin tối thiểu.
+      - Blameless: hỏi tại sao hệ thống cho phép.
+    followUp: What's the difference between --force and --force-with-lease, and why doesn't the latter fully solve the problem?
+    tags: [git, incident]
+  - id: engineering-practices-028
+    level: hard
+    type: scenario
+    q: You're two weeks into a four-week estimate and realize the work will take eight weeks. What do you do?
+    hint: |-
+      - Báo **ngay**, không đợi tới deadline; tin xấu sớm là tin có thể xử lý.
+      - Đến với **phân tích + phương án**: cái gì đã sai (giả định nào vỡ), ước lượng mới có range, và lựa chọn: cắt scope (MVP), ship theo phase, thêm người (cẩn trọng Brooks's law), dời ngày, chấp nhận nợ kỹ thuật có kiểm soát.
+      - Để PO/stakeholder chọn dựa trên trade-off; ghi lại quyết định.
+      - Sau đó: retro về estimation — spike sớm hơn, breakdown tốt hơn.
+    followUp: How do you estimate the remaining work so this doesn't happen twice?
+    redFlags:
+      - "Works overtime silently to hit the date"
+    tags: [estimation, communication]
+  - id: engineering-practices-029
+    level: hard
+    type: design
+    q: Your team wants to move from long-lived feature branches to trunk-based development. How would you roll that change out?
+    hint: |-
+      - Điều kiện tiên quyết: CI nhanh và tin cậy (< ~10–15 phút), test tự động đủ tốt, **feature flag** infra, branch protection, deploy tự động/đơn giản.
+      - Bắt đầu nhỏ: một team/service, giới hạn tuổi branch (vd. ≤ 2 ngày), PR nhỏ, review SLA.
+      - Dạy kỹ thuật: branch by abstraction, flag, dark launch, expand/contract migration.
+      - Đo: lead time, PR size, merge conflict, change failure rate trước/sau.
+      - Xử lý lo ngại: "code chưa xong lên main" → flag; "main hay vỡ" → CI gate + revert nhanh.
+    followUp: Which part of this change do teams usually underestimate?
+    tags: [branching, process]
+  - id: engineering-practices-030
+    level: hard
+    type: scenario
+    q: You strongly disagree with an architecture decision your tech lead made. It's already been announced. What do you do?
+    hint: |-
+      - Chắc chắn mình **hiểu đúng lý do** của lead (hỏi riêng, lắng nghe ràng buộc bạn chưa biết).
+      - Nếu vẫn bất đồng: trình bày **riêng**, bằng dữ liệu/ví dụ cụ thể (rủi ro, chi phí, prototype), đề xuất thử nghiệm nhỏ hoặc tiêu chí để xem lại.
+      - Nếu lead vẫn giữ: **disagree and commit** — làm hết sức cho quyết định, ghi rủi ro vào ADR/doc, đặt điểm review lại.
+      - Ngoại lệ: vi phạm bảo mật/pháp lý/đạo đức → escalate theo kênh chính thức.
+      - Không nói xấu sau lưng, không "làm ngầm" theo cách của mình.
+    followUp: Six months later, the decision turned out badly as you predicted. What do you do then?
+    tags: [conflict, influence]
+  - id: engineering-practices-031
+    level: hard
+    type: scenario
+    q: Code reviews in your team take three days on average and developers are frustrated. How do you fix it?
+    hint: |-
+      - Đo: thời gian chờ review lần đầu vs thời gian sửa; PR size; ai review nhiều nhất (bottleneck).
+      - Nguyên nhân hay gặp: PR to, ít reviewer có context, review không được coi là công việc, timezone.
+      - Biện pháp: guideline PR size, **review SLA** (vd. phản hồi đầu tiên trong 4 giờ làm việc), rotation/CODEOWNERS phân tải, dành slot review cố định mỗi ngày, stacked PR, pair programming cho thay đổi lớn, tự động hoá style bằng linter.
+      - Theo dõi metric sau vài sprint.
+    followUp: How do you balance review speed with review depth?
+    tags: [code-review, process]
+  - id: engineering-practices-032
+    level: hard
+    type: design
+    q: How would you plan a large refactor of a legacy module that has no tests and is critical to revenue?
+    hint: |-
+      - Hiểu hành vi hiện tại: đọc code, log, hỏi người biết; viết **characterization tests** (golden master) cho input/output thực tế.
+      - Thêm observability (metric, log) để so sánh trước/sau.
+      - Chiến lược tăng dần: **strangler fig / branch by abstraction** — tạo interface, implementation mới song song, chuyển traffic từng phần (flag, shadow/dual-run so sánh kết quả).
+      - PR nhỏ, mỗi bước có thể rollback.
+      - Có mục tiêu đo được (bug giảm, thời gian thêm feature giảm) để PO ủng hộ.
+    followUp: How do you convince the business to invest in this refactor?
+    tags: [refactor, legacy, tech-debt]
+  - id: engineering-practices-033
+    level: hard
+    type: scenario
+    q: A hotfix is needed in production, but main already contains unreleased, half-finished features. How do you ship the fix?
+    hint: |-
+      - Nếu trunk-based với flag: feature chưa xong đã tắt bằng flag → fix trên main và deploy bình thường (lý tưởng).
+      - Nếu không: tạo branch hotfix từ **tag/commit đang chạy prod**, cherry-pick/viết fix, test, deploy; sau đó **đưa fix về main** (cherry-pick/merge) để không mất.
+      - Rủi ro: quên đồng bộ fix về main → regression lần release sau; conflict.
+      - Bài học rút ra: đó là tín hiệu cần flag/release branch rõ ràng.
+    followUp: How do you make sure the hotfix is never lost in the next release?
+    tags: [git, release]
+  - id: engineering-practices-034
+    level: hard
+    type: scenario
+    q: A new requirement from the PO conflicts with a technical constraint (for example, real-time data across all tenants would overload the database). How do you handle it?
+    hint: |-
+      - Hỏi **vấn đề thật** đằng sau requirement (có cần real-time không, hay "trong vòng 1 phút" là đủ?).
+      - Định lượng ràng buộc: tải hiện tại, ước lượng tải mới, chi phí.
+      - Đưa phương án kèm trade-off: near-real-time (cache/ materialized view/ event), giới hạn phạm vi, chi phí infra thêm, phase.
+      - Quyết định cùng PO, ghi lại; đồng ý tiêu chí thành công đo được.
+    followUp: How do you explain a technical trade-off to a non-technical stakeholder?
+    tags: [po, trade-offs]
+  - id: engineering-practices-035
+    level: hard
+    type: gotcha
+    q: What are common failure modes of feature flags in production?
+    hint: |-
+      - **Flag debt**: flag cũ không dọn → nhiều nhánh logic, test tổ hợp bùng nổ.
+      - Default sai khi flag service lỗi (fail open vs fail closed).
+      - Flag đánh giá khác nhau giữa FE và BE → trạng thái không nhất quán.
+      - Tái sử dụng tên flag cũ → bật nhầm code cũ.
+      - Flag bao **migration dữ liệu** không đảo ngược → tắt flag không rollback được.
+      - Cache flag lâu → tắt không có hiệu lực ngay (kill switch chậm).
+      Thực hành: owner + ngày hết hạn, default an toàn, kiểm tra cả hai nhánh trong test.
+    followUp: How would you design a kill switch that is guaranteed to work during an incident?
+    tags: [feature-flags]
+  - id: engineering-practices-036
+    level: hard
+    type: scenario
+    q: You're asked to review a PR from a senior engineer that you believe has a significant design flaw. How do you approach it?
+    hint: |-
+      - Rank không đổi tiêu chuẩn review; seniority không miễn trừ.
+      - Chuẩn bị kỹ: hiểu thiết kế, xác minh flaw bằng ví dụ cụ thể (race, scale, security), có thể đã có lý do bạn chưa biết.
+      - Đặt dạng **câu hỏi + evidence**: "Nếu hai request cùng tới thì X xảy ra — tôi có hiểu sai không?"
+      - Vấn đề thiết kế lớn → gọi trao đổi thay vì comment dài; lẽ ra nên được bàn ở design doc — đề xuất quy trình đó cho lần sau.
+    followUp: They dismiss your concern without addressing it. What next?
+    tags: [code-review, influence]
+  - id: engineering-practices-037
+    level: senior
+    type: open
+    q: How do you mentor a mid-level engineer to become senior?
+    hint: |-
+      - Hiểu mục tiêu và khoảng cách của họ (kỹ thuật, ownership, giao tiếp).
+      - Giao **ownership tăng dần**: từ task → feature end-to-end → một quyết định thiết kế có design doc.
+      - Review **tư duy**, không chỉ code: hỏi "các phương án khác?", "cái gì có thể hỏng?".
+      - Cho họ dẫn: demo, refinement, review PR người khác, on-call.
+      - Feedback thường xuyên, cụ thể; tạo cơ hội được thấy (sponsorship), không chỉ lời khuyên.
+      - Đo tiến bộ bằng hành vi quan sát được.
+    followUp: Tell me about someone you mentored — what changed for them because of you?
+    tags: [mentoring, leadership]
+  - id: engineering-practices-038
+    level: senior
+    type: open
+    q: What is your philosophy on how much process a team needs?
+    hint: |-
+      - Process là **công cụ giảm rủi ro/tăng phối hợp**, có chi phí; đủ để team nhanh và an toàn, không hơn.
+      - Tỷ lệ với: số người, số team phụ thuộc, mức độ rủi ro (tiền, dữ liệu), yêu cầu compliance.
+      - Ưu tiên **tự động hoá** (CI, lint, template) hơn quy định bằng lời.
+      - Xem lại định kỳ: bỏ ceremony không ai thấy giá trị.
+      - Ví dụ cụ thể: process bạn thêm/bỏ và tác động.
+    followUp: Give me a process you removed or simplified, and what happened.
+    tags: [process, opinion]
+  - id: engineering-practices-039
+    level: senior
+    type: design
+    q: How would you introduce ADRs or design docs in a team that currently makes decisions ad hoc in chat?
+    hint: |-
+      - Bắt đầu nhẹ: template ADR 1 trang trong repo, tự viết 2–3 ADR cho quyết định gần đây làm mẫu.
+      - Ngưỡng rõ: khi nào cần (khó đảo ngược, ảnh hưởng nhiều team, tốn > N ngày).
+      - Quy trình review ngắn (async 2–3 ngày), owner quyết.
+      - Liên kết từ PR/ticket; nhắc trong onboarding.
+      - Đo giá trị: ít tranh luận lại, onboarding nhanh hơn; thu thập feedback, điều chỉnh.
+      Không biến thành bureaucracy — ADR ngắn quan trọng hơn doc hoàn hảo.
+    followUp: How do you prevent design docs from becoming a bottleneck?
+    tags: [adr, design-doc, leadership]
+  - id: engineering-practices-040
+    level: senior
+    type: open
+    q: How do you decide between building something well now versus shipping quickly and taking on debt?
+    hint: |-
+      - Khung "one-way vs two-way door": thứ khó đảo ngược (data model, public API, security, tenant model) → làm kỹ; thứ dễ đổi (UI, internal impl) → ship nhanh.
+      - Mức độ bất định của sản phẩm: chưa chắc có người dùng → ship nhanh để học.
+      - Chi phí nợ: vùng sẽ được mở rộng nhiều → trả giá cao sau.
+      - Nếu nhận nợ: **ghi lại**, có ticket, có điều kiện kích hoạt trả nợ.
+      Ví dụ thực tế của bạn.
+    followUp: Tell me about a time you took on debt deliberately. Did you pay it back?
+    tags: [tech-debt, trade-offs]
+  - id: engineering-practices-041
+    level: senior
+    type: open
+    q: How do you influence technical direction across teams when you have no formal authority?
+    hint: |-
+      - Xây **uy tín** bằng việc giao hàng tốt và giúp đỡ người khác.
+      - Hiểu động lực/ưu tiên của từng team; tìm lợi ích chung.
+      - Viết đề xuất rõ (RFC) với dữ liệu, prototype chứng minh; mời phản biện sớm.
+      - Tìm đồng minh/champion; bắt đầu bằng pilot nhỏ, chia sẻ kết quả.
+      - Chấp nhận điều chỉnh; ghi nhận công của người khác.
+    followUp: Tell me about a time this didn't work. Why?
+    tags: [influence, leadership]
+  - id: engineering-practices-042
+    level: senior
+    type: design
+    q: Define a Definition of Done for a feature in a multi-tenant SaaS product. What would you include and why?
+    hint: |-
+      - Code review approved, CI xanh (lint/type/test).
+      - Test: unit + integration cho logic mới, **test cross-tenant negative**, test case lỗi.
+      - Security: authz/permission check, input validation, không lộ PII trong log.
+      - Migration an toàn (expand/contract), backward compatible, rollback plan.
+      - Observability: log/metric/alert cho luồng mới.
+      - Feature flag + rollout plan; docs/API docs cập nhật; QA sign-off; demo cho PO.
+      - Deployed + monitored sau release (không phải "merged").
+    followUp: The team says your DoD will slow them down. How do you respond?
+    tags: [process, quality, multi-tenancy]
+  - id: engineering-practices-043
+    level: cv
+    type: behavioral
+    q: You say you owned features end-to-end, from analysis through production. Walk me through that process for one feature, including how you worked with the PO, QA and designers.
+    hint: |-
+      Chọn một feature thật (vd. Checkout, Address Management hoặc Shift Management) và đi qua từng pha:
+      - **Analysis**: làm rõ requirement với PO, câu hỏi bạn hỏi, edge case phát hiện.
+      - **Breakdown**: task/PR, dependency, estimate.
+      - **Implementation**: quyết định thiết kế chính (schema, API, tenant).
+      - **Testing**: bạn test gì, QA test gì.
+      - **Demo & release**: rollout, monitoring, bug sau release.
+      Numbers: (điền số liệu thật của bạn) — thời gian, số task, bug sau release.
+    followUp: What was one thing the PO asked for that you pushed back on, and how did it end?
+    tags: [cv, ownership, collaboration]
+  - id: engineering-practices-044
+    level: cv
+    type: behavioral
+    q: You worked in an international, English-speaking distributed team. What did you personally do to make collaboration work across timezones?
+    hint: |-
+      Cụ thể hành động **của bạn**: cách viết handoff/update, cách chuẩn bị câu hỏi trước overlap hours, cách ghi lại quyết định, cách bạn xử lý hiểu lầm do ngôn ngữ (tóm tắt lại để xác nhận).
+      Một ví dụ khi giao tiếp bị lỗi và bạn sửa thế nào.
+      Numbers: (điền số liệu thật của bạn) — số giờ overlap, số timezone, kích thước team.
+    followUp: Tell me about a misunderstanding that caused rework. What changed afterwards?
+    tags: [cv, distributed, communication]
+  - id: engineering-practices-045
+    level: cv
+    type: scenario
+    q: You refactored legacy modules on a live platform. How did you decide what to refactor, and how did you avoid breaking behavior?
+    hint: |-
+      - Lý do chọn: module hay lỗi/hay phải sửa/chặn feature mới (có dữ liệu không?).
+      - An toàn: characterization test, refactor từng bước nhỏ, flag hoặc chạy song song, review kỹ, monitor sau deploy.
+      - Làm việc với PO: đóng gói refactor cùng feature hay xin thời gian riêng?
+      - Kết quả: (điền số liệu thật của bạn) — bug giảm, thời gian phát triển feature liên quan, kích thước module.
+    followUp: What did you NOT refactor, even though it was ugly?
+    tags: [cv, refactor, legacy]

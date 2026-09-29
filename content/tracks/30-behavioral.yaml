@@ -1,0 +1,708 @@
+id: 30-behavioral
+slug: behavioral
+title: Behavioral Interview (STAR)
+tier: 8
+status: drafted
+summary: "Story bank theo STAR cho senior full-stack: incident, conflict, ownership, failure, influence, trade-off dưới deadline, mentoring, feedback, why leaving — kèm red flags."
+cvLinked: false
+overview: |-
+  ## TL;DR
+
+  - Behavioral interview đánh giá **hành vi trong quá khứ** để dự đoán tương lai: ownership, judgment, giao tiếp, xử lý xung đột, học hỏi. Ở senior, interviewer đào **follow-up** tới khi thấy rõ phần *bạn* làm.
+  - Dùng **STAR** (Situation → Task → Action → Result) + **Reflection**. Dành ~60% thời lượng cho **Action**, nói "**I**" cho phần của bạn, "we" cho team.
+  - Chuẩn bị **story bank 8–10 câu chuyện** thật, mỗi câu phục vụ được 3–4 loại câu hỏi. Không học thuộc — nhớ khung và số liệu.
+  - **Numbers** biến câu chuyện thành bằng chứng: latency, số user/tenant, thời gian, tần suất lỗi. Không bịa — nếu không có số chính xác, nói ước lượng và cách bạn biết.
+  - Red flags lớn nhất: không có kết quả, đổ lỗi người khác, chỉ "we", câu chuyện không có xung đột/khó khăn thật, không rút ra bài học.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Situation | Bối cảnh tối thiểu để hiểu câu chuyện (≤ 20% thời lượng) | "Nền tảng e-commerce multi-tenant, checkout API bị timeout giờ cao điểm" |
+  | Task | Trách nhiệm/mục tiêu **của bạn** | "Tôi được giao tìm root cause và fix trong 48 giờ" |
+  | Action | Những gì **bạn** làm, theo bước, kèm lý do chọn | "Tôi đọc query plan, thấy scan toàn bảng, đề xuất composite index…" |
+  | Result | Kết quả đo được + tác động kinh doanh | "p95 từ X xuống Y, không còn timeout (điền số thật)" |
+  | Reflection | Bài học, sẽ làm khác gì | "Lẽ ra nên có alert cho slow query từ đầu" |
+  | Story bank | Bộ câu chuyện dùng lại cho nhiều câu hỏi | Một incident dùng cho: pressure, ownership, debugging, learning |
+  | Signal | Phẩm chất interviewer đang đo | Conflict question → đo sự đồng cảm + khả năng đạt kết quả |
+
+  ## Cơ chế hoạt động — trả lời một câu behavioral
+
+  ```mermaid
+  flowchart TD
+    Q["Câu hỏi: 'Tell me about a time…'"] --> P["Xác định signal cần chứng minh<br/>(ownership? conflict? judgment?)"]
+    P --> B["Chọn story từ story bank"]
+    B --> S["S + T: 20–30 giây"]
+    S --> A["Action: 60–90 giây<br/>'I' + lý do + khó khăn"]
+    A --> R["Result: số liệu + tác động"]
+    R --> F["Reflection: bài học / làm khác"]
+    F --> U{"Follow-up?"}
+    U -- "why that way?" --> A
+    U -- "what went wrong?" --> F
+    U -- "numbers?" --> R
+  ```
+
+  ### Story bank matrix (chuẩn bị trước)
+
+  | Story (của bạn) | Ownership | Conflict | Failure | Incident | Influence | Deadline | Learning | Mentoring |
+  |---|---|---|---|---|---|---|---|---|
+  | Feature end-to-end (vd. checkout) | ✓ | | | | | ✓ | | |
+  | Production incident BE/DB/FE | ✓ | | | ✓ | | ✓ | ✓ | |
+  | Zero-downtime migration | ✓ | | ✓ | | ✓ | | | |
+  | Bất đồng với lead/PO | | ✓ | | | ✓ | | | |
+  | Monolith → microservices | | | ✓ | | ✓ | | ✓ | |
+  | Học nhanh công nghệ mới | | | | | | ✓ | ✓ | |
+  | Hỗ trợ đồng nghiệp/junior | | | | | ✓ | | | ✓ |
+
+  ## Trade-offs
+
+  | Lựa chọn khi kể | Tốt khi | Rủi ro |
+  |---|---|---|
+  | Story gần đây (1–2 năm) | Chi tiết còn nhớ, phản ánh level hiện tại | Có thể bị hỏi sâu về kỹ thuật — phải nắm chắc |
+  | Story lớn, nhiều người | Cho thấy scope | Khó tách phần "I" |
+  | Story nhỏ, bạn làm chủ hoàn toàn | Rõ ownership | Có thể trông không đủ senior |
+  | Thừa nhận thất bại thật | Tạo tin tưởng, cho thấy tự nhận thức | Chọn thất bại quá nghiêm trọng/không có bài học |
+  | Nói ngắn (1.5–2 phút) + để follow-up | Tương tác tốt | Thiếu chi tiết nếu interviewer không hỏi thêm |
+
+  ## Pitfalls
+
+  - Chỉ nói "we" — interviewer không biết bạn làm gì.
+  - Situation dài 2 phút, Action 20 giây.
+  - Không có Result hoặc Result mơ hồ ("mọi thứ tốt hơn nhiều").
+  - Đổ lỗi PO/QA/lead, nói xấu công ty cũ.
+  - "Weakness" giả (perfectionist) hoặc failure không có trách nhiệm của mình.
+  - Bịa số liệu — follow-up sẽ lộ.
+  - Kể câu chuyện giả định ("I would…") khi được hỏi về quá khứ ("Tell me about a time…").
+  - Không có câu hỏi cho interviewer.
+
+  ## Cheat sheet
+
+  - **Cấu trúc**: S/T 20% · A 60% · R 20% · + 1 câu reflection. Mục tiêu 2 phút.
+  - **Ngôn ngữ**: "I decided / I proposed / I wrote / I asked…", động từ mạnh, cụ thể.
+  - **Numbers to collect** (điền số thật của bạn): p95/p99 latency trước/sau · RPS · số tenant/user · kích thước bảng · thời gian migration · downtime (0?) · MTTR · số bug/incident trước/sau · bundle size · thời gian xử lý CSV · số người trong team · số timezone.
+  - **Senior signals**: nói về trade-off, rủi ro, người khác bị ảnh hưởng, cách phòng ngừa lần sau, cách bạn nhân rộng bài học cho team.
+  - **Honest gaps**: "Tôi chưa dùng X trong production; tôi đang học bằng Y; đây là cách tôi sẽ tiếp cận".
+  - **Luôn có** 3–5 câu hỏi cho interviewer về team, kỹ thuật, kỳ vọng.
+notionRefs: []
+references:
+  - title: Amazon — Leadership Principles (commonly used behavioral framework)
+    url: https://www.amazon.jobs/content/en/our-workplace/leadership-principles
+  - title: MIT Career Advising — The STAR method for behavioral interviews
+    url: https://capd.mit.edu/resources/the-star-method-for-behavioral-interviews/
+  - title: Google re:Work — Use structured interviewing
+    url: https://rework.withgoogle.com/guides/hiring-use-structured-interviewing/steps/introduction/
+  - title: Tech Interview Handbook — Behavioral interview
+    url: https://www.techinterviewhandbook.org/behavioral-interview/
+  - title: Staff Engineer — Guides (influence, leadership without authority)
+    url: https://staffeng.com/guides/
+questions:
+  - id: behavioral-001
+    level: easy
+    type: behavioral
+    q: Tell me about yourself.
+    hint: |-
+      Không phải STAR mà là **Present → Past → Future** trong 60–90 giây:
+      - **Present**: senior full-stack ~4.5 năm, Node/TS/React/Next.js/SQL; hiện làm nền tảng e-commerce multi-tenant, own feature end-to-end.
+      - **Past**: 2–3 điểm nhấn liên quan job (monolith → microservices với Kafka, banking SPA, real-time finance).
+      - **Future**: tại sao vị trí này (một lý do cụ thể về sản phẩm/kỹ thuật của công ty).
+      Numbers to mention: (điền số liệu thật của bạn) — quy mô tenant/user, 1 kết quả nổi bật.
+      Reflection: kết bằng một câu mở cửa cho follow-up ("Tôi có thể kể thêm về phần tenant isolation").
+    followUp: Which of those projects are you most proud of, and why?
+    redFlags:
+      - "Recites the CV chronologically for five minutes"
+      - "Talks about personal life unrelated to the job"
+    tags: [opener]
+  - id: behavioral-002
+    level: easy
+    type: behavioral
+    q: Why are you looking to leave your current role?
+    hint: |-
+      Hướng **tới** điều bạn muốn, không chạy **khỏi** điều bạn ghét:
+      - Nêu điều bạn đã học và trân trọng ở vai trò hiện tại (1 câu).
+      - Điều bạn tìm kiếm tiếp theo: scope lớn hơn, sản phẩm own lâu dài, domain cụ thể, cơ hội tech leadership, cloud/infra ownership.
+      - Liên kết với vị trí đang ứng tuyển.
+      Numbers to mention: không bắt buộc; có thể nhắc thời gian gắn bó.
+      Reflection: trung thực nhưng tích cực; không nói xấu công ty/client/người.
+    followUp: What would your current company need to change for you to stay?
+    redFlags:
+      - "Complains about the manager or the company"
+      - "Only mentions salary"
+    tags: [opener, motivation]
+  - id: behavioral-003
+    level: easy
+    type: behavioral
+    q: Why do you want to work at this company?
+    hint: |-
+      Chuẩn bị trước: đọc sản phẩm, engineering blog, tech stack, tin gần đây.
+      - 1 lý do về **sản phẩm/vấn đề** họ giải quyết.
+      - 1 lý do về **kỹ thuật/cách làm** (scale, stack, culture) khớp kinh nghiệm của bạn (multi-tenant, e-commerce, microservices).
+      - 1 lý do về **phát triển**: bạn đóng góp gì và học gì.
+      Numbers to mention: có thể nhắc số liệu công khai của công ty (user, thị trường) cho thấy bạn tìm hiểu.
+      Reflection: cụ thể cho công ty này — nếu câu trả lời áp dụng cho mọi công ty thì chưa đạt.
+    followUp: What do you know about our tech stack or engineering challenges?
+    redFlags:
+      - "Generic answer: 'great culture, big company'"
+    tags: [opener, motivation]
+  - id: behavioral-004
+    level: easy
+    type: behavioral
+    q: Tell me about the project you are most proud of.
+    hint: |-
+      - **S**: dự án gì, quy mô, vấn đề kinh doanh.
+      - **T**: vai trò của bạn, phần bạn own.
+      - **A**: 2–3 quyết định kỹ thuật quan trọng **bạn** đưa ra + lý do + khó khăn vượt qua.
+      - **R**: kết quả cho user/business và cho team.
+      Numbers to mention: (điền số liệu thật của bạn) — latency, số tenant/user, thời gian delivery, bug giảm.
+      Reflection: vì sao bạn tự hào (học được gì, tác động tới người khác), và sẽ làm khác gì.
+    followUp: What was the hardest technical decision in that project, and what alternatives did you reject?
+    redFlags:
+      - "Describes the product, not their own contribution"
+    tags: [opener, ownership]
+  - id: behavioral-005
+    level: easy
+    type: behavioral
+    q: What are your strengths as an engineer?
+    hint: |-
+      Chọn **2–3 điểm mạnh** liên quan job, mỗi cái kèm **bằng chứng ngắn** (một ví dụ thật):
+      - Own feature end-to-end qua BE/FE/DB (ví dụ feature bạn giao).
+      - Debug sự cố xuyên tầng (ví dụ incident).
+      - Giao tiếp trong team quốc tế phân tán.
+      Numbers to mention: (điền số liệu thật của bạn) cho ví dụ.
+      Reflection: nói điểm mạnh giúp team thế nào, không chỉ giúp bạn.
+    followUp: Which of those would your teammates say is your biggest strength? Why?
+    redFlags:
+      - "Lists adjectives with no evidence"
+    tags: [opener, self-awareness]
+  - id: behavioral-006
+    level: easy
+    type: behavioral
+    q: What is one area you are actively working to improve?
+    hint: |-
+      Chọn điểm yếu **thật, liên quan nhưng không chí mạng**, và đang có hành động cụ thể:
+      - Ví dụ trung thực với profile: chưa có kinh nghiệm production với AWS/NestJS → đang học qua dự án cá nhân/khóa học, đã làm được gì.
+      - Hoặc: trước đây ít đo lường kết quả bằng số → giờ thu thập metric trước/sau cho mỗi thay đổi.
+      Numbers to mention: tiến độ cụ thể (khóa học, POC, thời gian).
+      Reflection: cho thấy tự nhận thức + có kế hoạch, không phải lời xin lỗi.
+    followUp: How will we know in six months whether you've improved?
+    redFlags:
+      - "I'm a perfectionist / I work too hard"
+      - "Names a weakness that is core to the job without any mitigation"
+    tags: [opener, self-awareness]
+  - id: behavioral-007
+    level: easy
+    type: behavioral
+    q: How do you like to work with a team, and what kind of environment helps you do your best work?
+    hint: |-
+      - Mô tả cách làm việc thật: ownership rõ, feedback thẳng thắn, viết rõ trong team phân tán, PR nhỏ, review nhanh.
+      - Ví dụ ngắn: một thời điểm môi trường như vậy giúp bạn giao kết quả tốt.
+      - Linh hoạt: bạn thích nghi thế nào khi môi trường khác đi.
+      Numbers to mention: kích thước team, số timezone (điền số liệu thật của bạn).
+      Reflection: cho thấy bạn là người **đóng góp** vào môi trường tốt, không chỉ đòi hỏi.
+    followUp: Tell me about a time the team environment was not like that. What did you do?
+    tags: [opener, collaboration]
+  - id: behavioral-008
+    level: easy
+    type: behavioral
+    q: What questions do you have for us?
+    hint: |-
+      Luôn có 3–5 câu, chọn theo người phỏng vấn:
+      - **Engineer**: "Một thay đổi đi từ ticket tới production như thế nào?", "Incident gần nhất và team học được gì?", "Tech debt lớn nhất hiện tại?"
+      - **Manager**: "Thành công ở vị trí này sau 6 tháng trông như thế nào?", "Senior ở đây khác mid ở điểm nào?"
+      - **Culture**: "Quyết định kỹ thuật được đưa ra thế nào khi có bất đồng?", "Team dùng AI tool với policy gì?"
+      Tránh hỏi thứ có trên website; lương/benefit để HR round.
+      Reflection: câu hỏi tốt cũng là tín hiệu senior — bạn đánh giá họ như họ đánh giá bạn.
+    followUp: Based on what you've heard, what concerns do you have about this role?
+    redFlags:
+      - "No questions"
+      - "Only asks about vacation and remote days"
+    tags: [closing]
+  - id: behavioral-009
+    level: medium
+    type: behavioral
+    q: Tell me about the biggest technical challenge you've faced.
+    hint: |-
+      - **S**: hệ thống/feature, ràng buộc (traffic, multi-tenant, legacy, deadline).
+      - **T**: vì sao nó khó và bạn chịu trách nhiệm phần nào.
+      - **A**: cách bạn phân tích (đo, đọc plan, prototype), phương án cân nhắc, lý do chọn, vấn đề phát sinh giữa chừng.
+      - **R**: kết quả đo được, tác động lên user/team.
+      Numbers to mention: (điền số liệu thật của bạn) — trước/sau latency, lỗi, thời gian, kích thước dữ liệu.
+      Reflection: nếu làm lại, bạn sẽ làm gì khác ngay từ đầu.
+    followUp: What alternative did you seriously consider, and why didn't you go with it?
+    redFlags:
+      - "The 'challenge' was just a lot of work, not a hard problem"
+      - "Cannot explain why the chosen approach was better"
+    tags: [technical, ownership]
+  - id: behavioral-010
+    level: medium
+    type: behavioral
+    q: Tell me about a production incident you handled. What was your role?
+    hint: |-
+      - **S**: triệu chứng (alert/user report), phạm vi ảnh hưởng.
+      - **T**: vai trò của bạn (on-call, người phát hiện, owner của module).
+      - **A**: **mitigate trước** (rollback, flag, scale), rồi điều tra: log/metric/query plan, giả thuyết → kiểm chứng; giao tiếp với stakeholder trong lúc xử lý.
+      - **R**: thời gian khôi phục, root cause, action item phòng ngừa (test, alert, runbook).
+      Numbers to mention: (điền số liệu thật của bạn) — thời gian phát hiện, MTTR, số user/tenant/đơn hàng bị ảnh hưởng.
+      Reflection: thay đổi hệ thống nào sau đó để lỗi không lặp lại / phát hiện sớm hơn.
+    followUp: How did you communicate with non-technical stakeholders during the incident?
+    redFlags:
+      - "Jumped straight to root-causing while users were still affected"
+      - "No prevention step afterwards"
+    tags: [incident, pressure]
+  - id: behavioral-011
+    level: medium
+    type: behavioral
+    q: Tell me about a time you failed.
+    hint: |-
+      Chọn thất bại **thật, có phần trách nhiệm của bạn**, không quá thảm hoạ:
+      - **S/T**: bạn định làm gì.
+      - **A**: quyết định/hành động của bạn dẫn tới thất bại (estimate sai, bỏ qua edge case, không hỏi sớm, migration lỗi).
+      - **R**: hậu quả thực tế, bạn khắc phục thế nào.
+      - Điều quan trọng nhất: **bài học và thay đổi hành vi** cụ thể, kèm bằng chứng đã áp dụng lần sau.
+      Numbers to mention: (điền số liệu thật của bạn) — thời gian trễ, impact, sau khi cải thiện.
+      Reflection: "Từ đó tôi luôn…" + ví dụ lần sau.
+    followUp: How did your manager react, and what did you learn about yourself?
+    redFlags:
+      - "Fake failure that is actually a success"
+      - "Blames others or circumstances"
+    tags: [failure, learning]
+  - id: behavioral-012
+    level: medium
+    type: behavioral
+    q: Tell me about a conflict you had with a teammate or tech lead. How did you resolve it?
+    hint: |-
+      - **S**: bất đồng về gì (thiết kế, cách làm, ưu tiên), vì sao quan trọng.
+      - **T**: mục tiêu của bạn: kết quả tốt cho sản phẩm, giữ quan hệ.
+      - **A**: bạn tìm hiểu quan điểm bên kia, đưa dữ liệu/prototype, nói riêng thay vì công khai, đề xuất tiêu chí khách quan, chấp nhận thỏa hiệp.
+      - **R**: quyết định cuối cùng, kết quả, quan hệ sau đó.
+      Numbers to mention: dữ liệu bạn dùng để thuyết phục (điền số liệu thật của bạn).
+      Reflection: bạn hiểu thêm gì về góc nhìn bên kia; nếu bạn sai thì thừa nhận.
+    followUp: What would you do if they still disagreed after you presented the data?
+    redFlags:
+      - "The other person was simply wrong/incompetent"
+      - "Avoided the conflict entirely"
+    tags: [conflict]
+  - id: behavioral-013
+    level: medium
+    type: behavioral
+    q: Tell me about a time you disagreed with a product owner about scope or priority.
+    hint: |-
+      - **S**: yêu cầu của PO và vì sao bạn lo ngại (rủi ro kỹ thuật, chi phí, UX, bảo mật).
+      - **A**: hiểu mục tiêu kinh doanh đằng sau; định lượng chi phí/rủi ro; đưa **phương án thay thế** (MVP, phase, flag); để PO quyết phần sản phẩm.
+      - **R**: kết quả, feature ship ra sao.
+      Numbers to mention: (điền số liệu thật của bạn) — estimate, thời gian tiết kiệm, rủi ro tránh được.
+      Reflection: tôn trọng quyền quyết định sản phẩm của PO, trách nhiệm của bạn là làm rõ trade-off.
+    followUp: Tell me about a time the PO was right and you were wrong.
+    redFlags:
+      - "Just did what the PO said without raising concerns"
+      - "Refused to build it"
+    tags: [conflict, po, trade-offs]
+  - id: behavioral-014
+    level: medium
+    type: behavioral
+    q: Tell me about a time you had to make a trade-off under a tight deadline.
+    hint: |-
+      - **S**: deadline gì, vì sao cứng (demo khách hàng, go-live, hợp đồng).
+      - **A**: bạn xác định **must-have vs nice-to-have**, phần không được thỏa hiệp (bảo mật, dữ liệu, tenant isolation), phần chấp nhận nợ; thông báo trade-off cho PO/lead; ghi ticket follow-up.
+      - **R**: ship đúng hạn không, chất lượng, nợ được trả chưa.
+      Numbers to mention: (điền số liệu thật của bạn) — thời gian còn lại, scope cắt, bug sau release.
+      Reflection: trade-off đó có đúng nhìn lại không.
+    followUp: Did you pay back the debt you took on? If not, why?
+    redFlags:
+      - "Cut testing silently to hit the date"
+    tags: [deadline, trade-offs]
+  - id: behavioral-015
+    level: medium
+    type: behavioral
+    q: Tell me about a time you owned something end-to-end.
+    hint: |-
+      - **S/T**: feature/vấn đề, không ai giao hết mọi phần nhưng bạn nhận trọn.
+      - **A**: đi qua cả vòng: làm rõ requirement, breakdown, thiết kế (DB/API/FE), test, demo, deploy, **theo dõi sau release**, xử lý bug.
+      - **R**: kết quả cho user/business; điều bạn làm vượt phạm vi task (monitoring, docs, cleanup).
+      Numbers to mention: (điền số liệu thật của bạn) — thời gian, adoption, bug sau release.
+      Reflection: ownership = quan tâm tới kết quả sau khi merge, không chỉ tới lúc merge.
+    followUp: What happened after it shipped? How did you know it was working?
+    redFlags:
+      - "Ownership ended at 'PR merged'"
+    tags: [ownership]
+  - id: behavioral-016
+    level: medium
+    type: behavioral
+    q: Tell me about a time you had to learn a new technology or domain quickly.
+    hint: |-
+      - **S/T**: công nghệ/domain gì, vì sao phải học nhanh (task mới, dự án mới).
+      - **A**: cách học có hệ thống: docs chính thức, POC nhỏ, đọc code có sẵn, hỏi người biết, (AI để hỏi "tại sao" nhưng kiểm chứng), áp dụng ngay vào task thật.
+      - **R**: bạn giao được gì trong bao lâu.
+      Numbers to mention: (điền số liệu thật của bạn) — thời gian ramp-up.
+      Reflection: phương pháp học bạn tái sử dụng; hiện áp dụng cho khoảng trống nào (vd. AWS/NestJS).
+    followUp: What did you get wrong at first because you were new to it?
+    tags: [learning]
+  - id: behavioral-017
+    level: medium
+    type: behavioral
+    q: Tell me about a time you helped a teammate grow or mentored someone.
+    hint: |-
+      - **S**: ai (junior/đồng nghiệp mới), họ gặp khó gì.
+      - **A**: bạn làm gì cụ thể: pair programming, review giải thích why, giao task tăng dần, onboarding doc, để họ tự debug trước.
+      - **R**: họ thay đổi thế nào (tự làm được gì), tác động lên team.
+      Numbers to mention: (điền số liệu thật của bạn) — thời gian onboarding, số PR tự làm.
+      Reflection: bạn học được gì về cách dạy người khác.
+    followUp: What would you do differently if you mentored them again?
+    redFlags:
+      - "Mentoring = answering questions when asked"
+    tags: [mentoring]
+  - id: behavioral-018
+    level: medium
+    type: behavioral
+    q: Tell me about critical feedback you received and what you did with it.
+    hint: |-
+      - **S**: ai đưa feedback, về gì (communication, estimate, review quá gắt, thiếu update).
+      - **A**: phản ứng ban đầu (trung thực), hỏi thêm để hiểu, kế hoạch thay đổi cụ thể.
+      - **R**: bằng chứng đã thay đổi; feedback lần sau.
+      Numbers to mention: tần suất/thời gian (điền số liệu thật của bạn).
+      Reflection: thái độ với feedback — coi là dữ liệu, không phải tấn công.
+    followUp: Have you ever received feedback you disagreed with? What did you do?
+    redFlags:
+      - "Can't recall any critical feedback"
+      - "Feedback was wrong so they ignored it"
+    tags: [feedback, self-awareness]
+  - id: behavioral-019
+    level: medium
+    type: behavioral
+    q: Tell me about a time you gave difficult feedback to a colleague.
+    hint: |-
+      - **S**: hành vi cần feedback và tác động lên team/sản phẩm.
+      - **A**: chọn thời điểm/kênh riêng tư; nói theo **SBI** (Situation–Behavior–Impact); lắng nghe; thống nhất bước tiếp theo.
+      - **R**: thay đổi sau đó, quan hệ.
+      Numbers to mention: tác động đo được nếu có (review time, bug) — (điền số liệu thật của bạn).
+      Reflection: bạn học được gì về việc đưa feedback trong team đa văn hoá.
+    followUp: How do you adapt feedback for someone from a very different culture?
+    tags: [feedback, communication]
+  - id: behavioral-020
+    level: medium
+    type: behavioral
+    q: Tell me about a time you had to work with incomplete or ambiguous requirements.
+    hint: |-
+      - **S**: requirement mơ hồ ở đâu (edge case, nghiệp vụ, UX).
+      - **A**: liệt kê câu hỏi và giả định, hỏi PO/designer sớm, làm prototype/spike, đề xuất default hợp lý và ghi lại; thiết kế để dễ thay đổi.
+      - **R**: tránh được rework thế nào.
+      Numbers to mention: (điền số liệu thật của bạn) — số câu hỏi làm rõ, rework tránh được.
+      Reflection: khi nào nên tự quyết, khi nào phải chờ.
+    followUp: What do you do when the PO is unavailable and you're blocked?
+    tags: [ambiguity, communication]
+  - id: behavioral-021
+    level: medium
+    type: behavioral
+    q: Tell me about a time you improved a process or developer experience for your team.
+    hint: |-
+      - **S**: điểm đau (build chậm, review lâu, deploy thủ công, test flaky, onboarding khó).
+      - **A**: bạn đo, đề xuất, triển khai (script, CI, template, docs, rules file cho AI), thuyết phục team áp dụng.
+      - **R**: thời gian tiết kiệm, adoption.
+      Numbers to mention: (điền số liệu thật của bạn) — trước/sau.
+      Reflection: làm sao để thay đổi được duy trì.
+    followUp: Did anyone resist? How did you handle it?
+    tags: [process, initiative]
+  - id: behavioral-022
+    level: medium
+    type: scenario
+    q: Imagine you join our team and find that a critical service has no tests and one person understands it. What do you do in your first month?
+    hint: |-
+      - Tuần 1–2: học từ người hiểu (pairing, ghi lại), đọc code, vẽ luồng, xác định rủi ro lớn nhất.
+      - Viết characterization test cho luồng quan trọng, thêm observability.
+      - Viết docs/runbook, đề xuất rotation để giảm bus factor.
+      - Đưa kế hoạch cải thiện có ưu tiên cho lead, không tự ý rewrite.
+      Reflection: cân bằng giữa học và giao giá trị sớm; tôn trọng người đang own.
+    followUp: That person is defensive about their code. How do you approach them?
+    tags: [scenario, onboarding]
+  - id: behavioral-023
+    level: hard
+    type: behavioral
+    q: Tell me about a time you influenced a technical decision without having formal authority.
+    hint: |-
+      - **S**: quyết định gì, ai có quyền quyết, vì sao bạn nghĩ hướng hiện tại chưa tốt.
+      - **A**: bạn thu thập dữ liệu (benchmark, incident, chi phí), viết đề xuất/RFC ngắn, làm POC, nói chuyện riêng với từng stakeholder, tìm đồng minh, điều chỉnh theo phản hồi.
+      - **R**: quyết định cuối cùng, tác động.
+      Numbers to mention: (điền số liệu thật của bạn) — dữ liệu dùng để thuyết phục, kết quả sau thay đổi.
+      Reflection: nếu không thành công, bạn học được gì về cách thuyết phục.
+    followUp: What did the people who disagreed with you care about, and how did you address it?
+    redFlags:
+      - "Went around the lead to their manager as a first step"
+      - "Influence = repeating the argument louder"
+    tags: [influence]
+  - id: behavioral-024
+    level: hard
+    type: behavioral
+    q: Tell me about a time you disagreed with a decision but had to commit to it anyway.
+    hint: |-
+      - **S**: quyết định gì, lý do bạn không đồng ý.
+      - **A**: bạn nêu ý kiến rõ ràng (một lần, có dữ liệu) qua kênh đúng; khi đã chốt, bạn **thực hiện hết sức**, ghi rủi ro, đề xuất cách giảm rủi ro trong khuôn khổ quyết định.
+      - **R**: kết quả thực tế — quyết định đúng hay sai; bạn xử lý thế nào nếu rủi ro xảy ra.
+      Numbers to mention: (điền số liệu thật của bạn) nếu có.
+      Reflection: "disagree and commit" không phải im lặng — là nói rõ rồi làm hết mình.
+    followUp: If the decision turned out to be wrong, how did you raise it without saying "I told you so"?
+    redFlags:
+      - "Quietly implemented it their own way"
+    tags: [conflict, commitment]
+  - id: behavioral-025
+    level: hard
+    type: behavioral
+    q: Tell me about the hardest bug you've ever debugged.
+    hint: |-
+      - **S**: triệu chứng (intermittent, chỉ prod, chỉ một tenant, dưới load), vì sao khó.
+      - **A**: phương pháp: reproduce, thu hẹp phạm vi (bisect, log, trace), giả thuyết → kiểm chứng; những giả thuyết sai đã loại; công cụ dùng.
+      - **R**: root cause thật (race condition, cache key, timezone, connection pool…), fix, test regression.
+      Numbers to mention: (điền số liệu thật của bạn) — thời gian debug, tần suất lỗi, impact.
+      Reflection: bạn thay đổi gì (observability, test) để lần sau tìm nhanh hơn.
+    followUp: What was the moment you realized what the root cause was, and what evidence confirmed it?
+    redFlags:
+      - "It just started working after I restarted it"
+    tags: [debugging, technical]
+  - id: behavioral-026
+    level: hard
+    type: behavioral
+    q: Tell me about a time you made a decision that turned out to be wrong in production.
+    hint: |-
+      - **S/T**: quyết định gì (schema, cache strategy, library, rollout), bạn ra quyết định với thông tin nào.
+      - **A**: cách phát hiện sai, cách bạn **nhận trách nhiệm**, mitigate, sửa.
+      - **R**: impact và phục hồi.
+      Numbers to mention: (điền số liệu thật của bạn) — thời gian phát hiện, số user ảnh hưởng.
+      Reflection: quyết định có hợp lý **với thông tin lúc đó** không? Quy trình nào thay đổi (review, test, flag, rollout dần)?
+    followUp: With the same information again, would you make the same decision?
+    redFlags:
+      - "Hides the mistake or minimizes impact"
+    tags: [failure, judgment]
+  - id: behavioral-027
+    level: hard
+    type: behavioral
+    q: Tell me about a time you had to push back on a deadline or scope from management or a client.
+    hint: |-
+      - **S**: deadline/scope không khả thi hoặc rủi ro.
+      - **A**: bạn chuẩn bị dữ liệu (breakdown, estimate range, rủi ro), gặp sớm, đưa **lựa chọn** (cắt scope, phase, thêm thời gian, chấp nhận rủi ro có ghi lại), không chỉ nói "không".
+      - **R**: thống nhất được gì, kết quả delivery.
+      Numbers to mention: (điền số liệu thật của bạn) — estimate gốc vs cam kết, kết quả.
+      Reflection: làm sao giữ niềm tin của client/manager khi nói tin xấu.
+    followUp: What if they said no to all your options?
+    tags: [deadline, communication]
+  - id: behavioral-028
+    level: hard
+    type: behavioral
+    q: Tell me about a time you had to deliver bad news to stakeholders.
+    hint: |-
+      - **S**: tin xấu gì (trễ, bug nghiêm trọng, sự cố dữ liệu, không làm được như cam kết).
+      - **A**: báo **sớm**, trực tiếp, kèm: chuyện gì xảy ra, impact, việc đang làm, phương án, lần update tiếp theo khi nào.
+      - **R**: phản ứng của stakeholder, kết quả cuối cùng.
+      Numbers to mention: (điền số liệu thật của bạn) — thời gian báo sau khi biết, impact.
+      Reflection: sự minh bạch ảnh hưởng tới niềm tin thế nào.
+    followUp: How do you decide how much technical detail to include for a non-technical audience?
+    tags: [communication, pressure]
+  - id: behavioral-029
+    level: hard
+    type: behavioral
+    q: Tell me about a time you went beyond your role to solve a problem.
+    hint: |-
+      - **S**: vấn đề nằm ngoài trách nhiệm trực tiếp (module team khác, infra, quy trình, lỗi DB).
+      - **A**: bạn chủ động điều tra, phối hợp với owner (không tự sửa thay họ trái quy trình), đề xuất/triển khai fix.
+      - **R**: impact cho user/team.
+      Numbers to mention: (điền số liệu thật của bạn).
+      Reflection: ranh giới giữa ownership và "giẫm chân" team khác.
+    followUp: How did the owning team react to you getting involved?
+    tags: [ownership, initiative]
+  - id: behavioral-030
+    level: hard
+    type: behavioral
+    q: Tell me about a time you had to balance quality with speed, and you chose speed. Was it the right call?
+    hint: |-
+      - **S**: áp lực gì, chất lượng cụ thể nào bị đánh đổi.
+      - **A**: bạn đánh giá rủi ro (dễ đảo ngược không? ảnh hưởng dữ liệu/bảo mật?), giữ ranh giới không thỏa hiệp, ghi nợ, thông báo cho team.
+      - **R**: hậu quả thực tế của nợ đó.
+      Numbers to mention: (điền số liệu thật của bạn).
+      Reflection: thành thật đánh giá — đúng hay sai, và tiêu chí bạn dùng bây giờ.
+    followUp: Where do you draw the line — what would you never trade for speed?
+    tags: [trade-offs, judgment]
+  - id: behavioral-031
+    level: hard
+    type: behavioral
+    q: Tell me about a time a project you were on failed or was cancelled. What was your part in it?
+    hint: |-
+      - **S**: dự án gì, vì sao thất bại/huỷ (requirement đổi, kỹ thuật, business).
+      - **A**: bạn đã làm gì, dấu hiệu nào bạn thấy sớm, có lên tiếng không.
+      - **R**: tác động; bạn cứu vãn được gì (code tái sử dụng, bài học).
+      Numbers to mention: (điền số liệu thật của bạn).
+      Reflection: nhận phần trách nhiệm của mình; lần sau bạn sẽ lên tiếng/hành động khác thế nào.
+    followUp: Looking back, what signal did you ignore?
+    redFlags:
+      - "It was entirely management's fault"
+    tags: [failure]
+  - id: behavioral-032
+    level: hard
+    type: scenario
+    q: A teammate repeatedly misses commitments, which blocks your work. How would you handle it?
+    hint: |-
+      - Nói chuyện riêng trước, tò mò thay vì phán xét: có blocker gì, estimate sai, việc cá nhân?
+      - Đề xuất giúp: chia nhỏ task, pair, làm rõ contract để bạn làm song song (mock API).
+      - Làm rõ kỳ vọng và phụ thuộc trong standup/board.
+      - Nếu vẫn tiếp diễn và ảnh hưởng delivery → báo lead dưới dạng **rủi ro dự án**, không phải phàn nàn cá nhân.
+      Reflection: bảo vệ delivery và bảo vệ quan hệ cùng lúc.
+    followUp: Have you been in this situation for real? What happened?
+    tags: [conflict, scenario]
+  - id: behavioral-033
+    level: hard
+    type: scenario
+    q: In your first week, you notice a security issue in production code written by a respected senior engineer. What do you do?
+    hint: |-
+      - Xác minh trước (reproduce trên môi trường không phải prod), đánh giá mức độ nghiêm trọng.
+      - Báo **riêng và nhanh** cho người owner + lead qua kênh phù hợp (không công khai lỗ hổng trong kênh chung).
+      - Đề xuất fix hoặc tự làm nếu được giao; coi đây là vấn đề hệ thống (review/test) chứ không phải lỗi cá nhân.
+      - Nếu nghiêm trọng mà không được xử lý → escalate theo quy trình security.
+      Reflection: người mới vẫn có trách nhiệm lên tiếng về bảo mật.
+    followUp: They dismiss it as low risk. You disagree. Now what?
+    tags: [security, scenario, courage]
+  - id: behavioral-034
+    level: hard
+    type: behavioral
+    q: Tell me about a time you worked with a difficult stakeholder or client.
+    hint: |-
+      - **S**: "khó" ở điểm nào cụ thể (đổi yêu cầu liên tục, deadline vô lý, giao tiếp gắt).
+      - **A**: hiểu động lực/áp lực của họ, thiết lập kênh và nhịp giao tiếp rõ, ghi lại thỏa thuận, đưa lựa chọn thay vì từ chối, giữ bình tĩnh.
+      - **R**: quan hệ và kết quả dự án.
+      Numbers to mention: (điền số liệu thật của bạn).
+      Reflection: mô tả họ công bằng — interviewer nghe cách bạn nói về người khác.
+    followUp: What would they say about working with you?
+    redFlags:
+      - "Describes the stakeholder with contempt"
+    tags: [stakeholders, communication]
+  - id: behavioral-035
+    level: senior
+    type: behavioral
+    q: Tell me about a technical decision you drove that had impact beyond your own work or team.
+    hint: |-
+      - **S**: vấn đề ở mức hệ thống/team (caching strategy, migration pattern, tenant-aware data access chung, coding standard, AI workflow).
+      - **A**: bạn nhận ra vấn đề, đề xuất (doc/POC), thuyết phục, triển khai, **nhân rộng** (docs, template, dạy người khác).
+      - **R**: nhiều team/người áp dụng; kết quả đo được.
+      Numbers to mention: (điền số liệu thật của bạn) — số service/module/người áp dụng, kết quả.
+      Reflection: điều gì làm nó lan tỏa (hoặc không).
+    followUp: What's the evidence that it is still being used today?
+    tags: [senior, influence, impact]
+  - id: behavioral-036
+    level: senior
+    type: behavioral
+    q: How do you decide what not to work on?
+    hint: |-
+      - Khung: tác động (user/business) × chi phí × rủi ro nếu không làm × khả năng đảo ngược.
+      - Ví dụ thật: một thứ bạn chọn **không** làm (refactor, tối ưu sớm, feature nice-to-have) và lý do; cách bạn nói "không"/"chưa" với người yêu cầu.
+      Numbers to mention: (điền số liệu thật của bạn) — thời gian tiết kiệm, ưu tiên thay thế.
+      Reflection: nói không có lý do là kỹ năng senior; ghi lại để xem lại sau.
+    followUp: Tell me about something you deprioritized that came back to bite you.
+    tags: [senior, prioritization]
+  - id: behavioral-037
+    level: senior
+    type: behavioral
+    q: Tell me about a time you raised the engineering bar for your team.
+    hint: |-
+      - **S**: chuẩn nào đang thấp (test, review, observability, migration safety, security).
+      - **A**: bạn làm mẫu trước, viết guideline/checklist, tự động hoá (CI gate, lint), dạy qua review, đo lường.
+      - **R**: thay đổi hành vi của team, kết quả (bug/incident giảm).
+      Numbers to mention: (điền số liệu thật của bạn).
+      Reflection: cách nâng chuẩn mà không trở thành "cảnh sát code".
+    followUp: How did you handle teammates who saw it as slowing them down?
+    tags: [senior, quality, leadership]
+  - id: behavioral-038
+    level: senior
+    type: open
+    q: What does "senior engineer" mean to you, and where are you on that path?
+    hint: |-
+      - Định nghĩa của bạn: ownership kết quả (không chỉ task), judgment về trade-off, làm người khác tốt hơn, giao tiếp rõ với non-tech, xử lý bất định.
+      - Tự đánh giá trung thực: điểm đã có (kèm bằng chứng từ dự án) và khoảng trống (vd. cloud/infra ownership, leadership chính thức, đo lường) + kế hoạch.
+      Reflection: thể hiện tự nhận thức, không phòng thủ.
+    followUp: What would your last manager say is the one thing holding you back from the next level?
+    tags: [senior, self-awareness]
+  - id: behavioral-039
+    level: senior
+    type: behavioral
+    q: Tell me about a time you had to rebuild trust after something went wrong.
+    hint: |-
+      - **S**: niềm tin bị tổn hại thế nào (incident do bạn, trễ cam kết, bất đồng căng thẳng).
+      - **A**: nhận trách nhiệm công khai, sửa, minh bạch về tiến độ, cam kết nhỏ và giữ đúng, xin feedback.
+      - **R**: quan hệ sau đó; bằng chứng niềm tin đã hồi phục.
+      Numbers to mention: (điền số liệu thật của bạn).
+      Reflection: niềm tin được xây bằng hành vi nhất quán theo thời gian.
+    followUp: How long did it take, and how did you know it was restored?
+    tags: [senior, trust]
+  - id: behavioral-040
+    level: senior
+    type: open
+    q: Where do you see yourself in three to five years?
+    hint: |-
+      - Trả lời có hướng nhưng linh hoạt: đi sâu kỹ thuật (staff/principal track) hay kết hợp tech lead; domain quan tâm (distributed systems, platform, e-commerce scale).
+      - Liên hệ với vai trò này: những gì bạn sẽ học/đóng góp ở đây giúp bạn tới đó.
+      - Nêu bước cụ thể đang làm (học cloud, design docs, mentoring).
+      Reflection: interviewer muốn biết bạn có động lực phát triển và có ở lại đủ lâu không.
+    followUp: What would make you leave a job within a year?
+    tags: [motivation, career]
+  - id: behavioral-041
+    level: cv
+    type: behavioral
+    q: What earned your team the award you mention on your CV, and what was your personal contribution?
+    hint: |-
+      - **S**: team, dự án, giai đoạn; award ghi nhận điều gì (delivery, chất lượng, khách hàng hài lòng).
+      - **T/A**: **phần của bạn** cụ thể — feature, fix, cải thiện quy trình, hỗ trợ đồng đội.
+      - **R**: kết quả của team và mối liên hệ với đóng góp của bạn.
+      Numbers to mention: (điền số liệu thật của bạn) — quy mô team, thời gian, kết quả dự án.
+      Reflection: bạn học được gì về làm việc nhóm hiệu quả.
+    followUp: If I asked a teammate from that time, what would they say you did?
+    redFlags:
+      - "Only 'we' — no personal contribution"
+    tags: [cv, teamwork]
+  - id: behavioral-042
+    level: cv
+    type: behavioral
+    q: Your CV lists skills like NestJS or AWS that I don't see in your project history. Tell me honestly about your experience with them.
+    hint: |-
+      Trung thực là bắt buộc:
+      - Nói rõ: chưa dùng trong production; học qua (khóa học, side project, POC) — cụ thể đã làm gì.
+      - Liên hệ kinh nghiệm chuyển giao: Express/Node architecture → NestJS module/DI; microservices, caching, Kafka → khái niệm cloud tương đương.
+      - Cách bạn sẽ ramp-up nếu vào team.
+      Numbers to mention: thời gian học, dự án cá nhân (điền số liệu thật của bạn).
+      Reflection: thừa nhận khoảng trống + kế hoạch tạo tin tưởng hơn là thổi phồng.
+    followUp: Walk me through how you would deploy a Node.js service you built on AWS today.
+    redFlags:
+      - "Overclaims production experience and collapses under follow-up"
+    tags: [cv, honesty, gaps]
+  - id: behavioral-043
+    level: cv
+    type: behavioral
+    q: You've worked with product teams and clients across several countries. Tell me about a cultural or communication difference that caused a problem, and how you handled it.
+    hint: |-
+      - **S**: khác biệt gì (thẳng vs gián tiếp, "yes" không có nghĩa là đồng ý, kỳ vọng về update, timezone).
+      - **A**: bạn nhận ra vấn đề thế nào, điều chỉnh gì (xác nhận bằng văn bản, tóm tắt lại, hỏi câu mở, update chủ động).
+      - **R**: rework/hiểu lầm giảm.
+      Numbers to mention: (điền số liệu thật của bạn) — số timezone, tần suất sync.
+      Reflection: thói quen giao tiếp bạn giữ đến nay.
+    followUp: How do you make sure silence in a meeting isn't mistaken for agreement?
+    tags: [cv, communication, distributed]
+  - id: behavioral-044
+    level: cv
+    type: behavioral
+    q: Your CV has no numbers. Pick your strongest claim and tell me the impact in measurable terms.
+    hint: |-
+      Chuẩn bị trước — đây là câu hỏi gần như chắc chắn gặp.
+      - Chọn một claim (Redis cho hot API, query optimization, Memcached giảm tải DB, CSV bottleneck, migration zero-downtime).
+      - Đưa số **thật** trước/sau; nếu không có số chính xác, nói ước lượng + cách bạn đo/biết ("theo dashboard lúc đó khoảng…").
+      Numbers to mention: (điền số liệu thật của bạn) — p95/p99, DB CPU, hit rate, thời gian xử lý, số request.
+      Reflection: thừa nhận lúc đó chưa đo kỹ và giờ bạn luôn đặt baseline trước khi tối ưu.
+    followUp: How did you measure that, and what else changed at the same time that could explain the improvement?
+    redFlags:
+      - "Invents precise numbers they cannot defend"
+      - "'It was significantly faster' with no measurement"
+    tags: [cv, metrics]
+  - id: behavioral-045
+    level: cv
+    type: behavioral
+    q: Tell me about a production issue you resolved that crossed backend, database and frontend.
+    hint: |-
+      - **S**: triệu chứng user thấy (trang chậm, lỗi checkout, dữ liệu sai).
+      - **A**: cách bạn lần theo từng tầng: FE (network tab, error), BE (log, trace), DB (query plan, lock, index); giả thuyết loại dần; phối hợp với ai.
+      - **R**: root cause, fix ở tầng nào (có thể nhiều tầng), phòng ngừa.
+      Numbers to mention: (điền số liệu thật của bạn) — MTTR, user bị ảnh hưởng, latency trước/sau.
+      Reflection: công cụ observability nào bạn ước đã có lúc đó.
+    followUp: Which tools did you use to find the root cause, specifically?
+    tags: [cv, incident, full-stack]

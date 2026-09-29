@@ -1,0 +1,1167 @@
+id: 13-sql-postgres
+slug: sql-postgres
+title: SQL & PostgreSQL
+tier: 4
+status: drafted
+summary: Indexes, EXPLAIN, transactions & isolation, MVCC/VACUUM, locking, pooling, replication, zero-downtime migrations — kèm so sánh với SQL Server.
+cvLinked: true
+prerequisites: []
+overview: |-
+  ## TL;DR
+
+  - PostgreSQL là **MVCC thuần**: mỗi `UPDATE` tạo **tuple version mới**, bản cũ thành dead tuple chờ **VACUUM** dọn. Reader không block writer, writer không block reader — khác SQL Server mặc định (lock-based `READ COMMITTED`, trừ khi bật **RCSI**).
+  - Postgres **không có clustered index**: mọi table là **heap**, mọi index (kể cả PK) là secondary index trỏ tới `ctid`. `CLUSTER` chỉ sắp xếp lại một lần, không duy trì.
+  - Senior interview xoáy vào: **đọc `EXPLAIN (ANALYZE, BUFFERS)`**, **vì sao planner bỏ qua index**, **anomaly ở từng isolation level**, **bloat / long transaction / xid wraparound**, **lock queue khi migrate**, **PgBouncer transaction mode**, **replica lag**.
+  - Zero-downtime migration = **expand → migrate (backfill theo batch) → contract**, cộng `lock_timeout`, `CREATE INDEX CONCURRENTLY`, constraint `NOT VALID` + `VALIDATE`.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | B-tree index | Cây cân bằng, sắp xếp theo key; hỗ trợ `=`, `<`, `>`, `BETWEEN`, `ORDER BY`, prefix `LIKE 'abc%'` (cần C collation hoặc `text_pattern_ops`) | `CREATE INDEX ON orders (tenant_id, created_at DESC)` |
+  | Composite index | Thứ tự cột quan trọng: equality trước, range/sort sau | `(tenant_id, status, created_at)` phục vụ `WHERE tenant_id=? AND status=? ORDER BY created_at` |
+  | Covering index | `INCLUDE` cột payload để có **Index Only Scan** (PG 11+) | `CREATE INDEX ON orders (customer_id) INCLUDE (total)` |
+  | Partial index | Index chỉ một tập con row | `CREATE INDEX ON jobs (run_at) WHERE status = 'pending'` |
+  | Expression index | Index trên biểu thức; query phải dùng đúng biểu thức | `CREATE INDEX ON users (lower(email))` |
+  | GIN / GiST / BRIN | GIN: inverted (jsonb, array, full-text) · GiST: range/geo/nearest · BRIN: block range tóm tắt cho data tăng dần | `CREATE INDEX ON events USING brin (created_at)` |
+  | MVCC | Mỗi row version có `xmin`/`xmax`; transaction nhìn theo **snapshot** | `SELECT xmin, xmax, ctid FROM t` |
+  | VACUUM | Dọn dead tuple, cập nhật visibility map, **freeze** xid cũ | `VACUUM (VERBOSE, ANALYZE) orders` |
+  | HOT update | Update không đụng cột indexed + còn chỗ trên page → không cần sửa index | `fillfactor = 90` cho table update nhiều |
+  | Row lock | Lưu trong tuple header, **không lock escalation** như SQL Server | `SELECT ... FOR UPDATE SKIP LOCKED` |
+  | Advisory lock | Lock theo số do app định nghĩa | `SELECT pg_try_advisory_xact_lock(hashtext('job:daily'))` |
+  | PgBouncer | Pooler nhẹ; mode `session` / `transaction` / `statement` | Transaction mode phá `SET`, session advisory lock, `LISTEN` |
+  | Streaming replication | Replica apply WAL; async mặc định → **replica lag** | `pg_stat_replication.replay_lag` |
+  | Declarative partitioning | Chia table theo range/list/hash; **partition pruning** | `PARTITION BY RANGE (created_at)` |
+  | Keyset pagination | Phân trang bằng `WHERE (k) > (last_k)` thay vì `OFFSET` | `WHERE (created_at, id) < ($1, $2) ORDER BY created_at DESC, id DESC LIMIT 50` |
+
+  ## Cơ chế hoạt động
+
+  ### Vòng đời một UPDATE dưới MVCC
+
+  ```mermaid
+  flowchart TD
+    A["UPDATE orders SET status='paid' WHERE id=42"] --> B["Tìm tuple hiện tại (ctid 7,3)"]
+    B --> C{"Row đang bị transaction khác lock?"}
+    C -- yes --> W["Chờ (hoặc lỗi nếu NOWAIT / lock_timeout)"]
+    W --> B
+    C -- no --> D["Set xmax = my xid trên tuple cũ"]
+    D --> E["Ghi tuple mới (xmin = my xid)"]
+    E --> F{"Cột indexed không đổi và page còn chỗ?"}
+    F -- yes --> G["HOT update: không đụng index"]
+    F -- no --> H["Thêm entry mới vào MỌI index"]
+    G --> I["COMMIT: ghi WAL, clog"]
+    H --> I
+    I --> J["Tuple cũ = dead khi không còn snapshot nào cần"]
+    J --> K["(auto)VACUUM dọn, cập nhật visibility map & FSM"]
+  ```
+
+  > SQL Server khác: update thường **in-place** trên page của clustered index; chỉ khi bật RCSI/SNAPSHOT thì bản cũ được copy vào **version store** (tempdb, hoặc Persistent Version Store khi bật ADR — SQL Server 2019+).
+
+  ### Zero-downtime column change (expand / contract)
+
+  ```mermaid
+  flowchart LR
+    A["1. Expand: ADD COLUMN nullable<br/>(metadata-only)"] --> B["2. Deploy app: dual-write<br/>old + new"]
+    B --> C["3. Backfill theo batch<br/>(1k-10k rows, sleep, theo dõi lag)"]
+    C --> D["4. CHECK (...) NOT VALID<br/>→ VALIDATE CONSTRAINT"]
+    D --> E["5. Deploy app: đọc cột mới"]
+    E --> F["6. Contract: ngừng ghi cột cũ<br/>→ DROP COLUMN"]
+  ```
+
+  Mỗi DDL chạy với `SET lock_timeout = '3s'` + retry: nếu `ALTER TABLE` phải chờ `ACCESS EXCLUSIVE` sau một transaction dài, **mọi query mới sẽ xếp hàng sau nó** → outage dù DDL "chỉ mất 1ms".
+
+  ### Đường đi của query qua pool & replica
+
+  ```mermaid
+  sequenceDiagram
+    participant App as Node app
+    participant PB as PgBouncer (transaction mode)
+    participant P as Primary
+    participant R as Replica (async)
+    App->>PB: BEGIN, UPDATE ..., COMMIT
+    PB->>P: mượn server connection cho 1 transaction
+    P-->>R: stream WAL (lag vài ms → vài giây)
+    App->>R: SELECT ngay sau khi ghi
+    R-->>App: dữ liệu cũ (read-your-writes bị vỡ)
+    Note over App,R: Fix: đọc primary sau khi ghi / so LSN / sticky theo session
+  ```
+
+  ## Trade-offs
+
+  | Chủ đề | Lựa chọn A | Lựa chọn B | Khi nào chọn gì |
+  |---|---|---|---|
+  | Concurrency control | Postgres MVCC (heap + VACUUM) | SQL Server lock-based RC (mặc định on-prem) / RCSI | MVCC: đọc không block; trả giá bằng bloat & vacuum. Lock-based: không bloat nhưng reader/writer block nhau, dễ deadlock |
+  | Pagination | `OFFSET` | Keyset | OFFSET cho admin nhỏ, cần nhảy trang; keyset cho feed/API lớn |
+  | PK | `bigint identity` | UUID (v4 / v7) | bigint nhỏ & nhanh; UUID khi sinh ở client / merge nhiều nguồn; v4 random làm B-tree phân mảnh, v7 time-ordered tốt hơn |
+  | Isolation | Read Committed + lock tường minh | Serializable (SSI) + retry | RC cho đa số OLTP; SSI khi invariant phức tạp (write skew), chấp nhận retry |
+  | Pooler mode | Session | Transaction | Transaction scale tốt hơn nhiều nhưng mất session state |
+  | Replication | Physical streaming | Logical | Physical: HA/read replica cả cluster; Logical: chọn table, khác major version, CDC |
+  | Chia dữ liệu | Partitioning (1 node) | Sharding (nhiều node, vd Citus) | Partition cho retention/pruning; shard khi 1 node không đủ write/storage |
+  | JSON | Cột quan hệ | `jsonb` | jsonb cho attribute thưa/động; field hay filter/join nên là cột thật |
+
+  ## Pitfalls
+
+  - `EXPLAIN ANALYZE` **thực thi thật** câu lệnh — với `UPDATE/DELETE` hãy bọc trong `BEGIN; ... ROLLBACK;`.
+  - Hàm/cast trên cột (`WHERE date(created_at) = ...`, so sánh `varchar` với tham số sai kiểu) làm index vô dụng.
+  - Transaction mở lâu (kể cả `idle in transaction`) giữ `xmin` → VACUUM không dọn được gì → bloat toàn DB.
+  - `CREATE INDEX` thường lock ghi cả table; dùng `CONCURRENTLY` — nhưng không chạy được trong transaction block (nhiều migration tool mặc định bọc transaction!).
+  - Thêm cột `DEFAULT now()`/`gen_random_uuid()` (volatile) vẫn **rewrite table**; default hằng số thì instant từ PG 11.
+  - Đọc từ replica ngay sau khi ghi → dữ liệu cũ.
+  - `timestamp without time zone` cho sự kiện thực tế → bug khi đổi DST / đa múi giờ; dùng `timestamptz`.
+  - Tin rằng `NOLOCK`-style dirty read tồn tại trong Postgres: `READ UNCOMMITTED` ở Postgres hoạt động như `READ COMMITTED`.
+
+  ## Cheat sheet
+
+  - Chẩn đoán query: `EXPLAIN (ANALYZE, BUFFERS)` → so **estimated vs actual rows**, tìm node tốn thời gian nhất, `shared read` (disk) vs `shared hit` (cache).
+  - Top query: `pg_stat_statements` (total_exec_time, calls, mean). Lock: `pg_locks` + `pg_blocking_pids(pid)`. Activity: `pg_stat_activity` (state, xact_start, backend_xmin).
+  - Bloat/vacuum: `pg_stat_user_tables` (n_dead_tup, last_autovacuum). Wraparound: `age(datfrozenxid)` trong `pg_database`.
+  - Isolation Postgres: RU≈RC (mặc định) · RR = snapshot isolation (không phantom, có write skew) · Serializable = SSI (lỗi `40001` → retry).
+  - Lock hàng: `FOR UPDATE` > `FOR NO KEY UPDATE` > `FOR SHARE` > `FOR KEY SHARE`; queue: `FOR UPDATE SKIP LOCKED`.
+  - Migration an toàn: `lock_timeout`, `ADD COLUMN` nullable, `CREATE INDEX CONCURRENTLY`, `ADD CONSTRAINT ... NOT VALID` → `VALIDATE CONSTRAINT`, backfill batch, `SET NOT NULL` sau khi có CHECK hợp lệ (PG 12+ bỏ qua full scan).
+  - Timeouts nên có: `statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout`, (PG 17+) `transaction_timeout`.
+  - SQL Server ↔ Postgres: `TOP` ↔ `LIMIT` · `IDENTITY` ↔ `GENERATED ... AS IDENTITY` · filtered index ↔ partial index · `datetimeoffset` ↔ `timestamptz` (Postgres không lưu offset, chỉ lưu instant UTC) · `MERGE` ↔ `INSERT ... ON CONFLICT` (Postgres có `MERGE` từ PG 15) · `WITH (NOLOCK)` ↔ không có.
+notionRefs:
+  - title: SQL Databases
+    url: https://app.notion.com/p/86f45690e260470e84af06f69f6efa40
+  - title: Databases
+    url: https://app.notion.com/p/179ef77f8ab28087b03cdcc78d68cfc3
+references:
+  - title: PostgreSQL docs — Indexes
+    url: https://www.postgresql.org/docs/current/indexes.html
+  - title: PostgreSQL docs — Using EXPLAIN
+    url: https://www.postgresql.org/docs/current/using-explain.html
+  - title: PostgreSQL docs — Transaction Isolation
+    url: https://www.postgresql.org/docs/current/transaction-iso.html
+  - title: PostgreSQL docs — Explicit Locking
+    url: https://www.postgresql.org/docs/current/explicit-locking.html
+  - title: PostgreSQL docs — Routine Vacuuming (incl. wraparound)
+    url: https://www.postgresql.org/docs/current/routine-vacuuming.html
+  - title: PostgreSQL docs — ALTER TABLE
+    url: https://www.postgresql.org/docs/current/sql-altertable.html
+  - title: PostgreSQL docs — CREATE INDEX (CONCURRENTLY)
+    url: https://www.postgresql.org/docs/current/sql-createindex.html
+  - title: PostgreSQL docs — Table Partitioning
+    url: https://www.postgresql.org/docs/current/ddl-partitioning.html
+  - title: PostgreSQL docs — High Availability & Hot Standby
+    url: https://www.postgresql.org/docs/current/hot-standby.html
+  - title: PostgreSQL docs — JSON Types
+    url: https://www.postgresql.org/docs/current/datatype-json.html
+  - title: PgBouncer — Features (pooling modes)
+    url: https://www.pgbouncer.org/features.html
+  - title: Microsoft Learn — Transaction locking and row versioning guide (SQL Server)
+    url: https://learn.microsoft.com/en-us/sql/relational-databases/sql-server-transaction-locking-and-row-versioning-guide
+questions:
+  - id: sql-postgres-001
+    level: easy
+    type: concept
+    q: What is a B-tree index, what queries can it speed up, and what does it cost you?
+    hint: |-
+      B-tree = cây cân bằng, leaf chứa key đã sắp xếp + pointer (`ctid`) tới row trong heap. Tra cứu O(log n), hỗ trợ `=`, range, `ORDER BY`, `MIN/MAX`, prefix `LIKE 'abc%'` (cần C collation hoặc `text_pattern_ops`).
+      Chi phí: mỗi `INSERT`/`UPDATE` (không HOT) phải cập nhật **mọi** index → write chậm hơn, thêm WAL, thêm dung lượng, thêm việc cho VACUUM.
+      Không giúp: `LIKE '%abc'`, hàm bọc cột, cột selectivity thấp (vd `is_active` 95% true).
+    followUp: Why can an index on a boolean column be useless, and what would you use instead?
+    redFlags:
+      - "More indexes always make the database faster"
+      - Cannot name any write-side cost of an index
+    tags: [indexes, b-tree]
+  - id: sql-postgres-002
+    level: easy
+    type: concept
+    q: Explain ACID in one line each, and which part is Postgres WAL responsible for?
+    hint: |-
+      - **Atomicity**: all-or-nothing (rollback).
+      - **Consistency**: constraint (PK, FK, CHECK) luôn đúng sau commit.
+      - **Isolation**: transaction đồng thời không thấy trạng thái dở dang của nhau (mức độ tuỳ isolation level).
+      - **Durability**: đã commit thì sống sót qua crash.
+      WAL (write-ahead log) chủ yếu phục vụ **Durability** (và atomicity khi crash recovery): ghi log trước, flush khi commit (`synchronous_commit`), data page ghi sau qua checkpoint.
+    followUp: What do you trade away if you set `synchronous_commit = off`?
+    tags: [transactions, acid, wal]
+  - id: sql-postgres-003
+    level: easy
+    type: concept
+    q: What are the four SQL-standard isolation levels, and which one is the default in PostgreSQL and in SQL Server?
+    hint: |-
+      Read Uncommitted · Read Committed · Repeatable Read · Serializable.
+      Postgres mặc định **Read Committed**; `READ UNCOMMITTED` được chấp nhận nhưng **hoạt động như Read Committed** (không có dirty read).
+      SQL Server mặc định cũng **Read Committed** nhưng **lock-based** (shared lock khi đọc) trừ khi bật `READ_COMMITTED_SNAPSHOT` (RCSI — mặc định ON trên Azure SQL Database). SQL Server còn có level `SNAPSHOT` riêng.
+    followUp: In Postgres, can two SELECTs in the same Read Committed transaction see different data? Why?
+    redFlags:
+      - "Postgres supports dirty reads with READ UNCOMMITTED like NOLOCK"
+    tags: [isolation, sql-server]
+    verify: true
+  - id: sql-postgres-004
+    level: easy
+    type: concept
+    q: What is MVCC and what problem does it solve compared to pure locking?
+    hint: |-
+      MVCC (Multi-Version Concurrency Control): mỗi row có nhiều version; mỗi transaction đọc theo **snapshot** → **reader không block writer, writer không block reader**. Chỉ writer–writer trên cùng row mới chờ nhau.
+      Postgres: version nằm ngay trong heap (`xmin`/`xmax` trên tuple). Giá phải trả: dead tuple → cần VACUUM, bloat, xid wraparound.
+      So với lock-based (SQL Server RC mặc định): SELECT phải lấy shared lock, có thể bị chặn bởi UPDATE đang chạy.
+    followUp: Where does Postgres keep old row versions, and where does SQL Server keep them when RCSI is on?
+    tags: [mvcc]
+  - id: sql-postgres-005
+    level: easy
+    type: concept
+    q: What does VACUUM do, and how is it different from VACUUM FULL?
+    hint: |-
+      `VACUUM`: đánh dấu dead tuple thành chỗ trống tái sử dụng (FSM), cập nhật **visibility map** (giúp index-only scan), **freeze** xid cũ chống wraparound. Không lock đọc/ghi, thường không trả dung lượng về OS.
+      `VACUUM FULL`: **rewrite toàn bộ table** sang file mới, trả dung lượng, nhưng giữ `ACCESS EXCLUSIVE` lock → table bị chặn hoàn toàn. Production thường dùng `pg_repack` thay thế.
+      Autovacuum chạy tự động dựa trên ngưỡng `autovacuum_vacuum_scale_factor` (mặc định 20% dead rows) + threshold.
+    followUp: A 500 GB table has 60% bloat. How do you reclaim space without downtime?
+    redFlags:
+      - Suggests running VACUUM FULL on a hot production table during business hours
+    tags: [vacuum, mvcc]
+  - id: sql-postgres-006
+    level: easy
+    type: gotcha
+    q: What is the difference between EXPLAIN and EXPLAIN ANALYZE, and what is the danger of running EXPLAIN ANALYZE on an UPDATE?
+    hint: |-
+      `EXPLAIN`: chỉ hiện **plan ước lượng** (cost, rows estimate), không chạy.
+      `EXPLAIN ANALYZE`: **thực thi thật** rồi thêm actual time, actual rows, loops. Thêm `BUFFERS` để thấy shared hit/read (cache vs disk).
+      Với `UPDATE/DELETE/INSERT`: dữ liệu **bị sửa thật** → bọc `BEGIN; EXPLAIN ANALYZE ...; ROLLBACK;`. Trên production cũng tốn tài nguyên như chạy thật.
+      SQL Server tương đương: estimated vs actual execution plan (`SET STATISTICS IO, TIME ON`).
+    example: |-
+      ```sql
+      BEGIN;
+      EXPLAIN (ANALYZE, BUFFERS)
+      UPDATE orders SET status = 'archived' WHERE created_at < now() - interval '2 years';
+      ROLLBACK;
+      ```
+    followUp: In an EXPLAIN ANALYZE output, what does a large gap between `rows=` estimated and actual tell you?
+    tags: [explain]
+  - id: sql-postgres-007
+    level: easy
+    type: concept
+    q: What is the N+1 query problem, and how do you detect it in a Node/TypeScript backend?
+    hint: |-
+      Lấy 1 danh sách (1 query) rồi với mỗi phần tử lại query thêm (N query) → latency = N round-trip, DB bị spam query nhỏ.
+      Phát hiện: log/trace số query mỗi request (OpenTelemetry span, ORM query log), `pg_stat_statements` có query nhỏ với `calls` rất cao.
+      Fix: `JOIN`, `WHERE id = ANY($1)` batch rồi group trong app, ORM eager loading (`include`/`relations`), DataLoader cho GraphQL.
+    followUp: Eager loading with a JOIN returned 50x more rows than expected. What happened and what is the alternative?
+    tags: [n-plus-one, orm]
+  - id: sql-postgres-008
+    level: easy
+    type: compare
+    q: Compare OFFSET pagination and keyset (cursor) pagination.
+    hint: |-
+      `OFFSET 100000 LIMIT 50`: DB vẫn phải **đọc và bỏ** 100k row → càng sâu càng chậm; row chèn/xoá giữa chừng gây **trùng/thiếu** item giữa các trang. Ưu: nhảy tới trang bất kỳ, dễ làm.
+      Keyset: `WHERE (created_at, id) < ($last_created_at, $last_id) ORDER BY created_at DESC, id DESC LIMIT 50` + index `(created_at DESC, id DESC)` → mỗi trang O(log n), ổn định khi data thay đổi. Nhược: không nhảy trang, cursor phải có **tiebreaker unique**.
+    followUp: Why must the cursor include a unique tiebreaker column like `id`?
+    tags: [pagination, keyset]
+  - id: sql-postgres-009
+    level: easy
+    type: compare
+    q: JSON vs JSONB in PostgreSQL — which do you use and why?
+    hint: |-
+      `json`: lưu nguyên văn text (giữ whitespace, thứ tự key, key trùng), parse lại mỗi lần đọc.
+      `jsonb`: lưu dạng binary đã parse, bỏ key trùng (giữ cái cuối), không giữ thứ tự key; ghi chậm hơn chút nhưng query nhanh và **index được bằng GIN** (`@>`, `?`, `jsonb_path_ops`).
+      Gần như luôn chọn `jsonb`. Chỉ dùng `json` khi cần giữ nguyên văn payload (vd audit webhook raw).
+    followUp: Which fields would you pull out of a JSONB column into real columns, and why?
+    tags: [jsonb]
+  - id: sql-postgres-010
+    level: easy
+    type: compare
+    q: "`serial` vs `GENERATED ... AS IDENTITY` vs UUID for primary keys — and how does SQL Server's IDENTITY compare?"
+    hint: |-
+      `serial` là shorthand cũ: tạo sequence + default `nextval`; quyền/ownership sequence dễ rối. **`GENERATED ALWAYS AS IDENTITY`** (PG 10+, chuẩn SQL) là cách khuyến nghị; `ALWAYS` chặn insert tay trừ khi `OVERRIDING SYSTEM VALUE`.
+      Sequence/identity **không transactional**: rollback vẫn "mất số" → có gap, đừng dùng cho số hoá đơn liên tục.
+      SQL Server `IDENTITY` tương tự (cũng có gap, `IDENTITY_INSERT` để chèn tay); SQL Server cũng có `SEQUENCE` object.
+      UUID: sinh ở client, không lộ số lượng; v4 random → insert rải khắp B-tree; UUIDv7 time-ordered (Postgres 18 có `uuidv7()`).
+    followUp: Your business requires gapless invoice numbers per tenant. How do you implement that?
+    tags: [identity, uuid, sql-server]
+    verify: true
+  - id: sql-postgres-011
+    level: easy
+    type: concept
+    q: Why does PostgreSQL need a connection pooler more than many other databases?
+    hint: |-
+      Postgres dùng mô hình **process-per-connection**: mỗi connection là một OS process (vài MB RAM, chi phí fork, context switch, snapshot phải quét danh sách backend). Hàng nghìn connection → hiệu năng giảm, `max_connections` đụng trần.
+      Node app có nhiều pod × pool size (vd 20 pod × 20 = 400) + serverless → dễ vượt.
+      Giải pháp: pool trong app (`pg.Pool`) cỡ nhỏ + pooler ngoài (PgBouncer, RDS Proxy, pgcat) ở **transaction mode**.
+    followUp: What is a reasonable starting point for pool size, and why is "bigger is better" wrong?
+    tags: [pooling, pgbouncer]
+  - id: sql-postgres-012
+    level: easy
+    type: compare
+    q: When would you use a window function instead of GROUP BY? Give an example.
+    hint: |-
+      `GROUP BY` **gộp** nhiều row thành một. Window function (`OVER (PARTITION BY ... ORDER BY ...)`) **giữ nguyên từng row** và thêm giá trị tính trên "cửa sổ": ranking, running total, so sánh với row trước (`LAG`).
+      Ví dụ: đơn hàng mới nhất mỗi customer, tổng luỹ kế theo ngày, % đóng góp mỗi sản phẩm trong category.
+    example: |-
+      ```sql
+      SELECT *
+      FROM (
+        SELECT o.*, row_number() OVER (PARTITION BY customer_id ORDER BY created_at DESC) AS rn
+        FROM orders o
+        WHERE tenant_id = $1
+      ) t
+      WHERE rn = 1;
+      -- Postgres-only alternative:
+      SELECT DISTINCT ON (customer_id) * FROM orders
+      WHERE tenant_id = $1 ORDER BY customer_id, created_at DESC;
+      ```
+    followUp: What is the difference between `ROW_NUMBER`, `RANK` and `DENSE_RANK` with ties?
+    tags: [window-functions]
+  - id: sql-postgres-013
+    level: medium
+    type: concept
+    q: How do you choose column order in a composite index? Walk through `(tenant_id, status, created_at)`.
+    hint: |-
+      Quy tắc: cột **equality** trước, cột **range / ORDER BY** sau cùng. Index `(tenant_id, status, created_at)` phục vụ tốt:
+      - `WHERE tenant_id=? AND status=? ORDER BY created_at DESC LIMIT 20` (không cần sort).
+      - `WHERE tenant_id=?` (leftmost prefix).
+      Kém: `WHERE status=?` một mình (không có leading column). Postgres 18 thêm **B-tree skip scan** giúp một số trường hợp thiếu leading column có ít giá trị distinct — nhưng đừng thiết kế dựa vào đó.
+      Range ở giữa (`created_at > ? AND status = ?` với created_at trước) làm cột sau không dùng được để seek.
+    followUp: Would you put a low-cardinality column like `status` first or last, and does "most selective first" always hold?
+    redFlags:
+      - "Column order does not matter, the planner reorders it"
+      - Always puts the most selective column first regardless of the query shape
+    tags: [indexes, composite]
+    verify: true
+  - id: sql-postgres-014
+    level: medium
+    type: concept
+    q: What is a covering index / Index Only Scan in Postgres, and why might an Index Only Scan still hit the heap?
+    hint: |-
+      Nếu index chứa đủ mọi cột query cần (key + `INCLUDE` cột payload, PG 11+), planner có thể dùng **Index Only Scan**.
+      Nhưng vì MVCC, visibility không nằm trong index → Postgres check **visibility map**: page nào chưa "all-visible" vẫn phải đọc heap. Xem `Heap Fetches:` trong `EXPLAIN ANALYZE`.
+      Table update liên tục + vacuum chậm → heap fetches cao → index-only scan mất lợi thế. Fix: autovacuum mạnh hơn cho table đó.
+      SQL Server: nonclustered index với `INCLUDE` là covering thật sự (không cần check visibility như Postgres).
+    example: |-
+      ```sql
+      CREATE INDEX orders_customer_cover ON orders (tenant_id, customer_id) INCLUDE (total, status);
+      EXPLAIN (ANALYZE) SELECT total, status FROM orders WHERE tenant_id = 7 AND customer_id = 42;
+      -- Index Only Scan using orders_customer_cover ... Heap Fetches: 0
+      ```
+    followUp: What is the difference between putting a column in the key versus in INCLUDE?
+    tags: [indexes, covering, visibility-map]
+  - id: sql-postgres-015
+    level: medium
+    type: concept
+    q: Give two production use cases for a partial index and explain when the planner can use it.
+    hint: |-
+      - Soft delete: `CREATE UNIQUE INDEX ON users (tenant_id, email) WHERE deleted_at IS NULL` → unique chỉ trên row còn sống, cho phép đăng ký lại email đã xoá.
+      - Queue/status hiếm: `CREATE INDEX ON jobs (run_at) WHERE status = 'pending'` → index nhỏ, luôn nằm trong RAM.
+      Planner chỉ dùng khi **WHERE của query suy ra được predicate của index** (khớp literal). Với prepared statement tham số `status = $1`, generic plan không chứng minh được `$1 = 'pending'` → có thể không dùng.
+      SQL Server tương đương: **filtered index** (có hạn chế với parameterized query tương tự).
+    followUp: Your partial index is ignored by an ORM-generated query. How do you confirm why and fix it?
+    tags: [indexes, partial-index, soft-delete]
+  - id: sql-postgres-016
+    level: medium
+    type: concept
+    q: When would you create an expression index, and what is the classic mistake that makes it unused?
+    hint: |-
+      Khi query filter/sort theo **biểu thức** chứ không phải cột thô: `lower(email)`, `(payload->>'sku')`, `date_trunc('day', created_at)` (lưu ý: chỉ hàm **IMMUTABLE** mới index được; `date_trunc` trên `timestamptz` phụ thuộc TimeZone nên không immutable).
+      Lỗi kinh điển: query viết biểu thức **khác** index (`LOWER(email)` vs `lower(trim(email))`, hoặc `email ILIKE $1`) → planner không match.
+      Sau khi tạo cần `ANALYZE` để có statistics cho biểu thức.
+      Thay thế: cột `citext` hoặc generated column + index thường.
+    example: |-
+      ```sql
+      CREATE UNIQUE INDEX users_email_lower ON users (tenant_id, lower(email));
+      SELECT * FROM users WHERE tenant_id = $1 AND lower(email) = lower($2); -- dùng index
+      SELECT * FROM users WHERE tenant_id = $1 AND email ILIKE $2;          -- không dùng
+      ```
+    followUp: Why can't you create an index on `date_trunc('day', created_at)` when `created_at` is `timestamptz`?
+    tags: [indexes, expression-index]
+  - id: sql-postgres-017
+    level: medium
+    type: compare
+    q: Compare GIN, GiST and BRIN indexes. Give one real use case for each.
+    hint: |-
+      - **GIN** (inverted): một row → nhiều key. Dùng cho `jsonb @>`, array `&&`/`@>`, full-text `tsvector`, trigram `pg_trgm` (`LIKE '%abc%'`). Đọc nhanh, ghi chậm (có `fastupdate` pending list).
+      - **GiST**: cây tổng quát cho dữ liệu chồng lấn: range (`tstzrange &&`), PostGIS, nearest-neighbour `ORDER BY <->`, **exclusion constraint** (chống đặt ca/phòng trùng giờ).
+      - **BRIN**: lưu min/max mỗi block range → cực nhỏ; hiệu quả khi giá trị **tương quan với thứ tự vật lý** (append-only log, `created_at` tăng dần). Vô dụng nếu data bị update/xáo trộn.
+    example: |-
+      ```sql
+      -- Chống 2 ca làm việc trùng giờ cho cùng nhân viên (cần extension btree_gist)
+      ALTER TABLE shifts ADD CONSTRAINT no_overlap
+        EXCLUDE USING gist (employee_id WITH =, tstzrange(starts_at, ends_at) WITH &&);
+      ```
+    followUp: A BRIN index on `created_at` stopped helping after a bulk backfill of old data. Why?
+    tags: [indexes, gin, gist, brin]
+  - id: sql-postgres-018
+    level: medium
+    type: concept
+    q: List the common reasons the Postgres planner ignores an index you expected it to use.
+    hint: |-
+      1. **Selectivity thấp**: query trả > vài % table → seq scan rẻ hơn thật.
+      2. **Statistics cũ/sai**: sau bulk load chưa `ANALYZE`; cột tương quan (cần `CREATE STATISTICS`).
+      3. **Hàm/cast trên cột**: `date(created_at)`, `col::text`, so `bigint` với `numeric`, `varchar` vs tham số khác collation.
+      4. **Không có leading column** của composite index.
+      5. `LIKE '%x'`, `ILIKE`, hoặc `LIKE 'x%'` với collation non-C mà index không có `text_pattern_ops`.
+      6. Partial index predicate không suy ra được; generic plan với tham số.
+      7. Table nhỏ; `random_page_cost` mặc định 4 (quá cao cho SSD) làm index scan có vẻ đắt.
+      8. `OR` giữa các cột khác nhau (có thể thành BitmapOr hoặc seq scan).
+    followUp: How would you test whether the index would actually be faster without dropping anything in production?
+    redFlags:
+      - Immediately reaches for query hints (Postgres has none built-in) instead of fixing statistics or the predicate
+    tags: [indexes, planner]
+  - id: sql-postgres-019
+    level: medium
+    type: concept
+    q: Read this plan. What are Seq Scan, Index Scan, Bitmap Heap Scan and Nested Loop, and when is each chosen?
+    example: |-
+      ```text
+      Nested Loop  (cost=0.85..1250.40 rows=120 width=64) (actual time=0.05..3.20 rows=118 loops=1)
+        Buffers: shared hit=480
+        ->  Index Scan using customers_tenant_email on customers c  (rows=1) (actual rows=1 loops=1)
+              Index Cond: ((tenant_id = 7) AND (email = 'a@b.com'))
+        ->  Bitmap Heap Scan on orders o  (rows=120) (actual rows=118 loops=1)
+              Recheck Cond: (customer_id = c.id)
+              ->  Bitmap Index Scan on orders_customer_id  (actual rows=118 loops=1)
+                    Index Cond: (customer_id = c.id)
+      ```
+    hint: |-
+      - **Seq Scan**: đọc toàn bộ table — tốt khi lấy phần lớn row hoặc table nhỏ.
+      - **Index Scan**: đi index rồi lấy từng row trong heap (random I/O) — tốt khi ít row.
+      - **Bitmap Index/Heap Scan**: gom `ctid` từ index thành bitmap theo page rồi đọc heap theo thứ tự page — trung gian (vài trăm → vài chục nghìn row), kết hợp nhiều index (BitmapAnd/Or). `Recheck Cond` khi bitmap lossy.
+      - **Nested Loop**: với mỗi row bên ngoài, tra bên trong — tốt khi outer ít row + inner có index. **Hash Join**: build hash bảng nhỏ — tốt cho join lớn không sort. **Merge Join**: hai input đã sort.
+      Ở đây estimate ≈ actual (120 vs 118), `shared hit` toàn bộ → plan khoẻ.
+    followUp: The same query becomes a Nested Loop with `loops=50000` on the inner side. What went wrong?
+    tags: [explain, planner, joins]
+  - id: sql-postgres-020
+    level: medium
+    type: gotcha
+    q: In Postgres Read Committed, two sessions run `UPDATE accounts SET balance = balance - 100 WHERE id = 1 AND balance >= 100` concurrently on a balance of 150. What happens?
+    hint: |-
+      Session B bị block chờ A (row lock). Khi A commit, Postgres **không dùng snapshot cũ**: B đọc lại **version mới nhất** của row và **re-evaluate WHERE** (cơ chế EvalPlanQual). Balance giờ là 50 → điều kiện `>= 100` sai → B update **0 row**. Không âm tiền.
+      Nhưng nếu app làm `SELECT balance` rồi mới `UPDATE balance = <số đã tính ở app>` → **lost update** vì SELECT không lock.
+      Bài học: dồn logic vào một câu `UPDATE` atomic có điều kiện, hoặc `SELECT ... FOR UPDATE`, hoặc optimistic `version` column.
+    followUp: What would happen in the same scenario at REPEATABLE READ?
+    redFlags:
+      - "Both succeed and the balance goes to -50"
+    tags: [isolation, read-committed, lost-update]
+  - id: sql-postgres-021
+    level: medium
+    type: concept
+    q: What does REPEATABLE READ actually give you in PostgreSQL, and how does it differ from the SQL standard and SQL Server?
+    hint: |-
+      Postgres RR = **snapshot isolation**: snapshot chụp ở câu lệnh đầu tiên, cả transaction nhìn một trạng thái → **không có non-repeatable read và cũng không có phantom** (mạnh hơn chuẩn yêu cầu).
+      Nếu cố update row mà transaction khác đã sửa & commit sau snapshot → lỗi `could not serialize access due to concurrent update` (SQLSTATE `40001`) → **app phải retry**.
+      Vẫn có **write skew** (hai transaction đọc chung, ghi khác row).
+      SQL Server RR là **lock-based**: giữ shared lock trên row đã đọc tới cuối transaction → chặn update nhưng **vẫn có phantom**; muốn snapshot thì dùng `SNAPSHOT` isolation.
+    followUp: Show a write-skew example that REPEATABLE READ allows but SERIALIZABLE prevents.
+    tags: [isolation, repeatable-read, sql-server]
+  - id: sql-postgres-022
+    level: medium
+    type: compare
+    q: "Compare three ways to prevent lost updates: atomic UPDATE, SELECT ... FOR UPDATE, and optimistic locking with a version column."
+    hint: |-
+      - **Atomic UPDATE** (`SET qty = qty - $1 WHERE id=$2 AND qty >= $1`): đơn giản, nhanh nhất; chỉ khi logic diễn đạt được bằng SQL.
+      - **Pessimistic `FOR UPDATE`**: lock row trong transaction, đọc-tính-ghi an toàn; tốn connection trong lúc giữ lock, rủi ro deadlock nếu lock nhiều row không theo thứ tự; đừng gọi HTTP bên ngoài khi đang giữ lock.
+      - **Optimistic** (`UPDATE ... SET version = version + 1 WHERE id=$1 AND version=$2`, check rowCount = 0 → conflict): không giữ lock, hợp với edit qua UI dài (form); contention cao → retry nhiều.
+    example: |-
+      ```ts
+      const r = await db.query(
+        `UPDATE addresses SET line1 = $1, version = version + 1
+         WHERE id = $2 AND tenant_id = $3 AND version = $4`,
+        [line1, id, tenantId, expectedVersion],
+      );
+      if (r.rowCount === 0) throw new ConflictError('Address was modified by someone else');
+      ```
+    followUp: Under heavy contention on one hot row (flash sale stock), which approach breaks down first and what do you do instead?
+    tags: [locking, optimistic-locking, concurrency]
+  - id: sql-postgres-023
+    level: medium
+    type: compare
+    q: Explain FOR UPDATE, FOR NO KEY UPDATE, FOR SHARE and FOR KEY SHARE. Why does a plain UPDATE usually not block inserts into a child table with a foreign key?
+    hint: |-
+      Từ mạnh → yếu: `FOR UPDATE` (sắp xoá/đổi key) > `FOR NO KEY UPDATE` (sửa cột không phải key — `UPDATE` thường lấy lock này) > `FOR SHARE` > `FOR KEY SHARE`.
+      Insert vào child table có FK sẽ lấy `FOR KEY SHARE` trên row cha. `FOR KEY SHARE` chỉ xung đột với `FOR UPDATE` → update cột non-key của cha **không chặn** insert con.
+      Nếu app dùng `SELECT ... FOR UPDATE` trên cha "cho chắc" → chặn luôn mọi insert con → contention không cần thiết. Dùng `FOR NO KEY UPDATE` khi không đổi key.
+    followUp: Why can updating a primary key value on a parent row cause lock waits on child inserts?
+    tags: [locking, row-locks, foreign-keys]
+  - id: sql-postgres-024
+    level: medium
+    type: design
+    q: Build a simple job queue on Postgres. How does `FOR UPDATE SKIP LOCKED` help, and what are its limits?
+    hint: |-
+      Worker lấy job bằng `SELECT ... FOR UPDATE SKIP LOCKED LIMIT n` → nhiều worker chạy song song mà **không chờ nhau**, mỗi row chỉ một worker lấy được.
+      Cần: partial index trên job pending; update trạng thái trong cùng transaction hoặc đánh dấu `locked_until` để job không bị kẹt khi worker chết; retry/backoff; dọn job cũ (bloat do update liên tục).
+      Giới hạn: không đảm bảo thứ tự nghiêm ngặt; throughput cực lớn / fan-out nhiều consumer → Kafka/SQS hợp hơn. Kết quả nhất quán không cần thiết cho SKIP LOCKED — đó là feature cho queue, **không** dùng cho báo cáo.
+    example: |-
+      ```sql
+      WITH next AS (
+        SELECT id FROM jobs
+        WHERE status = 'pending' AND run_at <= now()
+        ORDER BY run_at
+        FOR UPDATE SKIP LOCKED
+        LIMIT 10
+      )
+      UPDATE jobs j SET status = 'running', locked_at = now(), attempts = attempts + 1
+      FROM next WHERE j.id = next.id
+      RETURNING j.*;
+      ```
+    followUp: A worker crashes mid-job after the transaction committed `status = 'running'`. How does the job get picked up again?
+    tags: [locking, skip-locked, queue]
+  - id: sql-postgres-025
+    level: medium
+    type: concept
+    q: What are advisory locks, and when would you use a transaction-level versus session-level one?
+    hint: |-
+      Lock theo **số bigint** do app định nghĩa, DB không gắn với row nào: `pg_advisory_lock(key)`, `pg_try_advisory_lock`, `pg_advisory_xact_lock`.
+      Use case: đảm bảo chỉ một instance chạy cron/migration, serialize xử lý theo một entity (vd `hashtext('tenant:42:recalc')`).
+      **xact-level**: tự nhả khi commit/rollback — an toàn, dùng được với PgBouncer transaction mode.
+      **session-level**: giữ tới khi unlock hoặc đóng connection — **nguy hiểm với pooler transaction mode** (lock dính vào server connection người khác sẽ mượn) và dễ rò nếu quên unlock.
+    followUp: Why is `hashtext()` collision a concern, and how would you design the key space?
+    tags: [locking, advisory-locks, pgbouncer]
+  - id: sql-postgres-026
+    level: medium
+    type: concept
+    q: What is a HOT update, and how can table design make HOT updates more likely?
+    hint: |-
+      HOT (Heap-Only Tuple): khi UPDATE **không đổi cột nào có index** và **page hiện tại còn chỗ**, tuple mới nằm cùng page, index không cần entry mới → ít write amplification, ít bloat index, dọn bằng page pruning.
+      Tăng tỉ lệ HOT: `fillfactor` 80–90 cho table update nhiều; không index những cột update liên tục (vd `last_seen_at`, `view_count`); tách counter ra table riêng.
+      Theo dõi: `pg_stat_user_tables.n_tup_hot_upd` / `n_tup_upd`.
+    followUp: You added an index on `updated_at` for a sync job. Why did write latency and index bloat increase?
+    tags: [mvcc, hot, performance]
+  - id: sql-postgres-027
+    level: medium
+    type: compare
+    q: Explain PgBouncer's session, transaction and statement pooling modes, and what breaks in transaction mode.
+    hint: |-
+      - **session**: client giữ một server connection suốt phiên — an toàn nhất, ít lợi ích scale.
+      - **transaction**: server connection chỉ được mượn trong một transaction → vài chục connection phục vụ hàng nghìn client. Mode phổ biến nhất.
+      - **statement**: trả lại sau mỗi câu; cấm multi-statement transaction.
+      Transaction mode **không hỗ trợ**: `SET`/`RESET` session (dùng `SET LOCAL`), `LISTEN`, session advisory lock, `WITH HOLD` cursor, SQL-level `PREPARE`, temp table giữ qua transaction. Protocol-level prepared statements được hỗ trợ khi bật `max_prepared_statements` (PgBouncer 1.21+).
+    followUp: Your multi-tenant app sets `SET app.tenant_id = 42` per request behind PgBouncer transaction mode. What is the risk?
+    redFlags:
+      - Thinks PgBouncer transaction mode is fully transparent to the application
+    tags: [pooling, pgbouncer]
+    verify: true
+  - id: sql-postgres-028
+    level: medium
+    type: compare
+    q: Physical streaming replication vs logical replication — when do you use each?
+    hint: |-
+      **Physical (streaming)**: replica apply WAL byte-level → bản sao y hệt cả cluster, cùng major version, read-only hot standby. Dùng cho HA/failover và read replica.
+      **Logical** (PG 10+, publication/subscription): replicate thay đổi theo **table/row** → chọn table, khác major version, target có thể ghi. Dùng cho upgrade gần zero-downtime, CDC (Debezium dùng logical decoding), tách DB.
+      Hạn chế logical: không replicate DDL, sequence (chưa, tuỳ version), cần replica identity (PK) cho UPDATE/DELETE.
+      Cả hai dùng **replication slot** → slot không ai đọc giữ WAL mãi → đầy disk.
+    followUp: A Debezium connector was down for a weekend and the primary's disk filled up. Explain the mechanism and the guardrail.
+    tags: [replication, logical-replication, cdc]
+    verify: true
+  - id: sql-postgres-029
+    level: medium
+    type: scenario
+    q: Users update their address, the page reloads, and they see the old address. Reads go to a replica. How do you fix read-your-writes?
+    hint: |-
+      Nguyên nhân: streaming replication **async**, replica lag vài ms–vài giây.
+      Các cách:
+      - Sau khi ghi, **đọc từ primary** cho user đó trong N giây (flag trong session/cookie) hoặc cho các endpoint vừa ghi.
+      - Trả dữ liệu mới ngay trong response của write (client không cần đọc lại).
+      - So **LSN**: lưu `pg_current_wal_lsn()` sau commit, chỉ đọc replica khi `pg_last_wal_replay_lsn() >= lsn`.
+      - `synchronous_commit = remote_apply` cho replica đồng bộ — đắt, tăng latency ghi, replica chết thì ghi treo.
+    followUp: How would you monitor replica lag and what threshold triggers routing all reads back to the primary?
+    tags: [replication, replica-lag, consistency]
+  - id: sql-postgres-030
+    level: medium
+    type: concept
+    q: How does declarative partitioning work in Postgres, and when does it actually help performance?
+    hint: |-
+      `PARTITION BY RANGE | LIST | HASH`; mỗi partition là table riêng; planner **prune** partition không khớp WHERE (lúc plan và cả lúc execute với tham số).
+      Giúp khi: query luôn filter theo partition key (thời gian, tenant); **retention** bằng `DETACH`/`DROP PARTITION` thay vì `DELETE` hàng triệu row (không bloat); vacuum/index nhỏ theo partition.
+      Không giúp (thậm chí chậm hơn): query không có partition key → quét mọi partition; quá nhiều partition (hàng nghìn) → planning chậm.
+      Ràng buộc: PK/unique **phải chứa partition key**; không có global index.
+    example: |-
+      ```sql
+      CREATE TABLE events (
+        tenant_id bigint NOT NULL, id bigint GENERATED ALWAYS AS IDENTITY,
+        created_at timestamptz NOT NULL, payload jsonb,
+        PRIMARY KEY (created_at, id)
+      ) PARTITION BY RANGE (created_at);
+      CREATE TABLE events_2026_09 PARTITION OF events
+        FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
+      ```
+    followUp: How do you enforce global uniqueness of `id` across partitions?
+    tags: [partitioning]
+  - id: sql-postgres-031
+    level: medium
+    type: gotcha
+    q: Are CTEs an optimization fence in PostgreSQL? What changed, and how do you control it?
+    hint: |-
+      Trước PG 12: CTE **luôn materialize** (fence) → planner không đẩy WHERE vào trong → nhiều query CTE chậm bất ngờ.
+      Từ PG 12: CTE không đệ quy, không side effect, chỉ tham chiếu **một lần** sẽ được **inline** như subquery. Kiểm soát bằng `WITH x AS MATERIALIZED (...)` hoặc `NOT MATERIALIZED`.
+      CTE có `INSERT/UPDATE/DELETE` (data-modifying) luôn chạy đúng một lần.
+      SQL Server: CTE luôn được inline (không có materialize hint) — tham chiếu 2 lần = chạy 2 lần.
+    followUp: When would you deliberately force MATERIALIZED?
+    tags: [cte, planner]
+    verify: true
+  - id: sql-postgres-032
+    level: medium
+    type: concept
+    q: How do you index and query a JSONB attributes column efficiently?
+    hint: |-
+      - Containment: `WHERE attrs @> '{"color":"red"}'` + `CREATE INDEX ... USING gin (attrs jsonb_path_ops)` (nhỏ hơn, nhanh hơn cho `@>`; không hỗ trợ `?` key-exists). Mặc định `jsonb_ops` hỗ trợ nhiều operator hơn.
+      - Một key hay dùng: expression B-tree `((attrs->>'sku'))` để `=`/range/sort.
+      - `->` trả jsonb, `->>` trả text; so số phải cast `(attrs->>'price')::numeric`.
+      Planner không có statistics tốt cho giá trị bên trong jsonb → estimate kém; key quan trọng nên thành cột thật hoặc generated column.
+    example: |-
+      ```sql
+      CREATE INDEX products_attrs_gin ON products USING gin (attrs jsonb_path_ops);
+      SELECT id FROM products WHERE tenant_id = $1 AND attrs @> '{"brand":"acme","size":"M"}';
+      ```
+    followUp: Why does `WHERE attrs->>'brand' = 'acme'` not use the GIN index?
+    tags: [jsonb, gin, indexes]
+  - id: sql-postgres-033
+    level: medium
+    type: gotcha
+    q: Which ALTER TABLE ADD COLUMN operations are instant in Postgres, and which rewrite the table?
+    hint: |-
+      Instant (metadata-only, vẫn cần `ACCESS EXCLUSIVE` lock rất ngắn):
+      - `ADD COLUMN` nullable không default.
+      - `ADD COLUMN ... DEFAULT <hằng số / non-volatile>` từ **PG 11** (giá trị lưu trong catalog).
+      Rewrite toàn bộ table (lock suốt thời gian rewrite):
+      - Default **volatile** (`gen_random_uuid()`, `clock_timestamp()`, `random()`) → rewrite. Lưu ý `now()` là STABLE nên vẫn instant: mọi row cũ nhận **cùng một** giá trị lúc chạy ALTER.
+      - Đổi kiểu cột không binary-compatible (`int` → `bigint`, `varchar` → `int`). `varchar(50)` → `varchar(100)` hay → `text` thì không rewrite.
+      Luôn kèm `lock_timeout` vì ngay cả lock ngắn cũng xếp hàng sau transaction dài.
+    followUp: How do you migrate an `int` primary key that is close to overflowing to `bigint` without downtime?
+    redFlags:
+      - "Adding a column with a default always rewrites the table"
+    tags: [migrations, ddl]
+    verify: true
+  - id: sql-postgres-034
+    level: medium
+    type: concept
+    q: How does CREATE INDEX CONCURRENTLY work, and what are its caveats?
+    hint: |-
+      Lấy `SHARE UPDATE EXCLUSIVE` (không chặn INSERT/UPDATE/DELETE) thay vì `SHARE` lock của `CREATE INDEX` thường. Quét table **hai lần** và **chờ mọi transaction cũ kết thúc** → chậm hơn nhiều, có thể treo lâu nếu có transaction dài.
+      Caveats:
+      - **Không chạy trong transaction block** → tắt transaction wrapper của migration tool cho bước này.
+      - Nếu fail (deadlock, unique violation, cancel) → để lại index **INVALID** vẫn tốn chi phí ghi; phải `DROP INDEX CONCURRENTLY` rồi tạo lại.
+      - Mỗi lần chỉ một CIC trên một table; tốn I/O → chạy giờ thấp điểm.
+      Tương tự: `REINDEX CONCURRENTLY` (PG 12+). SQL Server: `WITH (ONLINE = ON)` (bản Enterprise/Azure).
+    followUp: How do you detect leftover invalid indexes after a failed deploy?
+    tags: [migrations, indexes, concurrently]
+  - id: sql-postgres-035
+    level: medium
+    type: compare
+    q: "`INSERT ... ON CONFLICT` in Postgres vs `MERGE` in SQL Server for upserts — what are the concurrency gotchas?"
+    hint: |-
+      Postgres `ON CONFLICT (cols) DO UPDATE/NOTHING` dựa trên **unique index/constraint** và an toàn với concurrency: hai insert đồng thời không tạo duplicate, không lỗi unique (một bên thành update).
+      Lưu ý: `DO NOTHING` không trả row có sẵn trong `RETURNING`; sequence vẫn bị tiêu hao khi conflict; không update cùng row hai lần trong một câu.
+      SQL Server `MERGE` **không atomic với concurrency theo mặc định** → race tạo lỗi PK duplicate; cần `WITH (HOLDLOCK)` / SERIALIZABLE; MERGE cũng có lịch sử bug. Pattern thường gặp: `UPDATE` rồi `IF @@ROWCOUNT = 0 INSERT` với lock hint.
+      Postgres có `MERGE` từ PG 15 nhưng `ON CONFLICT` vẫn là lựa chọn chuẩn cho upsert đồng thời.
+    followUp: Your idempotency-key table uses ON CONFLICT DO NOTHING. How do you return the original response to the retrying client?
+    tags: [upsert, sql-server, concurrency]
+    verify: true
+  - id: sql-postgres-036
+    level: medium
+    type: compare
+    q: You come from SQL Server. How does a clustered index there compare with how Postgres stores tables?
+    hint: |-
+      SQL Server: clustered index **là** table — leaf chứa cả row, sắp theo clustering key (mặc định PK). Nonclustered index lưu **clustering key** làm row locator → key lookup. Key rộng (GUID) làm mọi index phình và page split khi insert random.
+      Postgres: mọi table là **heap** không thứ tự; mọi index (kể cả PK) là secondary, trỏ `ctid` (page, offset). Không có "key lookup qua PK" — đi thẳng heap. `CLUSTER` chỉ sắp xếp **một lần**, không duy trì, và lock table.
+      Hệ quả: range scan theo PK ở Postgres có thể random I/O (xem `correlation` trong `pg_stats`); UPDATE ở Postgres tạo tuple mới nên index phải cập nhật (trừ HOT).
+    followUp: Why is a random GUID clustered key a classic SQL Server performance problem, and is UUIDv4 as a PK equally bad in Postgres?
+    redFlags:
+      - "Postgres primary keys are clustered by default like SQL Server"
+    tags: [sql-server, storage, clustered-index]
+  - id: sql-postgres-037
+    level: medium
+    type: compare
+    q: Compare SQL Server's default READ COMMITTED, READ COMMITTED SNAPSHOT (RCSI) and Postgres Read Committed.
+    hint: |-
+      - SQL Server RC (lock-based): SELECT lấy shared lock → **bị block** bởi writer đang giữ exclusive lock, writer bị block bởi reader. Deadlock reader–writer thường gặp → dev lạm dụng `NOLOCK` (dirty read, đọc trùng/thiếu row).
+      - **RCSI** (`ALTER DATABASE ... SET READ_COMMITTED_SNAPSHOT ON`): mỗi câu đọc snapshot từ **version store** (tempdb/PVS) → gần giống Postgres RC. Chi phí: tempdb, 14 byte version pointer mỗi row.
+      - Postgres RC: MVCC luôn bật, snapshot mỗi statement, không có dirty read, không cần hint.
+      Khi port code từ SQL Server: code dựa vào "SELECT bị block nên đọc đúng" có thể thành race condition trên Postgres/RCSI — cần lock tường minh.
+    followUp: What subtle bug can appear when an app written for lock-based RC is moved to RCSI or Postgres?
+    tags: [sql-server, isolation, rcsi, mvcc]
+  - id: sql-postgres-038
+    level: medium
+    type: concept
+    q: What is a deadlock, how does Postgres detect and resolve it, and how do you prevent it in application code?
+    hint: |-
+      Hai (hoặc nhiều) transaction chờ lock của nhau thành vòng. Postgres chờ `deadlock_timeout` (mặc định 1s) rồi chạy detector, **abort một transaction** với lỗi `40P01 deadlock detected`; log ghi cả hai câu lệnh.
+      Phòng tránh: lock row theo **thứ tự nhất quán** (sort id trước khi update batch), transaction ngắn, không gọi I/O ngoài khi giữ lock, lock sớm bằng `FOR UPDATE` thay vì nâng cấp lock giữa chừng.
+      App phải **retry** lỗi `40P01`/`40001` với backoff.
+      SQL Server: deadlock monitor tương tự, chọn victim theo `DEADLOCK_PRIORITY`/chi phí rollback, lỗi 1205; thêm nguồn deadlock từ **lock escalation** và reader–writer (không có ở Postgres).
+    followUp: Two batch jobs deadlock nightly while updating inventory. What information do you collect first?
+    tags: [locking, deadlock]
+  - id: sql-postgres-039
+    level: medium
+    type: gotcha
+    q: "`timestamp` vs `timestamptz` in Postgres — which do you use for a shift scheduling feature spanning time zones?"
+    hint: |-
+      `timestamptz` **không lưu time zone**: nó chuyển về UTC khi ghi và hiển thị theo `TimeZone` của session → đại diện một **instant**. `timestamp` là "giờ đồng hồ trên tường" không có ngữ cảnh.
+      Sự kiện đã xảy ra (created_at, clock-in) → `timestamptz`.
+      Lịch tương lai theo giờ địa phương ("ca bắt đầu 09:00 tại cửa hàng ở Sydney mỗi thứ Hai") → lưu **local time + IANA zone** (`'Australia/Sydney'`) rồi tính instant khi cần, vì luật DST có thể đổi. Không lưu offset cố định (`+10:00`).
+      SQL Server: `datetimeoffset` lưu **offset** (không phải zone), `datetime2` không có zone; `AT TIME ZONE` dùng tên zone Windows.
+    example: |-
+      ```sql
+      SELECT (date '2026-10-05' + time '09:00') AT TIME ZONE 'Australia/Sydney' AS starts_at_utc;
+      -- Ngày DST bắt đầu ở Sydney (2026-10-04) làm 02:00-03:00 không tồn tại.
+      ```
+    followUp: A night shift runs 22:00–06:00 across a DST change. How long is it, and how does your schema compute that?
+    tags: [timestamptz, time-zones, sql-server]
+    verify: true
+  - id: sql-postgres-040
+    level: hard
+    type: debug
+    q: This endpoint lists today's orders and does a sequential scan on a 200M-row table even though `orders(created_at)` is indexed. Find the problems.
+    example: |-
+      ```sql
+      -- index: CREATE INDEX orders_created_at ON orders (created_at);
+      SELECT id, total FROM orders
+      WHERE date(created_at) = current_date
+        AND tenant_id::text = $1          -- $1 bound as text by the driver
+      ORDER BY created_at DESC;
+      ```
+    hint: |-
+      - `date(created_at)` bọc hàm lên cột → index trên `created_at` không dùng được. Viết lại thành range: `created_at >= $day_start AND created_at < $day_start + interval '1 day'` (tính `$day_start` theo **time zone của tenant**, không phải `current_date` của server).
+      - `tenant_id::text = $1` cast **cột** chứ không cast tham số → không dùng index nào có `tenant_id`. Truyền tham số đúng kiểu (`$1::bigint`).
+      - Index nên là `(tenant_id, created_at DESC) INCLUDE (total)` để seek theo tenant, không cần sort, có thể index-only.
+      Kiểm chứng bằng `EXPLAIN (ANALYZE, BUFFERS)` trước/sau.
+    followUp: What is the equivalent SQL Server term for this problem, and does SQL Server's implicit conversion behave the same way?
+    redFlags:
+      - Suggests creating an index on `date(created_at)` without noticing the time-zone issue
+    tags: [indexes, sargable, debug]
+  - id: sql-postgres-041
+    level: hard
+    type: debug
+    q: The planner estimates 1 row but the query returns 480,000, choosing a Nested Loop that runs for 40 seconds. Diagnose and fix.
+    example: |-
+      ```text
+      Nested Loop  (cost=1.13..16.20 rows=1 width=40) (actual time=0.09..40211.55 rows=480112 loops=1)
+        ->  Index Scan using products_tenant_category on products p  (rows=1) (actual rows=480112 loops=1)
+              Index Cond: ((tenant_id = 12) AND (category_id = 900))
+        ->  Index Scan using inventory_pkey on inventory i  (rows=1) (actual rows=1 loops=480112)
+      ```
+    hint: |-
+      Estimate sai 480.000 lần → planner chọn Nested Loop (nghĩ chỉ lặp 1 lần) thay vì Hash Join.
+      Nguyên nhân thường gặp:
+      - Statistics cũ (bulk import cho tenant mới, autoanalyze chưa chạy) → `ANALYZE products`.
+      - **Cột tương quan**: planner nhân selectivity `tenant_id` × `category_id` như độc lập, trong khi category 900 chỉ thuộc tenant 12 → `CREATE STATISTICS s (dependencies, mcv) ON tenant_id, category_id FROM products; ANALYZE products;`.
+      - Data lệch (một tenant rất lớn): tăng `ALTER TABLE ... ALTER COLUMN tenant_id SET STATISTICS 1000`.
+      Không có query hint built-in trong Postgres (có extension `pg_hint_plan`) — fix gốc là statistics.
+    followUp: In a multi-tenant table where one tenant owns 60% of rows, why can the same prepared statement be fast for one tenant and slow for another?
+    tags: [explain, statistics, planner, debug]
+  - id: sql-postgres-042
+    level: hard
+    type: debug
+    q: A migration that "only adds a nullable column" caused a 3-minute outage on the orders API. Explain what happened.
+    example: |-
+      ```sql
+      -- migration 2026_09_01_add_gift_note.sql
+      ALTER TABLE orders ADD COLUMN gift_note text;
+
+      -- at the same time, pg_stat_activity shows:
+      -- pid 811  state: idle in transaction  xact_start: 00:12 ago  query: SELECT * FROM orders WHERE ...
+      ```
+    hint: |-
+      `ADD COLUMN` nullable là metadata-only nhưng vẫn cần **`ACCESS EXCLUSIVE`** lock. Pid 811 (một transaction bị bỏ quên / report dài) đang giữ `ACCESS SHARE` → ALTER phải chờ.
+      Lock queue của Postgres là FIFO: mọi `SELECT/INSERT` mới đến sau ALTER phải **xếp hàng sau ALTER** (xung đột với lock nó đang chờ) → API treo, pool cạn connection.
+      Fix:
+      - `SET lock_timeout = '2s'` trong migration + **retry có backoff** → thất bại nhanh thay vì chặn traffic.
+      - `idle_in_transaction_session_timeout`, `statement_timeout` cho app role.
+      - Trước khi migrate, kiểm tra `pg_stat_activity` tìm transaction dài.
+    followUp: How would you write a migration runner step that retries DDL with lock_timeout safely?
+    redFlags:
+      - "Adding a nullable column never takes a lock"
+    tags: [migrations, locking, lock-queue, debug]
+  - id: sql-postgres-043
+    level: hard
+    type: debug
+    q: Two checkout requests deadlock intermittently. Find the cause in this code and fix it.
+    example: |-
+      ```ts
+      async function reserve(tx: Tx, items: { productId: number; qty: number }[]) {
+        for (const it of items) {                 // cart order as the user added items
+          await tx.query(
+            `UPDATE inventory SET reserved = reserved + $1
+             WHERE product_id = $2 AND available - reserved >= $1`,
+            [it.qty, it.productId],
+          );
+        }
+      }
+      // Request A: items [101, 202]   Request B: items [202, 101]
+      ```
+    hint: |-
+      A lock row 101 rồi chờ 202; B lock 202 rồi chờ 101 → vòng chờ → sau `deadlock_timeout` Postgres abort một bên (`40P01`).
+      Fix:
+      - **Sort theo `productId`** trước khi update → mọi transaction lock theo cùng thứ tự.
+      - Hoặc một câu duy nhất: `UPDATE inventory i SET reserved = i.reserved + v.qty FROM (VALUES ...) v(product_id, qty) WHERE ...` (vẫn nên ORDER trong subquery `SELECT ... ORDER BY product_id FOR UPDATE`).
+      - Kiểm tra `rowCount` của từng item: 0 = hết hàng → rollback.
+      - Wrapper retry cho `40P01`/`40001`.
+    followUp: Why does a single multi-row UPDATE not fully guarantee lock order, and how do you force it?
+    tags: [deadlock, locking, checkout, debug]
+  - id: sql-postgres-044
+    level: hard
+    type: debug
+    q: Infinite-scroll users report duplicated and missing products, and page 2,000 takes 4 seconds. Fix the query.
+    example: |-
+      ```sql
+      SELECT id, name, price, updated_at FROM products
+      WHERE tenant_id = $1
+      ORDER BY updated_at DESC
+      LIMIT 50 OFFSET $2;   -- $2 = page * 50
+      ```
+    hint: |-
+      - `OFFSET` sâu: đọc và vứt 100k row → chậm tuyến tính.
+      - `updated_at` **không unique** → thứ tự giữa các row cùng timestamp không xác định → trùng/thiếu giữa trang; và sắp theo `updated_at` trong khi row đang bị update làm item "nhảy" trang.
+      Fix: keyset với tiebreaker + index khớp:
+      `WHERE tenant_id = $1 AND (updated_at, id) < ($2, $3) ORDER BY updated_at DESC, id DESC LIMIT 50` với index `(tenant_id, updated_at DESC, id DESC)`.
+      Cân nhắc sort theo cột ổn định (`created_at`, `id`) cho feed; cursor encode base64 opaque.
+    followUp: The product team wants "jump to page 37" and a total count. How do you respond?
+    tags: [pagination, keyset, debug]
+  - id: sql-postgres-045
+    level: hard
+    type: debug
+    q: After moving behind PgBouncer in transaction mode, the Node service logs `prepared statement "s_12" does not exist` and some requests see another tenant's search_path. Why?
+    example: |-
+      ```ts
+      // per request
+      await client.query(`SET search_path TO tenant_${tenantId}, public`);
+      await client.query({ name: 's_12', text: 'SELECT * FROM orders WHERE id = $1', values: [id] });
+      ```
+    hint: |-
+      Transaction mode: mỗi transaction (hoặc mỗi câu autocommit) có thể chạy trên **server connection khác**.
+      - Named prepared statement tạo trên connection X, lần sau chạy trên Y → "does not exist". Fix: bật `max_prepared_statements` (PgBouncer 1.21+) để PgBouncer quản lý protocol-level prepare, hoặc không dùng named statements.
+      - `SET search_path` là **session state** → dính lại trên server connection, request của tenant khác mượn connection đó sẽ thấy schema sai → **cross-tenant leak**. Fix: `BEGIN; SET LOCAL search_path ...; ...; COMMIT;` hoặc `set_config('search_path', ..., true)` trong transaction; tốt nhất schema-qualify tên table.
+    followUp: How would you write an integration test that catches this class of bug before production?
+    tags: [pgbouncer, pooling, multi-tenancy, debug]
+    verify: true
+  - id: sql-postgres-046
+    level: hard
+    type: debug
+    q: This ORM code powers an order list endpoint. p95 is 1.8s with 50 orders per page. What is wrong and how do you fix it?
+    example: |-
+      ```ts
+      const orders = await orderRepo.find({ where: { tenantId }, take: 50 });
+      for (const o of orders) {
+        o.customer = await customerRepo.findOneBy({ id: o.customerId });
+        o.items = await itemRepo.findBy({ orderId: o.id });
+      }
+      ```
+    hint: |-
+      N+1 (thực ra 1 + 2N = 101 query) → 101 round-trip; với pool nhỏ còn gây chờ connection.
+      Fix:
+      - Batch: lấy `customerIds`, `orderIds` rồi `WHERE id = ANY($1)` → 3 query tổng; map trong memory.
+      - Hoặc ORM eager load (`relations: ['customer','items']`) — nhưng JOIN 1-n với items có thể nhân số row & phá `LIMIT` (ORM phải paginate bằng subquery). Với collection, "select in" loading thường tốt hơn JOIN.
+      - Hoặc `json_agg` trong một query nếu API chỉ đọc.
+      Đo: số query/request trong trace; thêm cảnh báo khi > ngưỡng. Đừng quên `tenantId` trong mọi query con.
+    followUp: >-
+      Why can `take: 50` combined with a JOIN on items return fewer than 50 orders in some ORMs?
+    tags: [n-plus-one, orm, debug]
+  - id: sql-postgres-047
+    level: hard
+    type: scenario
+    q: Disk usage on the primary grows 5% per day, queries on `orders` are slowing, and `n_dead_tup` keeps rising despite autovacuum running. Walk through your investigation.
+    hint: |-
+      1. `pg_stat_activity`: tìm transaction có `xact_start` cũ hoặc `state = 'idle in transaction'`; xem `backend_xmin`. Một transaction mở 6 tiếng giữ **xmin horizon** → VACUUM không được dọn tuple nào mới hơn.
+      2. Các "thủ phạm" khác giữ horizon: **replication slot** không ai tiêu thụ / lag (`pg_replication_slots`), replica với `hot_standby_feedback = on` chạy query dài, prepared transaction bị bỏ quên (`pg_prepared_xacts`).
+      3. Autovacuum quá chậm: tăng `autovacuum_vacuum_cost_limit`, giảm `autovacuum_vacuum_scale_factor` riêng cho table lớn (`ALTER TABLE orders SET (autovacuum_vacuum_scale_factor = 0.02)`), thêm worker.
+      4. Sau khi gỡ nguyên nhân: VACUUM; bloat đã có → `pg_repack` (không phải VACUUM FULL).
+      Phòng: `idle_in_transaction_session_timeout`, alert trên tuổi transaction dài nhất và slot lag.
+    followUp: How do you estimate table and index bloat without installing extensions?
+    tags: [vacuum, bloat, mvcc, scenario]
+  - id: sql-postgres-048
+    level: hard
+    type: scenario
+    q: You get a warning `database "app" must be vacuumed within 10,000,000 transactions`. What is happening and what do you do right now?
+    hint: |-
+      Transaction ID là **32-bit** (~4 tỉ, so sánh modulo → cửa sổ ~2 tỉ). Tuple phải được **freeze** trước khi xid "quay vòng", nếu không dữ liệu cũ sẽ trông như ở tương lai (biến mất). Khi quá gần giới hạn, Postgres **từ chối cấp xid mới** (không nhận write) để bảo vệ dữ liệu.
+      Ngay lập tức:
+      - Tìm table già nhất: `SELECT relname, age(relfrozenxid) FROM pg_class WHERE relkind='r' ORDER BY 2 DESC`.
+      - Gỡ thứ chặn freeze: transaction dài, replication slot cũ, prepared xact.
+      - Chạy `VACUUM (FREEZE, VERBOSE)` trên table đó (có thể cần tăng `maintenance_work_mem`, tắt cost delay).
+      Lâu dài: theo dõi `age(datfrozenxid)`; autovacuum anti-wraparound (`autovacuum_freeze_max_age`, mặc định 200M) không được bị chặn; alert ở ~50% ngưỡng.
+    followUp: Why can an autovacuum "to prevent wraparound" not be cancelled like a normal autovacuum, and why does that matter during migrations?
+    tags: [xid-wraparound, vacuum, scenario]
+    verify: true
+  - id: sql-postgres-049
+    level: hard
+    type: scenario
+    q: Analytics queries on a read replica fail with `canceling statement due to conflict with recovery`, and when you fix it, replica lag grows to minutes. Explain the trade-off.
+    hint: |-
+      Replica apply WAL từ primary; khi primary VACUUM xoá tuple mà query dài trên replica vẫn cần → **conflict**. Replica phải chọn: huỷ query hay tạm dừng apply WAL.
+      - `max_standby_streaming_delay` (mặc định 30s): chờ tối đa bao lâu rồi huỷ query. Tăng → query sống, nhưng **lag tăng**.
+      - `hot_standby_feedback = on`: replica báo xmin về primary → primary không dọn tuple → **bloat trên primary**.
+      Giải pháp đúng: tách replica riêng cho analytics (chấp nhận lag, không phục vụ read-your-writes), hoặc đẩy analytics sang warehouse qua CDC; replica OLTP giữ delay thấp.
+    followUp: How do you prevent API traffic from being routed to a replica that is lagging by minutes?
+    tags: [replication, hot-standby, scenario]
+  - id: sql-postgres-050
+    level: hard
+    type: scenario
+    q: >-
+      After scaling the API from 10 to 60 pods, Postgres starts returning `FATAL: sorry, too many clients already` and latency rises even when it doesn't error. What do you do?
+    hint: |-
+      60 pod × pool 20 = 1.200 connection > `max_connections`. Kể cả dưới ngưỡng, nhiều connection active tranh CPU/lock → throughput giảm.
+      - Đặt **PgBouncer / RDS Proxy** ở transaction mode giữa app và DB; pool thật tới DB nhỏ (thường vài lần số core).
+      - Giảm pool per pod; pool size tính theo tổng: `pods × pool ≤ ngưỡng pooler client`, DB pool = cỡ core × 2–4 rồi đo.
+      - Đặt `connectionTimeoutMillis` để fail nhanh thay vì treo; `statement_timeout`.
+      - Tìm connection giữ lâu: transaction mở trong lúc gọi HTTP ngoài, `idle in transaction`.
+      Không đơn giản tăng `max_connections` lên 5.000.
+    followUp: How does connection pooling interact with a Node.js event loop that awaits an external API inside a transaction?
+    redFlags:
+      - Only suggests raising max_connections
+    tags: [pooling, pgbouncer, scaling, scenario]
+  - id: sql-postgres-051
+    level: hard
+    type: design
+    q: How do you add a NOT NULL constraint to a 300M-row table in production without a long lock?
+    hint: |-
+      `ALTER TABLE ... SET NOT NULL` phải **quét cả table** dưới `ACCESS EXCLUSIVE` lock.
+      Cách an toàn (PG 12+):
+      1. Backfill NULL theo batch.
+      2. `ALTER TABLE t ADD CONSTRAINT t_col_nn CHECK (col IS NOT NULL) NOT VALID;` (instant; áp dụng cho row mới).
+      3. `ALTER TABLE t VALIDATE CONSTRAINT t_col_nn;` (quét nhưng chỉ lấy `SHARE UPDATE EXCLUSIVE` → không chặn đọc/ghi).
+      4. `ALTER TABLE t ALTER COLUMN col SET NOT NULL;` → Postgres dùng CHECK hợp lệ để **bỏ qua scan**.
+      5. `DROP CONSTRAINT t_col_nn`.
+      PG 18 cho phép thêm trực tiếp NOT NULL constraint dạng `NOT VALID` rồi validate. Mọi bước kèm `lock_timeout`.
+    example: |-
+      ```sql
+      SET lock_timeout = '3s';
+      ALTER TABLE orders ADD CONSTRAINT orders_currency_nn CHECK (currency IS NOT NULL) NOT VALID;
+      ALTER TABLE orders VALIDATE CONSTRAINT orders_currency_nn;
+      ALTER TABLE orders ALTER COLUMN currency SET NOT NULL;
+      ALTER TABLE orders DROP CONSTRAINT orders_currency_nn;
+      ```
+    followUp: How do you add a foreign key to a large table the same way?
+    tags: [migrations, constraints, zero-downtime]
+    verify: true
+  - id: sql-postgres-052
+    level: hard
+    type: design
+    q: You need to backfill a new column for 200M rows. Why not a single UPDATE, and how do you do it safely?
+    hint: |-
+      Một `UPDATE` khổng lồ: một transaction dài → giữ xmin (bloat toàn DB), lock hàng triệu row (chặn checkout), tạo **200M dead tuple** + WAL khổng lồ → replica lag, đầy disk; fail ở 90% là rollback hết.
+      An toàn:
+      - Batch theo **PK range** (keyset), 1k–10k row/batch, mỗi batch một transaction ngắn; `WHERE new_col IS NULL` để idempotent/resume được.
+      - Nghỉ giữa batch, **throttle theo replica lag** và CPU; chạy ngoài giờ cao điểm.
+      - App đã dual-write trước khi backfill (để row mới không cần backfill).
+      - Theo dõi autovacuum theo kịp; có thể `VACUUM` giữa chừng.
+    example: |-
+      ```sql
+      -- lặp từ app/script với :last_id tăng dần
+      UPDATE orders SET currency_code = legacy_currency
+      WHERE id > :last_id AND id <= :last_id + 5000 AND currency_code IS NULL;
+      ```
+    followUp: How would you make the backfill job resumable and observable?
+    tags: [migrations, backfill, zero-downtime]
+  - id: sql-postgres-053
+    level: hard
+    type: design
+    q: Walk through renaming a column (`zip` → `postal_code`) with zero downtime while multiple app versions are running.
+    hint: |-
+      `RENAME COLUMN` là instant nhưng app version cũ đang chạy (rolling deploy) sẽ lỗi ngay → cần expand/contract:
+      1. **Expand**: `ADD COLUMN postal_code` (nullable).
+      2. Deploy v2: **ghi cả hai** cột, đọc cột cũ (hoặc trigger đồng bộ hai chiều trong DB).
+      3. Backfill `postal_code` theo batch.
+      4. Deploy v3: đọc cột mới, vẫn ghi cả hai (để rollback về v2 an toàn).
+      5. Deploy v4: chỉ ghi cột mới.
+      6. **Contract**: drop cột cũ (sau khi chắc chắn không còn code/report/ETL nào đọc).
+      Mỗi bước deploy riêng, có thể rollback. Cách khác: view/tên cột alias — phức tạp hơn với ORM.
+    followUp: Where do things like ETL jobs, BI dashboards and the Elasticsearch indexer fit into this plan?
+    tags: [migrations, expand-contract, zero-downtime]
+  - id: sql-postgres-054
+    level: hard
+    type: scenario
+    q: A `CREATE INDEX CONCURRENTLY` in your deploy pipeline failed halfway with a unique violation. What state is the database in, and how do you recover?
+    hint: |-
+      Index tồn tại nhưng **INVALID**: planner không dùng để đọc, nhưng **vẫn được cập nhật khi ghi** (tốn chi phí) và với unique index vẫn có thể enforce uniqueness trên row mới → insert có thể lỗi.
+      Tìm: `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;`.
+      Phục hồi: sửa dữ liệu trùng (tìm bằng `GROUP BY ... HAVING count(*) > 1`), `DROP INDEX CONCURRENTLY` index hỏng, tạo lại. Migration nên idempotent (`IF NOT EXISTS` sẽ **bỏ qua index invalid** cùng tên → nguy hiểm, cần kiểm tra `indisvalid`).
+    followUp: Why can `CREATE INDEX CONCURRENTLY IF NOT EXISTS` silently leave you without a working index?
+    tags: [migrations, indexes, concurrently, scenario]
+  - id: sql-postgres-055
+    level: hard
+    type: gotcha
+    q: Show a write-skew anomaly that REPEATABLE READ allows in Postgres, and two ways to prevent it.
+    hint: |-
+      Bất biến: mỗi ca phải còn ≥ 1 bác sĩ on-call. T1 và T2 cùng đọc "có 2 người on-call", mỗi người tự tắt on-call của mình (ghi **row khác nhau**) → không có write-write conflict → cả hai commit → còn 0 người.
+      Cách chặn:
+      - `SERIALIZABLE` (SSI): Postgres phát hiện dependency nguy hiểm, abort một transaction với `40001` → app retry.
+      - Materialize conflict: `SELECT ... FOR UPDATE` các row cùng ca (hoặc lock row "shift" cha) trước khi kiểm tra.
+      - Hoặc constraint trong DB nếu diễn đạt được (exclusion constraint, trigger có lock).
+    example: |-
+      ```sql
+      -- T1 và T2 chạy song song ở REPEATABLE READ
+      SELECT count(*) FROM on_call WHERE shift_id = 9 AND active; -- cả hai thấy 2
+      UPDATE on_call SET active = false WHERE shift_id = 9 AND doctor_id = :me;
+      COMMIT; -- cả hai thành công → 0 active
+      ```
+    followUp: What does SERIALIZABLE cost in throughput and what must application code do differently?
+    tags: [isolation, write-skew, serializable]
+  - id: sql-postgres-056
+    level: hard
+    type: gotcha
+    q: Why is `SELECT count(*) FROM orders` slow on a large Postgres table, and what are your options?
+    hint: |-
+      Vì MVCC: mỗi transaction có thể thấy số row khác nhau → không có counter chung; phải quét (seq scan hoặc index-only scan, vẫn phụ thuộc visibility map).
+      Lựa chọn:
+      - Ước lượng: `reltuples` trong `pg_class` hoặc parse `EXPLAIN` → đủ cho "khoảng 1,2 triệu kết quả".
+      - Counter table cập nhật bằng trigger/app (cẩn thận hot row contention → shard counter).
+      - Count có filter hẹp + index phù hợp.
+      - UI: bỏ total count, dùng "has next page" (keyset lấy `LIMIT n+1`).
+      SQL Server `COUNT(*)` cũng phải quét (index nhỏ nhất); metadata `sys.dm_db_partition_stats` cho ước lượng.
+    followUp: How would you show accurate per-status order counts on a dashboard that refreshes every 5 seconds?
+    tags: [performance, mvcc, count]
+  - id: sql-postgres-057
+    level: hard
+    type: compare
+    q: Prepared statements in Postgres use custom vs generic plans. How does this compare to parameter sniffing in SQL Server, and how does it bite a multi-tenant app?
+    hint: |-
+      Postgres: 5 lần execute đầu dùng **custom plan** (theo giá trị tham số thật); sau đó nếu generic plan ước lượng không tệ hơn nhiều thì chuyển sang **generic plan** (không nhìn giá trị). Chỉnh bằng `plan_cache_mode = force_custom_plan | force_generic_plan`.
+      SQL Server: plan được compile theo tham số **lần đầu** rồi cache (parameter sniffing) → tenant nhỏ compile trước, tenant lớn dùng plan nested-loop → chậm. Fix: `OPTION (RECOMPILE)`, `OPTIMIZE FOR`, Query Store force plan.
+      Multi-tenant data lệch: plan tốt cho tenant 100 row tệ cho tenant 50M row. Postgres fix: `force_custom_plan` cho câu đó/role, partial index hoặc tách tenant lớn.
+    followUp: How would you detect that a slow query is caused by a generic plan rather than bad indexes?
+    tags: [planner, prepared-statements, sql-server, multi-tenancy]
+    verify: true
+  - id: sql-postgres-058
+    level: senior
+    type: design
+    q: Design the schema and indexes for a multi-tenant `orders` table serving list, detail, search-by-status and reporting endpoints at high traffic.
+    hint: |-
+      Điểm mạnh cần có:
+      - `tenant_id` là **cột đầu** của gần như mọi index và nằm trong PK/unique (`(tenant_id, id)` hoặc `id` + unique `(tenant_id, order_no)`).
+      - Index theo **access pattern**: list `(tenant_id, created_at DESC, id)`, status `(tenant_id, status, created_at)` hoặc partial index cho status hiếm (`pending`), lookup `(tenant_id, customer_id)`.
+      - Đo trước: `pg_stat_statements`, đừng index mọi cột (write cost, HOT).
+      - Reporting không chạy trên primary OLTP: replica riêng / warehouse.
+      - Partitioning khi retention hoặc kích thước đòi hỏi; tenant cực lớn → cân nhắc tách (bridge/silo).
+      - Guardrail: RLS hoặc repository bắt buộc `tenant_id`.
+    followUp: One tenant is now 40% of all orders. What changes?
+    tags: [design, indexes, multi-tenancy]
+  - id: sql-postgres-059
+    level: senior
+    type: design
+    q: An `events` table grows 30M rows a day and must keep 13 months. Design storage, indexing and retention.
+    hint: |-
+      - `PARTITION BY RANGE (created_at)` theo ngày hoặc tuần; tạo partition trước bằng job (hoặc `pg_partman`); retention = `DETACH PARTITION ... CONCURRENTLY` (PG 14+) rồi `DROP` → không DELETE, không bloat.
+      - Index nhỏ theo partition; BRIN trên `created_at` nếu append-only; B-tree cho tra cứu `(tenant_id, created_at)`.
+      - PK phải chứa `created_at`; nếu cần tra theo id toàn cục → id time-ordered (UUIDv7/snowflake) để suy ra partition.
+      - Ghi bằng batch/`COPY`; tránh update.
+      - Dữ liệu cũ: archive sang object storage (Parquet) cho analytics.
+      - Cân nhắc TimescaleDB/ClickHouse nếu workload chủ yếu là analytics.
+    followUp: How many partitions is too many, and what symptoms appear?
+    tags: [partitioning, design, retention]
+    verify: true
+  - id: sql-postgres-060
+    level: senior
+    type: open
+    q: Your team is migrating a service from SQL Server to PostgreSQL. What behaviors would you expect to break, beyond syntax?
+    hint: |-
+      Câu trả lời mạnh nêu được:
+      - **Concurrency**: lock-based RC → MVCC; code dựa vào blocking ngầm có thể thành race; `NOLOCK` biến mất; deadlock pattern khác; không có lock escalation.
+      - **Storage**: không clustered index; UUID/GUID PK; bloat & VACUUM là việc vận hành mới.
+      - **Case sensitivity & collation**: SQL Server thường case-insensitive (`CI_AS`), Postgres so sánh case-sensitive → login/email lookup vỡ; cần `citext`/`lower()` index/nondeterministic collation.
+      - Identifier: Postgres fold tên không quote về lowercase.
+      - Kiểu: `datetimeoffset` vs `timestamptz`, `bit` vs `boolean`, `money`, `NVARCHAR`.
+      - Empty string vs NULL, `TOP`/`LIMIT`, `ISNULL`/`COALESCE`, stored procedures & T-SQL → PL/pgSQL.
+      - Tooling: Query Store ↔ `pg_stat_statements`; SQL Agent ↔ `pg_cron`/scheduler bên ngoài.
+    followUp: How would you validate data correctness during a dual-run period?
+    tags: [sql-server, migration, open]
+  - id: sql-postgres-061
+    level: senior
+    type: open
+    q: The primary is at 85% CPU during peak. Walk me through how you decide between query tuning, read replicas, caching, partitioning and sharding.
+    hint: |-
+      Thứ tự hợp lý: **đo trước** (`pg_stat_statements` top theo `total_exec_time`, wait events, lock) → thường 5–10 query chiếm phần lớn tải.
+      1. Query/index tuning, bỏ N+1, giảm connection churn — rẻ nhất, hiệu quả nhất.
+      2. Cache (Redis) cho read nóng ít thay đổi; chấp nhận staleness & invalidation.
+      3. Read replica cho read chịu được lag; xử lý read-your-writes.
+      4. Scale up (vertical) — thường rẻ hơn công sức sharding.
+      5. Partitioning: giải quyết retention/maintenance, không phải CPU nói chung.
+      6. Sharding (Citus, theo tenant): khi write/storage vượt 1 node — đổi lấy cross-shard query/transaction phức tạp.
+      Nêu trade-off chi phí vận hành và độ phức tạp cho team.
+    followUp: What metrics would convince you that sharding is actually necessary?
+    tags: [scaling, performance, open]
+  - id: sql-postgres-062
+    level: senior
+    type: compare
+    q: "Primary key strategy for a new platform: bigint identity, UUIDv4, UUIDv7 or snowflake IDs. Make a recommendation."
+    hint: |-
+      - `bigint identity`: 8 byte, B-tree append ở cuối (ít page split), dễ đọc; nhược: lộ số lượng/thứ tự, sinh tập trung ở DB, khó merge nhiều nguồn.
+      - UUIDv4: sinh ở bất cứ đâu, không đoán được; nhược: 16 byte, **random** → insert rải khắp index, cache miss, WAL nhiều (full-page writes). SQL Server clustered GUID → page split nặng.
+      - UUIDv7 (RFC 9562): prefix thời gian → gần tuần tự như bigint, vẫn sinh phân tán; lộ thời điểm tạo. PG 18 có `uuidv7()`; version cũ sinh ở app.
+      - Snowflake: 64-bit time-ordered, cần cấp worker id.
+      Khuyến nghị phổ biến: bigint nội bộ + public id riêng, hoặc UUIDv7 nếu cần sinh phân tán.
+    followUp: Does exposing UUIDv7 in URLs leak anything sensitive?
+    tags: [identity, uuid, design]
+    verify: true
+  - id: sql-postgres-063
+    level: cv
+    type: behavioral
+    q: You designed zero-downtime, zero-data-loss schema migrations on a high-traffic multi-tenant platform. Walk me through one column change step by step.
+    hint: |-
+      Câu trả lời mạnh (STAR):
+      - **S/T**: cột nào, vì sao phải đổi (đổi kiểu, tách cột, thêm NOT NULL), table lớn cỡ nào, traffic ra sao (điền số liệu thật của bạn).
+      - **A**: expand → deploy dual-write → backfill theo batch (kích thước batch, throttle, idempotent) → validate constraint (SQL Server: `WITH NOCHECK` rồi `WITH CHECK`; Postgres: `NOT VALID` → `VALIDATE`) → chuyển read → contract. Nêu **lock timeout**, online index (`ONLINE = ON` trên SQL Server / `CONCURRENTLY` trên Postgres), rollback plan cho từng bước.
+      - Zero-data-loss: kiểm chứng bằng đếm/checksum giữa cột cũ và mới, không xoá cột cũ trước khi mọi consumer (report, indexer, ETL) đã chuyển.
+      - **R**: không downtime, thời gian backfill (điền số liệu thật của bạn).
+      - Reflection: lần sau làm khác gì.
+    followUp: Which step would you roll back first if error rates rose right after deploy, and how?
+    redFlags:
+      - Describes a single ALTER TABLE run during a maintenance window
+      - Cannot explain what lock each DDL step takes
+    tags: [cv, migrations, zero-downtime]
+  - id: sql-postgres-064
+    level: cv
+    type: behavioral
+    q: You say you did indexing and query optimization for high-traffic APIs. Pick one slow query and tell me how you found it, what the plan showed, and what you changed.
+    hint: |-
+      Câu trả lời mạnh có:
+      - **Cách phát hiện**: APM/trace p95 theo endpoint, Query Store (SQL Server) hoặc `pg_stat_statements`, slow query log.
+      - **Bằng chứng**: actual execution plan — key lookup / scan / sort spill / estimate lệch; logical reads trước/sau (`SET STATISTICS IO ON`).
+      - **Thay đổi**: composite index đúng thứ tự, `INCLUDE` để bỏ key lookup, sửa predicate non-SARGable, bỏ N+1, xử lý parameter sniffing (điền chi tiết thật của bạn).
+      - **Kết quả**: p95, logical reads, CPU trước/sau (điền số liệu thật của bạn) và chi phí ghi của index mới.
+      - Đề cập tenant_id trong index vì multi-tenant.
+    followUp: How did you make sure the new index did not slow down writes on checkout?
+    redFlags:
+      - "I just added an index on every column in the WHERE clause"
+      - Has no before/after measurement
+    tags: [cv, indexes, performance, sql-server]
+  - id: sql-postgres-065
+    level: cv
+    type: scenario
+    q: In your checkout flow, how did you prevent overselling inventory or double-charging when two requests for the same cart or product arrive at the same time?
+    hint: |-
+      Nội dung mạnh:
+      - Conditional atomic update `UPDATE ... SET stock = stock - @qty WHERE product_id = @id AND stock >= @qty` và kiểm tra rows affected; hoặc reservation có TTL.
+      - Lock ordering để tránh deadlock khi cart nhiều item; retry khi deadlock (SQL Server 1205 / Postgres 40P01).
+      - **Idempotency key** cho request checkout/payment (unique constraint), trạng thái order là state machine.
+      - Nói rõ isolation level dùng (SQL Server RC lock-based hay RCSI) và vì sao.
+      - Transaction không bao gồm call payment gateway bên ngoài (điền cách team bạn làm thật).
+    followUp: The payment provider timed out but may have charged the card. What does your code do?
+    tags: [cv, concurrency, checkout, locking]
+  - id: sql-postgres-066
+    level: cv
+    type: behavioral
+    q: You worked on a platform using both SQL Server and PostgreSQL. What differences surprised you or caused bugs?
+    hint: |-
+      Ví dụ tốt (chọn cái bạn thật sự gặp):
+      - Case-sensitive so sánh chuỗi trên Postgres (collation) → lookup email/code lỗi.
+      - MVCC vs lock-based: blocking/deadlock pattern khác, VACUUM/bloat là việc mới.
+      - Không có clustered index; `IDENTITY` vs `GENERATED AS IDENTITY`; `TOP` vs `LIMIT`; `datetimeoffset` vs `timestamptz`.
+      - Tên identifier bị lowercase nếu không quote.
+      - Tooling: Query Store vs `pg_stat_statements`, execution plan XML vs `EXPLAIN`.
+      Kết thúc bằng bài học: viết SQL và test tích hợp chạy trên đúng engine production (điền ví dụ thật của bạn).
+    followUp: If you had to pick one of the two for a new multi-tenant service today, which and why?
+    tags: [cv, sql-server, postgres]
+  - id: sql-postgres-067
+    level: cv
+    type: behavioral
+    q: You fixed a CSV processing bottleneck on a financial platform. What was slow, and how did you make bulk loading fast and safe?
+    hint: |-
+      Nội dung mạnh:
+      - Chẩn đoán: insert từng dòng (round-trip, mỗi dòng một transaction), parse cả file vào memory, validate đồng bộ (điền nguyên nhân thật của bạn).
+      - Fix: stream file (không load hết), batch insert / `COPY FROM STDIN` (Postgres) hoặc `SqlBulkCopy`/table-valued parameter (SQL Server); load vào **staging table** rồi `INSERT ... SELECT` / upsert sang table chính trong transaction.
+      - Idempotency: file hash / batch id để upload lại không nhân đôi; báo lỗi theo dòng.
+      - Index/constraint: cân nhắc tắt/đẩy index nặng sau load cho load lớn.
+      - Kết quả: thời gian trước/sau, memory (điền số liệu thật của bạn).
+    followUp: A 2 GB CSV fails at row 3,400,000. How does your design resume without duplicating money movements?
+    tags: [cv, bulk-load, copy, performance]
+  - id: sql-postgres-068
+    level: cv
+    type: design
+    q: Your Shift Management feature handles multiple time zones. How did you store shifts, and how do you query "all shifts active right now" across stores?
+    hint: |-
+      Nội dung mạnh:
+      - Instant (thời điểm thật) lưu UTC (`timestamptz` / `datetimeoffset` hoặc `datetime2` UTC có quy ước rõ); lịch lặp lại theo giờ địa phương lưu **local time + IANA/Windows zone id** của store.
+      - Tính instant bằng thư viện có tz database (không cộng offset thủ công); xử lý DST: giờ không tồn tại / lặp lại.
+      - "Active now": `WHERE starts_at <= now() AND ends_at > now()` trên cột instant + index `(tenant_id, starts_at)`; hoặc range type + GiST exclusion chống trùng ca (Postgres).
+      - Ca qua nửa đêm, ca qua ngày chuyển DST (dài 7h hoặc 9h).
+      - Bug thực tế bạn gặp và cách fix (điền ví dụ thật của bạn).
+    followUp: A store changes its time zone setting. What happens to already-scheduled future shifts?
+    tags: [cv, time-zones, design]

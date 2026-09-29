@@ -1,0 +1,1060 @@
+id: 23-auth-identity
+slug: auth-identity
+title: Authentication, OAuth2, OIDC & Authorization
+tier: 6
+status: drafted
+summary: Session vs JWT, refresh rotation/revocation, OAuth 2.0 flows + PKCE, OIDC, SSO/SAML, passkeys, RBAC vs ABAC vs ReBAC, tenant-scoped roles, policy engines.
+cvLinked: true
+prerequisites: []
+overview: |-
+  ## TL;DR
+
+  - **AuthN** = bạn là ai; **AuthZ** = bạn được làm gì **với resource nào**. Phần lớn sự cố thật nằm ở AuthZ (thiếu check object/tenant), không ở login.
+  - **OAuth 2.0** là framework **ủy quyền** (client lấy access token để gọi API thay user); **OIDC** thêm lớp **định danh** (ID token, userinfo, discovery). Flow chuẩn cho mọi client có user: **Authorization Code + PKCE**. Implicit và Password grant đã bị loại (RFC 9700, hướng OAuth 2.1).
+  - Session vs JWT không phải "cũ vs mới": session dễ revoke, JWT tiện cho phân tán nhưng **khó thu hồi** → access token ngắn + refresh token **rotation + reuse detection**.
+  - JWT pitfalls kinh điển: tin `alg` trong header (`none`, HS/RS confusion), không check `aud`/`iss`, dùng `decode` thay `verify`, token sống quá lâu, nhét quá nhiều quyền vào token.
+  - Authorization models: **RBAC** (role → permission), **ABAC** (thuộc tính + điều kiện), **ReBAC** (quan hệ, Zanzibar). Multi-tenant: role gắn với **membership (user, tenant)**, không gắn với user.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Session | Server lưu state, client giữ session id trong cookie | `__Host-sid=...` → Redis `sess:...` |
+  | JWT (JWS) | Token tự chứa claims, **ký** (không mã hoá) | `header.payload.signature`, payload đọc được bằng base64 |
+  | Access token | Credential để gọi **resource server** | `Authorization: Bearer eyJ...`, sống 5–15 phút |
+  | Refresh token | Đổi lấy access token mới, sống lâu | Rotation: mỗi lần dùng cấp token mới, huỷ token cũ |
+  | ID token | JWT cho **client** biết user là ai (OIDC) | `sub`, `iss`, `aud=client_id`, `nonce` |
+  | PKCE | Ràng buộc code với client tạo ra nó | `code_challenge = BASE64URL(SHA256(verifier))` |
+  | Scope | Quyền client được ủy quyền | `orders:read` |
+  | RBAC | User → role → permission | `store_manager` → `order.refund` |
+  | ABAC | Quyết định theo thuộc tính user/resource/context | `resource.tenant == user.tenant && amount < 5M` |
+  | ReBAC | Quyết định theo quan hệ đồ thị | `user:alice` là `editor` của `folder:x` → edit `doc:y` trong folder |
+  | Passkey | Credential WebAuthn (public-key) gắn với origin | Chống phishing, không có shared secret |
+
+  ## Cơ chế hoạt động
+
+  ### Authorization Code + PKCE (OIDC)
+
+  ```mermaid
+  sequenceDiagram
+    participant U as User browser
+    participant C as Client (BFF / app)
+    participant AS as Authorization server (IdP)
+    participant RS as Resource server (API)
+    C->>C: create code_verifier, state, nonce
+    C->>U: 302 to /authorize?response_type=code&client_id&redirect_uri&scope=openid...&state&nonce&code_challenge&code_challenge_method=S256
+    U->>AS: login + MFA + consent
+    AS->>U: 302 redirect_uri?code=...&state=...
+    U->>C: GET /callback?code&state
+    C->>C: check state matches
+    C->>AS: POST /token (code, code_verifier, redirect_uri, client auth)
+    AS->>AS: SHA256(verifier) == challenge?
+    AS-->>C: access_token, id_token, refresh_token
+    C->>C: verify id_token (signature via JWKS, iss, aud, exp, nonce)
+    C->>RS: API call with Bearer access_token
+    RS->>RS: verify token (sig, iss, aud, exp, scope) + authorize resource
+    RS-->>C: 200
+  ```
+
+  ### Refresh token rotation + reuse detection
+
+  ```mermaid
+  sequenceDiagram
+    participant A as Legit client
+    participant X as Attacker (stole RT1)
+    participant AS as Auth server
+    A->>AS: refresh with RT1
+    AS-->>A: AT2 + RT2 (RT1 marked used, same family)
+    X->>AS: refresh with RT1 (reuse!)
+    AS->>AS: RT1 already used -> revoke whole family
+    AS-->>X: 400 invalid_grant
+    A->>AS: refresh with RT2
+    AS-->>A: 400 invalid_grant -> user must log in again
+  ```
+
+  ### Quyết định authorization trong một request multi-tenant
+
+  ```mermaid
+  flowchart TD
+    R["Request + token"] --> V{"Token valid?<br/>sig, iss, aud, exp"}
+    V -- no --> E401["401"]
+    V -- yes --> T{"User has membership<br/>in requested tenant?"}
+    T -- no --> E403["403 / 404"]
+    T -- yes --> P{"Role in that tenant<br/>grants permission?"}
+    P -- no --> E403
+    P -- yes --> O{"Resource belongs to tenant<br/>and passes object rules?"}
+    O -- no --> E404["404"]
+    O -- yes --> OK["Allow + audit"]
+  ```
+
+  ## Trade-offs
+
+  | Quyết định | Lựa chọn A | Lựa chọn B | Ghi chú |
+  |---|---|---|---|
+  | Web session | Server session (cookie) | JWT stateless | Session: revoke tức thì; JWT: không cần lookup nhưng revoke khó |
+  | Token của SPA | BFF giữ token, browser chỉ có cookie | Token trong JS memory | BFF an toàn nhất; memory + refresh rotation chấp nhận được |
+  | Access token format | JWT (verify local) | Opaque + introspection | JWT nhanh; opaque revoke tức thì, không lộ claims |
+  | Ký JWT | Asymmetric (RS256/ES256/EdDSA) | Symmetric HS256 | Nhiều verifier → asymmetric; HS chỉ khi issuer = verifier |
+  | Quyền trong token | Nhét role/permission vào claims | Tra cứu lúc request | Claims nhanh nhưng stale tới khi hết hạn và token phình to |
+  | Model | RBAC | ABAC / ReBAC | RBAC đủ cho đa số; share/hierarchy → ReBAC; điều kiện động → ABAC |
+  | Enterprise SSO | OIDC | SAML 2.0 | OIDC cho app mới; SAML vì khách hàng enterprise yêu cầu |
+  | Policy | Code trong service | Policy engine (OPA/Cedar/OpenFGA) | Engine khi nhiều service/nhiều team cần một nguồn luật |
+
+  ## Pitfalls
+
+  - `jwt.decode()` thay `jwt.verify()`; không truyền `algorithms` allowlist; không check `aud`/`iss`.
+  - Dùng **ID token** để gọi API, hoặc chấp nhận access token cấp cho service khác (thiếu `aud`).
+  - Access token sống 24h, không có refresh rotation, không có cách revoke khi user bị xoá khỏi tenant.
+  - Lưu refresh token trong `localStorage`.
+  - Role lưu trên bảng `users` (một role toàn cục) trong khi user thuộc nhiều tenant.
+  - Check role ở route nhưng không check resource thuộc tenant nào.
+  - Tin `email` từ IdP làm khoá định danh / auto-link account khi `email_verified` không đúng.
+  - `redirect_uri` so khớp prefix/wildcard → rò code.
+  - Không xử lý **JWKS rotation** (cache key mãi mãi, hoặc fetch JWKS mỗi request).
+
+  ## Cheat sheet
+
+  - Flows: có user → **Auth Code + PKCE**; machine-to-machine → **Client Credentials**; TV/CLI → **Device Authorization Grant** (RFC 8628). Không dùng Implicit/ROPC.
+  - `state` = chống CSRF ở callback · `nonce` = gắn ID token với request (chống replay/injection) · PKCE = chống code interception/injection.
+  - Verify JWT: allowlist `alg` → key theo `kid` từ JWKS của **issuer đã cấu hình** → signature → `iss` → `aud` → `exp`/`nbf` (leeway ~60s) → claims nghiệp vụ.
+  - Access token 5–15', refresh token rotation + reuse detection + absolute lifetime; revoke family khi reuse.
+  - Revoke JWT: TTL ngắn, denylist `jti`, `token_version`/`sessions` table, introspection.
+  - Multi-tenant RBAC: `memberships(user_id, tenant_id)` + `membership_roles` + `role_permissions`; check (tenant membership → permission → object).
+  - SAML = XML assertion, enterprise legacy; OIDC = JSON/JWT, discovery, mobile-friendly.
+  - Passkeys: WebAuthn, phishing-resistant vì bound với RP ID (origin), private key không rời authenticator.
+notionRefs:
+  - title: Authentication
+    url: https://app.notion.com/p/170ef77f8ab280db8370da98c82fe1b5
+  - title: OpenID (OIDC)
+    url: https://app.notion.com/p/2eaef77f8ab2806c8ed1c13c0c37c233
+  - title: RBAC
+    url: https://app.notion.com/p/3abef77f8ab280b48e1ae7f5cab8dfc8
+  - title: KeyCloak
+    url: https://app.notion.com/p/38eef77f8ab280debbe6facfc9c963ec
+references:
+  - title: RFC 6749 — The OAuth 2.0 Authorization Framework
+    url: https://www.rfc-editor.org/rfc/rfc6749
+  - title: RFC 7636 — Proof Key for Code Exchange (PKCE)
+    url: https://www.rfc-editor.org/rfc/rfc7636
+  - title: RFC 9700 — Best Current Practice for OAuth 2.0 Security
+    url: https://www.rfc-editor.org/rfc/rfc9700
+  - title: RFC 7519 — JSON Web Token (JWT)
+    url: https://www.rfc-editor.org/rfc/rfc7519
+  - title: RFC 8725 — JSON Web Token Best Current Practices
+    url: https://www.rfc-editor.org/rfc/rfc8725
+  - title: RFC 8628 — OAuth 2.0 Device Authorization Grant
+    url: https://www.rfc-editor.org/rfc/rfc8628
+  - title: RFC 9068 — JWT Profile for OAuth 2.0 Access Tokens
+    url: https://www.rfc-editor.org/rfc/rfc9068
+  - title: RFC 9449 — OAuth 2.0 Demonstrating Proof of Possession (DPoP)
+    url: https://www.rfc-editor.org/rfc/rfc9449
+  - title: RFC 8693 — OAuth 2.0 Token Exchange
+    url: https://www.rfc-editor.org/rfc/rfc8693
+  - title: RFC 7662 — OAuth 2.0 Token Introspection
+    url: https://www.rfc-editor.org/rfc/rfc7662
+  - title: OAuth 2.1 (IETF draft)
+    url: https://datatracker.ietf.org/doc/draft-ietf-oauth-v2-1/
+  - title: OAuth 2.0 for Browser-Based Applications (IETF draft)
+    url: https://datatracker.ietf.org/doc/draft-ietf-oauth-browser-based-apps/
+  - title: OpenID Connect Core 1.0
+    url: https://openid.net/specs/openid-connect-core-1_0.html
+  - title: OpenID Connect Discovery 1.0
+    url: https://openid.net/specs/openid-connect-discovery-1_0.html
+  - title: OpenID Connect Back-Channel Logout 1.0
+    url: https://openid.net/specs/openid-connect-backchannel-1_0.html
+  - title: W3C — Web Authentication (WebAuthn) Level 3
+    url: https://www.w3.org/TR/webauthn-3/
+  - title: Zanzibar — Google's Consistent, Global Authorization System (USENIX ATC 2019)
+    url: https://research.google/pubs/zanzibar-googles-consistent-global-authorization-system/
+  - title: Open Policy Agent documentation
+    url: https://www.openpolicyagent.org/docs/latest/
+  - title: Cedar policy language
+    url: https://www.cedarpolicy.com/
+  - title: OpenFGA documentation
+    url: https://openfga.dev/docs
+  - title: Casbin documentation
+    url: https://casbin.org/docs/overview
+  - title: Keycloak documentation
+    url: https://www.keycloak.org/documentation
+  - title: OWASP Cheat Sheet — JSON Web Token for Java (concepts apply generally)
+    url: https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_for_Java_Cheat_Sheet.html
+  - title: OWASP Cheat Sheet — Session Management
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html
+questions:
+  - id: auth-identity-001
+    level: easy
+    type: compare
+    q: What's the difference between authentication and authorization? Give an example where authentication succeeds but authorization must fail.
+    hint: |-
+      - **Authentication**: xác minh danh tính (password, passkey, OIDC login) → kết quả là một **principal** (`user_id`, session/token).
+      - **Authorization**: principal đó có được **thực hiện action X trên resource Y** trong **context Z** (tenant) không.
+      Ví dụ: nhân viên cửa hàng A đăng nhập hợp lệ (401 không xảy ra) nhưng gọi `POST /orders/123/refund` của cửa hàng B hoặc không có quyền refund → 403/404.
+      HTTP: **401** = chưa xác thực/xác thực hỏng; **403** = đã xác thực nhưng không được phép (hoặc 404 để không lộ resource tồn tại).
+    followUp: When would you return 404 instead of 403 for an unauthorized resource?
+    tags: [authn, authz]
+  - id: auth-identity-002
+    level: easy
+    type: compare
+    q: Compare server-side sessions and JWT-based stateless tokens. Which do you pick for a classic web app?
+    hint: |-
+      - **Session**: server lưu state (Redis/DB), cookie chỉ chứa id ngẫu nhiên → revoke tức thì (xoá session), dữ liệu không lộ, cần store dùng chung khi scale ngang.
+      - **JWT stateless**: claims nằm trong token, verify bằng key, không lookup → hợp phân tán/nhiều service, nhưng **khó revoke** trước `exp`, token to, claims stale.
+      Web app cùng domain với backend → **session cookie** thường là lựa chọn đơn giản và an toàn hơn. JWT hợp cho access token gọi API giữa nhiều service/đối tác.
+      "JWT trong cookie" vẫn là cookie → vẫn cần chống CSRF.
+    followUp: If you choose JWT, how do you log a user out of all devices immediately?
+    redFlags:
+      - "Sessions don't scale, JWT is always better"
+    tags: [session, jwt]
+  - id: auth-identity-003
+    level: easy
+    type: concept
+    q: What are the three parts of a JWT? Is the payload encrypted?
+    hint: |-
+      `base64url(header).base64url(payload).base64url(signature)`. Header: `alg`, `typ`, `kid`. Payload: claims (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti` + custom). Signature: ký trên `header.payload`.
+      JWS **không mã hoá** — ai cũng decode được payload → không để PII/secret trong đó. Cần bí mật thì dùng **JWE** (ít khi cần) hoặc opaque token.
+      Chữ ký chỉ đảm bảo **integrity + nguồn gốc**, không đảm bảo token còn hiệu lực về mặt nghiệp vụ (user có thể đã bị khoá).
+    example: |-
+      ```ts
+      const [h, p] = token.split('.');
+      JSON.parse(Buffer.from(p, 'base64url').toString()); // anyone can read the claims
+      ```
+    followUp: Why is putting a user's email and role list in the access token a trade-off rather than a free win?
+    tags: [jwt]
+  - id: auth-identity-004
+    level: easy
+    type: concept
+    q: Name the four roles in OAuth 2.0 and map them onto "Sign in with Google to let our app read your Google Calendar".
+    hint: |-
+      - **Resource owner**: người dùng (chủ lịch).
+      - **Client**: app của bạn (muốn đọc lịch).
+      - **Authorization server**: Google Accounts (xác thực user, hỏi consent, cấp token).
+      - **Resource server**: Google Calendar API (nhận access token, trả dữ liệu).
+      OAuth trả lời "client được phép làm gì thay user" qua **scope** (`calendar.readonly`), không trả lời "user là ai" — đó là việc của OIDC.
+    followUp: In your own platform, which component plays the resource server role?
+    tags: [oauth2]
+  - id: auth-identity-005
+    level: easy
+    type: compare
+    q: OAuth 2.0 vs OpenID Connect — what does OIDC add, and why is "login with OAuth" without OIDC dangerous?
+    hint: |-
+      OIDC = lớp định danh trên OAuth 2.0: scope `openid`, **ID token** (JWT có `iss`, `sub`, `aud`, `exp`, `nonce`), endpoint **userinfo**, **discovery** (`/.well-known/openid-configuration`), JWKS, chuẩn logout.
+      "Login bằng OAuth thuần": dùng access token để suy ra user → access token không dành cho client đọc và **không có audience cho client** → token cấp cho app khác có thể bị đem sang app bạn (**token substitution / confused deputy**).
+      ID token có `aud = client_id` và `nonce` → gắn chặt với client và request.
+    followUp: Can your backend use the ID token as a bearer token for its own APIs? Why not?
+    tags: [oauth2, oidc]
+  - id: auth-identity-006
+    level: easy
+    type: compare
+    q: ID token vs access token — who is the audience of each, and what is each used for?
+    hint: |-
+      - **ID token**: audience là **client** (`aud = client_id`). Client đọc để biết ai vừa đăng nhập, rồi tạo session. Luôn là JWT. Không gửi cho API.
+      - **Access token**: audience là **resource server/API**. Client coi nó là **opaque** (không parse), chỉ gắn vào `Authorization: Bearer`. Có thể là JWT (RFC 9068, `typ: at+jwt`) hoặc opaque.
+      Sai lầm thường gặp: gọi API bằng ID token; client parse access token để lấy thông tin user; API chấp nhận ID token vì "chữ ký hợp lệ".
+    followUp: How can an API reject an ID token that has a valid signature from the same issuer?
+    tags: [oidc, tokens]
+  - id: auth-identity-007
+    level: easy
+    type: concept
+    q: What is PKCE and what attack does it prevent? Is it only for mobile apps?
+    hint: |-
+      Client sinh `code_verifier` ngẫu nhiên (43–128 ký tự), gửi `code_challenge = BASE64URL(SHA256(verifier))` + `code_challenge_method=S256` khi authorize; khi đổi code phải gửi `code_verifier` gốc → AS kiểm tra khớp.
+      Chống **authorization code interception** (app độc đăng ký cùng custom scheme trên mobile, log/referrer) và **code injection** — code bị lấy cắp vô dụng nếu thiếu verifier.
+      Không chỉ mobile: RFC 9700 khuyến nghị PKCE cho **mọi client**, kể cả confidential client có secret; OAuth 2.1 yêu cầu PKCE cho auth code flow. Dùng `S256`, không dùng `plain`.
+    followUp: If a confidential client already authenticates with a client secret, what does PKCE still add?
+    verify: true
+    tags: [pkce, oauth2]
+  - id: auth-identity-008
+    level: easy
+    type: compare
+    q: Scopes vs roles vs permissions — how do they differ, and where is each checked?
+    hint: |-
+      - **Scope** (OAuth): giới hạn những gì **client** được user/AS ủy quyền (`orders:read`). Là trần của client, không phải quyền của user.
+      - **Role**: nhóm permission gán cho **user** (thường trong một tenant) — `store_manager`.
+      - **Permission**: action cụ thể trên loại resource — `order.refund`.
+      Quyết định cuối = **scope của token ∩ permission của user trong tenant ∩ rule trên object**. Ví dụ: admin dùng app bên thứ ba chỉ có `orders:read` → không refund được dù là admin.
+    followUp: Should roles be encoded as scopes in access tokens? What are the trade-offs?
+    tags: [scopes, rbac]
+  - id: auth-identity-009
+    level: easy
+    type: concept
+    q: What is SSO and how does it work at a high level with an identity provider?
+    hint: |-
+      Single Sign-On: user đăng nhập **một lần** ở IdP (Okta, Entra ID, Google Workspace, Keycloak) và vào được nhiều app (RP/SP) mà không nhập lại credential.
+      Cơ chế: app redirect sang IdP (OIDC/SAML) → IdP có **session riêng** (cookie trên domain IdP) → nếu đã login thì cấp ngay ID token/assertion cho app mới → mỗi app tạo **session cục bộ** của mình.
+      Hệ quả: logout phức tạp (session app ≠ session IdP), deprovision user ở IdP không tự huỷ session ở app → cần SCIM/back-channel logout/TTL ngắn.
+    followUp: An employee is fired and disabled in the company IdP. How long can they still use your app?
+    tags: [sso, oidc, saml]
+  - id: auth-identity-010
+    level: easy
+    type: concept
+    q: What are the authentication factor categories, and why is SMS OTP considered a weak second factor?
+    hint: |-
+      Factors: **something you know** (password, PIN), **something you have** (phone, security key, TOTP app), **something you are** (biometric — thường dùng để mở khoá authenticator).
+      SMS OTP yếu: **SIM swap**, chặn SS7, malware đọc SMS, và **phishing real-time** (proxy như Evilginx chuyển tiếp OTP). NIST SP 800-63B xếp PSTN OTP là "restricted".
+      TOTP tốt hơn SMS nhưng vẫn phishable. **Passkeys/WebAuthn (FIDO2)** là **phishing-resistant** vì gắn với origin.
+    followUp: Why can't a phishing proxy relay a passkey assertion the way it relays a TOTP code?
+    verify: true
+    tags: [mfa, passkeys]
+  - id: auth-identity-011
+    level: easy
+    type: concept
+    q: Explain RBAC and sketch the minimal tables for it.
+    hint: |-
+      RBAC: user được gán **role**, role gồm **permission**, check bằng permission (không bằng tên role) → đổi quyền của role không phải sửa code.
+      Tables: `roles(id, name)`, `permissions(id, key)`, `role_permissions(role_id, permission_id)`, `user_roles(user_id, role_id)`.
+      Check trong code: `can(user, 'order.refund')` thay vì `if (user.role === 'admin')`.
+      Multi-tenant: `user_roles` phải có `tenant_id` (xem câu tenant-scoped roles).
+    example: |-
+      ```ts
+      // avoid: if (user.role === 'admin' || user.role === 'manager')
+      if (!(await authz.can(ctx, 'order.refund'))) throw new ForbiddenError();
+      ```
+    followUp: Why is checking role names in code (`role === 'admin'`) a maintenance problem?
+    tags: [rbac]
+  - id: auth-identity-012
+    level: easy
+    type: concept
+    q: Why do we have refresh tokens at all? Why not just issue a long-lived access token?
+    hint: |-
+      Access token được gửi tới **nhiều** resource server, dễ lộ (log, proxy, XSS) → nên sống **ngắn** (5–15'). Refresh token chỉ gửi tới **authorization server**, cho phép lấy access token mới không bắt user login lại.
+      Lợi: giới hạn cửa sổ lạm dụng khi access token lộ; mỗi lần refresh AS có cơ hội **kiểm tra lại** (user bị khoá? bị xoá khỏi tenant? đổi quyền?).
+      Refresh token cũng cần bảo vệ: rotation + reuse detection, sender-constrained (DPoP), lưu HttpOnly/secure storage, absolute lifetime.
+    followUp: What should the authorization server re-check on every refresh?
+    tags: [refresh-token, tokens]
+  - id: auth-identity-013
+    level: medium
+    type: compare
+    q: Where should a single-page app store tokens? Compare localStorage, in-memory, HttpOnly cookies and a BFF.
+    hint: |-
+      - **localStorage/sessionStorage**: mọi JS (kể cả XSS, script bên thứ ba) đọc được → token bị **exfiltrate** và dùng từ máy khác. Tránh cho refresh token.
+      - **In-memory** (biến JS): XSS vẫn dùng được trong phiên nhưng khó lấy mang đi; mất khi reload → cần refresh token ở đâu đó (cookie HttpOnly hoặc silent auth).
+      - **HttpOnly cookie**: JS không đọc được; cần SameSite + CSRF defense; cần cùng site với API.
+      - **BFF** (backend-for-frontend): token nằm ở server, browser chỉ có session cookie HttpOnly → an toàn nhất theo IETF "OAuth for Browser-Based Apps".
+      XSS vẫn cho attacker **gọi API** trong mọi phương án → chống XSS vẫn là gốc.
+    followUp: Why doesn't an HttpOnly cookie make XSS harmless?
+    tags: [spa, token-storage, bff]
+  - id: auth-identity-014
+    level: medium
+    type: concept
+    q: How do you revoke JWT access tokens before they expire? Compare the options.
+    hint: |-
+      - **TTL ngắn** (5–10') + revoke refresh token → chấp nhận cửa sổ vài phút. Đơn giản nhất.
+      - **Denylist theo `jti`** (Redis, TTL = thời gian còn lại của token) → check mỗi request; chỉ cần lưu token bị revoke.
+      - **`token_version`/`session_id` claim** so với giá trị trong DB/cache (tăng version khi logout-all, đổi password, đổi quyền) → revoke theo user/session.
+      - **Opaque token + introspection** (RFC 7662) → revoke tức thì, đổi lại một lookup/request (cache ngắn).
+      - Event-driven: publish "user revoked" để các service cập nhật cache.
+      Mọi cách tức thì đều **đưa state trở lại** — chấp nhận điều đó cho hành động nhạy cảm.
+    followUp: Which option would you pick when an employee is removed from a tenant, and why?
+    tags: [jwt, revocation]
+  - id: auth-identity-015
+    level: medium
+    type: concept
+    q: Explain refresh token rotation with reuse detection. How do you implement it and avoid logging out users due to race conditions?
+    hint: |-
+      Mỗi lần refresh: cấp **RT mới**, đánh dấu RT cũ `used`; tất cả RT của một phiên thuộc cùng **family**. Nếu RT đã `used` bị dùng lại → coi như bị đánh cắp → **revoke cả family** (cả attacker và user thật phải login lại).
+      Lưu RT dạng **hash** trong DB: `(id, family_id, user_id, hash, used_at, expires_at, absolute_expires_at)`.
+      Race: hai tab refresh cùng lúc với cùng RT → tab thứ hai bị coi là reuse. Giảm bằng: **grace period** ngắn (vài giây) trả lại cùng cặp token cho RT vừa dùng, hoặc đồng bộ refresh giữa tab (BroadcastChannel/lock), hoặc refresh qua BFF duy nhất.
+      Có absolute lifetime (vd 30 ngày) + idle timeout.
+    followUp: A mobile app on a flaky network sends the refresh request, the server rotates, but the response is lost. What happens?
+    tags: [refresh-token, rotation, security]
+  - id: auth-identity-016
+    level: medium
+    type: concept
+    q: Walk me through the Authorization Code flow with PKCE step by step, and point out where each security parameter is checked.
+    hint: |-
+      1. Client tạo `code_verifier`, `state`, `nonce`, lưu trong session/cookie tạm.
+      2. Redirect `/authorize` với `response_type=code`, `client_id`, **exact** `redirect_uri`, `scope=openid ...`, `state`, `nonce`, `code_challenge`, `S256`.
+      3. User login + consent ở AS → redirect về `redirect_uri?code&state` (có thể kèm `iss` — RFC 9207 chống mix-up).
+      4. Client **check `state`** → POST `/token` với `code`, `code_verifier`, `redirect_uri`, client auth (nếu confidential).
+      5. AS check code chưa dùng, còn hạn (ngắn, ~≤ 1 phút), đúng client, `redirect_uri` khớp, **SHA256(verifier) = challenge**.
+      6. Client verify ID token (chữ ký, `iss`, `aud`, `exp`, **`nonce`**) → tạo session.
+      Code **dùng một lần**; dùng lại → AS nên revoke token đã cấp từ code đó.
+    followUp: What is the OAuth "mix-up attack" and how does the `iss` parameter in the authorization response help?
+    tags: [oauth2, pkce, oidc]
+  - id: auth-identity-017
+    level: medium
+    type: compare
+    q: "`state`, `nonce` and PKCE all look like random values sent in the authorization request. What does each one protect against?"
+    hint: |-
+      - **`state`**: gắn callback với **phiên browser** đã bắt đầu flow → chống **CSRF ở redirect** (attacker ép nạn nhân hoàn tất flow với code của attacker → login CSRF/account linking sai). Cũng dùng mang dữ liệu (return URL) — ký/lưu server-side.
+      - **`nonce`** (OIDC): xuất hiện lại trong **ID token** → chống **ID token replay/injection**; bắt buộc cho implicit/hybrid, khuyến nghị cho code flow.
+      - **PKCE**: gắn **code** với client instance tạo request → chống code interception/injection ở bước token.
+      PKCE cũng chống CSRF ở mức nhất định (RFC 9700 cho phép PKCE thay `state` cho mục đích CSRF nếu AS hỗ trợ PKCE), nhưng thực tế nên dùng cả ba.
+    followUp: Where do you store these values between the redirect and the callback in a server-rendered app?
+    verify: true
+    tags: [oauth2, oidc, pkce, csrf]
+  - id: auth-identity-018
+    level: medium
+    type: concept
+    q: When do you use the Client Credentials grant, and what are its security considerations?
+    hint: |-
+      Machine-to-machine không có user: cron job, service A gọi service B, đối tác tích hợp server-side. Client xác thực trực tiếp với AS (`client_id` + secret, hoặc tốt hơn **`private_key_jwt`**/mTLS) → nhận access token, không có refresh token, không có ID token.
+      Lưu ý: secret là credential dài hạn → secrets manager + rotation; scope tối thiểu per client; `aud` đúng API; token ngắn hạn, cache và tái dùng tới gần hết hạn (đừng xin token mỗi request).
+      Không dùng để "đại diện user" — nếu service cần hành động thay user → token exchange hoặc propagate user token.
+    example: |-
+      ```bash
+      curl -X POST https://auth.example.com/oauth2/token \
+        -u "$CLIENT_ID:$CLIENT_SECRET" \
+        -d grant_type=client_credentials -d scope="inventory:read"
+      ```
+    followUp: How does `private_key_jwt` client authentication improve on a shared client secret?
+    tags: [oauth2, client-credentials, m2m]
+  - id: auth-identity-019
+    level: medium
+    type: concept
+    q: How does the Device Authorization Grant work, and where would you use it?
+    hint: |-
+      Cho thiết bị không có browser/khó nhập liệu (Smart TV, CLI, IoT) — RFC 8628.
+      1. Device POST `/device_authorization` → nhận `device_code`, `user_code` (ngắn, dễ gõ), `verification_uri`, `interval`.
+      2. Hiển thị "vào example.com/activate, nhập ABCD-EFGH" (hoặc QR `verification_uri_complete`).
+      3. Device **poll** `/token` với `grant_type=urn:ietf:params:oauth:grant-type:device_code` theo `interval` → `authorization_pending`, `slow_down`, rồi token.
+      Rủi ro: **phishing device code** (attacker gửi user_code của họ cho nạn nhân để nạn nhân cấp quyền cho thiết bị attacker) → hiển thị rõ tên client/thiết bị trên trang xác nhận, TTL ngắn.
+    followUp: How would you implement `az login`-style CLI authentication for your internal tool?
+    tags: [oauth2, device-flow]
+  - id: auth-identity-020
+    level: medium
+    type: concept
+    q: Why were the Implicit grant and the Resource Owner Password Credentials grant deprecated, and what does OAuth 2.1 change?
+    hint: |-
+      - **Implicit**: token trả trong **URL fragment** → lộ qua history, referrer, extension; không có client authentication, không PKCE, không refresh token an toàn; token injection. Lý do tồn tại (CORS chưa có) không còn.
+      - **ROPC** (password grant): client nhận **password** của user → phá mô hình ủy quyền, không hỗ trợ MFA/SSO/passkey, dạy user nhập password vào app bên thứ ba.
+      RFC 9700 (OAuth 2.0 Security BCP, 01/2025): implicit **SHOULD NOT**, ROPC **MUST NOT**. **OAuth 2.1** (vẫn là IETF draft) gộp BCP: bỏ implicit & password grant, PKCE bắt buộc cho code flow, **exact match** redirect URI, không gửi bearer token trong query string, refresh token của public client phải sender-constrained hoặc rotate.
+    followUp: A legacy mobile app still uses the password grant. How do you migrate it?
+    verify: true
+    tags: [oauth2, oauth21, deprecation]
+  - id: auth-identity-021
+    level: medium
+    type: concept
+    q: How do OIDC discovery and JWKS work, and how should a resource server handle signing key rotation?
+    hint: |-
+      Discovery: `GET {issuer}/.well-known/openid-configuration` → `issuer`, `authorization_endpoint`, `token_endpoint`, `jwks_uri`, thuật toán hỗ trợ… `issuer` trong document phải **đúng bằng** issuer đã cấu hình.
+      JWKS: tập public key, mỗi key có `kid`. Token header có `kid` → chọn key.
+      Rotation đúng: IdP publish key mới **trước** khi dùng (hai key song song), sau đó mới ngừng key cũ. Verifier: **cache JWKS** (theo Cache-Control/TTL), khi gặp `kid` lạ thì **refetch một lần** (có rate limit/cooldown để attacker không ép bạn gọi IdP liên tục), không hardcode key.
+      `jose.createRemoteJWKSet` đã làm cache + cooldown.
+    example: |-
+      ```ts
+      import { createRemoteJWKSet, jwtVerify } from 'jose';
+      const JWKS = createRemoteJWKSet(new URL('https://idp.example.com/.well-known/jwks.json'));
+      const { payload } = await jwtVerify(token, JWKS, {
+        issuer: 'https://idp.example.com',
+        audience: 'orders-api',
+        algorithms: ['RS256'],
+        clockTolerance: 60,
+      });
+      ```
+    followUp: Why must the JWKS URL come from your configuration rather than from a header in the token?
+    tags: [oidc, jwks, key-rotation]
+  - id: auth-identity-022
+    level: medium
+    type: concept
+    q: List every check a relying party must perform on an ID token before trusting it.
+    hint: |-
+      1. Nhận qua kênh back-channel (token endpoint, TLS) trong code flow.
+      2. `alg` nằm trong **allowlist** đã cấu hình (không `none`), key lấy từ **JWKS của issuer đã cấu hình** theo `kid`, verify chữ ký.
+      3. `iss` khớp chính xác issuer.
+      4. `aud` chứa `client_id` của bạn; nếu nhiều audience thì `azp` = client_id.
+      5. `exp` chưa qua (leeway nhỏ), `iat` hợp lý; `nbf` nếu có.
+      6. `nonce` khớp giá trị đã lưu cho request này (và dùng một lần).
+      7. Nếu yêu cầu: `auth_time`/`max_age`, `acr`/`amr` (đã MFA chưa).
+      Sau đó: định danh user bằng **(`iss`, `sub`)**, không bằng email.
+    followUp: Why is `(iss, sub)` the right user key rather than `sub` alone or `email`?
+    tags: [oidc, id-token, validation]
+  - id: auth-identity-023
+    level: medium
+    type: compare
+    q: HS256 vs RS256 vs ES256/EdDSA for signing JWTs — how do you choose?
+    hint: |-
+      - **HS256** (HMAC, shared secret): nhanh, key ngắn; nhưng **mọi bên verify đều có thể ký** → chỉ hợp khi issuer và verifier là **cùng một** service. Secret phải đủ entropy (≥ 256 bit), không phải `"secret"`.
+      - **RS256** (RSA 2048+): verifier chỉ cần public key → hợp khi nhiều service/đối tác verify; token/chữ ký to hơn, ký chậm hơn verify.
+      - **ES256** (ECDSA P-256) / **EdDSA** (Ed25519): chữ ký nhỏ, nhanh; EdDSA deterministic, ít bẫy nonce hơn ECDSA; kiểm tra thư viện/IdP hỗ trợ.
+      Luôn: allowlist đúng **một** họ thuật toán cho mỗi key, publish qua JWKS, rotate.
+    followUp: Why is allowing both HS256 and RS256 for the same key dangerous?
+    tags: [jwt, cryptography]
+  - id: auth-identity-024
+    level: medium
+    type: compare
+    q: SAML 2.0 vs OpenID Connect for enterprise SSO — when do you still need SAML, and what are its classic pitfalls?
+    hint: |-
+      - **SAML**: XML assertion ký bằng XML-DSig, browser POST binding, SP/IdP metadata; phổ biến ở enterprise (ADFS, Okta, Entra ID) và nhiều khách hàng B2B **yêu cầu** SAML.
+      - **OIDC**: JSON/JWT, discovery, hợp mobile/SPA/API, dễ implement hơn.
+      Pitfalls SAML: **XML signature wrapping** (verify chữ ký một element nhưng đọc dữ liệu từ element khác), chấp nhận assertion không ký, không check `Audience`/`Recipient`/`NotOnOrAfter`, replay (thiếu check `InResponseTo`/ID đã dùng), XXE trong parser, IdP-initiated SSO (không có request để đối chiếu).
+      Thực tế: dùng thư viện/broker trưởng thành (Keycloak, Auth0, WorkOS, samlify đã vá) thay vì tự parse XML.
+    followUp: A customer wants IdP-initiated SAML login. What extra risks does that bring?
+    tags: [saml, oidc, sso]
+  - id: auth-identity-025
+    level: medium
+    type: compare
+    q: RBAC vs ABAC vs ReBAC — explain each with an e-commerce or SaaS example and say when you'd move from one to another.
+    hint: |-
+      - **RBAC**: role → permission. "`store_manager` được `order.refund`". Dễ hiểu, dễ audit; bùng nổ role khi có điều kiện ("manager của store 3 chỉ refund < 5 triệu").
+      - **ABAC**: rule theo thuộc tính user/resource/môi trường. "`user.storeId == order.storeId && order.amount < user.refundLimit && time trong giờ làm`". Linh hoạt; khó trả lời "ai có quyền X?".
+      - **ReBAC**: quyền suy ra từ **quan hệ** (graph). "Alice là editor của folder F; doc D nằm trong F → Alice edit D". Tự nhiên cho sharing, hierarchy (org → store → order), Google Zanzibar/OpenFGA/SpiceDB.
+      Thường kết hợp: RBAC làm nền, ABAC điều kiện cho vài action, ReBAC khi có chia sẻ/hierarchy sâu.
+    followUp: With ABAC, how do you answer an auditor asking "list everyone who can refund orders in store 3"?
+    tags: [rbac, abac, rebac, authorization]
+  - id: auth-identity-026
+    level: medium
+    type: concept
+    q: Design the schema for tenant-scoped roles so one user can be an admin in tenant A and a viewer in tenant B, with custom roles per tenant.
+    hint: |-
+      Role gắn với **membership**, không gắn với user:
+      - `users(id, …)` — định danh toàn cục.
+      - `tenants(id, …)`, `memberships(id, user_id, tenant_id, status)` unique `(user_id, tenant_id)`.
+      - `roles(id, tenant_id NULL, key)` — `tenant_id NULL` = role hệ thống, có giá trị = custom role của tenant.
+      - `permissions(key)`, `role_permissions(role_id, permission_key)`, `membership_roles(membership_id, role_id)`.
+      Check: tìm membership của `(user, tenant hiện tại)` → hợp permission của các role → cache theo `(user, tenant)` + invalidate khi đổi.
+      Constraint: custom role của tenant A không được gán cho membership thuộc tenant B (composite FK hoặc check).
+    example: |-
+      ```sql
+      CREATE TABLE memberships (
+        id uuid PRIMARY KEY, user_id uuid NOT NULL, tenant_id uuid NOT NULL,
+        status text NOT NULL DEFAULT 'active', UNIQUE (user_id, tenant_id), UNIQUE (id, tenant_id)
+      );
+      CREATE TABLE roles (id uuid PRIMARY KEY, tenant_id uuid NULL, key text NOT NULL);
+      CREATE TABLE membership_roles (
+        membership_id uuid NOT NULL, tenant_id uuid NOT NULL, role_id uuid NOT NULL REFERENCES roles(id),
+        PRIMARY KEY (membership_id, role_id),
+        FOREIGN KEY (membership_id, tenant_id) REFERENCES memberships (id, tenant_id)
+      );
+      -- app/trigger check: roles.tenant_id IS NULL OR roles.tenant_id = membership_roles.tenant_id
+      ```
+    followUp: Where does the "current tenant" come from on each request, and how do you stop a user from simply changing it?
+    tags: [rbac, multi-tenancy, schema]
+  - id: auth-identity-027
+    level: medium
+    type: compare
+    q: Self-contained JWT access tokens vs opaque tokens with introspection — what are the trade-offs for a platform with 20 microservices?
+    hint: |-
+      - **JWT**: verify local bằng JWKS → không phụ thuộc AS mỗi request, latency thấp, AS sập vẫn chạy tới khi token hết hạn. Nhược: revoke khó, claims stale, lộ claims cho bất kỳ ai cầm token, token to (header mỗi request).
+      - **Opaque + introspection** (RFC 7662): revoke tức thì, không lộ thông tin, token nhỏ; mỗi request (hoặc mỗi lần cache miss) gọi AS → AS thành dependency critical, cần cache ngắn.
+      - Kết hợp phổ biến: **phantom token** — client ngoài dùng opaque token, **gateway** introspect và đổi thành JWT nội bộ cho các service phía sau.
+    followUp: With JWTs, what happens to your platform if the IdP is down for 30 minutes?
+    tags: [jwt, opaque-token, introspection, microservices]
+  - id: auth-identity-028
+    level: medium
+    type: debug
+    q: This middleware has two serious bugs that let attackers forge identities. Find them.
+    example: |-
+      ```ts
+      import jwt from 'jsonwebtoken';
+
+      export function auth(req, res, next) {
+        const token = req.headers.authorization?.split(' ')[1];
+        const claims = jwt.decode(token) as any;          // "we verify at the gateway"
+        if (!claims || claims.exp * 1000 < Date.now()) return res.sendStatus(401);
+        req.user = { id: claims.sub, tenantId: claims.tid, roles: claims.roles };
+        next();
+      }
+
+      // elsewhere, the token service
+      jwt.verify(token, process.env.JWT_KEY!);   // no algorithms option
+      ```
+    hint: |-
+      1. `jwt.decode` **không verify chữ ký** → ai cũng tự tạo token `{sub: 'admin', roles: ['owner']}`. "Gateway đã verify" không đủ: service vẫn bị gọi trực tiếp trong mạng nội bộ (zero trust) hoặc qua SSRF → luôn `verify` (hoặc chỉ tin header nội bộ có mTLS).
+      2. `jwt.verify` không có `algorithms` allowlist → rủi ro **algorithm confusion** (nếu key là RSA public key dạng PEM, token HS256 ký bằng chính public key có thể được chấp nhận ở thư viện/phiên bản cũ; `jsonwebtoken` ≥ 9 đã chặn một phần, nhưng đừng dựa vào default).
+      Fix: `jwt.verify(token, key, { algorithms: ['RS256'], issuer, audience })`, hoặc `jose.jwtVerify` với JWKS; thiếu token → 401 rõ ràng.
+    followUp: Your gateway verifies tokens. How should downstream services receive identity without re-verifying a JWT on every hop — and is that safe?
+    verify: true
+    tags: [jwt, debug, verification]
+  - id: auth-identity-029
+    level: medium
+    type: debug
+    q: "The billing API accepted a token that was issued for the analytics API by the same IdP. Why, and how do you fix it?"
+    example: |-
+      ```ts
+      const { payload } = await jwtVerify(token, JWKS, {
+        issuer: 'https://idp.example.com',
+        algorithms: ['RS256'],
+      });
+      if (!payload.scope?.toString().includes('read')) throw new Forbidden();
+      ```
+    hint: |-
+      Thiếu check **`aud`** → mọi access token hợp lệ từ cùng IdP (cấp cho analytics, cho app bên thứ ba, thậm chí ID token nếu cùng key) đều được billing chấp nhận → **token substitution / confused deputy**; service analytics bị compromise có thể dùng token của user để gọi billing.
+      Bug thứ hai: `scope.includes('read')` khớp chuỗi con — `analytics:read` hay `unread` cũng qua. Tách scope bằng khoảng trắng và so khớp chính xác (`scopes.includes('billing:read')`).
+      Fix: `audience: 'billing-api'`, kiểm tra `typ: at+jwt` (RFC 9068) để loại ID token, scope chính xác, cấu hình IdP phát audience theo resource (resource indicators RFC 8707).
+    followUp: How does an IdP know which audience to put in the token when a client calls several APIs?
+    tags: [jwt, audience, debug]
+  - id: auth-identity-030
+    level: medium
+    type: debug
+    q: Users on the mobile app get randomly logged out, and the security team says refresh tokens are never invalidated. Review this refresh handler.
+    example: |-
+      ```ts
+      app.post('/auth/refresh', async (req, res) => {
+        const rt = await db.refreshToken.findUnique({ where: { token: req.body.refreshToken } });
+        if (!rt || rt.expiresAt < new Date()) return res.sendStatus(401);
+        const newRt = randomToken();
+        await db.refreshToken.create({ data: { token: newRt, userId: rt.userId, expiresAt: addDays(new Date(), 30) } });
+        res.json({ accessToken: signAccess(rt.userId), refreshToken: newRt });
+      });
+      ```
+    hint: |-
+      - RT cũ **không bị đánh dấu used/xoá** → rotation giả: mọi RT từng cấp vẫn dùng được 30 ngày; RT bị lộ dùng mãi, không có reuse detection.
+      - Lưu RT **plaintext** → DB leak = chiếm mọi phiên → lưu hash (SHA-256 của token random đủ entropy).
+      - Mỗi lần refresh gia hạn 30 ngày → phiên **vô hạn**; cần `absolute_expires_at` theo family.
+      - Không check user còn active / còn membership.
+      - "Random logout" thường do race khi app gửi 2 refresh song song (sau khi sửa rotation) → cần grace period hoặc serialize refresh ở client.
+      Fix: transaction: lock RT → nếu `used_at` != null → revoke family; else set `used_at`, tạo RT mới cùng `family_id`.
+    followUp: Write the SQL or Prisma transaction that marks the old token used and detects reuse atomically.
+    tags: [refresh-token, debug, rotation]
+  - id: auth-identity-031
+    level: medium
+    type: debug
+    q: "A store manager in tenant A refunded an order in tenant B. The code checks permissions. What's missing?"
+    example: |-
+      ```ts
+      router.post('/orders/:id/refund', requireAuth, requirePermission('order.refund'), async (req, res) => {
+        const order = await orders.findById(req.params.id);
+        await payments.refund(order.paymentId, order.total);
+        res.json({ ok: true });
+      });
+
+      // requirePermission loads roles for the user across ALL memberships
+      async function userPermissions(userId: string) {
+        return db.query(`SELECT p.key FROM membership_roles mr
+          JOIN memberships m ON m.id = mr.membership_id
+          JOIN role_permissions p ON p.role_id = mr.role_id WHERE m.user_id = $1`, [userId]);
+      }
+      ```
+    hint: |-
+      Hai lỗi:
+      1. Permission được tính trên **mọi tenant** của user → là manager ở A thì có `order.refund` "toàn cục". Phải tính theo **membership của tenant hiện tại** (`WHERE m.user_id = $1 AND m.tenant_id = $2`).
+      2. Không có **object-level check**: `findById` không scope theo tenant → order của B vẫn được load và refund.
+      Fix: resolve tenant context (đã verify membership) → permissions theo `(user, tenant)` → `orders.findById(id, { tenantId })` trả 404 nếu khác tenant → rule nghiệp vụ (trạng thái, hạn mức refund) → audit log.
+    followUp: How would you test this class of bug automatically for every endpoint?
+    tags: [rbac, multi-tenancy, debug, bola]
+  - id: auth-identity-032
+    level: medium
+    type: concept
+    q: What is session fixation, and what should happen to a session on login, privilege change and logout?
+    hint: |-
+      **Session fixation**: attacker cài trước session id đã biết vào browser nạn nhân (qua subdomain, URL param cũ); nạn nhân login → session id đó trở thành đã xác thực → attacker dùng.
+      - **Login**: **regenerate** session id (huỷ id cũ), chỉ set sau khi xác thực.
+      - **Privilege change** (step-up MFA, đổi role, impersonation): regenerate lại.
+      - **Logout**: xoá session **ở server** (không chỉ xoá cookie), clear cookie; nếu dùng IdP → cân nhắc RP-initiated logout.
+      - Đổi password: huỷ mọi session khác (tuỳ chọn cho user).
+      Timeout: idle + absolute.
+    followUp: With JWTs instead of sessions, what's the equivalent of "destroy the session on logout"?
+    tags: [session, session-fixation]
+  - id: auth-identity-033
+    level: medium
+    type: concept
+    q: What is the Backend-for-Frontend (BFF) pattern for SPAs, and what problems does it solve and create?
+    hint: |-
+      BFF = server-side component (Next.js route handler, Express) cùng site với SPA, đóng vai **confidential OAuth client**: thực hiện Auth Code + PKCE, **giữ access/refresh token ở server**, browser chỉ có **session cookie HttpOnly, Secure, SameSite**; BFF proxy API call và gắn token.
+      Giải quyết: token không bao giờ vào JS → XSS không exfiltrate được token; refresh xử lý tập trung; client secret/`private_key_jwt` được.
+      Tạo ra: thêm hop/latency, BFF phải scale và chịu tải proxy, cần CSRF defense (cookie!), session store; XSS vẫn gọi API **qua** BFF trong phiên.
+      IETF "OAuth 2.0 for Browser-Based Apps" xếp BFF là phương án an toàn nhất.
+    followUp: How does a Next.js app implement a BFF, and where are tokens stored?
+    verify: true
+    tags: [bff, spa, oauth2]
+  - id: auth-identity-034
+    level: medium
+    type: concept
+    q: How do passkeys (WebAuthn) work, and why are they phishing-resistant?
+    hint: |-
+      Đăng ký: authenticator (điện thoại, laptop, security key) tạo **cặp key riêng cho RP ID** (domain), gửi public key + credential id cho server. Đăng nhập: server gửi **challenge** ngẫu nhiên → authenticator ký (sau khi user verify bằng biometric/PIN) → server verify bằng public key, kiểm tra `rpIdHash`, **origin**, challenge, counter/flags.
+      Phishing-resistant vì browser chỉ cho dùng credential cho **đúng RP ID** — trang `shop-login.evil` không thể yêu cầu credential của `shop.com`; không có secret dùng chung để lộ ở server.
+      Synced passkeys (iCloud/Google Password Manager) vs device-bound (security key) — trade-off recovery vs assurance. Cần luồng **account recovery** không phá tính an toàn.
+    followUp: What does your account recovery flow look like if a user loses all their passkeys?
+    tags: [passkeys, webauthn, mfa]
+  - id: auth-identity-035
+    level: hard
+    type: gotcha
+    q: "Explain the `alg: none` and algorithm-confusion (RS256 → HS256) attacks on JWT. Why do they still appear in 2026?"
+    hint: |-
+      - **`alg: none`**: attacker sửa header thành `none`, bỏ chữ ký; verifier "tin header" chấp nhận token không ký.
+      - **Algorithm confusion**: server dùng RSA, public key công khai. Attacker ký token bằng **HS256 với public key (PEM) làm HMAC secret**; thư viện chọn thuật toán theo header và dùng cùng "key" → chữ ký hợp lệ.
+      Vẫn xuất hiện vì: code tự viết/thư viện cũ, verify với key lấy theo `alg` trong header, hỗ trợ "mọi thuật toán cho linh hoạt", key object không gắn thuật toán.
+      Phòng: **allowlist `algorithms`** gắn cố định với key (RFC 8725), key typing (JWK có `alg`/`kty`), thư viện hiện đại (`jose`) từ chối key sai loại, test âm tính trong CI.
+    followUp: Write a unit test that proves your API rejects an `alg none` token.
+    tags: [jwt, attacks]
+  - id: auth-identity-036
+    level: hard
+    type: gotcha
+    q: What are the `kid`, `jku` and `x5u` header attacks on JWT verification?
+    hint: |-
+      Header JWT do **attacker kiểm soát** trước khi verify:
+      - **`jku`/`x5u`**: URL tới JWKS/cert → verifier "tiện" fetch key từ URL trong token → attacker trỏ về JWKS của họ → token tự ký hợp lệ; cũng là **SSRF**.
+      - **`kid` injection**: `kid` dùng để tra key trong DB/file → SQLi (`kid: "x' UNION SELECT 'secret'--"`), path traversal (`kid: "../../dev/null"` → key rỗng với HMAC).
+      - **`jwk` embedded**: token mang luôn public key để verify chính nó.
+      Phòng: key chỉ từ **JWKS URL cấu hình sẵn cho issuer**, bỏ qua `jku/x5u/jwk` trong token; `kid` chỉ là key lookup trong map đã load; issuer allowlist trước khi chọn JWKS.
+    followUp: Your service accepts tokens from three IdPs. How do you pick the right JWKS safely?
+    tags: [jwt, attacks, ssrf]
+  - id: auth-identity-037
+    level: hard
+    type: scenario
+    q: "At 10:05 every API starts returning 401 with \"no matching key found\". The IdP team rotated signing keys at 10:00. What went wrong and how do you fix it now and permanently?"
+    hint: |-
+      Nguyên nhân khả dĩ: verifier **cache JWKS vô thời hạn**/hardcode public key; không refetch khi gặp `kid` lạ; IdP rotate **không có overlap** (dùng key mới ngay khi publish); cache JWKS ở CDN/proxy với TTL dài; cooldown refetch quá dài.
+      Ngay: restart/flush cache JWKS (hoặc IdP tạm thời ký lại bằng key cũ nếu có thể).
+      Lâu dài: dùng thư viện JWKS có cache + refetch-on-unknown-kid + cooldown; IdP publish key mới **trước N giờ** rồi mới dùng, giữ key cũ tới khi token cũ hết hạn; monitor tỷ lệ 401 theo lý do; runbook rotation có kiểm thử trên staging.
+    followUp: How long must the old key stay in the JWKS after rotation?
+    tags: [scenario, jwks, key-rotation]
+  - id: auth-identity-038
+    level: hard
+    type: scenario
+    q: Your reuse-detection alert fires — a refresh token family was used from two countries within a minute. What does the system do automatically, and what do you do as the engineer on call?
+    hint: |-
+      Tự động: revoke **cả family**, huỷ access token còn hiệu lực nếu có cơ chế (denylist `jti`/`session_id`), buộc re-login + (tuỳ) MFA, notify user ("phát hiện đăng nhập bất thường").
+      On call: xác định có phải false positive (race nhiều tab/app retry, VPN) hay thật; nếu nhiều family cùng lúc → nghi ngờ **nguồn lộ chung** (XSS đọc token, malware extension, log chứa token, SDK bên thứ ba); kiểm tra hành động đã làm bằng token bị lạm dụng (audit log), rollback nếu cần.
+      Sửa gốc: chuyển sang BFF/HttpOnly, sender-constrained token (DPoP), rút ngắn TTL, bỏ token khỏi log.
+    followUp: How would DPoP have changed the impact of this theft?
+    tags: [scenario, refresh-token, incident-response]
+  - id: auth-identity-039
+    level: hard
+    type: scenario
+    q: A customer removes an employee from their tenant, but the employee keeps accessing tenant data for up to an hour. Why, and how do you close the gap?
+    hint: |-
+      Quyền/tenant nằm trong **claims của JWT** (hoặc cache permission TTL dài) → vẫn hợp lệ tới `exp`; refresh token vẫn đổi được token mới nếu refresh không kiểm tra lại membership.
+      Fix theo lớp:
+      - Access token ngắn (5–10') và refresh **luôn re-check** membership/status.
+      - Không đặt permission chi tiết vào token; lấy từ **cache `(user, tenant)`** có invalidation qua event `membership.removed`.
+      - Revoke tức thì: tăng `authz_version` của membership (claim so với cache), hoặc denylist session; ngắt WebSocket đang mở.
+      - SSO enterprise: SCIM deprovisioning + back-channel logout từ IdP của khách.
+      Nói rõ SLA: "revocation hiệu lực trong ≤ N giây".
+    followUp: What's the cost of checking membership on every request, and how do you keep it under 1 ms?
+    tags: [scenario, revocation, multi-tenancy]
+  - id: auth-identity-040
+    level: hard
+    type: concept
+    q: Explain the Zanzibar model (relationship tuples, check, and the "new enemy" problem). When would you adopt OpenFGA or SpiceDB?
+    hint: |-
+      Zanzibar (Google, 2019): quyền lưu dạng **tuple** `object#relation@subject` (`doc:readme#viewer@user:alice`, `doc:readme#parent@folder:eng`), **namespace config** định nghĩa relation suy ra (`viewer = direct viewer ∪ editor ∪ viewer of parent`). API: `Check`, `Expand`, `ListObjects`/`LookupResources`, `Write`.
+      **New enemy problem**: xoá Bob khỏi ACL rồi thêm nội dung mới → check trên replica cũ vẫn cho Bob xem nội dung mới. Zanzibar dùng **zookie** (consistency token) để check "ít nhất mới bằng" snapshot của lần sửa nội dung.
+      Adopt OpenFGA/SpiceDB khi: sharing tới user/nhóm, hierarchy sâu (org → workspace → project → doc), nhiều service cần một nguồn quyền. Chi phí: đồng bộ tuple với DB nghiệp vụ (dual write → outbox), latency, vận hành thêm một hệ thống, **list filtering** khó.
+    followUp: How do you return a paginated list of 10,000 documents filtered to only what the user can view?
+    tags: [rebac, zanzibar, openfga]
+  - id: auth-identity-041
+    level: hard
+    type: compare
+    q: Compare OPA (Rego), Cedar, Casbin and OpenFGA as policy engines. Which would you choose for a Node.js multi-tenant platform?
+    hint: |-
+      - **OPA/Rego**: engine general-purpose (CNCF graduated), policy-as-code dùng cho cả K8s admission, API authz; Rego mạnh nhưng khó học; chạy sidecar/library (WASM), cần đẩy data vào.
+      - **Cedar** (AWS, open source): ngôn ngữ chuyên cho authz (RBAC + ABAC), cú pháp dễ đọc, **phân tích/verify được** policy, SDK Rust/WASM (có binding JS), Amazon Verified Permissions là bản managed.
+      - **Casbin**: thư viện nhúng nhiều ngôn ngữ (node-casbin), model PERM cấu hình (RBAC có domain/tenant, ABAC), đơn giản; policy lưu DB qua adapter.
+      - **OpenFGA/SpiceDB**: ReBAC kiểu Zanzibar, service riêng, mạnh cho sharing/hierarchy.
+      Chọn: RBAC theo tenant + vài điều kiện → Casbin hoặc code tự viết + bảng; nhiều service/nhiều team, cần audit policy → Cedar/OPA; chia sẻ phức tạp → OpenFGA. Tiêu chí: latency, data locality, testability, ai viết policy.
+    followUp: Where does the data (roles, resource attributes) come from when the policy engine makes a decision?
+    verify: true
+    tags: [policy-engine, opa, cedar, casbin, openfga]
+  - id: auth-identity-042
+    level: hard
+    type: concept
+    q: In a microservices system, service A receives a user request and must call service B on the user's behalf. How do you propagate identity securely?
+    hint: |-
+      Phương án:
+      - **Forward access token của user**: đơn giản; nhưng token phải có `aud` chứa B (hoặc audience rộng — kém an toàn), B nhận toàn quyền của token.
+      - **Token exchange (RFC 8693)**: A đổi token user lấy token mới cho `aud=B`, scope hẹp, có claim `act` (A đang hành động thay user) → least privilege, audit rõ.
+      - **Internal signed context**: gateway verify token ngoài, phát JWT nội bộ ngắn hạn (user, tenant, permissions) ký bằng key nội bộ; service verify + **mTLS** giữa service (service identity).
+      Tránh: header `X-User-Id` không ký mà service tin vì "nằm trong mạng nội bộ".
+      Với Kafka event: đưa `actor_id`, `tenant_id` vào event (đã xác thực tại producer), consumer **không** tái sử dụng token user (có thể đã hết hạn).
+    followUp: How do you authorize a Kafka consumer's action that was triggered by a user event hours earlier?
+    tags: [microservices, token-exchange, zero-trust]
+  - id: auth-identity-043
+    level: hard
+    type: concept
+    q: What are sender-constrained tokens (DPoP, mTLS-bound tokens), and what attack do they mitigate that bearer tokens can't?
+    hint: |-
+      Bearer token = ai cầm cũng dùng được → token bị lộ (log, XSS, proxy) là bị lạm dụng.
+      **Sender-constrained**: token gắn với key của client; khi dùng phải chứng minh sở hữu private key.
+      - **DPoP** (RFC 9449): client tạo keypair (có thể non-extractable WebCrypto), mỗi request gửi header `DPoP` = JWT ký chứa `htm`, `htu`, `iat`, `jti` (+ `ath` hash của access token); token có `cnf.jkt` = thumbprint key. Server check chữ ký, method/URL, chống replay theo `jti`.
+      - **mTLS** (RFC 8705): token gắn thumbprint certificate client (`cnf.x5t#S256`) — hợp server-to-server.
+      Không chống được XSS gọi API **ngay trong** browser, nhưng chống **exfiltrate rồi dùng nơi khác**. OAuth 2.1 yêu cầu refresh token của public client phải sender-constrained hoặc rotate.
+    followUp: What does the server need to store to prevent DPoP proof replay, and for how long?
+    verify: true
+    tags: [dpop, mtls, tokens]
+  - id: auth-identity-044
+    level: hard
+    type: concept
+    q: How does logout work with OIDC and SSO? Compare RP-initiated, front-channel and back-channel logout.
+    hint: |-
+      Có ít nhất 3 session: **session app (RP)**, **session IdP**, và token đã cấp.
+      - **RP-initiated logout**: app xoá session của mình rồi redirect tới `end_session_endpoint` (`id_token_hint`, `post_logout_redirect_uri`) → IdP kết thúc session SSO.
+      - **Front-channel**: IdP render iframe tới `frontchannel_logout_uri` của từng RP — phụ thuộc browser, **third-party cookie bị chặn** làm nó không đáng tin.
+      - **Back-channel**: IdP POST **logout token** (JWT, có `sid`/`sub`, event `http://schemas.openid.net/event/backchannel-logout`) tới server của RP → RP xoá session tương ứng. Đáng tin nhất, cần RP map `sid` → session.
+      Và: revoke refresh token (RFC 7009); access token JWT còn sống tới `exp`.
+    followUp: Your app uses stateless JWT sessions. How do you honor a back-channel logout?
+    tags: [oidc, logout, sso]
+  - id: auth-identity-045
+    level: hard
+    type: gotcha
+    q: What is account pre-hijacking in social login, and how should account linking between email/password and "Sign in with Google" work?
+    hint: |-
+      **Pre-hijacking**: attacker đăng ký trước bằng email nạn nhân (không verify) + password của attacker; sau đó nạn nhân "Sign in with Google" cùng email → hệ thống **auto-merge** → attacker vẫn login bằng password và thấy dữ liệu nạn nhân. Biến thể: IdP không verify email/cho phép đổi email tuỳ ý → chiếm account bằng email claim.
+      Đúng:
+      - Khoá định danh là `(iss, sub)` trong bảng identities, **không phải email**.
+      - Chỉ auto-link khi email **đã verify ở cả hai phía** và provider đáng tin cho domain đó; an toàn nhất: yêu cầu user đã đăng nhập tài khoản hiện có (hoặc xác minh qua email) rồi mới liên kết.
+      - Tài khoản email/password chưa verify → không cho merge; khi link, vô hiệu hoá session/password cũ chưa verify.
+    followUp: Microsoft Entra ID multi-tenant apps have had issues with the `email` claim. Why is `email` from some IdPs not trustworthy?
+    verify: true
+    tags: [account-linking, oauth2, oidc]
+  - id: auth-identity-046
+    level: hard
+    type: concept
+    q: "Checking permission for one resource is easy. How do you enforce authorization on list and search endpoints (e.g., \"orders I can see\") efficiently?"
+    hint: |-
+      Không thể "load 10 000 rồi check từng cái" (chậm, phá pagination).
+      - **Chuyển policy thành filter**: RBAC theo tenant/store → `WHERE tenant_id = $t AND store_id = ANY($allowedStores)`; ABAC đơn giản → điều kiện SQL/ES query sinh từ policy (OPA partial evaluation, Cedar/Casbin filter).
+      - **Precompute**: bảng `user_resource_access` hoặc ES field `allowed_principals` (denormalized ACL) — cập nhật khi quyền đổi.
+      - **ReBAC**: `ListObjects`/`LookupResources` rồi `WHERE id IN (...)` (giới hạn kích thước) hoặc đồng bộ ACL vào index.
+      - Kết hợp: filter thô ở DB + check chi tiết trên trang kết quả (có thể làm trang ngắn hơn page size — xử lý bằng over-fetch).
+      Count/aggregation cũng phải áp filter (không lộ "có 57 kết quả").
+    followUp: How do you keep denormalized ACLs in Elasticsearch in sync when a role changes?
+    tags: [authorization, search, performance]
+  - id: auth-identity-047
+    level: hard
+    type: gotcha
+    q: Tokens are rejected intermittently with "jwt not active" or "jwt expired" right after login on some pods. What's going on?
+    hint: |-
+      **Clock skew**: đồng hồ pod/VM lệch so với IdP → token có `iat`/`nbf` "trong tương lai" (pod chậm) hoặc `exp` đã qua sớm (pod nhanh). Thường gặp với container trên host không chạy NTP, VM resume từ suspend, laptop dev.
+      Fix: NTP/chrony trên mọi node (cloud time sync), **leeway** nhỏ khi verify (`clockTolerance: 30–60s`), monitor clock offset.
+      Không fix bằng cách tăng leeway lên phút/giờ (mở cửa cho token hết hạn).
+      Liên quan: TTL token quá ngắn (1 phút) + skew → lỗi thường xuyên; refresh chủ động trước `exp` (ví dụ còn 60s).
+    followUp: How would you detect clock skew from your metrics before users notice?
+    tags: [jwt, clock-skew]
+  - id: auth-identity-048
+    level: hard
+    type: compare
+    q: You're adopting Keycloak for a multi-tenant SaaS. Realm per tenant vs a single realm with groups/organizations — what are the trade-offs?
+    hint: |-
+      - **Realm per tenant**: cô lập mạnh (user, IdP federation, theme, policy riêng), tenant tự cấu hình SSO; nhưng **số realm lớn** (hàng nghìn) gây vấn đề hiệu năng/khởi động/admin, migration cấu hình N lần, user dùng nhiều tenant phải có nhiều tài khoản.
+      - **Single realm** + groups hoặc **Organizations** (tính năng organizations của Keycloak 25/26) để mô hình tenant, IdP per organization (identity-first login theo domain email), token có claim tổ chức; một user nhiều tenant tự nhiên hơn. Cô lập yếu hơn, cấu hình per tenant hạn chế hơn.
+      Thường: single realm + organization cho đa số, realm riêng cho khách enterprise đặc biệt. Kiểm tra version đang dùng và giới hạn số realm được khuyến nghị.
+      Authorization chi tiết (resource-level) thường **vẫn nằm ở app**, Keycloak lo authN + role thô.
+    followUp: Would you use Keycloak Authorization Services for resource-level checks, or keep them in your app? Why?
+    verify: true
+    tags: [keycloak, multi-tenancy, sso]
+  - id: auth-identity-049
+    level: hard
+    type: scenario
+    q: A security researcher shows that a malicious app on Android can capture your mobile app's OAuth redirect. How is that possible and what's the fix?
+    hint: |-
+      App dùng **custom URI scheme** (`myshop://callback`) — bất kỳ app nào cũng có thể đăng ký cùng scheme → OS có thể giao redirect (chứa `code`) cho app độc. Nếu không có PKCE → app độc đổi code lấy token.
+      Fix: **PKCE bắt buộc** (code bị chặn vô dụng); dùng **claimed HTTPS redirect** (Android App Links / iOS Universal Links đã verify domain); mở flow trong **system browser/Custom Tabs/ASWebAuthenticationSession** (RFC 8252), không dùng WebView nhúng (app đọc được credential); AS kiểm tra redirect URI **exact match**.
+      Mobile là **public client** → không nhúng client secret (bị giải nén từ APK).
+    followUp: Why is an embedded WebView worse than the system browser for OAuth, beyond the redirect issue?
+    tags: [scenario, mobile, pkce, oauth2]
+  - id: auth-identity-050
+    level: hard
+    type: concept
+    q: Permission checks hit the database on every request and add 15 ms. How do you cache authorization decisions without creating security holes?
+    hint: |-
+      - Cache **input của quyết định** (permissions của `(user, tenant)`, role version) thay vì từng quyết định `(user, resource, action)` → ít key, dễ invalidate.
+      - Hai tầng: in-process LRU TTL ngắn (vài giây) + Redis; key có **tenant** và **version**.
+      - Invalidation: event khi đổi role/membership/role_permissions → bump `authz_version:{tenant}:{user}` hoặc version của role → key cũ tự hết giá trị.
+      - Bảo mật: fail-closed khi cache/DB lỗi cho action nhạy cảm; TTL tối đa là cửa sổ revoke chấp nhận được; không cache quyết định "deny do lỗi".
+      - Object-level (resource thuộc tenant) vẫn check trong query — không cache.
+    followUp: A role's permissions change and 50,000 users hold that role. How does your invalidation scale?
+    tags: [authorization, caching, performance]
+  - id: auth-identity-051
+    level: hard
+    type: debug
+    q: "The authorization server validates redirect URIs like this. How can an attacker steal authorization codes?"
+    example: |-
+      ```ts
+      function isAllowedRedirect(client: Client, redirectUri: string) {
+        return client.redirectUris.some((allowed) => redirectUri.startsWith(allowed));
+      }
+      // registered: https://shop.example.com/callback
+      ```
+    hint: |-
+      So khớp **prefix** cho qua những URI khác với URI đã đăng ký:
+      - `https://shop.example.com/callback/../promo?next=https://evil.com` hoặc `…/callback?next=//evil.com` → kết hợp một **open redirect** trên site, `code` trong query bị chuyển tiếp tới attacker (qua redirect hoặc header `Referer`).
+      - Nếu client đăng ký `https://shop.example.com` (không có path) thì `https://shop.example.com.evil.com/cb` cũng khớp prefix → code gửi thẳng tới domain của attacker.
+      Fix: **exact string match** (RFC 9700, OAuth 2.1), chỉ cho phép đăng ký URI đầy đủ; localhost native app: cho phép port động theo RFC 8252. Kèm PKCE + `Referrer-Policy` trên trang callback + không có open redirect.
+    followUp: How do you support preview deployments with dynamic URLs (e.g., per-PR domains) without wildcards?
+    tags: [oauth2, redirect-uri, debug]
+  - id: auth-identity-052
+    level: senior
+    type: design
+    q: Design authentication for a multi-tenant B2B SaaS where some tenants bring their own IdP (Okta, Entra ID via OIDC or SAML) and others use email/password or Google.
+    hint: |-
+      - **Identity-first login**: user nhập email → tra domain/tenant → điều hướng tới IdP của tenant (home realm discovery) hoặc form password/Google.
+      - **Broker**: dùng Keycloak/Auth0/WorkOS/Cognito làm identity broker để ứng dụng chỉ nói OIDC với một issuer; broker federation SAML/OIDC per tenant.
+      - **Identity model**: `users` + `identities(provider, iss, sub)` + `memberships`; JIT provisioning khi login SSO lần đầu, **SCIM** cho provisioning/deprovisioning.
+      - **Policy per tenant**: enforce SSO (chặn password cho domain đó), MFA bắt buộc, session lifetime, allowed domains.
+      - **Tokens**: app nhận token từ broker với claim tenant (org), app vẫn check membership.
+      - **Failure**: IdP khách sập → không login được (nói rõ trong SLA), break-glass admin account; domain verification (DNS TXT) để tenant không "claim" domain người khác.
+    followUp: A user's email domain belongs to tenant A's SSO, but they were also invited to tenant B as a guest. Where do they log in?
+    tags: [design, sso, multi-tenancy, federation]
+  - id: auth-identity-053
+    level: senior
+    type: design
+    q: Design a central authorization approach for 15 microservices so that policies are consistent but each service stays fast and available.
+    hint: |-
+      - Tách **PDP** (decision) khỏi **PEP** (enforcement trong mỗi service).
+      - Lựa chọn: library nhúng + policy/data phân phối (OPA bundle, Cedar policy store, Casbin + DB) → latency thấp, chịu được PDP sập; vs authz service trung tâm (OpenFGA, custom) → nhất quán, thêm hop → cần cache + timeout + fail-closed.
+      - Data: role/membership từ identity service qua event → cache local; resource attributes do service owner cung cấp lúc check.
+      - Coarse-grained ở gateway (authenticated, scope), fine-grained trong service (object-level).
+      - Governance: policy-as-code trong git, test, review, versioning; decision log để audit.
+      - Nêu trade-off: nhất quán vs availability, độ tươi của quyền vs latency.
+    followUp: How do you roll out a policy change safely across all services?
+    tags: [design, authorization, microservices, policy-engine]
+  - id: auth-identity-054
+    level: senior
+    type: open
+    q: Your company has a homegrown JWT auth (HS256 shared secret across 8 services, 24-hour tokens, no refresh). How do you migrate to an OIDC provider without a big-bang cutover?
+    hint: |-
+      - Rủi ro hiện tại: mọi service có secret → mọi service **ký** được token; không revoke; token 24h.
+      - Bước: dựng IdP (managed/Keycloak) → services chấp nhận **cả hai issuer** trong giai đoạn chuyển (verify theo `iss` → key tương ứng, allowlist) → client mới login qua OIDC (Code + PKCE/BFF) → access token ngắn + refresh rotation → migrate user (password hash import nếu IdP hỗ trợ, hoặc lazy migration khi login) → tắt issuer cũ, rotate secret cũ.
+      - Đo: tỷ lệ traffic theo issuer, lỗi 401; feature flag theo client/tenant; rollback plan.
+      - Communicate với team mobile (release cycle chậm) — hỗ trợ version cũ tới hạn định.
+    followUp: How do you migrate password hashes into the new IdP if it doesn't support your hash format?
+    tags: [migration, oidc, jwt, judgment]
+  - id: auth-identity-055
+    level: senior
+    type: open
+    q: Build vs buy for identity — Auth0/Okta CIC, Cognito, Keycloak self-hosted, or your own. How do you decide?
+    hint: |-
+      Tiêu chí: yêu cầu enterprise SSO/SAML/SCIM, số MAU và **mô hình giá** (managed đắt nhanh ở B2C lớn), data residency/compliance, tuỳ biến UX login, đa tenant (organizations), năng lực vận hành (Keycloak cần HA, upgrade, backup, security patch), lock-in (export password hash được không?), SLA.
+      Gợi ý: không tự viết IdP (password reset, MFA, brute-force protection, OIDC compliance là việc lớn và dễ sai); buy/managed khi team nhỏ; Keycloak khi cần self-host/chi phí/tuỳ biến và có người vận hành; tự viết chỉ phần **authorization** nghiệp vụ.
+      Luôn đặt app phía sau chuẩn OIDC để có thể đổi provider.
+    followUp: What's the exit plan if the managed provider triples its price next year?
+    tags: [build-vs-buy, identity, judgment]
+  - id: auth-identity-056
+    level: senior
+    type: design
+    q: Design the rollout of passkeys for an e-commerce site with 5 million existing password users.
+    hint: |-
+      - **Enroll dần**: đề nghị tạo passkey sau khi login thành công/checkout, trong settings; không ép.
+      - **Login UX**: conditional UI (autofill passkey trong ô username), fallback password + OTP; identifier-first để biết user có passkey.
+      - **Server**: bảng `webauthn_credentials(user_id, credential_id, public_key, sign_count, transports, backup_eligible, backup_state, created_at, last_used_at)`; thư viện đã kiểm chứng (SimpleWebAuthn); RP ID = domain gốc để dùng được cho subdomain.
+      - **Recovery**: passkey synced giảm mất mát; recovery bằng email + step-up, không để recovery yếu hơn phá lợi ích.
+      - **Đo**: tỷ lệ enroll, tỷ lệ login bằng passkey, giảm ATO/support ticket.
+      - Cân nhắc: sau một thời gian cho user **tắt password** (passwordless thật).
+    followUp: What is conditional mediation (passkey autofill), and why does it improve adoption?
+    verify: true
+    tags: [passkeys, webauthn, design]
+  - id: auth-identity-057
+    level: senior
+    type: design
+    q: Design API keys for third-party developers integrating with your platform — creation, storage, scoping, rotation and abuse handling.
+    hint: |-
+      - Format: prefix nhận dạng + random ≥ 128 bit (`sk_live_…`) → dễ secret-scan (đăng ký pattern với GitHub), phân biệt môi trường.
+      - Lưu **hash** (SHA-256 đủ vì key có entropy cao), chỉ hiển thị một lần; lưu `last4`, `created_by`, `last_used_at`.
+      - Scope + tenant + (tuỳ) IP allowlist; key thuộc **app/integration**, không thuộc cá nhân nhân viên.
+      - Rotation: cho phép 2 key active song song, expiry, revoke tức thì (lookup hash có cache ngắn).
+      - Abuse: rate limit/quota per key, alert khi dùng từ vị trí lạ, auto-revoke khi phát hiện key lộ public (secret scanning partner).
+      - Cân nhắc OAuth client credentials cho đối tác lớn (token ngắn hạn thay vì key dài hạn).
+    followUp: Why is a fast hash acceptable for API keys but not for passwords?
+    tags: [api-keys, design]
+  - id: auth-identity-058
+    level: senior
+    type: design
+    q: How do you authenticate service-to-service calls in a zero-trust setup on Kubernetes? Compare shared secrets, mTLS via service mesh, and OAuth client credentials.
+    hint: |-
+      - **Shared secret/API key nội bộ**: đơn giản, nhưng dài hạn, khó rotate, không có identity rõ ràng.
+      - **mTLS với service mesh** (Istio/Linkerd, SPIFFE ID): identity workload tự động, cert ngắn hạn tự xoay, mã hoá in-transit; authorization policy theo service identity (A được gọi B). Chi phí vận hành mesh.
+      - **OAuth client credentials / workload identity federation**: JWT có `aud`, scope; hợp khi gọi qua ranh giới cluster/cloud, API bên ngoài.
+      Thực tế: mTLS cho "ai đang gọi" + token người dùng/đã exchange cho "thay mặt ai" + authorization trong service. Không tin mạng nội bộ.
+    followUp: How do you still enforce per-user authorization when a request passes through three services?
+    tags: [zero-trust, mtls, service-mesh, m2m]
+  - id: auth-identity-059
+    level: cv
+    type: design
+    q: You built RBAC and permission checks on a multi-tenant platform. Can one user hold different roles in two tenants? Show the schema you used and how a request resolves its effective permissions.
+    hint: |-
+      Câu trả lời mạnh có:
+      - Schema thật: role gắn với **membership (user, tenant)** hay gắn với user (nếu gắn với user — nói rõ hạn chế và bạn sẽ đổi thế nào).
+      - Luồng request: token → user → tenant hiện tại (nguồn: subdomain/header/claim) → **kiểm tra membership** → load permission (cache?) → check permission → check object thuộc tenant.
+      - Role hệ thống vs custom role per tenant; ai được gán role (tránh privilege escalation: manager không tự gán owner).
+      - Trên SQL Server: index, query, cache Redis cho permission.
+      (điền số liệu thật của bạn: số role, số permission, latency của check)
+    followUp: How did you prevent a tenant admin from granting themselves a permission that only platform operators should have?
+    tags: [cv, rbac, multi-tenancy, schema]
+  - id: auth-identity-060
+    level: cv
+    type: scenario
+    q: You implemented auth flows with JWT and OAuth. Walk me through token lifetimes, where tokens lived in the browser, and how refresh worked.
+    hint: |-
+      Câu trả lời mạnh có:
+      - TTL access token/refresh token và lý do.
+      - Lưu ở đâu (cookie HttpOnly? memory? localStorage?) — nếu từng dùng localStorage, nói thẳng rủi ro và hướng cải thiện (BFF).
+      - Refresh: rotation có/không, reuse detection có/không, xử lý nhiều tab/request song song (queue refresh trong axios interceptor).
+      - Ký bằng thuật toán gì, key quản lý thế nào, verify ở gateway hay từng service, check `aud`/`iss`.
+      - Logout/revoke hoạt động ra sao.
+      (điền số liệu thật của bạn)
+    followUp: What would you change in that design today, knowing RFC 9700 and the BFF recommendation?
+    tags: [cv, jwt, oauth2, refresh-token]
+  - id: auth-identity-061
+    level: cv
+    type: scenario
+    q: You integrated Google OAuth. Which flow did you use, what did you validate on the ID token, and how did you map the Google identity to users and tenants?
+    hint: |-
+      Câu trả lời mạnh có:
+      - Flow: Auth Code (+ PKCE) phía server hay Google Identity Services (ID token trực tiếp ở frontend → backend verify) — nói rõ và vì sao.
+      - Validate: chữ ký qua JWKS Google, `iss` (`accounts.google.com` / `https://accounts.google.com`), `aud` = client id, `exp`, `nonce`/`state`, `email_verified`, `hd` nếu giới hạn domain Workspace.
+      - Mapping: bảng identities theo `sub`; linking với account email/password; user mới → tạo user nhưng **chưa** có membership tenant (invite/approval).
+      - Token của Google có được lưu không (chỉ khi cần gọi Google API; refresh token Google lưu mã hoá).
+      (điền số liệu thật của bạn)
+    followUp: Why is checking the `hd` claim alone not enough to restrict login to a company's Google Workspace?
+    verify: true
+    tags: [cv, google-oauth, oidc]
+  - id: auth-identity-062
+    level: cv
+    type: scenario
+    q: You enforced permission checks across APIs and business resources. Give me one resource where a simple role check wasn't enough and explain the rule you implemented.
+    hint: |-
+      Câu trả lời mạnh có:
+      - Ví dụ cụ thể (vd: refund chỉ cho order của store mình quản lý, address chỉ chủ sở hữu hoặc staff CS của tenant, shift chỉ manager của location).
+      - Rule dạng ABAC/ownership: điều kiện trên thuộc tính resource + user.
+      - Nơi đặt: service/policy function, testable; áp dụng cả cho list endpoint (filter).
+      - Cách test và audit.
+      (điền số liệu thật của bạn)
+    followUp: How did the same rule get applied to the list/search endpoint for that resource?
+    tags: [cv, authorization, abac]
+  - id: auth-identity-063
+    level: cv
+    type: design
+    q: On your multi-tenant platform, how did a user switch between tenants in the UI? Was the tenant in the token, in a header, or in the URL — and why?
+    hint: |-
+      Câu trả lời mạnh có:
+      - Cách đã làm và trade-off:
+        - **Token per tenant** (claim `tid`, đổi tenant = xin token mới) → server tin claim, nhưng thêm round trip, token cần re-issue khi đổi quyền.
+        - **Header/URL** (`/t/{tenant}/…` hoặc `X-Tenant-Id`) + server **luôn kiểm tra membership** → linh hoạt, nhiều tab nhiều tenant.
+      - Cache, CSRF (nếu cookie), deep link, bookmark.
+      - Sai lầm cần tránh: tin tenant từ client mà không check membership.
+      (điền số liệu thật của bạn)
+    followUp: A user has two browser tabs open on two tenants. What happens in your design?
+    tags: [cv, multi-tenancy, tenant-context]
+  - id: auth-identity-064
+    level: cv
+    type: scenario
+    q: When a tenant admin changed a user's role on your platform, how quickly did it take effect, and how did you propagate the change?
+    hint: |-
+      Câu trả lời mạnh có:
+      - Quyền nằm trong JWT hay tra DB/cache → độ trễ hiệu lực (tới khi token hết hạn? tới khi cache TTL?).
+      - Cơ chế invalidation: xoá cache `(user, tenant)`, version, event.
+      - Trường hợp bị hạ quyền/xoá khỏi tenant: có revoke refresh token/session không, có ngắt kết nối realtime không.
+      - SLA revocation bạn đặt ra và vì sao chấp nhận được.
+      (điền số liệu thật của bạn)
+    followUp: What would it take to make revocation effectively instant, and was it worth it?
+    tags: [cv, revocation, rbac]
+  - id: auth-identity-065
+    level: cv
+    type: scenario
+    q: In the monolith-to-microservices migration with Kafka, where did you validate tokens, and how did downstream services and event consumers know which user and tenant an action belonged to?
+    hint: |-
+      Câu trả lời mạnh có:
+      - Validate ở gateway, ở mỗi service, hay cả hai; cách chia sẻ JWKS/key.
+      - Identity propagation cho sync call: forward token / JWT nội bộ / header có ký + mTLS.
+      - Event Kafka: `tenant_id`, `actor_id`, `correlation_id` trong envelope; consumer authorize dựa trên dữ liệu event + trạng thái hiện tại, không dùng lại token user.
+      - Backward compatibility: monolith và service mới cùng chấp nhận token trong giai đoạn chuyển.
+      (điền số liệu thật của bạn)
+    followUp: A consumer processes an event from a user who was deleted in the meantime. What does it do?
+    tags: [cv, microservices, kafka, identity-propagation]
+  - id: auth-identity-066
+    level: cv
+    type: scenario
+    q: "Your platform is B2B2C: tenant staff and end customers both log in. How did you separate these two populations in authentication and authorization?"
+    hint: |-
+      Câu trả lời mạnh có:
+      - Tách pool/realm/`user_type` hay chung bảng users + membership khác loại; lý do.
+      - Customer thuộc tenant (storefront) vs staff có role trong tenant; cùng email có thể là customer ở tenant A và staff ở tenant B?
+      - Token khác audience/issuer cho admin app và storefront; MFA bắt buộc cho staff.
+      - Authorization: customer chỉ thấy resource của chính mình (ownership), staff theo role + tenant.
+      - Rủi ro đã phòng: token customer dùng được trên admin API?
+      (điền số liệu thật của bạn)
+    followUp: What stops a customer token from calling a staff-only endpoint in your design?
+    tags: [cv, b2b2c, authentication, authorization]

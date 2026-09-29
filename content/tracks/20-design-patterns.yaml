@@ -1,0 +1,960 @@
+id: 20-design-patterns
+slug: design-patterns
+title: Design Principles & Patterns
+tier: 5
+status: drafted
+summary: SOLID, GoF trong TypeScript, DI, Clean/Hexagonal architecture, DDD tactical, CQRS — và khi nào KHÔNG dùng.
+cvLinked: false
+prerequisites: []
+overview: |-
+  ## TL;DR
+
+  - Pattern là **tên chung cho một giải pháp đã lặp lại nhiều lần**, không phải checklist phải áp dụng. Senior interview đo **judgment**: bạn biết khi nào pattern giúp và khi nào nó chỉ thêm indirection.
+  - Trong TypeScript, rất nhiều GoF pattern **co lại thành function**: Strategy = truyền function, Command = closure, Factory = function trả object, Observer = `EventEmitter`. Class hierarchy là lựa chọn cuối.
+  - SOLID là về **quản lý thay đổi và coupling**: module nào đổi vì lý do gì, ai phụ thuộc vào ai. DIP + DI là nền của Clean/Hexagonal architecture.
+  - DDD tactical (Entity, Value Object, Aggregate, Domain Event) giải bài toán **invariant nghiệp vụ phức tạp**; CRUD đơn giản thì không cần. CQRS/Event Sourcing mạnh nhưng đắt — chỉ dùng cho một bounded context có lý do rõ ràng.
+  - Câu hỏi luôn đi kèm: **"When would you NOT use it?"** — chuẩn bị sẵn câu trả lời cho mọi pattern.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn (TS) |
+  |---|---|---|
+  | SRP | Một module chỉ có **một actor** khiến nó phải đổi | Tách `InvoicePdfRenderer` khỏi `InvoiceCalculator` |
+  | OCP | Mở để mở rộng, đóng để sửa — thêm hành vi bằng code mới | Thêm `PaypalProvider` mà không sửa `CheckoutService` |
+  | LSP | Subtype dùng thay được supertype mà không phá contract | `ReadonlyRepo extends Repo` rồi `save()` throw → vi phạm |
+  | ISP | Client không bị ép phụ thuộc method nó không dùng | `Reader` / `Writer` thay vì `Repository` 30 method |
+  | DIP | High-level phụ thuộc **abstraction**, không phụ thuộc chi tiết | `OrderService(repo: OrderRepository)` thay vì `new PrismaClient()` |
+  | Composition over inheritance | Ghép hành vi bằng object/function thay vì cây kế thừa | `withRetry(withCache(fetcher))` |
+  | Strategy | Hoán đổi thuật toán lúc runtime | `const pricing: PricingRule = vipRule` |
+  | Decorator | Bọc object để thêm hành vi, cùng interface | `new CachedRepo(new SqlRepo())` |
+  | Adapter | Chuyển interface lạ về interface mình cần | `StripeAdapter implements PaymentGateway` |
+  | Repository / UoW | Collection-like access cho aggregate / gom thay đổi trong một transaction | `uow.orders.add(o); await uow.commit()` |
+  | Aggregate | Cụm object có **một root**, bảo vệ invariant trong một transaction | `Order` giữ `OrderLine[]`, chỉ sửa qua `order.addLine()` |
+  | CQRS | Tách model ghi (command) và model đọc (query) | Ghi vào SQL, đọc từ Elasticsearch projection |
+
+  ## Cơ chế hoạt động
+
+  ### Hexagonal (Ports & Adapters) — dependency rule
+
+  ```mermaid
+  flowchart LR
+    subgraph Driving["Driving adapters (inbound)"]
+      HTTP["Express/Nest controller"]
+      CLI["CLI / cron job"]
+      MQ["Kafka consumer"]
+    end
+    subgraph Core["Application core (không import framework)"]
+      UC["Use cases<br/>PlaceOrder, CancelOrder"]
+      DOM["Domain model<br/>Order, Money, events"]
+      PIN["Inbound port<br/>PlaceOrderUseCase"]
+      POUT["Outbound ports<br/>OrderRepository, PaymentGateway"]
+    end
+    subgraph Driven["Driven adapters (outbound)"]
+      SQL["SqlOrderRepository"]
+      STRIPE["StripePaymentGateway"]
+      KAFKA["KafkaEventPublisher"]
+    end
+    HTTP --> PIN
+    CLI --> PIN
+    MQ --> PIN
+    PIN --> UC --> DOM
+    UC --> POUT
+    SQL -. implements .-> POUT
+    STRIPE -. implements .-> POUT
+    KAFKA -. implements .-> POUT
+  ```
+
+  Mũi tên source-code dependency **luôn hướng vào core**. Core định nghĩa interface (port); adapter ở ngoài implement. Nhờ vậy test use case bằng in-memory adapter, đổi DB/provider không chạm domain.
+
+  ### Chain of Responsibility — Express middleware là ví dụ sống
+
+  ```mermaid
+  sequenceDiagram
+    participant C as Client
+    participant A as authn
+    participant T as tenantResolver
+    participant R as rateLimit
+    participant H as handler
+    C->>A: request
+    A->>T: next()
+    T->>R: next()
+    R-->>C: 429 (dừng chuỗi)
+    R->>H: next() nếu còn quota
+    H-->>C: 200
+  ```
+
+  ## Trade-offs
+
+  | Lựa chọn | Được | Mất | Khi KHÔNG dùng |
+  |---|---|---|---|
+  | Inheritance | Tái dùng nhanh, polymorphism sẵn | Coupling chặt, fragile base class | Khi quan hệ không phải "is-a" thật sự hoặc cần ghép nhiều hành vi |
+  | Composition | Linh hoạt, test dễ | Nhiều object nhỏ, wiring dài hơn | Khi hierarchy thực sự ổn định (AST node, UI widget framework) |
+  | Repository trên ORM | Tách domain khỏi ORM, test dễ | Thêm một lớp, dễ thành "generic repo" vô nghĩa | CRUD app mỏng, query phức tạp dùng trực tiếp query builder |
+  | DI container | Wiring tự động, scopes | Magic, lỗi runtime thay vì compile | Service nhỏ — manual constructor injection là đủ |
+  | Clean/Hexagonal | Core độc lập framework, test nhanh | Nhiều file, mapping DTO ↔ domain | Prototype, CRUD admin, lambda nhỏ |
+  | CQRS | Scale đọc/ghi độc lập, read model tối ưu | Eventual consistency, 2 model | Domain đơn giản, đọc-ghi cùng shape |
+  | Event Sourcing | Audit đầy đủ, time travel, rebuild projection | Schema evolution khó, query khó, học khó | Hầu hết CRUD; team chưa có kinh nghiệm |
+
+  ## Pitfalls
+
+  - **Pattern-driven design**: chọn pattern trước rồi tìm vấn đề. Bắt đầu từ lực đẩy thay đổi (what varies?).
+  - **DRY sai chỗ**: gộp hai đoạn code *trông giống* nhưng đổi vì lý do khác nhau → abstraction sai, đầy boolean flag. "Duplication is far cheaper than the wrong abstraction" (Sandi Metz).
+  - **Singleton giữ state theo request** trong Node → rò dữ liệu giữa user/tenant.
+  - **Generic `Repository<T>`** với `findAll/findById/save` cho mọi entity → leak ORM, không mang ngữ nghĩa domain.
+  - **Anemic domain model** + service 2000 dòng gọi là "DDD".
+  - **Aggregate quá to** (Order chứa Customer chứa mọi Order khác) → lock contention, load chậm.
+  - **Event Sourcing cho cả hệ thống** thay vì một bounded context cần audit.
+  - **Observer không unsubscribe** → memory leak, handler chạy nhiều lần.
+
+  ## Cheat sheet
+
+  - SOLID = **S**ingle actor · **O**pen for extension · **L**iskov contract · **I**nterface nhỏ · **D**epend on abstraction.
+  - Creational: Factory (ẩn `new`, chọn implementation), Builder (object nhiều bước/tuỳ chọn), Singleton (một instance — **thường là smell**, dùng DI scope thay thế).
+  - Structural: Adapter (đổi interface), Facade (đơn giản hoá subsystem), Decorator (thêm hành vi, cùng interface), Proxy (kiểm soát truy cập, cùng interface).
+  - Behavioral: Strategy (hoán thuật toán), Observer (pub/sub in-process), Command (request thành object → queue/undo), Chain of Responsibility (middleware), Template Method (khung cố định, bước tuỳ biến qua kế thừa).
+  - Decorator vs Proxy: cùng cấu trúc; Decorator **thêm** hành vi, Proxy **kiểm soát** truy cập (lazy, cache, auth).
+  - Aggregate rule: tham chiếu aggregate khác **bằng ID**, một transaction sửa **một** aggregate, nhất quán giữa aggregate bằng domain event (eventual).
+  - Refactor legacy: characterization tests → tìm seam → Strangler Fig → xoá code cũ.
+notionRefs:
+  - title: Design Patterns
+    url: https://app.notion.com/p/179ef77f8ab2800ea774f081d17b835e
+  - title: Principles and Theorems
+    url: https://app.notion.com/p/380ef77f8ab2808a8d0bc77b94779dda
+references:
+  - title: Refactoring.Guru — Design Patterns catalog
+    url: https://refactoring.guru/design-patterns/catalog
+  - title: Martin Fowler — CQRS
+    url: https://martinfowler.com/bliki/CQRS.html
+  - title: Martin Fowler — Event Sourcing
+    url: https://martinfowler.com/eaaDev/EventSourcing.html
+  - title: Martin Fowler — Strangler Fig Application
+    url: https://martinfowler.com/bliki/StranglerFigApplication.html
+  - title: Martin Fowler — Inversion of Control Containers and the Dependency Injection pattern
+    url: https://martinfowler.com/articles/injection.html
+  - title: Martin Fowler — Anemic Domain Model
+    url: https://martinfowler.com/bliki/AnemicDomainModel.html
+  - title: Martin Fowler — DDD Aggregate
+    url: https://martinfowler.com/bliki/DDD_Aggregate.html
+  - title: Alistair Cockburn — Hexagonal Architecture
+    url: https://alistair.cockburn.us/hexagonal-architecture/
+  - title: Sandi Metz — The Wrong Abstraction
+    url: https://sandimetz.com/blog/2016/1/20/the-wrong-abstraction
+  - title: NestJS — Injection scopes
+    url: https://docs.nestjs.com/fundamentals/injection-scopes
+  - title: TypeScript 5.0 — Decorators
+    url: https://www.typescriptlang.org/docs/handbook/release-notes/typescript-5-0.html
+questions:
+  - id: design-patterns-001
+    level: easy
+    type: concept
+    q: Walk me through SOLID. For each letter give a one-line TypeScript example of a violation.
+    hint: |-
+      - **S**RP: `UserService` vừa validate, vừa gửi email, vừa render PDF → nhiều actor cùng sửa một file.
+      - **O**CP: `switch (provider)` trong `pay()` — thêm provider phải sửa hàm cũ.
+      - **L**SP: subclass `throw new Error('not supported')` cho method của parent.
+      - **I**SP: interface `Repository` 30 method, client chỉ cần `findById`.
+      - **D**IP: `class OrderService { db = new PrismaClient() }` — high-level phụ thuộc chi tiết.
+      Mục tiêu chung: **giảm coupling, cô lập thay đổi**, không phải "nhiều class hơn".
+    followUp: Which SOLID principle do you break most often on purpose, and why is that OK?
+    redFlags:
+      - "Recites the acronym but can't show a violation in code"
+      - "SRP means a class should have only one method"
+    tags: [solid]
+  - id: design-patterns-002
+    level: easy
+    type: concept
+    q: The Single Responsibility Principle is often explained as "a class should do one thing". Why is that definition misleading?
+    hint: |-
+      Uncle Bob định nghĩa lại: "một module chỉ nên chịu trách nhiệm với **một actor**" (một nhóm stakeholder là nguồn thay đổi).
+      "Do one thing" dẫn tới class một method, phân mảnh vô nghĩa. Đúng hơn: gom những thứ **đổi cùng nhau vì cùng một lý do**, tách những thứ đổi vì lý do khác.
+      Ví dụ: `Employee.calculatePay()` (kế toán) và `Employee.reportHours()` (HR) dùng chung helper → kế toán sửa helper làm hỏng báo cáo HR.
+    example: |-
+      ```ts
+      // Hai actor khác nhau: finance vs. ops
+      class Invoice {
+        total(): Money { /* finance rules */ }
+        toPdf(): Buffer { /* layout team */ }   // tách ra InvoicePdfRenderer
+      }
+      ```
+    followUp: How does SRP relate to cohesion and to how you split microservices?
+    tags: [solid, srp, cohesion]
+  - id: design-patterns-003
+    level: easy
+    type: compare
+    q: Why do people say "favor composition over inheritance"? Show a case where inheritance is still the right tool.
+    hint: |-
+      Inheritance tạo coupling chặt nhất: subclass phụ thuộc chi tiết implementation của base (**fragile base class**), không ghép được nhiều hành vi (cache + retry + logging → bùng nổ subclass).
+      Composition: ghép hành vi bằng object/function, đổi lúc runtime, test riêng từng mảnh.
+      Inheritance vẫn hợp khi có quan hệ **is-a ổn định** và framework thiết kế cho nó: `class AppError extends Error`, AST node types, base class của framework (`extends React.Component` cũ).
+    example: |-
+      ```ts
+      type Fetcher = (url: string) => Promise<Response>;
+      const withRetry = (f: Fetcher, n = 3): Fetcher => async (u) => {
+        for (let i = 0; ; i++) {
+          try { return await f(u); } catch (e) { if (i >= n - 1) throw e; }
+        }
+      };
+      const withLog = (f: Fetcher): Fetcher => async (u) => { console.time(u); try { return await f(u); } finally { console.timeEnd(u); } };
+      const http = withLog(withRetry(fetch)); // ghép tuỳ ý, không cần subclass
+      ```
+    followUp: What is the fragile base class problem? Give a concrete example.
+    redFlags:
+      - "Inheritance is always bad"
+    tags: [composition, inheritance]
+  - id: design-patterns-004
+    level: easy
+    type: concept
+    q: Define DRY, KISS and YAGNI. Give one example where blindly applying DRY makes the code worse.
+    hint: |-
+      - **DRY**: mỗi *knowledge* có một nguồn duy nhất — về kiến thức nghiệp vụ, không phải về ký tự trùng.
+      - **KISS**: giải pháp đơn giản nhất chạy được. **YAGNI**: đừng build cho yêu cầu tưởng tượng.
+      - DRY sai: hai hàm validate address của **Checkout** và **Shipping partner** trông giống nhau → gộp làm một → sau đó mỗi bên đổi rule riêng → hàm có `if (isCheckout)` và 5 flag. Đó là **accidental duplication**.
+      Rule of three: chờ lần lặp thứ ba và chắc chúng đổi cùng lý do rồi mới trừu tượng hoá.
+    followUp: How do you decide whether two duplicated blocks represent the same knowledge?
+    redFlags:
+      - "DRY means never have two similar lines of code"
+    tags: [dry, kiss, yagni]
+  - id: design-patterns-005
+    level: easy
+    type: concept
+    q: What is dependency injection? Show constructor injection in TypeScript without any framework.
+    hint: |-
+      DI = object **nhận** dependency từ bên ngoài thay vì tự tạo (`new`). Là một cách hiện thực **Inversion of Control**.
+      Lợi ích: thay implementation (test double, provider khác), cấu hình tập trung ở **composition root** (`main.ts`).
+      Không cần container: manual DI với constructor là đủ cho service nhỏ; container (NestJS, tsyringe, InversifyJS) hữu ích khi graph lớn và cần scopes.
+    example: |-
+      ```ts
+      interface Clock { now(): Date }
+      interface OrderRepo { save(o: Order): Promise<void> }
+
+      class PlaceOrder {
+        constructor(private repo: OrderRepo, private clock: Clock) {}
+        async run(cmd: PlaceOrderCmd) {
+          const order = Order.create(cmd, this.clock.now());
+          await this.repo.save(order);
+        }
+      }
+
+      // composition root
+      const useCase = new PlaceOrder(new SqlOrderRepo(pool), { now: () => new Date() });
+      // test
+      const t = new PlaceOrder(new InMemoryOrderRepo(), { now: () => new Date('2026-01-01') });
+      ```
+    followUp: What's the difference between DI and the Service Locator pattern, and why is Service Locator considered an anti-pattern?
+    tags: [di, ioc]
+  - id: design-patterns-006
+    level: easy
+    type: concept
+    q: What problem does the Strategy pattern solve? Implement it idiomatically in TypeScript.
+    hint: |-
+      Strategy: đóng gói một họ thuật toán hoán đổi được, client chọn lúc runtime → thay `if/switch` rải rác.
+      Trong TS thường là **function type** hoặc map `Record<Key, Fn>`, không cần class + interface.
+      Khi KHÔNG dùng: chỉ có 2 nhánh và không có dấu hiệu tăng → `if` rõ ràng hơn.
+    example: |-
+      ```ts
+      type ShippingFee = (o: { weightKg: number; subtotal: number }) => number;
+
+      const strategies: Record<'standard' | 'express' | 'free', ShippingFee> = {
+        standard: (o) => 20_000 + o.weightKg * 5_000,
+        express: (o) => 50_000 + o.weightKg * 8_000,
+        free: () => 0,
+      };
+
+      const fee = strategies[order.shippingMethod](order);
+      ```
+    followUp: How is Strategy different from State?
+    tags: [strategy, behavioral]
+  - id: design-patterns-007
+    level: easy
+    type: concept
+    q: Explain the Observer pattern and where it already exists in Node.js and the browser.
+    hint: |-
+      Subject giữ danh sách observer, notify khi state đổi; observer không biết nhau → loose coupling.
+      Có sẵn: Node `EventEmitter`, DOM `addEventListener`, RxJS, Redux `subscribe`, React `useSyncExternalStore`.
+      Khác pub/sub qua broker (Kafka): Observer là **in-process, đồng bộ**, mất khi process chết.
+      Rủi ro: quên unsubscribe → leak; một listener throw làm hỏng emit (EventEmitter gọi listener đồng bộ).
+    followUp: If one listener throws inside `emitter.emit()`, what happens to the other listeners?
+    tags: [observer, behavioral, node]
+  - id: design-patterns-008
+    level: easy
+    type: compare
+    q: Adapter vs Facade — both wrap something. What is the difference in intent?
+    hint: |-
+      - **Adapter**: chuyển **một** interface lạ thành interface client đang mong đợi (1-1). Ví dụ: `StripeAdapter implements PaymentGateway`.
+      - **Facade**: cung cấp interface **đơn giản hơn** cho cả một subsystem (1-n). Ví dụ: `CheckoutFacade.placeOrder()` gọi inventory, pricing, payment, notification.
+      Adapter là về **tương thích**, Facade là về **đơn giản hoá**. Anti-corruption layer (DDD) thường là tập Adapter + translation.
+    example: |-
+      ```ts
+      interface PaymentGateway { charge(amount: Money, token: string): Promise<ChargeResult> }
+
+      class StripeAdapter implements PaymentGateway {
+        constructor(private stripe: Stripe) {}
+        async charge(amount: Money, token: string) {
+          const pi = await this.stripe.paymentIntents.create({ amount: amount.minor, currency: amount.currency, payment_method: token, confirm: true });
+          return { id: pi.id, status: pi.status === 'succeeded' ? 'paid' : 'pending' } as const;
+        }
+      }
+      ```
+    followUp: Where does an Anti-Corruption Layer fit, and how is it more than an adapter?
+    tags: [adapter, facade, structural]
+  - id: design-patterns-009
+    level: easy
+    type: gotcha
+    q: What is a Singleton, and why is it often called an anti-pattern? How do you get "one instance" in Node.js without the classic pattern?
+    hint: |-
+      Singleton = đảm bảo một instance + global access point. Vấn đề: **global state ẩn**, dependency không hiện trên constructor, khó test (không thay được), dễ giữ state theo request.
+      Trong Node, **module cache** đã làm module thành singleton per process — export instance là đủ; hoặc để DI container quản lý scope singleton.
+      Gotcha: "một instance" chỉ đúng **per process và per resolved path** — cluster/nhiều pod, hoặc hai version của cùng package trong `node_modules` → nhiều instance.
+      Hợp lệ: connection pool, logger, config — miễn là **stateless theo request** và được inject.
+    followUp: Your app runs 8 pods. A developer uses a Singleton in-memory counter for rate limiting. What breaks?
+    redFlags:
+      - "Singleton guarantees one instance across the whole system"
+    tags: [singleton, creational, node]
+  - id: design-patterns-010
+    level: medium
+    type: concept
+    q: Show the Open/Closed Principle with a real example. When does following OCP become over-engineering?
+    hint: |-
+      OCP: thêm hành vi bằng **code mới** (implement interface, đăng ký vào registry), không sửa code đã ổn định.
+      Cơ chế: polymorphism, Strategy, plugin registry, event.
+      Over-engineering khi: dự đoán sai trục biến đổi (tạo extension point cho thứ không bao giờ đổi), chỉ có 1 implementation, chi phí indirection > chi phí sửa `switch`.
+      Thực tế: áp OCP **sau khi** trục biến đổi đã xuất hiện 2–3 lần.
+    example: |-
+      ```ts
+      interface DiscountRule { applies(c: Cart): boolean; amount(c: Cart): number }
+      class Pricing {
+        constructor(private rules: DiscountRule[]) {}
+        discount(c: Cart) { return this.rules.filter(r => r.applies(c)).reduce((s, r) => s + r.amount(c), 0); }
+      }
+      // thêm rule mới = thêm class/object mới, Pricing không đổi
+      ```
+    followUp: How do you handle rules that must be applied in a specific order or are mutually exclusive?
+    tags: [solid, ocp]
+  - id: design-patterns-011
+    level: medium
+    type: gotcha
+    q: Explain the Liskov Substitution Principle beyond the Square/Rectangle example. How can a TypeScript subtype satisfy the compiler but still violate LSP?
+    hint: |-
+      LSP là về **behavioral contract**: precondition không được mạnh hơn, postcondition không được yếu hơn, invariant giữ nguyên, không throw exception mới.
+      TS type system chỉ check **shape** (structural typing), không check hành vi → subclass có đúng signature nhưng `throw`, trả dữ liệu khác nghĩa, hay có side effect bất ngờ vẫn compile.
+      Ví dụ: `CachedUserRepo.findById` trả dữ liệu stale 10 phút trong khi caller dựa vào read-your-writes.
+      Fix: tách interface (ISP) — `ReadRepo` vs `WriteRepo` — thay vì subtype từ chối method.
+    example: |-
+      ```ts
+      class FileStorage { async write(path: string, data: Buffer) { /* ... */ } }
+      class ReadOnlyStorage extends FileStorage {
+        async write(): Promise<void> { throw new Error('read-only'); } // compile OK, LSP broken
+      }
+      ```
+    followUp: Is a method parameter type in TypeScript checked covariantly or contravariantly? What does `strictFunctionTypes` change?
+    verify: true
+    tags: [solid, lsp, typescript]
+  - id: design-patterns-012
+    level: medium
+    type: concept
+    q: What does the Interface Segregation Principle look like in a TypeScript backend? Show a refactor.
+    hint: |-
+      Client chỉ phụ thuộc phần interface nó dùng. Interface béo → mọi thay đổi lan tới client không liên quan, test double phải stub 30 method.
+      TS: dùng interface nhỏ theo **role** (`OrderReader`, `OrderWriter`), hoặc `Pick<>` tại chỗ dùng. Một class có thể implement nhiều role.
+      Liên quan hexagonal: port nên được định nghĩa **theo nhu cầu của use case**, không theo khả năng của DB.
+    example: |-
+      ```ts
+      // Trước
+      interface OrderRepository { findById; findByUser; search; save; delete; archive; exportCsv; /* ... */ }
+      // Sau
+      interface OrderReader { findById(id: OrderId): Promise<Order | null> }
+      interface OrderWriter { save(o: Order): Promise<void> }
+      class CancelOrder { constructor(private orders: OrderReader & OrderWriter) {} }
+      class SqlOrderRepository implements OrderReader, OrderWriter { /* ... */ }
+      ```
+    followUp: How does ISP make mocking in unit tests easier?
+    tags: [solid, isp]
+  - id: design-patterns-013
+    level: medium
+    type: compare
+    q: Dependency Inversion Principle vs Dependency Injection vs Inversion of Control — are they the same thing?
+    hint: |-
+      - **IoC**: nguyên lý chung — framework gọi code của bạn ("don't call us, we'll call you"): event loop, Express handler, template method.
+      - **DIP**: nguyên lý thiết kế — module high-level và low-level cùng phụ thuộc **abstraction**; và abstraction thuộc về phía high-level (core định nghĩa port).
+      - **DI**: kỹ thuật truyền dependency từ ngoài vào (constructor/setter/parameter).
+      Có thể dùng DI mà vẫn vi phạm DIP: inject thẳng `PrismaClient` vào domain service — dependency được inject nhưng hướng phụ thuộc vẫn trỏ về chi tiết.
+    followUp: In hexagonal architecture, which package owns the `OrderRepository` interface and why?
+    redFlags:
+      - "DIP just means using a DI container"
+    tags: [solid, dip, di, ioc]
+  - id: design-patterns-014
+    level: medium
+    type: compare
+    q: Simple factory function vs Factory Method vs Abstract Factory — when would you use each in a TypeScript codebase?
+    hint: |-
+      - **Factory function**: `createNotifier(channel)` trả object theo input — 90% trường hợp trong TS.
+      - **Factory Method**: base class định nghĩa `createX()` abstract, subclass quyết định class cụ thể — hợp khi đã có hierarchy (template method + factory).
+      - **Abstract Factory**: tạo **một họ** object liên quan phải đi cùng nhau (ví dụ `AwsStorage` + `AwsQueue` vs `GcpStorage` + `GcpQueue`; UI theme components).
+      Khi KHÔNG dùng: chỉ có một implementation và không có lý do đổi → `new` trực tiếp.
+    example: |-
+      ```ts
+      type Channel = 'email' | 'sms' | 'push';
+      interface Notifier { send(to: string, msg: string): Promise<void> }
+      const createNotifier = (c: Channel, deps: Deps): Notifier => {
+        switch (c) {
+          case 'email': return new SesNotifier(deps.ses);
+          case 'sms': return new TwilioNotifier(deps.twilio);
+          case 'push': return new FcmNotifier(deps.fcm);
+          default: { const _exhaustive: never = c; throw new Error(_exhaustive); }
+        }
+      };
+      ```
+    followUp: Why is the `never` exhaustive check useful when a new channel is added?
+    tags: [factory, creational]
+  - id: design-patterns-015
+    level: medium
+    type: concept
+    q: TypeScript has object literals and optional properties. Is the Builder pattern still useful? Show a case where it is.
+    hint: |-
+      Với config đơn giản, object literal + default (`{ ...defaults, ...opts }`) là đủ → Builder thừa.
+      Builder có giá trị khi: (1) xây dựng **nhiều bước có ràng buộc thứ tự/validation**, (2) object **immutable** sau khi build, (3) fluent API cho query/request (Knex, Prisma query, test data builder), (4) **type-state builder** bắt lỗi thiếu field lúc compile.
+      Test Data Builder (`anOrder().withStatus('paid').build()`) là use case phổ biến nhất.
+    example: |-
+      ```ts
+      class OrderBuilder {
+        private o: Partial<Order> = { status: 'draft', lines: [] };
+        withLine(sku: string, qty: number) { this.o.lines!.push({ sku, qty }); return this; }
+        paid() { this.o.status = 'paid'; return this; }
+        build(): Order {
+          if (!this.o.lines!.length) throw new Error('order needs at least one line');
+          return Object.freeze({ id: randomUUID(), ...this.o }) as Order;
+        }
+      }
+      const order = new OrderBuilder().withLine('SKU-1', 2).paid().build();
+      ```
+    followUp: How would you make a builder that refuses to compile `build()` until required fields are set?
+    tags: [builder, creational, testing]
+  - id: design-patterns-016
+    level: medium
+    type: compare
+    q: The GoF Decorator pattern vs TypeScript `@decorators` — same thing? What changed with TypeScript 5.0 decorators?
+    hint: |-
+      - GoF Decorator: **object wrapper** cùng interface, thêm hành vi lúc runtime (`new LoggingRepo(new SqlRepo())`), ghép được nhiều lớp.
+      - TS `@decorator`: **metaprogramming** trên class/method/field lúc định nghĩa — có thể dùng để hiện thực ý tưởng decorator (`@Cacheable`), nhưng áp lên class, không phải per-instance.
+      - TS 5.0 hỗ trợ **ECMAScript (Stage 3) decorators** chuẩn; `experimentalDecorators` là phiên bản legacy mà NestJS/TypeORM/class-validator vẫn dựa vào, và `emitDecoratorMetadata` chỉ chạy với legacy mode.
+      Chọn wrapper object khi muốn bật/tắt theo config hoặc test riêng.
+    followUp: Why can't NestJS just switch to standard decorators today?
+    verify: true
+    tags: [decorator, typescript, structural]
+  - id: design-patterns-017
+    level: medium
+    type: concept
+    q: What is the Proxy pattern, and how does it differ from Decorator? Give three production use cases.
+    hint: |-
+      Proxy cùng interface với subject, **kiểm soát truy cập** tới nó; Decorator **bổ sung hành vi**. Cấu trúc gần như giống nhau — khác ở **intent**.
+      Use cases: **virtual proxy** (lazy load client nặng), **caching proxy**, **protection proxy** (check permission trước khi gọi), **remote proxy** (gRPC stub, HTTP client sinh từ OpenAPI).
+      JS có built-in `Proxy` object (traps `get/set/apply`) — dùng cho Vue reactivity, MobX, Immer; nhưng có chi phí performance và khó debug.
+    example: |-
+      ```ts
+      const lazy = <T extends object>(factory: () => T): T => {
+        let inst: T | undefined;
+        return new Proxy({} as T, { get: (_t, k) => Reflect.get((inst ??= factory()), k) });
+      };
+      const s3 = lazy(() => new S3Client({ region: 'ap-southeast-1' })); // chỉ khởi tạo khi dùng lần đầu
+      ```
+    followUp: What pitfalls come with using a JS `Proxy` around a class that has private `#fields`?
+    tags: [proxy, structural]
+  - id: design-patterns-018
+    level: medium
+    type: concept
+    q: Explain the Command pattern. How does it show up in job queues and in undo/redo?
+    hint: |-
+      Command = biến một request thành **object** (tên + payload + đôi khi `execute/undo`) → có thể queue, log, retry, gửi qua mạng, undo.
+      Job queue (BullMQ): job `{ name: 'send-invoice', data }` là command serializable; worker là handler. Idempotency key nằm trong command.
+      Undo/redo (editor, Redux): stack command có `undo()` hoặc lưu inverse.
+      CQRS: "command" cùng ý tưởng — ý định thay đổi state, validate rồi mới chấp nhận.
+      Khi KHÔNG dùng: gọi hàm trực tiếp là đủ và không cần queue/log/undo.
+    example: |-
+      ```ts
+      interface Command<T = unknown> { type: string; payload: T; idempotencyKey: string }
+      const handlers: Record<string, (c: Command<any>) => Promise<void>> = {
+        'invoice.send': async (c) => sendInvoice(c.payload.orderId),
+      };
+      async function dispatch(c: Command) {
+        if (await processed.has(c.idempotencyKey)) return;
+        await handlers[c.type](c);
+        await processed.add(c.idempotencyKey);
+      }
+      ```
+    followUp: Why must a command in a queue be serializable, and what breaks if it holds a class instance or closure?
+    tags: [command, behavioral, queue]
+  - id: design-patterns-019
+    level: medium
+    type: concept
+    q: Where is Chain of Responsibility used in Node.js web frameworks? What are its failure modes?
+    hint: |-
+      Express/Koa middleware, NestJS guards → interceptors → pipes, Axios interceptors: mỗi handler xử lý hoặc chuyển tiếp qua `next()`.
+      Failure modes: **thứ tự sai** (rate limit sau auth nặng; body parser sau handler), quên gọi `next()` → request treo, gọi `next()` hai lần, error trong async middleware không được forward (Express 4 cần `next(err)`; Express 5 tự bắt rejected promise).
+      Tốt cho cross-cutting concern; tệ khi logic nghiệp vụ bị rải trong 12 middleware khó trace.
+    followUp: In Express 4, what happens if an async middleware throws and you don't call `next(err)`?
+    verify: true
+    tags: [chain-of-responsibility, express, middleware]
+  - id: design-patterns-020
+    level: medium
+    type: compare
+    q: Template Method vs Strategy — both let you vary part of an algorithm. When would you pick each?
+    hint: |-
+      - **Template Method**: base class cố định khung (`run()` gọi `validate → transform → load`), subclass override bước → dựa vào **inheritance**, chọn lúc compile.
+      - **Strategy**: truyền hành vi vào qua composition, đổi lúc runtime, ghép nhiều strategy độc lập.
+      Template Method hợp khi khung thật sự ổn định và nhiều bước dùng chung (ETL importer cho nhiều file format). Nhược: hierarchy sâu, subclass phụ thuộc thứ tự gọi của base.
+      Trong TS hiện đại thường thay Template Method bằng function nhận các bước làm tham số.
+    example: |-
+      ```ts
+      abstract class Importer<Row> {
+        async run(file: Buffer) {
+          const rows = this.parse(file);
+          const valid = rows.filter((r) => this.validate(r));
+          await this.save(valid);
+        }
+        protected abstract parse(f: Buffer): Row[];
+        protected abstract validate(r: Row): boolean;
+        protected abstract save(rows: Row[]): Promise<void>;
+      }
+      ```
+    followUp: Rewrite this importer without inheritance. What did you gain and lose?
+    tags: [template-method, strategy, behavioral]
+  - id: design-patterns-021
+    level: medium
+    type: compare
+    q: You already use Prisma or TypeORM. Is a Repository layer on top of it valuable or just ceremony?
+    hint: |-
+      Giá trị khi: domain có invariant thật và bạn muốn **aggregate-oriented** API (`orders.byId`, `orders.save(order)`), cô lập ORM để test use case bằng in-memory repo, đổi storage cho một phần (SQL → Elasticsearch cho search), che giấu tenant filter bắt buộc.
+      Ceremony khi: app CRUD mỏng, repository chỉ forward 1-1 sang ORM, hay **generic `Repository<T>`** lộ `IQueryable`/query builder ra ngoài.
+      Rule: repository theo **aggregate**, method mang ngữ nghĩa domain (`findOpenOrdersForCustomer`), không phải theo table.
+    followUp: Where do you put complex reporting queries that join 6 tables — in the repository?
+    redFlags:
+      - "Always wrap the ORM so we can switch databases later"
+    tags: [repository, orm, ddd]
+  - id: design-patterns-022
+    level: medium
+    type: concept
+    q: What is the Unit of Work pattern? How does it map to transactions in Prisma or TypeORM?
+    hint: |-
+      UoW theo dõi các object mới/đổi/xoá trong một business transaction và commit **một lần**, atomic.
+      ORM đã là UoW: TypeORM `EntityManager` trong `dataSource.transaction(async (em) => ...)`, Prisma `$transaction(async (tx) => ...)`, Hibernate/EF `DbContext`.
+      Hiện thực trong clean architecture: use case nhận `uow` chứa các repo dùng chung transaction; hoặc truyền `tx` qua `AsyncLocalStorage`.
+      Pitfall: gọi HTTP/Kafka **bên trong** transaction (giữ lock lâu, không rollback được side effect) → dùng Outbox.
+    example: |-
+      ```ts
+      await prisma.$transaction(async (tx) => {
+        const order = await tx.order.update({ where: { id }, data: { status: 'PAID' } });
+        await tx.outbox.create({ data: { type: 'order.paid', payload: { orderId: order.id } } });
+      }); // commit hoặc rollback cả hai
+      ```
+    followUp: How do you pass the transaction to repositories without threading `tx` through every function?
+    tags: [unit-of-work, transactions, orm]
+  - id: design-patterns-023
+    level: medium
+    type: debug
+    q: Under load, users occasionally see another user's cart. Find the bug in this "singleton" service.
+    example: |-
+      ```ts
+      // cart.service.ts
+      class CartService {
+        private currentUserId?: string;
+        setUser(id: string) { this.currentUserId = id; }
+        async getCart() {
+          await delay(5); // simulate DB
+          return db.cart.findFirst({ where: { userId: this.currentUserId } });
+        }
+      }
+      export const cartService = new CartService();
+
+      // route
+      app.get('/cart', async (req, res) => {
+        cartService.setUser(req.user.id);
+        res.json(await cartService.getCart());
+      });
+      ```
+    hint: |-
+      `cartService` là instance duy nhất per process (module cache) nhưng giữ **state theo request** (`currentUserId`). Hai request xen kẽ qua `await` → request A đọc `currentUserId` đã bị request B ghi đè → **rò dữ liệu giữa user**.
+      Fix: service **stateless** — truyền `userId` làm tham số; nếu cần context theo request dùng `AsyncLocalStorage` hoặc request-scoped provider.
+      Bài học: Singleton chỉ an toàn khi không có mutable per-request state.
+    followUp: How would `AsyncLocalStorage` solve this, and what does it cost?
+    tags: [singleton, concurrency, node, gotcha]
+  - id: design-patterns-024
+    level: medium
+    type: debug
+    q: Memory keeps growing and Node warns "MaxListenersExceededWarning". What's wrong?
+    example: |-
+      ```ts
+      const priceEvents = new EventEmitter();
+
+      app.get('/prices/stream', (req, res) => {
+        res.setHeader('Content-Type', 'text/event-stream');
+        priceEvents.on('price', (p) => res.write(`data: ${JSON.stringify(p)}\n\n`));
+      });
+      ```
+    hint: |-
+      Mỗi SSE connection thêm một listener nhưng **không bao giờ remove** khi client ngắt → listener giữ reference tới `res` → leak; đồng thời ghi vào socket đã đóng.
+      Fix: lưu handler, `req.on('close', () => priceEvents.off('price', handler))`. Warning mặc định bật khi > 10 listener cho một event — là tín hiệu, không phải giới hạn cứng; đừng chỉ `setMaxListeners(0)` để tắt nó.
+      Tổng quát: mọi `subscribe` cần `unsubscribe` gắn với lifecycle (React `useEffect` cleanup, RxJS `takeUntil`).
+    followUp: With 5 pods behind a load balancer, how do all SSE clients receive a price update published by one pod?
+    tags: [observer, memory-leak, node]
+  - id: design-patterns-025
+    level: medium
+    type: debug
+    q: This refactor introduced a production bug in checkout. Which principle is violated and how do you fix the design?
+    example: |-
+      ```ts
+      interface PaymentGateway {
+        charge(amount: number): Promise<string>;
+        refund(chargeId: string, amount: number): Promise<void>;
+      }
+      class CodGateway implements PaymentGateway { // Cash on delivery
+        async charge() { return 'cod-' + Date.now(); }
+        async refund() { throw new Error('COD cannot be refunded online'); }
+      }
+      // refund job, written against the interface
+      for (const o of cancelledOrders) await gateways[o.method].refund(o.chargeId, o.total);
+      ```
+    hint: |-
+      Vi phạm **LSP** (và ISP): `CodGateway` không thực hiện được contract `refund` nhưng vẫn khai báo implement → caller viết đúng theo interface vẫn crash, cả batch job dừng.
+      Fix: tách capability — `Chargeable` và `Refundable`; job refund chỉ nhận `Refundable`, COD đi luồng khác (hoàn tiền thủ công/ví). Có thể dùng type guard `supportsRefund(g)`.
+      Thêm: batch job nên cô lập lỗi từng item (`allSettled`) thay vì dừng cả vòng lặp.
+    followUp: How would you express "this gateway supports partial refunds" in the type system?
+    tags: [lsp, isp, payments]
+  - id: design-patterns-026
+    level: medium
+    type: compare
+    q: Anemic domain model vs rich domain model — what's the difference, and is anemic always wrong?
+    hint: |-
+      - **Anemic**: entity chỉ có data (getter/setter), toàn bộ rule nằm trong service → invariant có thể bị bỏ qua ở bất kỳ chỗ nào set field.
+      - **Rich**: entity/aggregate đóng gói rule (`order.cancel()` kiểm tra trạng thái, phát event) → invariant luôn đúng.
+      Fowler gọi anemic là anti-pattern **khi bạn đang cố làm DDD**. Nhưng với CRUD/transaction script đơn giản, anemic + service rõ ràng là hợp lý và dễ hiểu hơn.
+      Dấu hiệu cần rich model: cùng một rule bị copy ở 4 service, bug do trạng thái không hợp lệ (`status=SHIPPED` nhưng `paidAt=null`).
+    example: |-
+      ```ts
+      class Order {
+        private constructor(private status: 'pending' | 'paid' | 'cancelled', private paidAt?: Date) {}
+        pay(at: Date) {
+          if (this.status !== 'pending') throw new DomainError('ORDER_NOT_PAYABLE');
+          this.status = 'paid'; this.paidAt = at;
+        }
+      }
+      ```
+    followUp: How do you persist a rich domain object with private fields using an ORM?
+    tags: [ddd, domain-model]
+  - id: design-patterns-027
+    level: hard
+    type: concept
+    q: Explain Clean Architecture / Hexagonal Architecture. What is the dependency rule, and what does it cost you?
+    hint: |-
+      Core (domain + use cases) ở trung tâm, **không import** framework/DB/HTTP. Core định nghĩa **port** (interface); adapter ngoài (Express controller, SQL repo, Kafka publisher) implement/gọi port. Source dependency luôn hướng vào trong.
+      Được: test use case không cần DB (nhanh), đổi framework/provider cục bộ, business logic đọc được.
+      Mất: nhiều file/lớp, **mapping** DTO ↔ domain ↔ persistence model, dễ over-engineer cho CRUD, team cần kỷ luật (lint rule `no-restricted-imports`, dependency-cruiser).
+      Khi KHÔNG dùng: prototype, admin CRUD, Lambda đơn nhiệm, domain logic mỏng.
+    followUp: How do you enforce the dependency rule automatically in a TypeScript monorepo?
+    redFlags:
+      - "Clean architecture means having controllers, services and repositories folders"
+    tags: [clean-architecture, hexagonal]
+  - id: design-patterns-028
+    level: hard
+    type: concept
+    q: Explain the DDD tactical building blocks — Entity, Value Object, Aggregate, Domain Event, Domain Service. How do you decide aggregate boundaries?
+    hint: |-
+      - **Entity**: có identity, thay đổi theo thời gian (`Order#123`). **Value Object**: bất biến, so sánh theo giá trị (`Money`, `Address`).
+      - **Aggregate**: cụm entity/VO có **một root**; mọi thay đổi đi qua root; một transaction = một aggregate. **Domain Event**: sự kiện nghiệp vụ đã xảy ra (`OrderPaid`). **Domain Service**: rule không thuộc tự nhiên về entity nào (tính giá liên quan nhiều aggregate).
+      Boundary theo **invariant phải nhất quán tức thì** (true invariant). Vaughn Vernon: aggregate nhỏ, tham chiếu aggregate khác bằng ID, nhất quán giữa aggregate bằng event (eventual).
+    example: |-
+      ```ts
+      class Money {
+        private constructor(readonly minor: bigint, readonly currency: 'VND' | 'USD') {}
+        static of(minor: bigint, c: 'VND' | 'USD') { return new Money(minor, c); }
+        add(o: Money) { if (o.currency !== this.currency) throw new Error('CURRENCY_MISMATCH'); return new Money(this.minor + o.minor, this.currency); }
+        equals(o: Money) { return this.minor === o.minor && this.currency === o.currency; }
+      }
+      ```
+    followUp: Is "a customer can have at most 3 unpaid orders" an invariant inside Order or across aggregates? How do you enforce it?
+    tags: [ddd, aggregate, value-object]
+  - id: design-patterns-029
+    level: hard
+    type: scenario
+    q: Your `Order` aggregate now loads 10,000 line items and concurrent updates from warehouse staff fail with optimistic-lock conflicts. How do you redesign it?
+    hint: |-
+      Triệu chứng aggregate **quá to**: load chậm, version conflict vì nhiều người sửa phần không liên quan.
+      - Xác định invariant thật: có cần `sum(lines) = total` nhất quán tức thì không? Picking status của từng line có liên quan tới total không?
+      - Tách: `Order` (header, total, trạng thái thanh toán) và `Shipment/PickList` aggregate riêng theo line/kho; tham chiếu bằng `orderId`.
+      - Nhất quán giữa chúng qua domain event (`LinePicked` → cập nhật projection).
+      - Nếu vẫn chung: lazy load lines, version per line, command nhỏ hơn.
+      Trade-off: eventual consistency, UI phải chịu trạng thái trung gian.
+    followUp: Which parts of the UI now show eventually-consistent data, and how do you communicate that to users?
+    tags: [ddd, aggregate, concurrency]
+  - id: design-patterns-030
+    level: hard
+    type: concept
+    q: What is CQRS, what problem does it solve, and when do you push back on introducing it?
+    hint: |-
+      Tách model **ghi** (command, validate invariant, normalized) và model **đọc** (query, denormalized, tối ưu cho màn hình). Có thể cùng DB (view/table riêng) hoặc khác DB (SQL + Elasticsearch).
+      Giải: read/write shape rất khác nhau, tải đọc >> ghi, cần search/aggregation mà write DB không làm tốt.
+      Chi phí: **eventual consistency** (read-after-write lag), sync pipeline (outbox/CDC) phải monitor, rebuild projection, gấp đôi model.
+      Push back khi domain CRUD, read = write shape, team nhỏ. Fowler: CQRS thường chỉ hợp cho **một số bounded context**, không phải cả hệ thống. CQRS **không bắt buộc** Event Sourcing.
+    followUp: The user saves a product and the list page doesn't show it for 2 seconds. What are your options?
+    tags: [cqrs, architecture]
+  - id: design-patterns-031
+    level: hard
+    type: concept
+    q: Explain Event Sourcing. What are the hard problems that tutorials skip?
+    hint: |-
+      State = fold của chuỗi event bất biến (`OrderPlaced`, `ItemAdded`, `OrderPaid`); lưu event, không lưu state hiện tại. Được: audit log hoàn chỉnh, time travel, rebuild projection mới từ lịch sử.
+      Phần khó: **schema evolution** (event cũ phải đọc được mãi — upcaster, versioned event), **snapshot** khi stream dài, query ad-hoc cần projection, **GDPR xoá dữ liệu** trong log bất biến (crypto-shredding), concurrency trên stream (expected version), projection lag, debugging.
+      Khi KHÔNG dùng: không có nhu cầu audit/temporal thật, team chưa quen, domain CRUD. Audit log đơn giản (bảng history) thường đủ.
+    example: |-
+      ```ts
+      type OrderEvent =
+        | { type: 'OrderPlaced'; v: 1; orderId: string; total: number }
+        | { type: 'OrderPaid'; v: 1; orderId: string; paidAt: string };
+      const apply = (s: OrderState, e: OrderEvent): OrderState =>
+        e.type === 'OrderPlaced' ? { ...s, status: 'pending', total: e.total }
+        : e.type === 'OrderPaid' ? { ...s, status: 'paid' } : s;
+      const state = events.reduce(apply, initial);
+      ```
+    followUp: A user requests account deletion under GDPR. Your event store is append-only. What do you do?
+    tags: [event-sourcing, architecture]
+  - id: design-patterns-032
+    level: hard
+    type: gotcha
+    q: In NestJS you make one provider request-scoped to read the tenant ID. Suddenly latency goes up and a singleton behaves strangely. Explain.
+    hint: |-
+      Nest DI scope **lan ngược lên chuỗi inject**: provider nào inject một REQUEST-scoped provider cũng thành request-scoped → controller, service... bị **khởi tạo lại mỗi request** → tốn CPU/GC, cache in-memory trong service mất tác dụng.
+      Singleton inject request-scoped không được như mong đợi (hoặc chính nó bị chuyển scope).
+      Cách khác: truyền `tenantId` qua `AsyncLocalStorage` (nestjs-cls), đọc trong guard/interceptor; hoặc **durable providers** (`ContextIdStrategy`) để chia sẻ instance theo tenant thay vì theo request.
+    followUp: How would you implement per-tenant database connections in NestJS without request-scoping the whole graph?
+    verify: true
+    tags: [nestjs, di, scopes, multi-tenancy]
+  - id: design-patterns-033
+    level: hard
+    type: debug
+    q: The app boots, but `userService` is `undefined` inside `OrderService` at runtime. What's going on?
+    example: |-
+      ```ts
+      // order.service.ts
+      import { userService } from './user.service';
+      export class OrderService { owner(id: string) { return userService.find(id); } }
+      export const orderService = new OrderService();
+
+      // user.service.ts
+      import { orderService } from './order.service';
+      export class UserService {
+        find(id: string) { /* ... */ }
+        orders(id: string) { return orderService.owner(id); }
+      }
+      export const userService = new UserService();
+      ```
+    hint: |-
+      **Circular import**: `order.service` import `user.service`, `user.service` import `order.service`. Tuỳ entry point, một module được evaluate khi module kia **chưa chạy xong** → binding còn trong TDZ (ESM: `ReferenceError`) hoặc `undefined` (CJS partial exports).
+      Đây là dấu hiệu **coupling hai chiều** giữa module. Fix theo thứ tự ưu tiên: tách phần dùng chung thành module thứ ba; đảo phụ thuộc qua interface/event; lazy access (hàm trả dependency); NestJS `forwardRef()` chỉ là băng keo.
+      Phát hiện sớm: `madge --circular`, eslint `import/no-cycle`, dependency-cruiser.
+    followUp: Why does NestJS's `forwardRef()` fix the symptom but not the design problem?
+    tags: [circular-dependency, modules, node]
+  - id: design-patterns-034
+    level: hard
+    type: debug
+    q: A caching decorator was added to the product repository of a multi-tenant app. Two tenants now see each other's prices. Find the bug.
+    example: |-
+      ```ts
+      class CachedProductRepo implements ProductRepo {
+        constructor(private inner: ProductRepo, private cache: Redis) {}
+        async findBySku(sku: string, ctx: { tenantId: string }) {
+          const key = `product:${sku}`;
+          const hit = await this.cache.get(key);
+          if (hit) return JSON.parse(hit);
+          const p = await this.inner.findBySku(sku, ctx);
+          await this.cache.set(key, JSON.stringify(p), 'EX', 300);
+          return p;
+        }
+      }
+      ```
+    hint: |-
+      Cache key **thiếu `tenantId`** → tenant A ghi cache, tenant B đọc trúng. Decorator đúng về cấu trúc (cùng interface) nhưng làm mất một phần **ngữ nghĩa** của lời gọi.
+      Fix: key gồm mọi input ảnh hưởng kết quả: `t:${tenantId}:product:${sku}` (+ locale/currency nếu có); invalidate theo prefix tenant.
+      Thêm: cache cả `null` có TTL ngắn (chống penetration), test multi-tenant bắt buộc cho mọi decorator/cache.
+    followUp: How would you design the key and invalidation so a tenant's price update clears only its own entries?
+    tags: [decorator, caching, multi-tenancy]
+  - id: design-patterns-035
+    level: hard
+    type: concept
+    q: Name the anti-patterns you most often see in Node/TypeScript backends and how you'd detect each.
+    hint: |-
+      - **God object/service** (`OrderService` 3000 dòng) → churn + file size, nhiều reason-to-change.
+      - **Anemic model + transaction script lẫn lộn** → rule copy nhiều nơi.
+      - **Premature abstraction / speculative generality** → interface một implementation, flag không ai bật.
+      - **Golden hammer** (mọi thứ qua Kafka/Redis) · **Distributed monolith** (deploy cùng nhau, gọi sync chuỗi).
+      - **Shotgun surgery** (một thay đổi sửa 12 file) · **Primitive obsession** (`string` cho tiền, id, email).
+      - **Magic container wiring**, **catch-and-ignore**.
+      Phát hiện: git churn × complexity (hotspot), coupling metrics, review checklist.
+    followUp: How does primitive obsession cause real bugs with money and IDs? What does a branded type look like in TS?
+    tags: [anti-patterns, code-quality]
+  - id: design-patterns-036
+    level: hard
+    type: scenario
+    q: You inherit a 6-year-old checkout module with no tests, 4,000-line files, and it earns most of the revenue. How do you refactor it safely?
+    hint: |-
+      - **Characterization tests** trước: ghi lại hành vi hiện tại (kể cả bug) bằng test ở biên (HTTP/API level, golden master với input thật đã ẩn danh).
+      - Tìm **seam** (Michael Feathers): chỗ có thể thay hành vi mà không sửa code — tách I/O ra function, inject dependency.
+      - **Strangler Fig**: route từng use case sang module mới sau feature flag/proxy, chạy song song (shadow/dual-run, so sánh kết quả), rồi xoá code cũ.
+      - Refactor nhỏ, merge thường xuyên, mỗi bước có thể rollback; đo error rate/conversion.
+      - Không big-bang rewrite; không refactor cùng lúc đổi hành vi.
+    followUp: How do you compare old and new implementations in production without charging customers twice?
+    redFlags:
+      - "Rewrite it from scratch in a new service"
+    tags: [refactoring, legacy, strangler-fig]
+  - id: design-patterns-037
+    level: hard
+    type: scenario
+    q: A shared `buildOrderSummary(order, isAdmin, isEmail, isPdf, includeTax, legacyMode, tenantOverride)` is used by 9 callers and every change breaks someone. What happened and what do you do?
+    hint: |-
+      Đây là **wrong abstraction**: gộp code trông giống nhau nhưng thuộc các actor khác nhau; mỗi yêu cầu mới thêm một flag → tổ hợp 2^n hành vi, không ai dám sửa.
+      Cách của Sandi Metz: **inline lại** abstraction vào từng caller (chấp nhận duplication), xoá nhánh không dùng ở mỗi chỗ, rồi mới tìm abstraction đúng (nếu còn).
+      Kết quả thường là vài function nhỏ theo use case (email summary, PDF invoice, admin view) dùng chung **building block** thật (tính tiền, format tiền).
+      Boolean parameter là mùi code: tách thành function riêng hoặc option object có tên.
+    followUp: How do you convince the original author that re-introducing duplication is an improvement?
+    tags: [dry, wrong-abstraction, refactoring]
+  - id: design-patterns-038
+    level: hard
+    type: concept
+    q: How do domain events, Unit of Work and the Transactional Outbox pattern fit together?
+    hint: |-
+      Aggregate ghi nhận domain event trong bộ nhớ (`order.pullEvents()`); UoW commit state **và** ghi event vào bảng `outbox` **trong cùng transaction** → không bao giờ có trạng thái "DB đã lưu nhưng event mất" (dual-write problem).
+      Relay (polling hoặc CDC như Debezium) đọc outbox, publish lên Kafka, đánh dấu đã gửi → **at-least-once** → consumer phải idempotent (dedup theo event id).
+      Phân biệt: domain event (trong bounded context) vs integration event (contract public, versioned) — đừng publish nguyên domain event ra ngoài.
+    example: |-
+      ```ts
+      await uow.run(async (tx) => {
+        const order = await tx.orders.byId(id);
+        order.pay(clock.now());                       // records OrderPaid
+        await tx.orders.save(order);
+        await tx.outbox.addAll(order.pullEvents());   // same transaction
+      });
+      ```
+    followUp: Polling outbox vs CDC with Debezium — what are the trade-offs?
+    tags: [outbox, domain-events, unit-of-work]
+  - id: design-patterns-039
+    level: senior
+    type: open
+    q: You join a team where a simple CRUD feature touches controller, DTO, mapper, use case, port, adapter, repository and entity — 11 files. How do you decide whether to simplify?
+    hint: |-
+      Không có đáp án duy nhất — đo judgment:
+      - Hỏi **lý do lịch sử** trước (có đổi DB? có nhiều adapter? có test lợi từ nó?). Chesterton's fence.
+      - Đo chi phí thật: lead time cho thay đổi nhỏ, số file/PR, bug do mapping.
+      - Đề xuất **phân tầng theo độ phức tạp**: CRUD/read-heavy module dùng vertical slice mỏng; module có rule phức tạp (checkout, pricing) giữ hexagonal.
+      - Ghi ADR, thử trên một module, so sánh.
+      Tín hiệu senior: không dogmatic cả hai phía, tôn trọng consistency nhưng không để nó thành lý do cho ceremony.
+    followUp: How do you prevent the codebase from becoming inconsistent if different modules follow different styles?
+    tags: [architecture, judgment, over-engineering]
+  - id: design-patterns-040
+    level: senior
+    type: design
+    q: Design an extensible promotion/discount engine for an e-commerce platform (percentage, buy-X-get-Y, tiered, per-tenant rules). Which patterns do you use and where do they stop helping?
+    hint: |-
+      - Rule = **Strategy** + **Specification** (`isSatisfiedBy(cart)` ghép `and/or/not`) → điều kiện composable.
+      - Thứ tự/độc quyền: pipeline (**Chain of Responsibility**) có priority, `stackable` flag, "best discount wins".
+      - Rule lưu dạng **data** (JSON config per tenant) + interpreter có version → marketing tự cấu hình, không deploy.
+      - Tính toán **pure function** (cart in → breakdown out) để test/giải thích được ("tại sao tôi được giảm 50k?").
+      - Giới hạn: khi rule trở thành ngôn ngữ lập trình → cân nhắc rule engine có sẵn; đừng tự viết DSL Turing-complete.
+      Tiền: integer minor unit, rounding policy rõ.
+    followUp: How do you guarantee the price shown at cart equals the price charged at checkout when rules change in between?
+    tags: [design, strategy, specification, e-commerce]
+  - id: design-patterns-041
+    level: senior
+    type: design
+    q: Design a pluggable payment-provider integration (Stripe, a local e-wallet, COD, bank transfer) so a new provider can be added without touching checkout.
+    hint: |-
+      - Port `PaymentGateway` theo **capability** (`authorize`, `capture`, `refund?`, `webhook parse`) — không ép provider implement thứ không có (ISP/LSP).
+      - Mỗi provider là **Adapter** + anti-corruption mapping trạng thái về state machine chung (`pending → authorized → captured | failed`).
+      - **Registry/Factory** chọn provider theo tenant/country/method, config ở DB.
+      - Webhook: verify signature, idempotent theo provider event id, xử lý out-of-order.
+      - Test: contract test chung chạy trên mọi adapter + sandbox.
+      Khi dừng: đừng trừu tượng hoá sớm những flow khác hẳn (redirect 3DS vs QR vs COD) vào một method — dùng discriminated union cho "next action".
+    followUp: How do you model the "next action" (redirect, show QR, nothing) in TypeScript?
+    tags: [design, adapter, factory, payments]
+  - id: design-patterns-042
+    level: senior
+    type: design
+    q: Show me how you'd structure a Node.js/TypeScript service with hexagonal architecture — folders, where DI happens, and how each layer is tested.
+    hint: |-
+      - `domain/` (entity, VO, event — không import gì ngoài std), `application/` (use case + port interfaces), `adapters/in/http`, `adapters/in/kafka`, `adapters/out/sql`, `adapters/out/payment`, `main.ts` (**composition root** — nơi duy nhất `new` adapter).
+      - Test: domain = unit thuần; use case = unit với in-memory adapter; adapter out = integration test với DB thật (Testcontainers); adapter in = HTTP test mỏng; vài E2E.
+      - Enforce: dependency-cruiser/eslint boundaries.
+      - Thực dụng: có thể gộp application + domain cho module đơn giản; organize **theo feature** trước (`orders/`, `catalog/`) rồi mới theo layer bên trong.
+    example: |-
+      ```text
+      src/orders/
+        domain/order.ts, money.ts, events.ts
+        application/place-order.ts, ports.ts
+        adapters/http/orders.controller.ts
+        adapters/sql/sql-order-repository.ts
+      src/main.ts   // wiring
+      ```
+    followUp: Where does input validation (zod) belong — adapter or use case?
+    tags: [hexagonal, architecture, testing]
+  - id: design-patterns-043
+    level: senior
+    type: open
+    q: Product wants a full audit history and "undo" for inventory adjustments. A teammate proposes Event Sourcing for the whole platform. How do you respond?
+    hint: |-
+      - Tách nhu cầu: audit trail (ai đổi gì, khi nào) ≠ event sourcing. Bảng `inventory_movements` append-only + trạng thái tồn kho hiện tại (ledger pattern) thường giải được 90%.
+      - Nếu ES: giới hạn trong **bounded context inventory**, không cả platform.
+      - Đánh giá: kinh nghiệm team, schema evolution, projection infra, tooling debug, GDPR.
+      - "Undo" = compensating event/movement, không phải xoá lịch sử.
+      - Đề xuất spike có tiêu chí thành công đo được, ADR.
+      Senior signal: phân biệt nhu cầu nghiệp vụ với giải pháp kỹ thuật hấp dẫn.
+    followUp: How would the ledger table be designed so the current stock is always consistent with the movements?
+    tags: [event-sourcing, judgment, inventory]
+  - id: design-patterns-044
+    level: senior
+    type: open
+    q: How do you introduce design principles in a team with mixed seniority without turning code review into pattern policing?
+    hint: |-
+      - Nói bằng **vấn đề**, không bằng tên pattern: "đổi provider phải sửa 5 file" thay vì "phải dùng Strategy".
+      - Tài liệu ngắn: ADR, ví dụ "good/bad" từ chính codebase, template module.
+      - Tự động hoá phần cơ học (lint boundaries, cyclic deps, complexity) để review tập trung vào design.
+      - Pair/mob trên refactor thật; tech talk ngắn sau incident.
+      - Chấp nhận "good enough" với code ít thay đổi; đầu tư vào **hotspot**.
+    followUp: Tell me about a time you pushed back on an abstraction a senior colleague proposed.
+    tags: [leadership, code-review, behavioral]
+  - id: design-patterns-045
+    level: senior
+    type: open
+    q: Several GoF patterns were designed for languages without first-class functions. Which ones collapse into plain functions in TypeScript, and which still earn their class-based form?
+    hint: |-
+      Co lại thành function: **Strategy** (function param), **Command** (closure hoặc plain object + handler map), **Template Method** (higher-order function), **Observer** (callback/EventEmitter), **Factory** (function trả object), **Decorator** (higher-order function `withX(fn)`), **Iterator** (generator).
+      Vẫn đáng dùng dạng class/object: khi có **state + nhiều method liên quan** (Repository, Gateway adapter), lifecycle (connect/close), cần DI container, hoặc **State pattern** với nhiều transition.
+      Tín hiệu senior: chọn theo readability và testability, không theo sách; biết pattern như **từ vựng** để giao tiếp.
+    followUp: When does a higher-order-function chain become harder to debug than a class-based decorator?
+    tags: [functional, typescript, gof]
+  - id: design-patterns-046
+    level: medium
+    type: compare
+    q: "Exceptions vs a Result type (`{ ok: true, value } | { ok: false, error }`) for domain errors in TypeScript — which do you choose and why?"
+    hint: |-
+      - **Exception**: ngắn gọn, stack trace, phù hợp lỗi **không mong đợi** (DB down, bug). Nhược: TS không khai báo được `throws` → caller không biết phải xử lý gì.
+      - **Result/Either** (neverthrow, discriminated union): lỗi **nghiệp vụ dự kiến** (`INSUFFICIENT_STOCK`, `COUPON_EXPIRED`) nằm trong type → compiler ép xử lý, map sang HTTP 4xx rõ ràng.
+      Thực tế hay kết hợp: Result cho domain error, exception cho infrastructure; ở biên (controller) map cả hai sang response thống nhất.
+      Pitfall: Result khắp nơi làm code rườm rà; exception bị nuốt bởi `catch {}`.
+    example: |-
+      ```ts
+      type Result<T, E extends string> = { ok: true; value: T } | { ok: false; error: E };
+      function reserve(stock: number, qty: number): Result<number, 'INSUFFICIENT_STOCK'> {
+        return qty <= stock ? { ok: true, value: stock - qty } : { ok: false, error: 'INSUFFICIENT_STOCK' };
+      }
+      ```
+    followUp: How do you keep error codes consistent between the domain and your HTTP error responses?
+    tags: [error-handling, typescript]
+  - id: design-patterns-047
+    level: hard
+    type: scenario
+    q: "The codebase has `if (tenant.plan === 'enterprise')` checks in 40 places, and adding a new plan took two weeks and caused three bugs. How do you fix it?"
+    hint: |-
+      Đây là **shotgun surgery** + thiếu một khái niệm domain: "plan capabilities".
+      - Gom quyết định về **một chỗ**: `Entitlements` object (`canUseSso`, `maxSeats`, `features.has('bulk-import')`) sinh từ plan + override per tenant → caller hỏi capability, không hỏi tên plan.
+      - Replace conditional with polymorphism/Strategy khi hành vi khác nhau thật (billing calculator per plan).
+      - Lưu entitlements dạng data (DB/feature-flag service) để thêm plan không cần deploy.
+      - Refactor dần: grep mọi check, viết test cho từng hành vi, thay từng chỗ.
+    followUp: How do entitlements interact with RBAC permissions — are they the same check?
+    tags: [refactoring, strategy, multi-tenancy]

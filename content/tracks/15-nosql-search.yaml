@@ -1,0 +1,810 @@
+id: 15-nosql-search
+slug: nosql-search
+title: NoSQL & Search (Elasticsearch)
+tier: 4
+status: drafted
+summary: "Khi nào NoSQL, DynamoDB single-table, MongoDB essentials, Elasticsearch: inverted index, analyzer, mapping, shard, reindex với alias, sync DB → ES và drift."
+cvLinked: true
+prerequisites: []
+overview: |-
+  ## TL;DR
+
+  - NoSQL không phải "SQL nhưng nhanh hơn": mỗi loại tối ưu cho **access pattern** cụ thể. DynamoDB: key-value/wide-column, thiết kế **từ query ngược về schema**. MongoDB: document linh hoạt, embed vs reference. Relational vẫn là mặc định cho dữ liệu quan hệ + transaction.
+  - Elasticsearch là **search engine** (Lucene) — tuyệt cho full-text, relevance, facet, aggregation; **không phải source of truth**: near-real-time (refresh ~1s), không transaction đa document, mapping khó đổi.
+  - Pattern chuẩn: DB là nguồn sự thật → **sync sang ES** qua event/CDC → indexer idempotent, có versioning → **reconcile** để phát hiện drift → reindex bằng **alias** không downtime.
+  - Senior interview hỏi: mapping explosion, text vs keyword, analyzer tiếng Việt, shard sizing, deep pagination, dual-write, ordering/idempotency của indexer, hot partition DynamoDB.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Partition key (DynamoDB) | Hash quyết định partition vật lý; cần phân tán đều | `PK = TENANT#42#ORDER#991` |
+  | Sort key | Sắp xếp item trong cùng partition; cho phép range query | `SK = ITEM#0001`, `begins_with(SK, 'ITEM#')` |
+  | GSI / LSI | Index phụ: GSI khác partition key (eventual), LSI cùng PK khác SK (tạo lúc tạo table) | GSI `GSI1PK = CUSTOMER#7` |
+  | Single-table design | Nhiều entity trong một table, key overload để một Query lấy đủ dữ liệu | Order + items cùng `PK` |
+  | Embed vs reference (MongoDB) | Nhúng dữ liệu đọc cùng nhau; tham chiếu khi lớn/không giới hạn/chia sẻ | Address nhúng trong user; order tham chiếu product |
+  | Inverted index | term → danh sách document chứa term | `"cotton" → [doc1, doc7]` |
+  | Analyzer | char filter → tokenizer → token filter | `"Áo Thun" → [ao, thun]` với lowercase + asciifolding |
+  | `text` vs `keyword` | text: analyze để full-text; keyword: nguyên giá trị cho filter/sort/agg | `name` text + `name.keyword` |
+  | Mapping | Schema của index; field đã map **không đổi kiểu** được | `dynamic: strict` |
+  | Shard / replica | Primary shard chia dữ liệu (cố định khi tạo, trừ split/shrink); replica cho HA + đọc | 3 primary × 1 replica |
+  | Refresh | Làm document mới searchable (mặc định 1s) → near-real-time | `refresh_interval: 30s` khi bulk |
+  | Alias | Tên ảo trỏ tới một/nhiều index → đổi index không đổi code | `products` → `products_v7` |
+  | CDC | Đọc log thay đổi của DB (WAL/binlog/CDC table) để phát event | Debezium → Kafka → indexer |
+
+  ## Cơ chế hoạt động
+
+  ### Sync DB → Elasticsearch (outbox/CDC + indexer)
+
+  ```mermaid
+  flowchart LR
+    A["API ghi DB<br/>(product + outbox row<br/>trong cùng transaction)"] --> B[("SQL DB<br/>source of truth")]
+    B -- "CDC / outbox relay" --> K[["Kafka topic<br/>key = productId"]]
+    K --> I["Indexer service<br/>load latest from DB,<br/>transform, enrich"]
+    I -- "bulk index<br/>version = row version" --> E[("Elasticsearch<br/>alias: products")]
+    R["Reconciler (định kỳ)<br/>so count/checksum/updated_at"] --> B
+    R --> E
+    R -- "drift → re-emit" --> K
+  ```
+
+  ### Reindex không downtime bằng alias
+
+  ```mermaid
+  sequenceDiagram
+    participant Ops
+    participant ES
+    participant Idx as Indexer
+    Ops->>ES: PUT products_v8 (mapping mới, replicas 0, refresh -1)
+    Idx->>ES: dual-write: products_v7 (qua alias) + products_v8
+    Ops->>ES: _reindex / backfill từ DB vào products_v8
+    Ops->>ES: bật lại replicas & refresh, so sánh count + sample query
+    Ops->>ES: POST _aliases (remove v7, add v8) — atomic
+    Ops->>ES: giữ v7 vài ngày để rollback, rồi xoá
+  ```
+
+  ### Search: query then fetch
+
+  Coordinating node gửi query tới **một bản copy của mỗi shard** (scatter) → mỗi shard trả top-N id + score → gộp, sort → **fetch** `_source` của top kết quả. `from + size` lớn = mỗi shard phải trả `from + size` kết quả → deep pagination đắt.
+
+  ## Trade-offs
+
+  | Nhu cầu | Relational (Postgres/SQL Server) | DynamoDB | MongoDB | Elasticsearch |
+  |---|---|---|---|---|
+  | Transaction đa entity | Mạnh | Có (TransactWriteItems, giới hạn số item) | Có (multi-document, tốn hơn) | Không |
+  | Query ad-hoc / join | Mạnh | Yếu (phải biết trước access pattern) | Khá (`$lookup`, aggregation) | Không join; denormalize |
+  | Full-text + relevance | Cơ bản (FTS, pg_trgm) | Không | Có (Atlas Search) | Mạnh nhất |
+  | Scale ngang | Khó hơn (shard thủ công/Citus) | Tự động, gần như vô hạn | Sharding có sẵn | Shard có sẵn |
+  | Schema | Chặt | Linh hoạt, thiết kế key chặt | Linh hoạt (+ validator) | Mapping — khó đổi |
+  | Vận hành | Trung bình | Managed hoàn toàn | Trung bình / Atlas | Nặng (heap, shard, upgrade) |
+
+  | Cách sync DB → ES | Ưu | Nhược |
+  |---|---|---|
+  | Dual-write trong request | Đơn giản | Không atomic → drift khi một bên lỗi; tăng latency |
+  | Outbox + relay | Atomic với DB, thứ tự theo entity | Thêm table + relay |
+  | CDC (Debezium) | Không đụng code app, bắt mọi thay đổi | Hạ tầng Kafka/Connect, event mức row (cần transform) |
+  | Batch theo `updated_at` | Dễ | Trễ, bỏ sót delete, clock/transaction commit muộn |
+
+  ## Pitfalls
+
+  - Dùng ES làm source of truth hoặc đọc-sau-ghi từ ES rồi ngạc nhiên vì chưa refresh.
+  - `dynamic: true` cho object có key do user/provider định nghĩa → **mapping explosion** (vượt `index.mapping.total_fields.limit`, mặc định 1000).
+  - `term` trên field `text`; sort/aggregate trên `text`.
+  - Quá nhiều shard nhỏ (index per tenant per ngày...) → cluster state phình, heap cạn.
+  - `from/size` sâu (mặc định chặn ở `index.max_result_window = 10000`) → dùng `search_after` + PIT.
+  - Indexer không idempotent/không versioning → event cũ đến sau ghi đè dữ liệu mới.
+  - DynamoDB: partition key thấp cardinality (`status`) → hot partition; `Scan` + `FilterExpression` vẫn tính capacity cho mọi item đã đọc.
+  - MongoDB: mảng không giới hạn trong document (vượt 16MB, index multikey phình).
+
+  ## Cheat sheet
+
+  - ES: `text` cho search, `keyword` cho filter/sort/agg, multi-field cho cả hai; `filter` context không tính score và cache được.
+  - ES đổi mapping field đã có → index mới + `_reindex` + alias swap. Primary shard count: cố định (có `_split`/`_shrink` với điều kiện).
+  - Bulk load: `refresh_interval: -1`, `number_of_replicas: 0`, bulk 5–15MB/request, bật lại sau.
+  - Indexer: key Kafka = entity id, `version_type: external` với version từ DB, retry idempotent, DLQ.
+  - DynamoDB: liệt kê access pattern trước; Query > Scan; GSI eventual; item ≤ 400KB; conditional write cho optimistic locking.
+  - MongoDB: index theo ESR (Equality → Sort → Range); embed khi "đọc cùng nhau, giới hạn kích thước".
+notionRefs:
+  - title: NoSQL Databases
+    url: https://app.notion.com/p/179ef77f8ab280159654c5bee00287c5
+  - title: Elastic Search
+    url: https://app.notion.com/p/b494f019a75649ecac2987593b0cd8c3
+references:
+  - title: Elastic docs — Mapping
+    url: https://www.elastic.co/docs/manage-data/data-store/mapping
+  - title: Elastic docs — Text analysis
+    url: https://www.elastic.co/docs/manage-data/data-store/text-analysis
+  - title: Elastic docs — Aliases
+    url: https://www.elastic.co/docs/manage-data/data-store/aliases
+  - title: Elastic docs — Size your shards
+    url: https://www.elastic.co/docs/deploy-manage/production-guidance/optimize-performance/size-shards
+  - title: Elastic docs — Paginate search results (search_after, PIT)
+    url: https://www.elastic.co/docs/reference/elasticsearch/rest-apis/paginate-search-results
+  - title: Elastic docs — Tune for indexing speed
+    url: https://www.elastic.co/docs/deploy-manage/production-guidance/optimize-performance/indexing-speed
+  - title: AWS docs — Best practices for designing and architecting with DynamoDB
+    url: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/best-practices.html
+  - title: AWS docs — DynamoDB service quotas
+    url: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ServiceQuotas.html
+  - title: MongoDB docs — Data modeling
+    url: https://www.mongodb.com/docs/manual/data-modeling/
+  - title: MongoDB docs — The ESR (Equality, Sort, Range) guideline
+    url: https://www.mongodb.com/docs/manual/tutorial/equality-sort-range-guideline/
+  - title: Debezium documentation
+    url: https://debezium.io/documentation/
+questions:
+  - id: nosql-search-001
+    level: easy
+    type: compare
+    q: When would you choose a NoSQL database over a relational one? Give concrete signals.
+    hint: |-
+      Chọn NoSQL khi: access pattern **biết trước và đơn giản** (get/put theo key, range theo key) ở quy mô rất lớn/throughput đột biến (DynamoDB); dữ liệu dạng document lồng nhau đọc-ghi cả khối (MongoDB); cần scale ngang tự động, multi-region.
+      Ở lại relational khi: nhiều quan hệ, query ad-hoc/report, transaction đa entity, ràng buộc toàn vẹn, team quen SQL. Postgres với `jsonb` phủ được nhiều nhu cầu "schema linh hoạt".
+      Search engine (ES) là **bổ sung** cho full-text/facet, không thay DB.
+    followUp: Your team wants MongoDB "because the schema changes a lot". How do you challenge that?
+    redFlags:
+      - "NoSQL is always faster and scales better"
+    tags: [sql-vs-nosql]
+  - id: nosql-search-002
+    level: easy
+    type: concept
+    q: Name the main NoSQL families and a production use case for each.
+    hint: |-
+      - **Key-value**: Redis, DynamoDB (KV) → session, cache, rate limit, cart.
+      - **Document**: MongoDB, Couchbase, Firestore → catalog, profile, CMS.
+      - **Wide-column**: Cassandra, ScyllaDB, Bigtable → time-series, event log, write rất nặng.
+      - **Graph**: Neo4j, Neptune → recommendation, fraud ring.
+      - **Search engine**: Elasticsearch/OpenSearch → full-text, log analytics (thường xếp riêng).
+    followUp: DynamoDB is often called key-value — why is it also described as wide-column?
+    tags: [nosql, basics]
+  - id: nosql-search-003
+    level: easy
+    type: concept
+    q: In DynamoDB, what are the partition key and sort key, and why does partition key choice matter so much?
+    hint: |-
+      Primary key = partition key (hash) [+ sort key]. Partition key được hash để chọn **partition vật lý**; item cùng partition key sắp theo sort key → `Query` lấy range (`begins_with`, `between`).
+      Mỗi partition có giới hạn throughput (khoảng 3.000 RCU và 1.000 WCU mỗi giây); key cardinality thấp hoặc lệch (một tenant/ngày/status nóng) → **hot partition** → throttling dù tổng capacity dư. Adaptive capacity giảm bớt nhưng không cứu được key quá nóng.
+    followUp: How would you pick a partition key for an orders table in a multi-tenant system with a few huge tenants?
+    tags: [dynamodb, partition-key]
+    verify: true
+  - id: nosql-search-004
+    level: easy
+    type: compare
+    q: In MongoDB, when do you embed a sub-document and when do you reference another collection?
+    hint: |-
+      **Embed** khi dữ liệu **đọc cùng nhau**, thuộc về cha (1-1, 1-ít), **kích thước có giới hạn** (address của user, line items của order với snapshot giá). Một lần đọc, update atomic trong một document.
+      **Reference** khi: quan hệ 1-rất-nhiều/không giới hạn (comment, log), dữ liệu dùng chung và thay đổi độc lập (product dùng trong nhiều order), document sẽ vượt 16MB, hoặc cần truy cập riêng.
+      Hybrid: embed một bản sao tóm tắt (tên, giá lúc mua) + reference id.
+    followUp: Why should the order line items store a snapshot of product price instead of referencing the product?
+    tags: [mongodb, modeling]
+  - id: nosql-search-005
+    level: easy
+    type: concept
+    q: What is an inverted index and why does it make full-text search fast compared with `LIKE '%term%'`?
+    hint: |-
+      Inverted index: map **term → posting list** (các document chứa term, kèm vị trí/tần suất). Search = tra term trong từ điển đã sắp xếp + giao/hợp posting list → không phụ thuộc tuyến tính vào số document.
+      `LIKE '%term%'` không dùng được B-tree → quét toàn bộ; không hiểu ngôn ngữ (hoa/thường, dấu, số nhiều), không xếp hạng relevance.
+      Postgres có thể làm tương tự với `tsvector` + GIN hoặc `pg_trgm` + GIN.
+    followUp: What does the analyzer have to do with whether a document matches?
+    tags: [elasticsearch, inverted-index]
+  - id: nosql-search-006
+    level: easy
+    type: compare
+    q: "`text` vs `keyword` field types in Elasticsearch — when do you use each?"
+    hint: |-
+      `text`: qua analyzer → nhiều term → full-text search (`match`), có score. Không dùng để sort/aggregate (mặc định fielddata tắt).
+      `keyword`: lưu nguyên giá trị (có thể qua normalizer, vd lowercase) → exact filter (`term`), sort, aggregation, facet. Mặc định dynamic mapping có `ignore_above: 256`.
+      Thường dùng multi-field: `name` (text) + `name.keyword` (keyword). ID, SKU, status, tenantId, email → `keyword`.
+    followUp: Why is `sku` better as keyword even though users type it into the search box?
+    tags: [elasticsearch, mapping]
+  - id: nosql-search-007
+    level: easy
+    type: concept
+    q: What are primary shards and replicas in Elasticsearch, and what can you change after index creation?
+    hint: |-
+      Primary shard: mảnh dữ liệu (mỗi cái là một Lucene index); document được route theo `hash(_routing) % num_primary_shards` (thực tế có thêm `routing_num_shards`). Replica: bản sao của primary trên node khác → HA + tăng throughput đọc.
+      Sau khi tạo: **replica đổi bất cứ lúc nào**; số primary **không đổi trực tiếp** — phải reindex, hoặc dùng `_split` (tăng theo bội số) / `_shrink` (giảm theo ước số) với điều kiện index read-only tạm thời.
+      Thêm replica **không** giúp khi một shard quá lớn/chậm ghi.
+    followUp: Why is adding replicas not a fix for slow indexing?
+    tags: [elasticsearch, shards]
+  - id: nosql-search-008
+    level: medium
+    type: compare
+    q: DynamoDB Query vs Scan — why is `Scan` with a `FilterExpression` a trap?
+    hint: |-
+      `Query`: đúng một partition key (+ điều kiện sort key) → đọc đúng các item cần.
+      `Scan`: đọc **toàn bộ table** (theo trang 1MB). `FilterExpression` áp dụng **sau khi đọc** → vẫn tốn RCU cho mọi item đã đọc, latency cao, có thể trả trang rỗng kèm `LastEvaluatedKey`.
+      Fix: thiết kế key/GSI cho access pattern đó; Scan chỉ cho batch/export (parallel scan, off-peak) hoặc export to S3.
+    example: |-
+      ```ts
+      // Query: đơn của 1 customer trong tháng 9
+      await ddb.send(new QueryCommand({
+        TableName: 'app',
+        KeyConditionExpression: 'PK = :pk AND begins_with(SK, :m)',
+        ExpressionAttributeValues: { ':pk': 'TENANT#42#CUST#7', ':m': 'ORDER#2026-09' },
+      }));
+      ```
+    followUp: A Query returns 20 items but `LastEvaluatedKey` is set. Why, and how do you paginate correctly?
+    tags: [dynamodb, query, scan]
+  - id: nosql-search-009
+    level: medium
+    type: compare
+    q: Compare DynamoDB GSIs and LSIs.
+    hint: |-
+      - **GSI**: partition key + sort key tuỳ ý; tạo/xoá bất cứ lúc nào; **chỉ eventual consistency**; có capacity riêng (write vào table → write vào GSI, GSI throttle có thể ảnh hưởng write table); projection (KEYS_ONLY/INCLUDE/ALL).
+      - **LSI**: cùng partition key, sort key khác; **chỉ tạo lúc tạo table**; hỗ trợ strongly consistent read; giới hạn **10GB mỗi item collection** (mỗi partition key) khi có LSI.
+      Thường dùng GSI; LSI khi thật sự cần strong read trên sort key thay thế.
+    followUp: What is GSI overloading in single-table design?
+    tags: [dynamodb, gsi, lsi]
+    verify: true
+  - id: nosql-search-010
+    level: medium
+    type: design
+    q: Explain single-table design in DynamoDB with an example for orders and order items.
+    hint: |-
+      Nguyên tắc: **liệt kê access pattern trước**, đặt nhiều entity vào một table với key generic (`PK`, `SK`, `GSI1PK`, `GSI1SK`) để một `Query` lấy được "item collection" cần thiết (như pre-join).
+      Ví dụ:
+      - Order: `PK = TENANT#42#ORDER#991`, `SK = META`.
+      - Item: `PK = TENANT#42#ORDER#991`, `SK = ITEM#001` → một Query lấy order + items.
+      - "Đơn của customer theo thời gian": `GSI1PK = TENANT#42#CUST#7`, `GSI1SK = 2026-09-28T10:00Z#991`.
+      Trade-off: khó query ad-hoc, khó đổi access pattern, khó hiểu cho người mới; nhiều team chọn vài table theo bounded context thay vì "một table cho tất cả".
+    followUp: A new requirement asks for "all orders over $500 in the last week across all customers". How do you support it?
+    tags: [dynamodb, single-table, modeling]
+  - id: nosql-search-011
+    level: medium
+    type: concept
+    q: What consistency guarantees does DynamoDB offer on reads, and where can you not get strong consistency?
+    hint: |-
+      Mặc định **eventually consistent** read (rẻ bằng nửa). `ConsistentRead: true` → strongly consistent read trên table và LSI (trong một region).
+      **Không** có strong read trên **GSI**, DynamoDB Streams, và giữa region của Global Tables (Global Tables mặc định eventual; AWS có thêm chế độ multi-region strong consistency cho một số cấu hình — kiểm tra docs hiện tại).
+      Hệ quả: đọc-sau-ghi qua GSI có thể chưa thấy item mới.
+    followUp: How do you design a "check username availability then create" flow correctly in DynamoDB?
+    tags: [dynamodb, consistency]
+    verify: true
+  - id: nosql-search-012
+    level: medium
+    type: concept
+    q: How do you implement optimistic locking and multi-item atomic writes in DynamoDB?
+    hint: |-
+      - Optimistic locking: attribute `version`; `UpdateItem` với `ConditionExpression: version = :expected` và `SET version = version + 1` → `ConditionalCheckFailedException` khi conflict.
+      - Uniqueness: `PutItem` với `attribute_not_exists(PK)` (thường thêm item "unique marker" như `PK = EMAIL#a@b.com`).
+      - Multi-item: `TransactWriteItems` (all-or-nothing, tối đa 100 action, tốn gấp đôi capacity); `BatchWriteItem` **không** atomic (tối đa 25 item, trả `UnprocessedItems` phải retry).
+      - Idempotency: `ClientRequestToken` cho transaction.
+    example: |-
+      ```ts
+      await ddb.send(new UpdateCommand({
+        TableName: 'app',
+        Key: { PK: 'TENANT#42#PRODUCT#9', SK: 'STOCK' },
+        UpdateExpression: 'SET qty = qty - :n, version = version + :one',
+        ConditionExpression: 'qty >= :n AND version = :v',
+        ExpressionAttributeValues: { ':n': 2, ':one': 1, ':v': 17 },
+      }));
+      ```
+    followUp: Why is BatchWriteItem not a replacement for a transaction?
+    tags: [dynamodb, optimistic-locking, transactions]
+    verify: true
+  - id: nosql-search-013
+    level: medium
+    type: concept
+    q: How do you design a compound index in MongoDB? Explain the ESR guideline.
+    hint: |-
+      ESR: đặt field **Equality** trước, rồi **Sort**, cuối cùng **Range** → index lọc chính xác, trả kết quả đã sắp xếp (không in-memory sort), range thu hẹp ở cuối.
+      Ví dụ query `{ tenantId: 42, status: 'paid', createdAt: { $gte: d } }` sort `{ total: -1 }` → index `{ tenantId: 1, status: 1, total: -1, createdAt: 1 }`.
+      Kiểm tra bằng `explain('executionStats')`: `IXSCAN` vs `COLLSCAN`, `totalDocsExamined` vs `nReturned`, có `SORT` stage không.
+      Giống ý tưởng composite index SQL (equality trước, range sau).
+    followUp: What does it mean when `totalKeysExamined` is 100x `nReturned`?
+    tags: [mongodb, indexes, esr]
+  - id: nosql-search-014
+    level: medium
+    type: concept
+    q: Explain MongoDB write concern, read concern, and when multi-document transactions are worth it.
+    hint: |-
+      - **Write concern** `w: 'majority'` (mặc định từ MongoDB 5.0): ack khi đa số node đã ghi → không mất khi failover; `w: 1` nhanh hơn nhưng có thể rollback.
+      - **Read concern** `majority`/`linearizable`/`snapshot`: đọc dữ liệu đã được đa số xác nhận; kèm read preference (primary vs secondary — secondary có thể stale).
+      - **Multi-document transaction** (replica set từ 4.0, sharded từ 4.2): có nhưng tốn hơn, có thời gian sống giới hạn (mặc định 60s); ưu tiên model để thao tác atomic trong **một document**.
+    followUp: You read from a secondary right after writing to the primary. What anomalies can you see, and how do causal sessions help?
+    tags: [mongodb, consistency, transactions]
+    verify: true
+  - id: nosql-search-015
+    level: medium
+    type: concept
+    q: Walk through what an Elasticsearch analyzer does, and when would the index-time and search-time analyzers differ?
+    hint: |-
+      Analyzer = **char filters** (bỏ HTML, map ký tự) → **tokenizer** (tách token: standard, whitespace, icu) → **token filters** (lowercase, asciifolding, stop, stemmer, synonym, edge_ngram).
+      Thông thường dùng **cùng analyzer** lúc index và search để term khớp nhau. Khác nhau có chủ đích: autocomplete dùng `edge_ngram` lúc index nhưng `standard` lúc search (nếu không, query "ao" bị tách thành "a","ao" → match quá rộng); synonym graph thường chỉ áp dụng lúc search để đổi synonym không cần reindex.
+      Debug: `POST _analyze` / `GET index/_analyze` với field.
+    example: |-
+      ```json
+      POST products/_analyze
+      { "field": "name", "text": "Áo Thun Cotton" }
+      ```
+    followUp: A product named "Áo thun" is not found when users type "ao thun". What do you change?
+    tags: [elasticsearch, analyzer]
+  - id: nosql-search-016
+    level: medium
+    type: compare
+    q: "`match` vs `term` queries, and `must` vs `filter` in a bool query — what are the performance implications?"
+    hint: |-
+      - `match`: query được analyze theo analyzer của field → full-text trên `text`. `term`: không analyze, so khớp chính xác → dùng với `keyword`, số, bool, date.
+      - `must`: phải khớp **và tính score**. `filter`: phải khớp, **không tính score**, kết quả có thể được **cache** (node query cache) → nhanh hơn. `should` tăng score; `must_not` loại bỏ (filter context).
+      Quy tắc: tenant, status, category, price range, availability → `filter`; từ khoá người dùng → `must` (`multi_match` với boost field).
+    example: |-
+      ```json
+      GET products/_search
+      {
+        "query": {
+          "bool": {
+            "must":   [{ "multi_match": { "query": "ao thun", "fields": ["name^3", "description"] } }],
+            "filter": [
+              { "term":  { "tenantId": "42" } },
+              { "term":  { "status": "active" } },
+              { "range": { "price": { "lte": 200000 } } }
+            ]
+          }
+        }
+      }
+      ```
+    followUp: Why can putting the tenant condition in `must` subtly change ranking?
+    tags: [elasticsearch, query-dsl, performance]
+  - id: nosql-search-017
+    level: medium
+    type: concept
+    q: Why is Elasticsearch "near real-time"? Explain refresh, the translog and flush.
+    hint: |-
+      Document index vào **in-memory buffer** + ghi **translog** (durability). **Refresh** (mặc định mỗi 1s, với shard không có search trong 30s thì bỏ qua refresh định kỳ — "search idle") ghi buffer thành **segment** mới mở cho search → trễ tới ~1s mới search thấy.
+      **Flush** = Lucene commit segment xuống disk + cắt translog; không liên quan việc search thấy.
+      `GET /index/_doc/id` (real-time get) thấy ngay kể cả chưa refresh. Tuỳ chọn `refresh=wait_for` trên request ghi: chờ refresh tiếp theo (không ép refresh); `refresh=true` ép refresh — tránh dùng thường xuyên.
+      Tăng `refresh_interval` khi bulk load → ít segment nhỏ, index nhanh hơn.
+    followUp: A test creates a product and immediately searches for it, failing intermittently. Fix the test without hurting production.
+    tags: [elasticsearch, refresh, near-real-time]
+    verify: true
+  - id: nosql-search-018
+    level: medium
+    type: concept
+    q: Dynamic vs explicit mapping in Elasticsearch — what settings would you use for a product index?
+    hint: |-
+      Dynamic mapping đoán kiểu từ document đầu tiên: chuỗi → `text` + `keyword` sub-field; số "đầu tiên" quyết định `long` vs `float`; chuỗi dạng ngày → `date`. Đoán sai rồi thì **không đổi được**.
+      Product index: **explicit mapping** + `dynamic: strict` (reject field lạ) hoặc `false` (lưu trong `_source` nhưng không index) cho object tự do; dynamic templates cho pattern có kiểm soát.
+      Field không search → `index: false`/`enabled: false`; attributes động → `flattened` hoặc cặp `{name, value}` dạng nested.
+    followUp: >-
+      What is the difference between `dynamic: false` and `dynamic: strict` when an unknown field arrives?
+    tags: [elasticsearch, mapping]
+  - id: nosql-search-019
+    level: medium
+    type: concept
+    q: Why can't you change the type of an existing field in an Elasticsearch mapping, and what are your options?
+    hint: |-
+      Dữ liệu đã được index thành cấu trúc Lucene theo kiểu cũ (inverted index, doc values, points) trong segment bất biến → đổi kiểu = phải index lại toàn bộ.
+      Được phép: **thêm field mới**, thêm multi-field (chỉ áp dụng cho doc index sau đó → cần `_update_by_query` để áp cho doc cũ), đổi vài tham số (`ignore_above`...).
+      Đổi kiểu/analyzer: tạo index mới với mapping mới → `_reindex` (hoặc backfill từ DB) → **đổi alias** atomic. Có thể dùng runtime field tạm thời (tính lúc query, chậm).
+    followUp: Why is backfilling from the database often better than `_reindex` from the old index?
+    tags: [elasticsearch, mapping, reindex]
+  - id: nosql-search-020
+    level: medium
+    type: design
+    q: How do you do a zero-downtime reindex using aliases? Include how writes are handled during the reindex.
+    hint: |-
+      1. App đọc/ghi qua alias `products` (không bao giờ tên index thật).
+      2. Tạo `products_v8` với mapping mới (replicas 0, refresh -1 khi load).
+      3. Ghi: indexer **dual-write** vào v7 và v8, hoặc ghi vào v8 đồng thời ghi nhận thời điểm bắt đầu rồi replay event từ thời điểm đó sau backfill (Kafka offset).
+      4. Backfill v8 từ DB (hoặc `_reindex` từ v7).
+      5. Bật replicas/refresh, verify: count, sample query, relevance smoke test.
+      6. `POST _aliases` với `remove` + `add` trong **một request** → atomic; nếu alias dùng cho ghi thì set `is_write_index`.
+      7. Giữ v7 để rollback, rồi xoá.
+    example: |-
+      ```json
+      POST _aliases
+      {
+        "actions": [
+          { "remove": { "index": "products_v7", "alias": "products" } },
+          { "add":    { "index": "products_v8", "alias": "products", "is_write_index": true } }
+        ]
+      }
+      ```
+    followUp: How do you avoid losing an update that arrives while the backfill is copying that same product?
+    tags: [elasticsearch, alias, reindex, zero-downtime]
+  - id: nosql-search-021
+    level: medium
+    type: gotcha
+    q: A user pages to page 600 of search results and gets an error. Why, and how do you implement deep pagination in Elasticsearch?
+    hint: |-
+      `from + size` vượt `index.max_result_window` (mặc định 10.000) → lỗi. Lý do: mỗi shard phải trả `from + size` kết quả để coordinating node gộp → bộ nhớ/CPU tăng tuyến tính.
+      Giải pháp:
+      - `search_after` với sort ổn định (score/field + tiebreaker unique) + **Point in Time (PIT)** để snapshot nhất quán giữa các trang.
+      - UI: giới hạn số trang (phần lớn user không qua trang 5), khuyến khích filter.
+      - Export toàn bộ: PIT + search_after (scroll không còn được khuyến nghị cho deep pagination).
+      Không tăng `max_result_window` lên 1 triệu.
+    followUp: Why is a unique tiebreaker needed in the sort for search_after?
+    tags: [elasticsearch, pagination]
+    verify: true
+  - id: nosql-search-022
+    level: medium
+    type: concept
+    q: How does Elasticsearch score relevance by default, and how would you tune ranking for product search?
+    hint: |-
+      Mặc định **BM25**: term frequency (bão hoà dần), inverse document frequency (term hiếm giá trị hơn), độ dài field (field ngắn khớp giá trị hơn).
+      Tuning product search:
+      - Boost field: `name^3`, `brand^2`, `description`.
+      - `function_score`/`rank_feature`: đẩy sản phẩm bán chạy, còn hàng, rating.
+      - Exact match / phrase boost (`match_phrase` trong `should`).
+      - Synonym, typo tolerance (`fuzziness: AUTO`) có kiểm soát.
+      - Đo bằng bộ query chuẩn (judgement list), `_rank_eval`, CTR/conversion; đừng tune theo cảm giác.
+      Lưu ý IDF tính theo shard (mặc định) → shard ít doc có thể cho score lệch.
+    followUp: Why can relevance differ for the same query between two tenants in a shared index?
+    tags: [elasticsearch, relevance, bm25]
+  - id: nosql-search-023
+    level: medium
+    type: design
+    q: How would you configure Elasticsearch for Vietnamese product search so "ao thun", "Áo Thun" and "áo thun" all match?
+    hint: |-
+      - Custom analyzer: tokenizer `standard` hoặc `icu_tokenizer` (plugin analysis-icu) + filter `lowercase` + `asciifolding` (với `preserve_original: true` để exact có dấu vẫn được ưu tiên) hoặc `icu_folding`.
+      - Multi-field: `name` (analyzer có dấu, lowercase) + `name.folded` (bỏ dấu) → query cả hai, boost bản có dấu cao hơn.
+      - Tiếng Việt là ngôn ngữ đơn âm tiết ghép từ: "áo thun" là 2 token → dùng `match_phrase`/`shingle` để ưu tiên cụm từ.
+      - Có plugin phân tách từ tiếng Việt (cộng đồng) — cân nhắc chi phí vận hành plugin.
+    example: |-
+      ```json
+      PUT products_v8
+      {
+        "settings": { "analysis": { "analyzer": {
+          "vi_folded": { "tokenizer": "standard", "filter": ["lowercase", "asciifolding"] }
+        } } },
+        "mappings": { "properties": {
+          "name": { "type": "text", "fields": { "folded": { "type": "text", "analyzer": "vi_folded" } } }
+        } }
+      }
+      ```
+    followUp: Folding makes "bán" and "bàn" identical. How do you keep precision for users who do type accents?
+    tags: [elasticsearch, analyzer, vietnamese]
+  - id: nosql-search-024
+    level: medium
+    type: compare
+    q: Compare `edge_ngram`, `search_as_you_type` and the completion suggester for autocomplete.
+    hint: |-
+      - **edge_ngram** (index-time analyzer): "cotton" → c, co, cot... → linh hoạt, dùng query thường + filter; index to hơn; search analyzer phải khác (không ngram).
+      - **search_as_you_type** field: tự tạo sub-field shingle + edge ngram, query bằng `multi_match` type `bool_prefix` → dễ dùng, hỗ trợ prefix nhiều từ.
+      - **Completion suggester**: FST trong memory, cực nhanh cho prefix, nhưng chỉ prefix từ đầu, filter hạn chế (context), phải cập nhật input riêng.
+      E-commerce: `search_as_you_type`/edge_ngram khi cần filter theo tenant/tồn kho; completion cho gợi ý top query phổ biến.
+    followUp: How do you make autocomplete tenant-aware with the completion suggester?
+    tags: [elasticsearch, autocomplete]
+  - id: nosql-search-025
+    level: hard
+    type: debug
+    q: The product index started rejecting documents with `Limit of total fields [1000] has been exceeded`. Here is the document shape from the Data Enrichment Service. What is wrong and how do you fix it?
+    example: |-
+      ```json
+      {
+        "productId": "p-991",
+        "tenantId": "42",
+        "name": "Mechanical Keyboard",
+        "attributes": {
+          "switch_type": "brown",
+          "Kích thước": "75%",
+          "provider_x_custom_field_8812": "yes",
+          "bluetooth version": "5.1"
+        }
+      }
+      ```
+    hint: |-
+      `attributes` có **key do provider/merchant định nghĩa** + dynamic mapping → mỗi key mới thành field mới trong mapping → **mapping explosion**: vượt `index.mapping.total_fields.limit` (mặc định 1000), cluster state phình, mọi node phải cập nhật mapping.
+      Fix:
+      - Normalize key ở enrichment (map về tập attribute chuẩn), key lạ → bỏ hoặc lưu không index.
+      - Đổi model: `attributes: [{ "name": "switch_type", "value": "brown" }]` kiểu `nested` (query/facet chính xác theo cặp) hoặc `flattened` (một field, các value như keyword, query đơn giản).
+      - `dynamic: strict`/`false` cho phần còn lại; không "fix" bằng cách nâng limit lên 10.000.
+    followUp: What do you lose when you switch `attributes` to the `flattened` type?
+    redFlags:
+      - Only suggests raising index.mapping.total_fields.limit
+    tags: [elasticsearch, mapping-explosion, debug]
+  - id: nosql-search-026
+    level: hard
+    type: debug
+    q: This filter returns zero hits even though products with status "Active" clearly exist. Why?
+    example: |-
+      ```json
+      // mapping created by dynamic mapping: "status": { "type": "text", "fields": { "keyword": { "type": "keyword" } } }
+      GET products/_search
+      { "query": { "bool": { "filter": [ { "term": { "status": "Active" } } ] } } }
+      ```
+    hint: |-
+      `status` là `text` → lúc index "Active" được analyze thành term `active` (lowercase). `term` **không** analyze query → tìm term `Active` → không khớp.
+      Fix: `term` trên `status.keyword` (giá trị gốc "Active") — hoặc tốt hơn map `status` là `keyword` ngay từ đầu (có thể kèm `normalizer` lowercase để không phân biệt hoa thường).
+      Bài học: explicit mapping, và giá trị enum nên được chuẩn hoá (`active`) ở indexer.
+    followUp: Why would `match` on `status` "work" here but still be the wrong choice?
+    tags: [elasticsearch, term, mapping, debug]
+  - id: nosql-search-027
+    level: hard
+    type: debug
+    q: A DynamoDB table throttles writes every morning even though consumed capacity is far below the table's provisioned total. Here is the key design. Diagnose it.
+    example: |-
+      ```ts
+      // Table "jobs": PK = status, SK = createdAt#jobId
+      await ddb.send(new PutCommand({
+        TableName: 'jobs',
+        Item: { PK: 'PENDING', SK: `${new Date().toISOString()}#${id}`, tenantId, payload },
+      }));
+      // Workers: Query PK = 'PENDING' ORDER BY SK LIMIT 50
+      ```
+    hint: |-
+      Partition key `status` chỉ có vài giá trị → gần như mọi write buổi sáng vào **một partition** (`PENDING`) → vượt giới hạn per-partition (~1.000 WCU/s) → throttle dù tổng capacity còn dư. Mỗi lần đổi status còn phải delete + put sang partition khác.
+      Fix:
+      - Partition key có cardinality cao: `PK = JOB#<id>`; truy vấn "pending" qua **GSI sparse** (chỉ item có attribute `pendingShard` mới vào GSI).
+      - **Write sharding**: `GSI1PK = PENDING#<0..N-1>` (random/hash suffix), worker query song song N shard.
+      - Hoặc dùng queue đúng nghĩa (SQS) thay vì DynamoDB làm queue.
+    followUp: How do you choose N for write sharding, and what does it cost at read time?
+    tags: [dynamodb, hot-partition, debug]
+    verify: true
+  - id: nosql-search-028
+    level: hard
+    type: debug
+    q: Product updates sometimes never appear in search, and occasionally search shows a price that was reverted an hour ago. Find the design flaws.
+    example: |-
+      ```ts
+      async function updateProduct(id: string, patch: Patch) {
+        await db.transaction(async (tx) => {
+          await tx.products.update(id, patch);
+        });
+        // outside the transaction, fire-and-forget
+        es.index({ index: 'products', id, document: await buildDoc(id) }).catch(() => {});
+      }
+      ```
+    hint: |-
+      - **Dual write** không atomic: DB commit thành công nhưng ES lỗi/timeout → `.catch(() => {})` nuốt lỗi → **drift vĩnh viễn**.
+      - Process crash giữa hai bước → mất update.
+      - Hai update đồng thời: request A (giá cũ) có thể index **sau** request B (giá mới) → ES giữ giá cũ. Không có versioning.
+      Fix:
+      - **Outbox**: ghi event vào outbox table trong cùng transaction → relay → Kafka (key = productId) → indexer; hoặc CDC.
+      - Indexer đọc **trạng thái mới nhất từ DB** khi xử lý event (không tin payload cũ), index với `version_type: external` = row version/`updated_at` → bản cũ đến sau bị reject (409, bỏ qua).
+      - Retry + DLQ + metric lag; reconcile định kỳ.
+    followUp: With external versioning, what happens when you reindex everything from the DB into a new index?
+    tags: [elasticsearch, dual-write, sync, debug]
+  - id: nosql-search-029
+    level: hard
+    type: scenario
+    q: Customers report products that are deleted or out of stock still showing in search. You suspect DB → Elasticsearch drift. How do you detect, quantify and repair it?
+    hint: |-
+      Detect/quantify:
+      - So **count** theo tenant/category giữa DB và ES; so **checksum/`updated_at`/version** theo id theo lô (id range) để tìm doc lệch.
+      - Kiểm tra pipeline: consumer lag, DLQ, lỗi bulk (bulk API trả 200 nhưng **từng item có thể lỗi** — phải đọc `errors`/`items`).
+      - Delete: event xoá có được phát không (soft delete vs hard delete; CDC bắt được delete; batch sync theo `updated_at` **bỏ sót delete**).
+      Repair:
+      - Reconciler định kỳ re-emit event cho id lệch; job full rebuild vào index mới + alias swap khi drift lớn.
+      - Search API filter thêm `in_stock`/`status` và có thể **verify lại với DB** cho trang kết quả (hydrate từ DB) nếu dữ liệu nhạy cảm như giá/tồn kho.
+    followUp: What SLO would you set for index freshness, and how do you measure it?
+    tags: [elasticsearch, drift, reconciliation, scenario]
+  - id: nosql-search-030
+    level: hard
+    type: scenario
+    q: The Elasticsearch cluster turns red after a node restart and some searches fail. What does red vs yellow mean and how do you investigate?
+    hint: |-
+      - **Yellow**: mọi primary đã assign, một số **replica** chưa (ví dụ cluster 1 node, hoặc node đang recover) → vẫn search/ghi được, nhưng giảm HA.
+      - **Red**: ít nhất một **primary** chưa assign → dữ liệu shard đó không truy cập được; search trả partial/lỗi.
+      Điều tra: `GET _cluster/health`, `GET _cat/shards?v&h=index,shard,prirep,state,unassigned.reason`, `GET _cluster/allocation/explain` (lý do: disk watermark vượt ngưỡng, node thiếu, allocation filter, shard corrupt).
+      Khắc phục theo nguyên nhân: giải phóng disk (watermark mặc định high 90%, flood stage 95% → index read-only), đưa node về, `_cluster/reroute?retry_failed=true`; cuối cùng mới restore snapshot hoặc chấp nhận mất shard.
+    followUp: Why can a disk filling to 95% make every index read-only, and how do you undo it?
+    tags: [elasticsearch, cluster-health, operations, scenario]
+    verify: true
+  - id: nosql-search-031
+    level: hard
+    type: scenario
+    q: Kafka redelivers product events and they arrive out of order after a consumer rebalance. How do you make the indexer correct?
+    hint: |-
+      - **Ordering**: key message = `productId` → cùng partition → thứ tự trong partition. Rebalance/redelivery vẫn gây **duplicate** và có thể re-process event cũ.
+      - **Idempotent**: index là "set state" (không phải increment) → xử lý lại cùng event vô hại.
+      - **Versioning**: index với `version` = DB row version (monotonic) + `version_type: external` (hoặc `external_gte`) → event cũ hơn bị reject.
+      - Hoặc xử lý event như "tín hiệu": indexer load **bản mới nhất từ DB** rồi index → event cũ không mang state cũ.
+      - Delete: dùng tombstone/soft-delete version, tránh delete xong bị event update cũ "hồi sinh" doc (ES giữ version của doc đã xoá chỉ trong thời gian ngắn — `index.gc_deletes`, mặc định 60s).
+    followUp: How does the `gc_deletes` window affect a delete followed by a late, older update?
+    tags: [elasticsearch, kafka, idempotency, ordering]
+    verify: true
+  - id: nosql-search-032
+    level: hard
+    type: compare
+    q: Compare dual writes, the transactional outbox, and CDC (e.g. Debezium) for keeping a search index in sync with the database.
+    hint: |-
+      - **Dual write**: đơn giản nhất nhưng không atomic → drift; chỉ chấp nhận được khi có reconcile mạnh.
+      - **Outbox**: ghi event cùng transaction nghiệp vụ → không mất event; event mang ý nghĩa nghiệp vụ (`ProductPriceChanged`), kiểm soát schema; cần relay (poll hoặc CDC trên outbox table) và dọn outbox.
+      - **CDC trên table nghiệp vụ**: bắt mọi thay đổi kể cả từ script/migration/admin tool; không cần sửa app; nhưng event mức row (phải join/enrich), phụ thuộc schema DB (đổi cột làm vỡ consumer), cần hạ tầng Kafka Connect & quản lý replication slot/CDC log.
+      SQL Server: CDC dựa trên transaction log (bảng `cdc.*`), cần SQL Agent; Postgres: logical decoding.
+    followUp: A backfill script updated 2 million rows directly in SQL. Which approaches pick that up automatically?
+    tags: [sync, outbox, cdc]
+  - id: nosql-search-033
+    level: hard
+    type: gotcha
+    q: "Your team created one index per tenant per month: 3,000 tenants × 24 months, 1 primary + 1 replica each. The cluster is unstable. Why?"
+    hint: |-
+      = 72.000 index × 2 = **144.000 shard**. Mỗi shard có overhead cố định (heap cho segment/metadata, file handle, cluster state, recovery) → master chậm, heap cạn, restart mất hàng giờ.
+      Elastic khuyến nghị shard cỡ **~10–50GB** (và dưới ~200 triệu doc), tránh shard nhỏ li ti; số shard mỗi node có giới hạn mềm theo heap/`cluster.max_shards_per_node` (mặc định 1000 non-frozen shard mỗi node).
+      Fix: shared index (filter/routing theo tenant), index theo thời gian lớn hơn + ILM rollover theo kích thước, `_shrink`, xoá dữ liệu cũ; index riêng chỉ cho tenant lớn.
+    followUp: How does ILM rollover decide when to create a new index?
+    tags: [elasticsearch, sharding, oversharding]
+    verify: true
+  - id: nosql-search-034
+    level: hard
+    type: gotcha
+    q: A query for variants with color "red" AND size "M" matches a product that only has a red-S variant and a blue-M variant. Why, and how do you fix it?
+    example: |-
+      ```json
+      { "productId": "p1", "variants": [ { "color": "red", "size": "S" }, { "color": "blue", "size": "M" } ] }
+      ```
+    hint: |-
+      Mảng object kiểu `object` mặc định bị **flatten**: `variants.color = [red, blue]`, `variants.size = [S, M]` → mất liên kết giữa các field của cùng object → match chéo.
+      Fix: map `variants` là **`nested`** và query bằng `nested` query → mỗi variant là hidden document riêng.
+      Chi phí: mỗi nested object là một Lucene doc → index to hơn, update product phải reindex cả document, giới hạn `index.mapping.nested_objects.limit` (mặc định 10.000/doc). Thay thế: index mỗi variant (SKU) là một document riêng rồi collapse theo productId.
+    followUp: When would you index SKUs as separate documents and use `collapse` instead of nested?
+    tags: [elasticsearch, nested, mapping]
+  - id: nosql-search-035
+    level: hard
+    type: design
+    q: You must index 50 million products from scratch as fast as possible without hurting live search. What do you tune?
+    hint: |-
+      - Index mới (không phải index live), sau đó alias swap.
+      - Trong lúc load: `number_of_replicas: 0`, `refresh_interval: -1` → bật lại sau (replica sẽ copy segment, rẻ hơn index 2 lần).
+      - **Bulk API**, kích thước request vài MB (thử 5–15MB), nhiều worker song song; xử lý `429`/rejected với backoff; đọc lỗi từng item.
+      - Tắt/giảm field không cần (không index `description_raw`, `_source` excludes cẩn thận).
+      - Id tự sinh nhanh hơn (không cần check tồn tại) nhưng mất idempotency — thường vẫn dùng id nghiệp vụ.
+      - Tách node ingest/đọc hoặc chạy giờ thấp điểm; theo dõi heap, merge, disk.
+    followUp: After re-enabling replicas the cluster is yellow for 40 minutes. Is that a problem?
+    tags: [elasticsearch, bulk, performance]
+  - id: nosql-search-036
+    level: hard
+    type: gotcha
+    q: A MongoDB `orders` document embeds every status-change event and every shipment update. Six months later writes are slow and some fail. Why?
+    hint: |-
+      Mảng **không giới hạn** trong document:
+      - Document tiến tới giới hạn **16MB** → write lỗi.
+      - Mỗi update phải ghi lại document lớn; index **multikey** trên mảng phình (mỗi phần tử một index entry).
+      - Đọc order luôn kéo theo toàn bộ lịch sử.
+      Fix: tách `order_events` collection (reference `orderId`, index `{orderId, at}`), giữ trong order chỉ trạng thái hiện tại + N event gần nhất (subset pattern) hoặc bucket pattern theo thời gian.
+    followUp: What is the bucket pattern, and when is it better than one document per event?
+    tags: [mongodb, modeling, gotcha]
+  - id: nosql-search-037
+    level: hard
+    type: gotcha
+    q: >-
+      A DynamoDB Query with `Limit: 20` and a FilterExpression returns only 3 items and a `LastEvaluatedKey`. The UI shows "no more results". What is going on?
+    hint: |-
+      `Limit` giới hạn số item **được đọc** (trước filter), không phải số item trả về; mỗi trang tối đa 1MB. FilterExpression loại 17 item sau khi đọc → trả 3 + `LastEvaluatedKey`.
+      UI hiểu sai "trả ít hơn Limit = hết" → sai. Đúng: còn `LastEvaluatedKey` là **còn dữ liệu**; app lặp query với `ExclusiveStartKey` cho tới khi đủ số item cần hoặc hết.
+      Tốt hơn: đưa điều kiện filter vào key design (sort key/GSI) để không phải đọc rồi bỏ.
+    followUp: How do you expose DynamoDB pagination as an opaque cursor in a public API safely?
+    tags: [dynamodb, pagination, gotcha]
+  - id: nosql-search-038
+    level: senior
+    type: design
+    q: Design product search for a multi-tenant e-commerce platform with per-tenant catalogs, facets, and prices that can differ by customer group.
+    hint: |-
+      Câu trả lời mạnh gồm:
+      - **Index layout**: shared index + `tenantId` keyword + routing/filtered alias; tenant lớn index riêng.
+      - **Document**: product (hoặc SKU) denormalized: name/brand/category (text + keyword), attributes chuẩn hoá (nested/flattened), availability, popularity.
+      - **Giá**: giá cơ bản trong doc; giá theo customer group → field map nhỏ (`prices.groupA`) nếu số group ít, hoặc lọc/sort theo giá cơ bản rồi **hydrate giá thật từ pricing service** cho trang kết quả.
+      - **Query**: bool (must text, filter tenant/status/facet), aggregations cho facet, `search_after`.
+      - **Sync**: outbox/CDC → indexer idempotent + external version; reconcile; reindex bằng alias.
+      - **Relevance**: boost, synonym per tenant, đo bằng judgement list/CTR.
+      - **Ops**: shard sizing, ILM không cần cho catalog, snapshot.
+    followUp: How do synonyms defined per tenant work in a shared index?
+    tags: [design, elasticsearch, multi-tenancy]
+  - id: nosql-search-039
+    level: senior
+    type: open
+    q: A team proposes DynamoDB for a new order service instead of PostgreSQL. What questions do you ask before agreeing?
+    hint: |-
+      - Access pattern đã biết và ổn định chưa? Có report/query ad-hoc, admin search không (sẽ cần ES/warehouse)?
+      - Quy mô thật: throughput, spike, multi-region — Postgres managed có đáp ứng được không?
+      - Transaction đa entity (order + inventory + payment) — DynamoDB transaction giới hạn số item/cost.
+      - Team có kinh nghiệm single-table design? Chi phí học và debug.
+      - Chi phí: on-demand vs provisioned, GSI nhân write cost.
+      - Lock-in, local dev/test (DynamoDB Local), migration dữ liệu khi access pattern đổi.
+      Kết luận có điều kiện, không tôn giáo.
+    followUp: If you did choose DynamoDB, how would you support the finance team's monthly reporting?
+    tags: [dynamodb, architecture, open]
+  - id: nosql-search-040
+    level: senior
+    type: open
+    q: When is adding Elasticsearch the wrong decision? What would you use instead?
+    hint: |-
+      Sai khi: chỉ cần filter/sort có cấu trúc (index SQL đủ), catalog nhỏ (vài trăm nghìn row), team không có khả năng vận hành cluster (heap, shard, upgrade, security), yêu cầu strong consistency tức thì.
+      Thay thế: Postgres `tsvector` + GIN (FTS có ranking, dictionary), `pg_trgm` cho fuzzy/`ILIKE '%x%'`, `unaccent` cho bỏ dấu; SQL Server Full-Text Search; managed search (OpenSearch Service, Elastic Cloud, Algolia/Typesense/Meilisearch) nếu vẫn cần engine riêng.
+      Chi phí thật của ES: pipeline sync, drift, reindex, thêm một hệ thống để on-call.
+    followUp: What signals would tell you it is time to move from Postgres full-text search to a dedicated search engine?
+    tags: [elasticsearch, postgres-fts, open]
+  - id: nosql-search-041
+    level: senior
+    type: design
+    q: Upgrade the product index to a new mapping and analyzer for 500M documents across 40 tenants with zero downtime and a rollback plan.
+    hint: |-
+      - Kế hoạch theo **alias**: `products` (read) + write alias; index mới `products_v9`.
+      - Backfill: từ DB (nguồn sự thật) theo tenant/id range, song song có throttle; hoặc `_reindex` với `slices` nếu dữ liệu ES đủ tin cậy.
+      - Live changes: dual-write v8 + v9 từ indexer (hoặc ghi v9 và replay Kafka từ offset lúc bắt đầu backfill); external versioning đảm bảo không ghi đè bằng dữ liệu cũ.
+      - Verify: count per tenant, sample diff, **shadow traffic** (query cả hai, so kết quả/latency), relevance check.
+      - Cutover theo tenant (filtered alias per tenant) hoặc toàn bộ; rollback = swap alias lại (dual-write vẫn chạy nên v8 còn mới).
+      - Dọn: tắt dual-write, xoá v8 sau thời gian quan sát.
+    followUp: How long do you keep dual-writing after cutover, and what decides that?
+    tags: [elasticsearch, reindex, zero-downtime, design]
+  - id: nosql-search-042
+    level: cv
+    type: behavioral
+    q: You built an Indexer Service that transforms and indexes products into Elasticsearch. Walk me through its architecture and how it stays correct under failures.
+    hint: |-
+      Câu trả lời mạnh mô tả đúng hệ thống thật:
+      - Nguồn event (outbox/CDC/Kafka topic/queue), key/partition, consumer group (điền cách làm thật của bạn).
+      - Transform: load từ DB hay dùng payload; enrich (category, giá, tồn kho); document shape & mapping.
+      - Ghi ES: bulk size, retry/backoff khi 429, xử lý lỗi từng item, DLQ.
+      - Correctness: idempotency, versioning chống out-of-order, xử lý delete.
+      - Observability: lag, throughput, error rate, freshness (điền số liệu thật của bạn).
+      - Rebuild toàn bộ index làm thế nào.
+    followUp: What was the hardest production issue with the indexer, and how did you debug it?
+    redFlags:
+      - "We call Elasticsearch right after saving to the database"
+      - Cannot explain what happens when Elasticsearch is down for 10 minutes
+    tags: [cv, indexer, elasticsearch]
+  - id: nosql-search-043
+    level: cv
+    type: behavioral
+    q: Your Data Enrichment Service normalized product data from external providers. How did you handle inconsistent schemas, bad data and provider changes?
+    hint: |-
+      Nội dung mạnh:
+      - Adapter per provider → **canonical model** (schema có version), validation (zod/JSON Schema) ở biên; bản ghi lỗi → quarantine/DLQ kèm lý do, không chặn cả batch.
+      - Normalize: đơn vị, currency, category mapping, attribute key (chống mapping explosion ở ES), encoding/Unicode (tiếng Việt NFC vs NFD!).
+      - Idempotency & dedupe (provider gửi lại), lưu raw payload để replay khi rule đổi.
+      - Phát hiện provider đổi format: contract test, alert khi tỉ lệ lỗi tăng.
+      - Throughput/latency và số provider (điền số liệu thật của bạn).
+    followUp: A provider silently changed price from cents to dollars. How would your system detect and contain that?
+    tags: [cv, data-enrichment, normalization]
+  - id: nosql-search-044
+    level: cv
+    type: behavioral
+    q: Tell me about a time you had to change an Elasticsearch mapping or analyzer in production. How did you roll it out?
+    hint: |-
+      STAR:
+      - **S/T**: cần đổi gì (field type, analyzer tiếng Việt, nested), vì sao (bug search, yêu cầu facet mới).
+      - **A**: index mới + backfill + alias swap; cách xử lý write trong lúc reindex; verify (count, sample query); rollback plan.
+      - **R**: downtime (không), thời gian reindex, cải thiện đo được (điền số liệu thật của bạn).
+      - Reflection: lần sau thiết kế mapping thế nào từ đầu.
+      Nếu chưa từng làm trực tiếp: nói rõ vai trò và mô tả quy trình bạn sẽ làm — không bịa.
+    followUp: What would you do differently if the index were 10x larger?
+    tags: [cv, elasticsearch, reindex]
+  - id: nosql-search-045
+    level: cv
+    type: behavioral
+    q: Why did your platform use Elasticsearch for product search rather than SQL Server full-text search, and was it worth the operational cost?
+    hint: |-
+      Nội dung mạnh (dựa trên bối cảnh thật):
+      - Nhu cầu: relevance tuning, facet/aggregation nhanh, typo/fuzzy, bỏ dấu tiếng Việt, autocomplete, scale đọc tách khỏi DB OLTP.
+      - SQL Server FTS: có `CONTAINS`/`FREETEXT`, nhưng tuning relevance và facet kém linh hoạt hơn, tải search đè lên DB chính.
+      - Chi phí: pipeline indexer, drift, reindex, vận hành cluster.
+      - Đánh giá trung thực: có lúc nào thấy overkill không; số liệu latency/traffic (điền số liệu thật của bạn).
+    followUp: If you started over with PostgreSQL instead of SQL Server, would you still add Elasticsearch on day one?
+    tags: [cv, elasticsearch, sql-server]
+  - id: nosql-search-046
+    level: cv
+    type: scenario
+    q: On your platform, how would you prove to a stakeholder that search results match the SQL Server source of truth, for example after an indexer outage?
+    hint: |-
+      Nội dung mạnh:
+      - Reconciliation job: count theo tenant/category, so sánh `version`/`updated_at` theo lô id, liệt kê id lệch.
+      - Sau outage: replay từ Kafka offset / outbox chưa xử lý; hoặc re-emit theo `updated_at > outage_start` (cẩn thận delete).
+      - Metric freshness (thời gian từ commit DB → searchable) và dashboard drift.
+      - Báo cáo kết quả cho stakeholder bằng số (điền số liệu thật của bạn).
+    followUp: How would you handle products that were hard-deleted in SQL Server during the outage?
+    tags: [cv, drift, reconciliation]
+  - id: nosql-search-047
+    level: medium
+    type: concept
+    q: How does Elasticsearch route a document to a shard, and when would you use custom routing?
+    hint: |-
+      Mặc định routing value = `_id`; shard = hash(routing) mod số primary (thực tế qua `routing_num_shards` để hỗ trợ split). Search không có routing → hỏi **mọi shard**.
+      Custom routing (vd `routing = tenantId`): mọi document của tenant cùng shard → search của tenant chỉ chạm một shard (nhanh hơn, ít tài nguyên).
+      Rủi ro: tenant lớn → shard lệch (hot shard); phải truyền routing khi get/update/delete (thiếu → không tìm thấy doc); `index.routing_partition_size` để trải một routing value ra vài shard.
+    followUp: What happens if one request indexes a document with routing and a later delete omits it?
+    tags: [elasticsearch, routing, shards]
+  - id: nosql-search-048
+    level: easy
+    type: gotcha
+    q: Is Elasticsearch a good primary database for orders? Why or why not?
+    hint: |-
+      Không nên làm source of truth cho dữ liệu giao dịch:
+      - Không có transaction đa document, không có ràng buộc (FK, unique ngoài `_id`).
+      - Near-real-time: đọc sau ghi qua search có thể chưa thấy.
+      - Mapping khó đổi → schema evolution cần reindex.
+      - Lịch sử có các sự cố mất dữ liệu khi cấu hình sai (split brain ở version cũ, không snapshot).
+      Dùng ES làm **read model** cho search/analytics, dữ liệu gốc ở DB; order search cho admin là use case tốt.
+    followUp: What is CQRS, and how does this DB + search index pattern relate to it?
+    tags: [elasticsearch, source-of-truth]

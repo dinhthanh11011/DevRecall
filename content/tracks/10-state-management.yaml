@@ -1,0 +1,761 @@
+id: 10-state-management
+slug: state-management
+title: State Management & Data Fetching
+tier: 3
+status: drafted
+summary: Local vs global vs server state, Redux Toolkit & RTK Query, TanStack Query (cache, staleTime, invalidation), Zustand/Context, optimistic updates, real-time data vào cache, SSR store per request.
+cvLinked: true
+prerequisites: [09-react]
+overview: |-
+  ## TL;DR
+
+  - Câu hỏi đầu tiên không phải "Redux hay Zustand" mà là **state này thuộc loại nào**: server state (dữ liệu của backend, cache có thể cũ), client/UI state (chỉ tồn tại ở browser), URL state, form draft.
+  - **Server state** cần: cache, dedupe, stale-while-revalidate, refetch, invalidation, retry, pagination → dùng **TanStack Query** hoặc **RTK Query** (hoặc RSC ở Next.js). Copy response vào global store thủ công là nguồn bug số 1.
+  - **Client state** toàn cục (nhiều màn hình cùng ghi/đọc) → Redux Toolkit / Zustand / Jotai; ít đổi → Context.
+  - **Optimistic update** = cập nhật cache trước, rollback khi lỗi, luôn **reconcile** với server (invalidate/refetch) sau cùng.
+  - Selector + reference stability quyết định hiệu năng: selector trả object mới mỗi lần = re-render mỗi lần.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Server state | Bản sao **có thể cũ** của dữ liệu thuộc backend | danh sách order, profile |
+  | Client state | Dữ liệu chỉ có ở client | modal mở, theme, bước wizard, cart offline |
+  | Query key | Định danh cache entry (TanStack Query) | `['orders', { status, page }]` |
+  | `staleTime` | Bao lâu dữ liệu được coi là **fresh** (không refetch khi mount/focus) | default `0` → luôn stale |
+  | `gcTime` | Entry **không còn observer** bị xoá khỏi cache sau bao lâu | default 5 phút (v5, trước là `cacheTime`) |
+  | Invalidation | Đánh dấu stale + refetch query đang active | `invalidateQueries({ queryKey: ['orders'] })` |
+  | Tags (RTK Query) | Query `providesTags`, mutation `invalidatesTags` | `['Order', { type: 'Order', id }]` |
+  | Selector | Hàm đọc một phần store; memoized khi derive | `createSelector([selectItems], items => total(items))` |
+  | Normalization | Lưu entity theo id, list chỉ giữ id | `createEntityAdapter()` → `{ ids, entities }` |
+  | Optimistic update | Cập nhật UI trước khi server xác nhận | like/unlike, kéo thả sắp xếp |
+
+  ## Cơ chế hoạt động
+
+  ### TanStack Query — vòng đời một query
+
+  ```mermaid
+  flowchart TD
+    A["Component mount<br/>useQuery(key)"] --> B{"Có cache cho key?"}
+    B -- no --> C["status: pending<br/>fetch"]
+    B -- yes --> D{"Còn fresh?<br/>(age < staleTime)"}
+    D -- yes --> E["Trả cache, KHÔNG fetch"]
+    D -- no --> F["Trả cache ngay (stale)<br/>+ refetch nền (isFetching)"]
+    C --> G["success → cache[key]"]
+    F --> G
+    G --> H["Trigger refetch khi stale:<br/>mount mới, window focus,<br/>reconnect, invalidate, interval"]
+    I["Observer cuối unmount"] --> J["Đếm gcTime → xoá entry"]
+  ```
+
+  ### Optimistic update có rollback (TanStack Query)
+
+  ```mermaid
+  sequenceDiagram
+    participant UI
+    participant QC as QueryClient cache
+    participant API
+    UI->>QC: onMutate: cancelQueries(key)
+    UI->>QC: snapshot = getQueryData(key)
+    UI->>QC: setQueryData(key, optimistic)
+    UI->>API: mutationFn()
+    alt thành công
+      API-->>UI: 200
+    else lỗi
+      API-->>UI: 4xx/5xx
+      UI->>QC: onError: setQueryData(key, snapshot)
+    end
+    UI->>QC: onSettled: invalidateQueries(key) (reconcile)
+  ```
+
+  ### Redux Toolkit data flow
+
+  ```mermaid
+  flowchart LR
+    A["UI dispatch(action)"] --> B["Middleware<br/>(thunk, listener, RTK Query)"]
+    B --> C["Reducers (createSlice + Immer)<br/>pure, sync"]
+    C --> D["New state (immutable)"]
+    D --> E["useSelector re-run<br/>so sánh ===, render nếu khác"]
+  ```
+
+  ## Trade-offs
+
+  | Tool | Mạnh | Yếu | Hợp khi |
+  |---|---|---|---|
+  | Context + `useReducer` | Không thêm dependency | Không selector → consumer re-render hết | Theme, auth, locale, DI |
+  | Redux Toolkit | Kiến trúc rõ, DevTools, middleware, team lớn | Boilerplate hơn, học nhiều khái niệm | App lớn, nhiều người, logic client phức tạp |
+  | RTK Query | Cache server state tích hợp Redux, tags | Gắn với Redux; normalized cache không có sẵn | Đã dùng Redux |
+  | TanStack Query | Server state mạnh nhất, devtools, infinite, SSR hydration | Chỉ lo server state | Hầu hết app có API |
+  | Zustand | Nhỏ, selector, ngoài React dùng được | Ít convention, dễ thành "bãi rác" | Client state vừa phải |
+  | Jotai / atoms | State dạng nguyên tử, derive tự nhiên | Graph atom khó theo dõi khi lớn | UI state phân mảnh, editor |
+  | URL (search params) | Share link, back/forward | Chỉ serializable, giới hạn độ dài | Filter, sort, page, tab |
+
+  ## Pitfalls
+
+  - Lưu response API vào Redux **và** React Query → hai nguồn sự thật lệch nhau.
+  - `staleTime: 0` mặc định + nhiều component cùng key → refetch khi mỗi component mount/khi focus — tưởng là bug "gọi API liên tục".
+  - Query key thiếu biến (`['orders']` nhưng queryFn dùng `status`) → cache trả nhầm dữ liệu.
+  - Selector trả object/array mới (`state => ({ a: state.a })`, `.filter`) → re-render mỗi action.
+  - Tạo Redux store/QueryClient ở **module scope** trong app SSR → dữ liệu user A lộ sang user B.
+  - Optimistic update quên `cancelQueries` → refetch đang bay ghi đè giá trị optimistic.
+  - Thunk/effect không huỷ khi rời màn hình → set state vào store của màn hình khác.
+  - Lưu dữ liệu non-serializable (Date, class, Promise) vào Redux → DevTools/persist hỏng.
+
+  ## Cheat sheet
+
+  - TanStack Query v5: `staleTime` 0, `gcTime` 5 phút, `retry` 3 (client), refetch khi mount/focus/reconnect nếu stale. `isPending` = chưa có data; `isFetching` = đang fetch (kể cả nền); `isLoading` = `isPending && isFetching`.
+  - `invalidateQueries` (stale + refetch active) vs `refetchQueries` (fetch ngay) vs `setQueryData` (ghi tay) vs `removeQueries`.
+  - Query key: array, serializable, **chứa mọi biến queryFn dùng**; dùng key factory.
+  - RTK: `configureStore` (thunk + dev checks), `createSlice` (Immer), `createAsyncThunk`, `createEntityAdapter`, `createListenerMiddleware`, `createSelector`.
+  - RTK Query: `providesTags`/`invalidatesTags`, `keepUnusedDataFor` (default 60s), optimistic qua `onQueryStarted` + `updateQueryData` + `patch.undo()`.
+  - Zustand: luôn select slice; nhiều field → `useShallow`.
+  - SSR/Next.js: store & QueryClient **per request**; Server Components không dùng được store client.
+notionRefs:
+  - title: Redux
+    url: https://app.notion.com/p/2a9ef77f8ab280c6a795debf54596dae
+references:
+  - title: Redux — Redux Essentials tutorial
+    url: https://redux.js.org/tutorials/essentials/part-1-overview-concepts
+  - title: Redux — Style Guide
+    url: https://redux.js.org/style-guide/
+  - title: Redux Toolkit — RTK Query overview
+    url: https://redux-toolkit.js.org/rtk-query/overview
+  - title: Redux Toolkit — Optimistic updates (RTK Query)
+    url: https://redux-toolkit.js.org/rtk-query/usage/manual-cache-updates
+  - title: Redux Toolkit — Setup with Next.js
+    url: https://redux.js.org/usage/nextjs
+  - title: TanStack Query — Important defaults
+    url: https://tanstack.com/query/latest/docs/framework/react/guides/important-defaults
+  - title: TanStack Query — Query keys
+    url: https://tanstack.com/query/latest/docs/framework/react/guides/query-keys
+  - title: TanStack Query — Optimistic updates
+    url: https://tanstack.com/query/latest/docs/framework/react/guides/optimistic-updates
+  - title: TanStack Query — Migrating to v5
+    url: https://tanstack.com/query/latest/docs/framework/react/guides/migrating-to-v5
+  - title: TanStack Query — Advanced SSR
+    url: https://tanstack.com/query/latest/docs/framework/react/guides/advanced-ssr
+  - title: Zustand — docs
+    url: https://zustand.docs.pmnd.rs/
+  - title: react.dev — Choosing the state structure
+    url: https://react.dev/learn/choosing-the-state-structure
+questions:
+  - id: state-management-001
+    level: easy
+    type: compare
+    q: What is the difference between server state and client state, and why should they be managed by different tools?
+    hint: |-
+      - **Server state**: nguồn sự thật ở backend; client chỉ giữ **bản sao có thể cũ**, dùng chung với người khác, cần fetch async, cache, dedupe, refetch, invalidation, pagination, retry.
+      - **Client state**: chỉ tồn tại ở browser (modal mở, theme, draft, bước wizard), đồng bộ, client là nguồn sự thật.
+      - Trộn chung (fetch rồi `dispatch(setOrders(data))`) → phải tự viết loading/error/stale/refetch cho từng thứ, dễ stale & race.
+      - Tool: server state → TanStack Query / RTK Query / RSC; client state → useState, Context, Zustand, Redux slice.
+    followUp: Is a shopping cart server state or client state? Defend your answer for a logged-in vs a guest user.
+    tags: [fundamentals, server-state]
+  - id: state-management-002
+    level: easy
+    type: concept
+    q: Explain the core Redux concepts — store, action, reducer, dispatch, selector — and the rules reducers must follow.
+    hint: |-
+      - **Store**: một object state duy nhất; **action**: object `{ type, payload }` mô tả "chuyện gì đã xảy ra"; **reducer**: `(state, action) => newState`; **dispatch**: gửi action; **selector**: đọc/derive dữ liệu từ state.
+      - Reducer phải: **thuần** (không API call, không random, không `Date.now()`), **immutable** (không mutate state cũ — RTK dùng Immer nên "mutate" trong `createSlice` là an toàn), **đồng bộ**.
+      - Side effect nằm ở middleware (thunk, listener, RTK Query).
+      - Lợi ích: dễ dự đoán, time-travel debug, test reducer như function thuần.
+    followUp: Why should actions describe events ("orderPlaced") rather than setters ("setOrders")?
+    tags: [redux, fundamentals]
+  - id: state-management-003
+    level: easy
+    type: concept
+    q: What does Redux Toolkit give you over hand-written Redux?
+    hint: |-
+      - `configureStore`: gộp reducer, thêm thunk, bật Redux DevTools, và **dev-only check** mutation + non-serializable value.
+      - `createSlice`: action creator + reducer cùng chỗ, dùng **Immer** để viết code "mutate" an toàn.
+      - `createAsyncThunk`: action pending/fulfilled/rejected chuẩn.
+      - `createEntityAdapter`: normalized state + CRUD reducer + selector.
+      - `createSelector` (Reselect), `createListenerMiddleware` (side effect phản ứng theo action).
+      - RTK Query: data fetching + cache.
+      - RTK là cách viết Redux được khuyến nghị chính thức; `createStore` legacy bị đánh dấu deprecated.
+    followUp: What does Immer actually do under the hood, and what is one thing you cannot do inside a Immer reducer?
+    verify: true
+    tags: [redux-toolkit]
+  - id: state-management-004
+    level: easy
+    type: concept
+    q: In TanStack Query, what are `staleTime` and `gcTime`, and what are their defaults?
+    hint: |-
+      - `staleTime`: thời gian dữ liệu được coi là **fresh**; khi fresh, mount mới/focus/reconnect **không** refetch. Default **0** → dữ liệu stale ngay sau khi fetch.
+      - `gcTime` (v5; v4 gọi là `cacheTime`): khi query **không còn component nào dùng** (inactive), sau khoảng này entry bị xoá. Default **5 phút**.
+      - Hai khái niệm độc lập: dữ liệu có thể stale nhưng vẫn trong cache (hiển thị ngay + refetch nền).
+      - Chỉnh theo loại dữ liệu: danh mục ít đổi → `staleTime` vài phút; giá/tồn kho → thấp.
+    followUp: Users complain the app "calls the API every time I switch tabs". Which default is responsible and how do you tune it?
+    verify: true
+    tags: [tanstack-query, caching]
+  - id: state-management-005
+    level: easy
+    type: concept
+    q: What is a query key in TanStack Query and what are the rules for building one?
+    hint: |-
+      - Array serializable định danh cache entry: `['orders', { status, page }]`, `['order', id]`.
+      - **Mọi biến mà `queryFn` dùng phải nằm trong key** — thiếu biến → cache trả nhầm dữ liệu của tham số khác, không refetch khi tham số đổi.
+      - Hash ổn định với object (thứ tự key trong object không quan trọng), nhưng thứ tự **phần tử array** có quan trọng.
+      - Tổ chức phân cấp để invalidate theo prefix: `invalidateQueries({ queryKey: ['orders'] })` trúng mọi key bắt đầu bằng `'orders'`.
+      - Dùng **query key factory** (`orderKeys.list(filters)`) để tránh gõ tay lệch; tenant id nên nằm trong key nếu user đổi tenant không reload.
+    followUp: The user switches tenant in the header and sees the previous tenant's orders for a second. What is wrong with the keys?
+    tags: [tanstack-query]
+  - id: state-management-006
+    level: easy
+    type: compare
+    q: When is React Context enough, and when do you need a dedicated state library?
+    hint: |-
+      - Context đủ khi: giá trị **ít thay đổi** (theme, locale, user đăng nhập, feature flags, client instance) — nó là cơ chế **dependency injection**, không phải state manager.
+      - Cần thư viện khi: state đổi thường xuyên và nhiều component chỉ cần **một phần** (Context không có selector → mọi consumer render), cần middleware/devtools/persist, logic cập nhật phức tạp, dùng ngoài React.
+      - Server state → không dùng Context tự chế; dùng data library.
+    followUp: Show how splitting one context into two (state and actions) reduces re-renders.
+    tags: [context, fundamentals]
+  - id: state-management-007
+    level: easy
+    type: concept
+    q: What state belongs in the URL, and what are the benefits and limits of doing so?
+    hint: |-
+      - Nên ở URL: filter, sort, page/cursor, tab đang chọn, search query, id của item đang mở (modal detail).
+      - Lợi ích: share link/bookmark, back/forward hoạt động đúng, reload giữ nguyên, server (Next.js `searchParams`) render được trạng thái.
+      - Hạn chế: chỉ string/serializable, độ dài giới hạn, lộ thông tin (không để PII/token), mỗi thay đổi có thể trigger navigation/render server.
+      - Tránh 2 nguồn sự thật: đọc thẳng từ URL, không copy vào state rồi sync hai chiều (dùng thư viện như `nuqs` nếu cần typed).
+    followUp: Typing in a search box updates `?q=` on every keystroke and floods history. How do you fix it?
+    tags: [url-state]
+  - id: state-management-008
+    level: easy
+    type: concept
+    q: Why normalize state, and what does `createEntityAdapter` produce?
+    hint: |-
+      - Dữ liệu lồng/trùng (cùng một product trong nhiều order) → cập nhật một chỗ phải sửa nhiều chỗ, dễ lệch.
+      - Normalized: `{ ids: ['p1','p2'], entities: { p1: {...}, p2: {...} } }`; quan hệ bằng id; list chỉ giữ id.
+      - `createEntityAdapter` tạo state shape đó + reducer (`addOne`, `upsertMany`, `removeOne`, `updateOne`…) + selector (`selectAll`, `selectById`), có `sortComparer`.
+      - Không phải lúc nào cũng cần: cache của TanStack Query theo query (không normalized) thường đủ; normalize khi nhiều view cùng sửa entity.
+    followUp: TanStack Query does not normalize. How do you keep an item consistent between the list query and the detail query after an edit?
+    tags: [redux-toolkit, normalization]
+  - id: state-management-009
+    level: easy
+    type: concept
+    q: How do you read state from a Zustand store without causing unnecessary re-renders?
+    hint: |-
+      - Luôn dùng **selector**: `const count = useStore(s => s.count)` — component chỉ render khi `count` đổi (so sánh `Object.is`).
+      - `useStore()` không selector → subscribe cả store → render mọi thay đổi.
+      - Chọn nhiều field → selector trả object mới mỗi lần → luôn khác → dùng `useShallow(s => ({ a: s.a, b: s.b }))`; ở v5 selector trả reference mới mỗi lần có thể gây loop "Maximum update depth".
+      - Action đặt trong store, gọi ngoài React được qua `useStore.getState()`.
+    followUp: How would you persist part of a Zustand store to localStorage without breaking SSR?
+    verify: true
+    tags: [zustand, performance]
+  - id: state-management-010
+    level: medium
+    type: design
+    q: Implement an optimistic "toggle favourite" with TanStack Query. What steps prevent the UI from flickering or getting stuck in a wrong state?
+    hint: |-
+      - `onMutate`: `await queryClient.cancelQueries({ queryKey })` (tránh refetch đang bay ghi đè), snapshot `getQueryData`, `setQueryData` optimistic, return `{ previous }`.
+      - `onError`: rollback `setQueryData(queryKey, context.previous)` + thông báo.
+      - `onSettled`: `invalidateQueries({ queryKey })` để **reconcile** với server.
+      - Cập nhật **mọi** query chứa item (list + detail) hoặc chấp nhận invalidate cả hai.
+      - v5 có cách đơn giản hơn: render optimistic từ `mutation.variables` khi `isPending`, không đụng cache.
+    example: |-
+      ```ts
+      useMutation({
+        mutationFn: (id: string) => api.toggleFavourite(id),
+        onMutate: async (id) => {
+          await qc.cancelQueries({ queryKey: productKeys.lists() });
+          const previous = qc.getQueryData<Product[]>(productKeys.list(filters));
+          qc.setQueryData<Product[]>(productKeys.list(filters), (old) =>
+            old?.map((p) => (p.id === id ? { ...p, favourite: !p.favourite } : p)),
+          );
+          return { previous };
+        },
+        onError: (_err, _id, ctx) => qc.setQueryData(productKeys.list(filters), ctx?.previous),
+        onSettled: () => qc.invalidateQueries({ queryKey: productKeys.lists() }),
+      });
+      ```
+    followUp: The user toggles the same item 5 times quickly. What can go wrong with this implementation?
+    verify: true
+    tags: [tanstack-query, optimistic-ui]
+  - id: state-management-011
+    level: medium
+    type: concept
+    q: How does RTK Query cache invalidation with tags work? Show `providesTags` and `invalidatesTags` for a list and a detail.
+    hint: |-
+      - Query khai báo `providesTags` (dữ liệu này "thuộc" tag nào); mutation khai báo `invalidatesTags`; khi mutation xong, mọi query đang có subscription với tag trùng sẽ **refetch**.
+      - Pattern chuẩn: list cung cấp `{ type: 'Order', id: 'LIST' }` + từng `{ type: 'Order', id }`; tạo mới invalidate `LIST`; sửa một item invalidate `{ type: 'Order', id }`.
+      - Cache entry không còn subscriber bị xoá sau `keepUnusedDataFor` (default 60 giây).
+      - Invalidate quá rộng (`['Order']`) → refetch nhiều query không cần.
+    example: |-
+      ```ts
+      getOrders: build.query<Order[], void>({
+        query: () => '/orders',
+        providesTags: (result = []) => [
+          { type: 'Order', id: 'LIST' },
+          ...result.map(({ id }) => ({ type: 'Order' as const, id })),
+        ],
+      }),
+      updateOrder: build.mutation<Order, Partial<Order> & { id: string }>({
+        query: ({ id, ...patch }) => ({ url: `/orders/${id}`, method: 'PATCH', body: patch }),
+        invalidatesTags: (_r, _e, { id }) => [{ type: 'Order', id }],
+      }),
+      ```
+    followUp: How do you do an optimistic update in RTK Query, and how do you undo it?
+    verify: true
+    tags: [rtk-query, caching]
+  - id: state-management-012
+    level: medium
+    type: compare
+    q: TanStack Query vs RTK Query — how do you choose between them?
+    hint: |-
+      - Đã dùng Redux nhiều (state client lớn, middleware, DevTools) → **RTK Query** tích hợp tự nhiên, cache nằm trong store, invalidate bằng tags, sinh hook từ endpoint definition.
+      - Không dùng Redux / chỉ cần server state → **TanStack Query**: API linh hoạt theo từng query, infinite query mạnh, devtools riêng, SSR hydration, framework-agnostic.
+      - Khác biệt mô hình: RTK Query định nghĩa **API slice tập trung**; TanStack Query định nghĩa **tại chỗ** (hoặc qua `queryOptions`).
+      - Invalidation: tags (RTK Query) vs query key prefix (TanStack).
+      - Đừng dùng cả hai cho cùng dữ liệu.
+    followUp: How would you migrate a codebase from `createAsyncThunk` + slices storing API data to RTK Query incrementally?
+    tags: [rtk-query, tanstack-query, compare]
+  - id: state-management-013
+    level: medium
+    type: gotcha
+    q: Why does a selector like `useSelector(state => state.orders.filter(o => o.paid))` hurt performance, and how do you fix it?
+    hint: |-
+      - `useSelector` chạy lại selector sau **mọi** action và so sánh kết quả bằng `===`; `.filter` trả **array mới** mỗi lần → component render sau mọi action, kể cả không liên quan.
+      - React-Redux (v8+) còn cảnh báo dev khi selector trả reference khác cho cùng input.
+      - Fix: memoized selector `createSelector([selectOrders], orders => orders.filter(o => o.paid))` — chỉ tính lại khi `orders` đổi reference; hoặc select primitive/id; hoặc `shallowEqual` làm tham số thứ hai.
+      - Selector có tham số (theo `status`) → tạo selector instance per component (`useMemo(makeSelect, [])`) nếu cache size nhỏ.
+    followUp: What is the cache size of a Reselect selector, and how does that matter for parameterized selectors?
+    verify: true
+    tags: [redux, selectors, performance]
+  - id: state-management-014
+    level: medium
+    type: compare
+    q: "`invalidateQueries` vs `refetchQueries` vs `setQueryData` vs `resetQueries` — when do you use each after a mutation?"
+    hint: |-
+      - `invalidateQueries`: đánh dấu stale; query **đang active** refetch ngay, inactive refetch khi được dùng lại → lựa chọn mặc định an toàn.
+      - `refetchQueries`: fetch ngay theo filter (kể cả không stale) — ít dùng.
+      - `setQueryData`: ghi tay vào cache (dùng response của mutation, tránh round-trip) — cần đúng shape; hợp khi server trả entity đã cập nhật.
+      - `resetQueries`: về `initialData`/xoá data rồi refetch — dùng khi logout/đổi tenant.
+      - `removeQueries`: xoá khỏi cache không refetch.
+      - Thường: `setQueryData` cho detail từ response + `invalidateQueries` cho list.
+    followUp: After logout, what must happen to the query cache and why?
+    tags: [tanstack-query, caching]
+  - id: state-management-015
+    level: medium
+    type: concept
+    q: What are `isPending`, `isLoading`, `isFetching` and `placeholderData` in TanStack Query v5, and how do you avoid a spinner flash when paginating?
+    hint: |-
+      - `isPending`: chưa có data (status `pending`). `isFetching`: có request đang chạy (kể cả refetch nền). `isLoading` = `isPending && isFetching` (lần tải đầu).
+      - Đổi trang → key mới → không có cache → `isPending` → UI thay bằng spinner, bảng nhảy.
+      - `placeholderData: keepPreviousData` (v5 thay option `keepPreviousData: true` của v4): giữ data trang cũ trong lúc tải trang mới, `isPlaceholderData = true` để làm mờ/disable nút Next.
+      - Prefetch trang kế (`queryClient.prefetchQuery`) để chuyển trang tức thì.
+    followUp: How does `placeholderData` differ from `initialData` regarding caching and staleness?
+    verify: true
+    tags: [tanstack-query, pagination, ux]
+  - id: state-management-016
+    level: medium
+    type: design
+    q: How do you implement infinite scrolling with TanStack Query, and what are the gotchas when the list changes on the server?
+    hint: |-
+      - `useInfiniteQuery({ queryKey, queryFn: ({ pageParam }) => fetchPage(pageParam), initialPageParam, getNextPageParam: (last) => last.nextCursor ?? undefined })` — v5 bắt buộc `initialPageParam`.
+      - `data.pages` là mảng trang; `fetchNextPage` khi sentinel vào viewport (IntersectionObserver); `hasNextPage`, `isFetchingNextPage`.
+      - Dùng **cursor** pagination từ API (offset + insert mới → trùng item).
+      - Refetch infinite query refetch **tuần tự mọi trang** đã tải → 20 trang = 20 request; dùng `maxPages` để giới hạn.
+      - Kết hợp virtualization khi nhiều item.
+    followUp: A new item is created by the current user. Do you invalidate the whole infinite list or insert it into the first page?
+    verify: true
+    tags: [tanstack-query, pagination, infinite-scroll]
+  - id: state-management-017
+    level: medium
+    type: compare
+    q: "`createAsyncThunk` vs listener middleware vs RTK Query vs redux-saga — where should side effects live?"
+    hint: |-
+      - **RTK Query**: mặc định cho data fetching + cache.
+      - **`createAsyncThunk`**: một async flow gắn với một action (submit, workflow nhiều bước), dispatch pending/fulfilled/rejected; hỗ trợ `signal` để abort, `condition` để bỏ qua.
+      - **Listener middleware**: phản ứng **sau khi** action xảy ra ("khi `cartUpdated` thì lưu draft", debounce, cancel theo action mới) — thay thế nhẹ cho saga.
+      - **Saga**: generator, mạnh cho luồng phức tạp (race, cancel, channel) nhưng học khó, ít được khuyến nghị cho code mới.
+      - Không đặt side effect trong reducer hay component render.
+    followUp: Implement "autosave the draft 1 second after the last edit" with the listener middleware.
+    tags: [redux-toolkit, side-effects]
+  - id: state-management-018
+    level: medium
+    type: gotcha
+    q: Why is putting non-serializable values (Date, Map, class instances, Promises) into Redux state discouraged?
+    hint: |-
+      - Redux DevTools, time-travel, persist (redux-persist), SSR hydration dựa trên state serializable; `Date`/`Map`/class bị mất kiểu khi serialize.
+      - Class instance có method → khuyến khích mutate, phá immutability; so sánh reference khó đoán.
+      - RTK `configureStore` có **serializability check middleware** cảnh báo ở dev.
+      - Lưu: `Date` → ISO string hoặc epoch ms; `Map` → object/entity adapter; Promise → status field.
+      - Ngoại lệ có chủ đích (VD tham chiếu non-serializable trong action cho middleware) → cấu hình `ignoredActions`/`ignoredPaths`.
+    followUp: Where would you keep a WebSocket connection object if not in Redux?
+    tags: [redux, serialization]
+  - id: state-management-019
+    level: medium
+    type: design
+    q: How do you feed real-time updates (WebSocket / Socket.IO events) into a TanStack Query or RTK Query cache?
+    hint: |-
+      - Một kết nối dùng chung (module/provider), không mỗi component một socket.
+      - Khi nhận event: **patch cache** trực tiếp (`queryClient.setQueryData(['order', id], …)` / RTK Query `updateQueryData` hoặc `onCacheEntryAdded` streaming updates) nếu payload đủ; hoặc **invalidate** key liên quan nếu event chỉ báo "có thay đổi".
+      - Event có version/timestamp → bỏ event cũ hơn dữ liệu cache (chống out-of-order).
+      - Khi reconnect: invalidate để bắt kịp những event bị lỡ.
+      - Throttle event dồn dập, batch cập nhật.
+      - `staleTime` có thể tăng cao vì socket giữ dữ liệu tươi.
+    followUp: What happens to cached data that was patched by a socket event when the query refetches with an older server response?
+    tags: [realtime, tanstack-query, rtk-query]
+  - id: state-management-020
+    level: medium
+    type: gotcha
+    q: Why must you create the Redux store (or QueryClient) per request in a Next.js App Router app?
+    hint: |-
+      - Trên server, module JS được **dùng chung giữa mọi request**; store tạo ở module scope (`export const store = configureStore(…)`) → state của user A còn trong store khi render cho user B → **rò dữ liệu**.
+      - Pattern: `makeStore()` factory; Client Component provider giữ instance bằng `useRef`/`useState(() => makeStore())`, tạo một lần mỗi request (server) / một lần mỗi phiên (client).
+      - Server Components **không** đọc được store client (không hook, không context) → dữ liệu server lấy qua fetch/DAL rồi truyền props hoặc hydrate vào store.
+      - TanStack Query: `new QueryClient()` trong provider; SSR prefetch + `HydrationBoundary`/`dehydrate`.
+    followUp: How do you pre-populate the store with data fetched in a Server Component without a client-side refetch?
+    tags: [ssr, nextjs, redux, tanstack-query]
+  - id: state-management-021
+    level: medium
+    type: design
+    q: How do you structure a large Redux Toolkit codebase — slices, selectors, and feature boundaries?
+    hint: |-
+      - **Feature folder** (`features/cart/cartSlice.ts`, `selectors.ts`, `hooks.ts`) thay vì tách theo loại (actions/, reducers/).
+      - Mỗi slice sở hữu một phần state; slice khác phản ứng qua `extraReducers` (builder callback) thay vì đọc/ghi chéo.
+      - Selector là **public API** của slice; component không đọc `state.cart.items` trực tiếp.
+      - Typed hooks: `useAppDispatch`, `useAppSelector` (`withTypes`).
+      - Server data → RTK Query API slice (`injectEndpoints` để tách theo feature, code splitting).
+      - Tránh store "god object": UI state tạm thời để local.
+    followUp: Two slices need to react to `userLoggedOut`. How do you clear both without them importing each other?
+    verify: true
+    tags: [redux-toolkit, architecture]
+  - id: state-management-022
+    level: medium
+    type: concept
+    q: How do you prefetch and hydrate TanStack Query data during SSR in Next.js App Router?
+    hint: |-
+      - Trong Server Component: tạo `QueryClient` (per request), `await queryClient.prefetchQuery({ queryKey, queryFn })`, rồi render `<HydrationBoundary state={dehydrate(queryClient)}>` bao Client Component.
+      - Client Component gọi `useQuery` **cùng queryKey** → lấy data từ cache hydrate, không fetch lại ngay (nếu `staleTime` > 0; với `staleTime: 0` sẽ refetch sau mount).
+      - Đặt `staleTime` mặc định > 0 (VD 60s) khi SSR để tránh double fetch.
+      - Không prefetch dữ liệu nhạy cảm của user khác; QueryClient phía browser tạo **một lần** (không tạo lại mỗi render).
+      - Có thể stream: prefetch không await + dehydrate pending queries (tính năng mới, verify theo version).
+    followUp: When would you skip TanStack Query entirely and just pass server data as props from a Server Component?
+    verify: true
+    tags: [tanstack-query, ssr, nextjs]
+  - id: state-management-023
+    level: medium
+    type: gotcha
+    q: Why do derived values stored in state cause bugs, and what should you do instead?
+    hint: |-
+      - Lưu `total` bên cạnh `items` → mỗi chỗ sửa `items` phải nhớ cập nhật `total`; quên một chỗ = UI sai; đồng bộ bằng effect → render thừa, lệch một nhịp.
+      - Nguyên tắc: lưu **tối thiểu** (source of truth), **derive** khi đọc — trong render, `useMemo`, hoặc memoized selector (`createSelector`).
+      - Ngoại lệ: derive rất đắt và input ít đổi → cache có chủ đích (selector memo), không lưu thủ công.
+      - Tương tự: không copy props vào state (trừ khi cố ý làm "initial value").
+    followUp: The cart total must include server-calculated tax. Is that derived state or server state?
+    tags: [fundamentals, derived-state]
+  - id: state-management-024
+    level: medium
+    type: concept
+    q: What are the default retry and refetch behaviours of TanStack Query, and when should you override them?
+    hint: |-
+      - Client: query lỗi **retry 3 lần** với exponential backoff; mutation mặc định **không retry**. Trên server (SSR) retry mặc định 0.
+      - Refetch khi query stale và: component mới mount (`refetchOnMount`), window focus (`refetchOnWindowFocus`), mạng reconnect (`refetchOnReconnect`).
+      - Override: không retry lỗi 4xx (401/403/404/422) — `retry: (count, err) => err.status >= 500 && count < 3`; tắt focus refetch cho form/màn hình nặng; bật `refetchInterval` cho dashboard.
+      - Test: tắt retry trong QueryClient của test để lỗi hiện ngay.
+    followUp: A 401 triggers three retries and three failed token refreshes. How do you design this properly?
+    verify: true
+    tags: [tanstack-query, defaults]
+  - id: state-management-025
+    level: hard
+    type: debug
+    q: Users sometimes see another user's filter results after navigating back. Find the bug in this query hook.
+    example: |-
+      ```ts
+      export function useOrders(filters: { status: string; page: number }) {
+        const { tenantId } = useTenant();
+        return useQuery({
+          queryKey: ['orders', filters.page],
+          queryFn: () => api.get('/orders', { params: { ...filters, tenantId } }),
+          staleTime: 5 * 60_000,
+        });
+      }
+      ```
+    hint: |-
+      - Query key thiếu `filters.status` và `tenantId` → hai lệnh gọi khác status/tenant **dùng chung** cache entry `['orders', 1]`; với `staleTime` 5 phút, cache cũ được trả ngay mà không refetch.
+      - Fix: `queryKey: ['orders', tenantId, filters]` (hoặc key factory); mọi biến dùng trong queryFn phải nằm trong key. ESLint plugin của TanStack Query (`exhaustive-deps` cho query key) bắt được lỗi này.
+      - Đổi tenant/logout → `queryClient.clear()`/`resetQueries` để không hiển thị dữ liệu tenant trước.
+      - Server vẫn phải lấy tenant từ token, không từ param client gửi.
+    followUp: Why is `tenantId` in the query params a security smell even though it fixes the cache?
+    tags: [tanstack-query, debug, multi-tenancy]
+  - id: state-management-026
+    level: hard
+    type: debug
+    q: This Zustand component re-renders in a loop / on every store change. Why?
+    example: |-
+      ```tsx
+      const useCart = create<CartState>()((set) => ({
+        items: [],
+        coupon: null,
+        add: (item) => set((s) => ({ items: [...s.items, item] })),
+      }));
+
+      function CartBadge() {
+        const { count, hasCoupon } = useCart((s) => ({
+          count: s.items.length,
+          hasCoupon: s.coupon !== null,
+        }));
+        return <span>{count}{hasCoupon && '*'}</span>;
+      }
+      ```
+    hint: |-
+      - Selector trả **object mới** mỗi lần gọi → so sánh `Object.is` luôn khác → component render mỗi lần store đổi; ở Zustand v5 (dựa `useSyncExternalStore`), selector không ổn định có thể gây **"Maximum update depth exceeded"**.
+      - Fix: `useCart(useShallow((s) => ({ count: s.items.length, hasCoupon: s.coupon !== null })))`, hoặc hai selector primitive riêng (`useCart(s => s.items.length)`).
+      - Tương tự Redux: selector phải trả primitive hoặc reference ổn định.
+    followUp: How would you write a unit test that proves `CartBadge` does not re-render when an unrelated field changes?
+    verify: true
+    tags: [zustand, debug, performance]
+  - id: state-management-027
+    level: hard
+    type: debug
+    q: After an optimistic "rename project", the old name flashes back for a moment and then the new name appears. What is missing?
+    example: |-
+      ```ts
+      useMutation({
+        mutationFn: renameProject,
+        onMutate: ({ id, name }) => {
+          queryClient.setQueryData(['project', id], (p: Project) => ({ ...p, name }));
+        },
+        onSettled: (_d, _e, { id }) => queryClient.invalidateQueries({ queryKey: ['project', id] }),
+      });
+      ```
+    hint: |-
+      - Thiếu `await queryClient.cancelQueries({ queryKey: ['project', id] })` trong `onMutate`: một refetch đang bay (do focus/mount) trả về **tên cũ** sau khi đã set optimistic → ghi đè → flash tên cũ → `onSettled` refetch lại mới đúng.
+      - Thiếu snapshot + rollback trong `onError` → lỗi thì UI kẹt tên sai tới khi refetch.
+      - List query (`['projects']`) không được cập nhật → nơi khác vẫn hiện tên cũ.
+      - Nếu mutation dồn dập: chỉ invalidate khi không còn mutation cùng key đang chạy (`isMutating`) để tránh nhảy qua lại.
+    followUp: How do you handle two optimistic mutations on the same item where the first fails and the second succeeds?
+    tags: [tanstack-query, optimistic-ui, debug]
+  - id: state-management-028
+    level: hard
+    type: scenario
+    q: A dashboard makes 40 API calls on load and the same endpoint is called 6 times. How do you diagnose and fix it?
+    hint: |-
+      - Network tab + React Query/RTK Query devtools: cùng URL nhưng **khác query key** (key không ổn định, object tham số tạo khác thứ tự array, `Date` mới mỗi render) → không dedupe.
+      - Fetch trong `useEffect` ở nhiều component độc lập → không có cache chung → chuyển sang data library dùng chung key.
+      - StrictMode dev double mount → phân biệt dev vs production.
+      - `staleTime: 0` + nhiều component mount lệch thời điểm → refetch → tăng `staleTime` phù hợp.
+      - Waterfall/fan-out: nhiều widget → cân nhắc endpoint gộp (BFF), prefetch ở route/server.
+      - Đo lại số request và thời gian tới dữ liệu đầy đủ.
+    followUp: When is a single aggregated "dashboard" endpoint better than many small queries, and when is it worse?
+    tags: [scenario, performance, data-fetching]
+  - id: state-management-029
+    level: hard
+    type: scenario
+    q: After a user logs out and a different user logs in on the same browser, they briefly see the previous user's data. List every place state can leak and how you clear it.
+    hint: |-
+      - **Query cache** (TanStack/RTK Query) còn trong memory → `queryClient.clear()` / `api.util.resetApiState()`.
+      - **Redux/Zustand store** → root reducer reset khi `loggedOut` (trả `undefined` cho slice) hoặc reload trang.
+      - **Persisted state**: localStorage/sessionStorage/IndexedDB (redux-persist, query persister) → xoá hoặc key theo user id.
+      - **Service worker / HTTP cache** cho response cá nhân → `Cache-Control: private, no-store`.
+      - **Framework cache**: Next.js client router cache → `router.refresh()` hoặc hard navigation sau logout.
+      - Socket vẫn kết nối với token cũ → disconnect.
+      - Cách an toàn nhất cho app nhạy cảm (banking): full page reload sau logout.
+    followUp: How do you test this automatically?
+    tags: [security, scenario, cache]
+  - id: state-management-030
+    level: hard
+    type: design
+    q: Design state management for a multi-step checkout (cart, address, shipping, payment, review) that must survive page reloads and work for guests.
+    hint: |-
+      - Phân loại: cart (server state nếu đăng nhập; guest → server cart với anonymous id, hoặc local rồi merge khi login), address/shipping options (server), bước hiện tại (URL `/checkout/shipping`), form draft (local form state).
+      - Persist: server-side checkout session (id trong cookie) là nguồn sự thật — reload/đổi device vẫn tiếp tục; tránh chỉ lưu localStorage (lệch giá, tồn kho).
+      - Giá/tax/tồn kho luôn tính lại ở server trước khi đặt hàng; UI hiển thị thay đổi.
+      - Step machine: chặn nhảy tới bước chưa hợp lệ (guard theo state server).
+      - Submit: idempotency key, disable nút theo `isPending`, xử lý lỗi theo mã.
+    followUp: A guest adds items, then logs in and already has a server cart. How do you merge?
+    tags: [design, checkout, state]
+  - id: state-management-031
+    level: hard
+    type: gotcha
+    q: What are the pitfalls of persisting Redux or query cache to localStorage (redux-persist, query persisters)?
+    hint: |-
+      - **Schema drift**: phiên bản app mới đọc state cũ khác shape → crash; cần `version` + `migrate`, hoặc xoá khi version đổi.
+      - **Stale / sai dữ liệu**: hiển thị giá/quyền cũ; cần `maxAge` và revalidate khi khởi động.
+      - **Bảo mật**: localStorage đọc được bởi mọi script (XSS) → không lưu token, PII, dữ liệu tài chính; máy dùng chung.
+      - **Hydration SSR**: server không có localStorage → mismatch; rehydrate sau mount + gate UI.
+      - **Hiệu năng**: serialize state lớn mỗi thay đổi chặn main thread → throttle, chỉ whitelist slice cần.
+      - Multi-tab: hai tab ghi đè nhau → `storage` event để sync.
+    followUp: Which parts of a banking app's state would you never persist, and which are acceptable?
+    tags: [persistence, security, gotcha]
+  - id: state-management-032
+    level: hard
+    type: compare
+    q: Compare `useMutation` + manual cache updates, React 19 `useOptimistic`, and Next.js Server Actions with revalidation for optimistic UI.
+    hint: |-
+      - **TanStack `useMutation`**: cache client là nguồn sự thật; tự quản snapshot/rollback/invalidate; cập nhật **mọi màn hình** dùng cùng key; hợp SPA/client-heavy.
+      - **`useOptimistic`**: lớp optimistic **cục bộ** trong một component suốt thời gian transition; tự revert khi transition xong; không cập nhật cache toàn app.
+      - **Server Action + `revalidatePath`/`updateTag`/`refresh`**: server là nguồn sự thật, response trả kèm UI mới trong cùng round-trip; kết hợp `useOptimistic` cho phản hồi tức thì.
+      - Chọn theo kiến trúc: RSC-first → Server Actions + `useOptimistic`; client cache nặng → TanStack.
+      - Trộn cả hai cho cùng dữ liệu → hai cache lệch nhau.
+    followUp: In a Next.js app using both TanStack Query and Server Actions, how do you keep them consistent after a mutation?
+    verify: true
+    tags: [optimistic-ui, react-19, nextjs, tanstack-query]
+  - id: state-management-033
+    level: hard
+    type: gotcha
+    q: What happens when a component dispatches a thunk and unmounts before the request finishes? How do you cancel it?
+    hint: |-
+      - Thunk vẫn chạy; `fulfilled` vẫn cập nhật store — thường vô hại nếu state là global, nhưng gây lỗi logic nếu kết quả thuộc màn hình đã rời (ghi đè dữ liệu của màn hình mới, race giữa hai request cùng slice).
+      - `createAsyncThunk` truyền `signal` (AbortSignal) cho payload creator → `fetch(url, { signal })`; promise trả từ `dispatch` có `.abort()` → gọi trong cleanup của effect.
+      - Reducer có thể bỏ qua kết quả không khớp `requestId` mới nhất (`action.meta.requestId`).
+      - RTK Query/TanStack Query tự xử lý dedupe và bỏ kết quả không còn dùng.
+    example: |-
+      ```ts
+      useEffect(() => {
+        const promise = dispatch(fetchReport(filters));
+        return () => promise.abort();
+      }, [dispatch, filters]);
+      ```
+    followUp: How does `condition` in `createAsyncThunk` help avoid duplicate requests?
+    tags: [redux-toolkit, async, cancellation]
+  - id: state-management-034
+    level: hard
+    type: scenario
+    q: Two browser tabs of your app show different cart contents after the user edits in one tab. How do you keep tabs in sync?
+    hint: |-
+      - Nguồn sự thật nên ở **server** → mỗi tab refetch khi focus (TanStack Query `refetchOnWindowFocus`) là giải pháp đơn giản nhất.
+      - Đồng bộ tức thì giữa tab: `BroadcastChannel` (gửi event "cart-updated" → tab kia invalidate/patch cache), hoặc `storage` event nếu state persist ở localStorage.
+      - Real-time đa thiết bị: WebSocket/SSE từ server.
+      - Tránh ghi đè: dùng version/`updatedAt` khi merge; không để tab cũ ghi toàn bộ state lên localStorage đè tab mới.
+    followUp: Would you sync the auth logout event across tabs the same way? What is different?
+    tags: [scenario, multi-tab, sync]
+  - id: state-management-035
+    level: hard
+    type: design
+    q: How do you keep list and detail views consistent in TanStack Query after editing an item, without refetching everything?
+    hint: |-
+      - Mutation trả entity mới → `setQueryData(['order', id], updated)` cho detail.
+      - List: hoặc `setQueryData` map qua các list query (`getQueriesData({ queryKey: ['orders'] })` rồi thay item), hoặc `invalidateQueries({ queryKey: ['orders', 'list'] })` (refetch list đang active, list inactive refetch khi dùng lại).
+      - Dùng `initialData`/`placeholderData` từ list khi mở detail để hiển thị ngay.
+      - Nếu item thay đổi **thứ tự/filter** (đổi status khỏi filter hiện tại) → invalidate list an toàn hơn patch tay.
+      - Key hierarchy (`['orders','list',filters]`, `['orders','detail',id]`) giúp invalidate chính xác.
+    followUp: When is normalizing into a client entity store (Redux entity adapter) worth it over this approach?
+    tags: [tanstack-query, caching, design]
+  - id: state-management-036
+    level: senior
+    type: open
+    q: You inherit an app where every API response is stored in Redux via thunks, with hand-written loading flags per slice. Propose a migration plan.
+    hint: |-
+      Đo độ trưởng thành:
+      - Kiểm kê: slice nào là **server state** (phần lớn) vs client state thật.
+      - Chọn đích: RTK Query (giữ Redux, ít thay đổi mental model) hoặc TanStack Query.
+      - Incremental: feature mới dùng tool mới; migrate từng endpoint (strangler) — component chuyển sang hook mới, xoá slice cũ khi không còn reader; giữ selector cũ làm adapter tạm nếu nhiều nơi đọc.
+      - Guardrails: lint cấm thêm thunk fetch mới, định nghĩa query key/tag convention.
+      - Đo: số dòng code, số request trùng, bug stale data trước/sau.
+      - Rủi ro: hai nguồn dữ liệu trong giai đoạn chuyển tiếp — tránh cùng dữ liệu ở hai nơi.
+    followUp: How do you convince the team that the migration is worth it before any user-visible benefit?
+    tags: [migration, architecture, leadership]
+  - id: state-management-037
+    level: senior
+    type: design
+    q: Design the data layer for a React app that must work offline (field sales app) and sync when back online.
+    hint: |-
+      - Local-first store: IndexedDB (Dexie) là nguồn đọc cho UI; server là nguồn sự thật cuối cùng.
+      - Ghi offline: **outbox queue** các mutation (có id client, idempotency key), xử lý tuần tự khi online; UI hiển thị trạng thái "pending sync".
+      - Conflict: last-write-wins theo field, version/`updatedAt` + merge, hoặc hỏi user cho dữ liệu quan trọng; CRDT cho collaborative.
+      - Đọc: sync delta (`since=cursor`) thay vì tải lại toàn bộ.
+      - TanStack Query có persist + `networkMode`/mutation pause & resume làm nền tảng.
+      - Bảo mật dữ liệu lưu trên thiết bị, xoá khi logout.
+    followUp: A price changed on the server while the salesperson created an order offline. What does the sync do?
+    tags: [offline, design, sync]
+  - id: state-management-038
+    level: senior
+    type: open
+    q: How do you decide between Redux Toolkit, Zustand, Jotai and "no global store at all" for a new product? What evidence would change your mind later?
+    hint: |-
+      Không có một đáp án:
+      - Bắt đầu tối giản: server state → data library/RSC; URL state; local state. Nhiều app **không cần** global store.
+      - Cần global client state: Zustand (nhỏ, nhanh, ít convention) cho team nhỏ; RTK cho team lớn cần convention, DevTools, middleware, time-travel; Jotai khi state phân mảnh/derive nhiều (editor).
+      - Tiêu chí: số người/team, độ phức tạp workflow client, nhu cầu debug/audit, SSR, kỹ năng hiện có.
+      - Evidence thay đổi quyết định: prop drilling/Context re-render đo được, bug đồng bộ state giữa màn hình, logic side effect rải rác khó test.
+    followUp: What is your rule for what may go into the global store in code review?
+    tags: [architecture, decision-making]
+  - id: state-management-039
+    level: senior
+    type: design
+    q: Design caching and data fetching on the client for a multi-tenant admin app where users switch tenants without reloading and permissions differ per tenant.
+    hint: |-
+      - Tenant id là phần **đầu** của mọi query key (`['t', tenantId, 'orders', …]`) → không bao giờ lẫn cache; khi switch: `cancelQueries` + `removeQueries` tenant cũ (hoặc `clear()`), reset store client theo tenant.
+      - Token/claims theo tenant đang active; API client lấy tenant từ session, server luôn verify.
+      - Permission: tải cùng tenant context, hook `useCan()`; UI ẩn chức năng, server vẫn chặn.
+      - Prefetch dữ liệu hay dùng khi switch để chuyển nhanh; giữ URL chứa tenant (`/t/:tenantId/...`) để deep link.
+      - Socket subscription đổi theo tenant (unsubscribe room cũ).
+    followUp: A request for tenant A returns after the user switched to tenant B. How do you make sure it never lands in the UI?
+    tags: [multi-tenancy, caching, design]
+  - id: state-management-040
+    level: cv
+    type: design
+    q: On the banking SPA you used Redux Toolkit. Which state lived in Redux, which did not, and how did you structure slices and selectors?
+    hint: |-
+      Câu trả lời mạnh:
+      - Liệt kê cụ thể: session/user, account đang chọn, workflow chuyển tiền nhiều bước, notifications → Redux; form draft/local UI → component; dữ liệu API → RTK Query hoặc thunks (nói thật cách team làm).
+      - Cấu trúc: feature slices, selector memoized (`createSelector`), typed hooks, không lưu derived data.
+      - Bảo mật: không persist dữ liệu nhạy cảm, reset store khi logout/timeout phiên.
+      - Một quyết định bạn sẽ làm khác nếu làm lại (VD chuyển fetch sang RTK Query).
+      - (Điền chi tiết thật của bạn.)
+    followUp: How did you handle session timeout while a multi-step transfer was in progress?
+    tags: [cv, redux-toolkit, architecture]
+  - id: state-management-041
+    level: cv
+    type: scenario
+    q: You separated business logic from presentation with custom hooks on the banking SPA. How did those hooks interact with the Redux store and API layer, and how did you test them?
+    hint: |-
+      Gợi ý:
+      - Hook nhận/đọc store qua `useAppSelector`, dispatch action/thunk, gọi API qua service/RTK Query; component chỉ nhận `{ state, actions }`.
+      - Test: `renderHook` với store thật (`makeStore(preloadedState)`) thay vì mock `useSelector`; MSW cho API; kiểm tra luồng trạng thái.
+      - Ranh giới: logic thuần (tính phí, validate hạn mức) là function thuần test riêng.
+      - (Điền ví dụ thật của bạn: tên hook, số test, bug đã bắt được.)
+    followUp: Why is testing with a real store usually better than mocking `useSelector`?
+    tags: [cv, hooks, testing, redux]
+  - id: state-management-042
+    level: cv
+    type: scenario
+    q: On the financial platform with Socket.IO, how did real-time updates flow into application state, and how did you avoid flooding React with renders?
+    hint: |-
+      Câu trả lời mạnh:
+      - Luồng: socket service → buffer/throttle → dispatch batch action (hoặc cập nhật store ngoài React) → component subscribe theo selector nhỏ.
+      - Class components: `shouldComponentUpdate`/`PureComponent`, tách component theo ô dữ liệu.
+      - Xử lý reconnect: resubscribe, lấy snapshot mới rồi áp delta; bỏ message cũ theo sequence/timestamp.
+      - Số liệu: message/giây, CPU/render time trước và sau khi throttle (điền số liệu thật của bạn).
+    followUp: How would you model the same flow today with RTK Query `onCacheEntryAdded` or TanStack Query?
+    tags: [cv, realtime, socket-io, performance]
+  - id: state-management-043
+    level: cv
+    type: design
+    q: On the multi-tenant commerce platform (React/Next.js), how did the frontend cache catalog and cart data, and how did it stay consistent with the backend Redis cache?
+    hint: |-
+      Nội dung mạnh:
+      - Phân tầng cache: browser (query cache/router cache), CDN/HTTP cache cho dữ liệu public, Next.js server cache (nếu có), Redis ở backend, DB.
+      - Catalog: cache lâu hơn + invalidate theo event/tag khi retailer cập nhật; cart: không cache chung, luôn per user, refetch khi focus.
+      - Key có tenant ở mọi tầng.
+      - Một bug stale data thật và cách bạn tìm tầng nào giữ dữ liệu cũ (điền chi tiết thật của bạn).
+    followUp: A retailer changes a price and customers still see the old price. How do you walk the cache layers to find the culprit?
+    tags: [cv, caching, multi-tenancy]
+  - id: state-management-044
+    level: cv
+    type: scenario
+    q: For Shift Management, how did you model the UI state for creating and editing shifts — especially conflicts when two managers edit the same schedule?
+    hint: |-
+      Gợi ý:
+      - Server state (lịch ca) qua data layer; draft chỉnh sửa trong form state; validation chồng ca ở cả client (phản hồi nhanh) và server (nguồn thật).
+      - Concurrency: version/`updatedAt`, `409`/`412` khi xung đột → UI hiển thị thay đổi của người khác, cho merge/reload.
+      - Optimistic update cho thao tác nhỏ (kéo ca), rollback khi server từ chối.
+      - Timezone/ngày ISO khi hiển thị lịch.
+      - (Điền chi tiết thật của bạn.)
+    followUp: How did you handle shifts that cross midnight or daylight-saving changes?
+    tags: [cv, concurrency, forms]
+  - id: state-management-045
+    level: cv
+    type: behavioral
+    q: Tell me about a stale-data or state-sync bug you shipped or fixed. What was the root cause and what did you change in the team's conventions afterwards?
+    hint: |-
+      STAR skeleton:
+      - **S**: màn hình, triệu chứng (dữ liệu cũ, dữ liệu tenant/user khác, UI nhảy), ai phát hiện, ảnh hưởng.
+      - **T/A**: cách tái hiện, tầng nào giữ dữ liệu sai (query key, store, cache server), fix.
+      - **R**: kết quả + test/lint/convention thêm (key factory, lint rule, reset store khi logout) — (điền số liệu thật của bạn).
+      - Reflection: vì sao review/test không bắt được.
+    followUp: What automated check would have caught it earlier?
+    tags: [cv, behavioral, debugging]
