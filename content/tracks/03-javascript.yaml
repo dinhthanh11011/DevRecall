@@ -740,13 +740,15 @@ questions:
 
       // logger.ts
       import { config } from './config';
-      export function log(msg: string) { if (config.level !== 'silent') console.log(msg); }
+      const threshold = config.level; // top-level read, added in the refactor
+      export function log(msg: string) { if (threshold !== 'silent') console.log(msg); }
       // entry: import './config'
       ```
     hint: |-
-      - Circular dependency: `config` bắt đầu evaluate → import `logger` → `logger` evaluate xong (chỉ khai báo function) → quay lại `config`, gọi `log` **trước** khi dòng `export const config` chạy.
-      - ESM: `config` đang ở **TDZ** → `ReferenceError: Cannot access 'config' before initialization`.
-      - CJS: `require('./config')` trong logger trả về `module.exports` **chưa hoàn tất** (`{}`) → `config` là `undefined` → lỗi lệch chỗ, khó hiểu.
+      - Circular dependency: entry load `config` → `config` import `logger` → `logger` evaluate **trước** (dependency chạy trước), lúc đó `config` chưa chạy dòng `export const config`.
+      - ESM: `logger` đọc `config.level` ở **top level** trong khi binding `config` còn ở **TDZ** → `ReferenceError: Cannot access 'config' before initialization`.
+      - CJS: `require('./config')` trong logger trả về `module.exports` **chưa hoàn tất** (`{}`) → `config` là `undefined` → `TypeError: Cannot read properties of undefined`, kèm Node warning về circular dependency.
+      - Lưu ý: nếu logger chỉ đọc `config` **bên trong** `log()` (không đọc ở top level), bản ESM chạy bình thường nhờ **live binding** (lúc `log` được gọi thì `config` đã khởi tạo); bản CJS có destructure lúc load vẫn nhận `undefined`.
       - Fix: tách phần dùng chung ra module thứ ba (config thuần không import gì), đảo hướng phụ thuộc (inject logger), lazy access trong function; phát hiện bằng `madge --circular` / `eslint-plugin-import` `no-cycle`.
     followUp: Why do circular imports often "work" until someone adds a top-level side effect?
     tags: [modules, esm, commonjs, debug]

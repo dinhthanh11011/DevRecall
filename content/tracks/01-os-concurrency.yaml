@@ -284,7 +284,7 @@ questions:
       });
       ```
     hint: |-
-      - `npm start` làm **PID 1** là npm → tuỳ phiên bản có thể không forward SIGTERM tới node → app không biết, bị SIGKILL sau `terminationGracePeriodSeconds` (30s) → connection bị cắt.
+      - `npm start` làm **PID 1** là npm → tuỳ phiên bản có thể không forward SIGTERM tới node (npm 10 ở exec form đã forward trong thử nghiệm, verify); lỗi chắc chắn xảy ra khi **shell** làm PID 1 (`CMD npm start` shell form, `sh -c 'node x && …'`) → app không nhận SIGTERM, bị SIGKILL sau `terminationGracePeriodSeconds` (30s, exit 137) → connection bị cắt.
       - PID 1 trong Linux không có default signal handler → phải tự xử lý; dùng `CMD ["node", "server.js"]` hoặc init nhỏ (`tini`, `docker run --init`).
       - Handler `exit(0)` ngay → cắt in-flight requests. Đúng: fail readiness, `server.close()`, chờ in-flight có deadline, đóng pool, rồi exit.
       - Endpoint còn bị gỡ khỏi Service **bất đồng bộ** với SIGTERM → thêm `preStop` sleep vài giây để LB kịp ngừng gửi traffic.
@@ -385,7 +385,7 @@ questions:
     q: In a container limited to 2 CPUs on a 64-core host, what does `os.cpus().length` return, and why does it matter?
     hint: |-
       - `os.cpus()` đọc CPU của **host/VM** → trả 64; app spawn 64 worker/cluster process hoặc đặt pool size 64 → tranh nhau quota 2 CPU → CFS **throttling**, latency tăng vọt.
-      - Node có `os.availableParallelism()` (Node 18.14+/19.4+) — dựa trên libuv, tôn trọng CPU affinity; nhưng **CPU quota của cgroup** có thể vẫn không phản ánh đầy đủ tuỳ phiên bản → đọc limit từ env hoặc cgroup (`/sys/fs/cgroup/cpu.max`).
+      - Node có `os.availableParallelism()` (Node 18.14+/19.4+) — dựa trên libuv; trên Node 22/24 thử với `--cpus=2` nó trả 2 (tôn trọng cgroup quota, verify theo phiên bản) nhưng bản cũ có thể không → vẫn nên cho cấu hình pool size qua env hoặc đọc `/sys/fs/cgroup/cpu.max`.
       - Tương tự memory: `os.totalmem()` là của host.
     followUp: How do you detect CFS throttling in Kubernetes?
     verify: true
@@ -397,7 +397,7 @@ questions:
     hint: |-
       - Container vượt memory limit của cgroup → kernel OOM killer gửi **SIGKILL** → exit code 137, không có log từ app.
       - V8 heap chỉ là một phần RSS: còn Buffer (off-heap), native addon, code, stack, threadpool.
-      - Đặt `--max-old-space-size` thấp hơn limit (thường ~70–80%) để V8 GC mạnh/throw `heap out of memory` có log, thay vì bị kill im lặng. Node đời mới tự tính heap limit theo memory khả dụng/cgroup, nhưng đặt tường minh vẫn an toàn hơn.
+      - Đặt `--max-old-space-size` thấp hơn limit (thường ~70–80%) để V8 GC mạnh/throw `heap out of memory` có log, thay vì bị kill im lặng. Node đời mới tự tính heap limit ≈ 50% memory của cgroup nhưng có mức sàn (~259 MB trong thử nghiệm, verify) → container 256 MB vẫn có thể bị OOMKilled im lặng; đặt tường minh vẫn an toàn hơn.
       - Theo dõi `process.memoryUsage()` (`rss`, `heapUsed`, `external`, `arrayBuffers`).
     followUp: RSS keeps growing while `heapUsed` is flat. Where do you look?
     verify: true
@@ -543,7 +543,7 @@ questions:
       ```
     hint: |-
       - `server.close()` chỉ ngừng accept connection mới và **trả về ngay** (callback khi mọi connection đóng) → code đóng DB **trong khi** in-flight requests còn dùng DB → lỗi.
-      - Keep-alive connection idle giữ server không bao giờ "close xong" → treo; dùng `server.closeIdleConnections()` (Node 18.2+) và/hoặc `closeAllConnections()` sau deadline.
+      - Keep-alive connection idle giữ server không bao giờ "close xong" → treo; dùng `server.closeIdleConnections()` (Node 18.2+) — nhưng socket trở nên idle *sau* lời gọi đó vẫn mở, nên khi shutting down trả thêm header `Connection: close` cho mỗi response và `closeAllConnections()` sau deadline.
       - Không có **deadline**: phải `exit(1)` trước khi k8s gửi SIGKILL.
       - Thiếu bước readiness fail + chờ LB gỡ endpoint (preStop / sleep) → request mới vẫn tới.
       - Handler async có thể chạy **hai lần** nếu nhận SIGTERM rồi SIGINT → dùng cờ `shuttingDown`.
