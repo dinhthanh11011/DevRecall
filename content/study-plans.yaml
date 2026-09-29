@@ -1,0 +1,227 @@
+# Study plans (lộ trình ôn tập). Each day lists tracks; for each track the app shows:
+#   - what to read (`read`: overview headings; default TL;DR + Cheat sheet),
+#   - the first `take` ids of the track's `essentials` (default: all), plus `extra` ids.
+# Validated by `npm run validate` (tracks, headings and ids must exist).
+plans:
+  - id: cram-1-day
+    title: Cấp tốc 1 ngày
+    summary: Mai phỏng vấn — 4 buổi, chỉ các câu trọng điểm nhất của core stack, data, system design và behavioral.
+    intro: |-
+      Dành cho khi **chỉ còn 1 ngày**. Không học mới — chỉ ôn các câu hỏi có xác suất bị hỏi cao nhất.
+
+      Cách dùng mỗi buổi:
+      1. Đọc **TL;DR + Cheat sheet** của từng track (5–10 phút/track).
+      2. Bấm **Practice phần này**: tự trả lời thành tiếng *trước* khi mở gợi ý, chấm 0–4.
+      3. Câu nào ≤ 2: mở **Kiến thức liên quan** ngay dưới gợi ý, đọc lại rồi chấm lại.
+      4. Buổi tối: dành ít nhất 30 phút cho project deep-dive và behavioral, đó là phần quyết định level.
+    days:
+      - title: "Buổi 1 · Runtime & Backend"
+        goal: Event loop, async, TypeScript type system, NestJS lifecycle/DI và các nguyên tắc API (idempotency, pagination, status code).
+        items:
+          - { track: 03-javascript, take: 3 }
+          - { track: 05-nodejs, take: 4 }
+          - { track: 04-typescript, take: 2 }
+          - { track: 07-nestjs, take: 3 }
+          - { track: 08-api-design, take: 3 }
+      - title: "Buổi 2 · Frontend"
+        goal: Re-render, effect & race condition, Server vs Client Components, rendering strategy, Core Web Vitals.
+        items:
+          - { track: 09-react, take: 3 }
+          - { track: 11-nextjs, take: 4 }
+          - { track: 10-state-management, take: 2 }
+          - { track: 12-browser-web-perf, take: 2 }
+      - title: "Buổi 3 · Data & Distributed"
+        goal: Index/planner, isolation, cache-aside & stampede, Kafka delivery semantics & outbox, multi-tenant isolation, idempotency.
+        items:
+          - { track: 13-sql-postgres, take: 4 }
+          - { track: 16-caching, take: 4 }
+          - { track: 17-messaging-kafka, take: 4 }
+          - { track: 14-multi-tenancy, take: 2 }
+          - { track: 18-distributed-systems, take: 2 }
+      - title: "Buổi 4 · Senior layer"
+        goal: Khung system design, security (IDOR/CSRF/XSS), auth (session vs JWT, OIDC + PKCE), AWS cốt lõi, rồi luyện STAR và project deep-dive thành tiếng.
+        items:
+          - { track: 21-system-design, take: 3 }
+          - { track: 22-web-security, take: 3 }
+          - { track: 23-auth-identity, take: 3 }
+          - { track: 24-aws, take: 2 }
+          - { track: 30-behavioral, take: 3 }
+          - { track: 99-project-deep-dive, take: 4 }
+
+  - id: sprint-7-days
+    title: Tăng tốc 7 ngày
+    summary: 1 tuần, mỗi ngày một mảng — toàn bộ câu trọng điểm của core stack, kết thúc bằng scenario production và behavioral.
+    intro: |-
+      Dành cho khi còn **khoảng 1 tuần**. Mỗi ngày ~2–3 giờ: đọc phần trọng điểm của overview, rồi luyện toàn bộ câu *essentials* của ngày.
+
+      - Mục tiêu mỗi ngày: mọi câu trong ngày đạt **≥ 3 (Solid)**. Thanh tiến độ của ngày dựa trên đúng tiêu chí này.
+      - Sáng hôm sau, dành 15 phút mở **Random** với pool *Chưa vững (≤2)* để ôn lại hôm trước.
+      - Còn thời gian thì đọc thêm **Cơ chế hoạt động** của track, nơi có flow diagram.
+    days:
+      - title: "Ngày 1 · Language & Runtime"
+        goal: JavaScript core, TypeScript, Node.js internals — event loop, streams/backpressure, graceful shutdown, worker vs cluster.
+        items:
+          - { track: 03-javascript }
+          - { track: 04-typescript }
+          - { track: 05-nodejs, read: [TL;DR, Event loop phases, Cheat sheet] }
+      - title: "Ngày 2 · Backend & API"
+        goal: Express middleware/error handling, NestJS lifecycle/DI/scopes, thiết kế API production-grade.
+        items:
+          - { track: 06-express }
+          - { track: 07-nestjs }
+          - { track: 08-api-design }
+      - title: "Ngày 3 · Frontend"
+        goal: React rendering & effects, server vs client state, Next.js App Router, web performance & frontend security.
+        items:
+          - { track: 09-react }
+          - { track: 10-state-management, take: 6 }
+          - { track: 11-nextjs }
+          - { track: 12-browser-web-perf, take: 6 }
+      - title: "Ngày 4 · Data"
+        goal: PostgreSQL (index, MVCC, isolation, migration lock), multi-tenancy, Elasticsearch cơ bản, caching.
+        items:
+          - { track: 13-sql-postgres }
+          - { track: 14-multi-tenancy }
+          - { track: 15-nosql-search, take: 4 }
+          - { track: 16-caching }
+      - title: "Ngày 5 · Distributed Systems"
+        goal: Kafka, idempotency/saga/timeout, microservices boundaries, khung system design end-to-end.
+        items:
+          - { track: 17-messaging-kafka }
+          - { track: 18-distributed-systems, take: 6 }
+          - { track: 19-microservices, take: 6 }
+          - { track: 21-system-design }
+      - title: "Ngày 6 · Security, Identity & Cloud"
+        goal: OWASP thực chiến, OAuth2/OIDC/JWT, AWS core services, observability khi có incident.
+        items:
+          - { track: 22-web-security }
+          - { track: 23-auth-identity }
+          - { track: 24-aws, take: 6 }
+          - { track: 26-observability, take: 4 }
+      - title: "Ngày 7 · Scenarios & Behavioral"
+        goal: Câu hỏi tình huống production, STAR stories và project deep-dive. Luyện nói thành tiếng, bấm giờ 2–3 phút mỗi câu.
+        items:
+          - { track: 31-scenario-performance-scale, take: 4 }
+          - { track: 34-scenario-migration-zero-loss, take: 3 }
+          - { track: 35-scenario-concurrency-reliability, take: 3 }
+          - { track: 30-behavioral }
+          - { track: 99-project-deep-dive }
+
+  - id: full-3-weeks
+    title: Nền tảng tới senior trong 3 tuần
+    summary: 21 ngày đi hết roadmap theo tier — mọi track, mọi câu trọng điểm, đọc cả phần khái niệm và cơ chế.
+    intro: |-
+      Dành cho khi có **2–4 tuần** và muốn chắc từ nền tảng. Đi đúng thứ tự tier của roadmap, mỗi ngày 1–2 track.
+
+      - Đọc **TL;DR → Khái niệm cốt lõi → Cheat sheet**, rồi luyện essentials.
+      - Sau essentials, nếu còn sức: vào trang track, lọc *Chưa chấm* và làm thêm 5–10 câu Hard/Senior.
+      - Mỗi cuối tuần (ngày 7, 14, 21) là ngày tổng ôn: mở **Random** với pool *Chưa vững (≤2)*.
+    days:
+      - title: "Ngày 1 · Networking & OS"
+        goal: Vòng đời một request, TCP/TLS/HTTP versions, concurrency vs parallelism, race condition cơ bản.
+        items:
+          - { track: 00-networking, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+          - { track: 01-os-concurrency, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+      - title: "Ngày 2 · DSA & JavaScript"
+        goal: Cấu trúc dữ liệu dùng trong production (LRU, token bucket, B+tree), closure, this, event loop trong JS.
+        items:
+          - { track: 02-dsa, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+          - { track: 03-javascript, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+      - title: "Ngày 3 · TypeScript & Node.js"
+        goal: Type system, narrowing, generics; event loop phases, libuv thread pool, streams.
+        items:
+          - { track: 04-typescript, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+          - { track: 05-nodejs, read: [TL;DR, Khái niệm cốt lõi, Event loop phases, Cheat sheet] }
+      - title: "Ngày 4 · Express & NestJS"
+        goal: Middleware pipeline, error handling, NestJS modules/DI/enhancers.
+        items:
+          - { track: 06-express, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+          - { track: 07-nestjs, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+      - title: "Ngày 5 · API Design & Web Security"
+        goal: REST semantics, versioning, idempotency, rate limit; OWASP Top 10 áp dụng vào API.
+        items:
+          - { track: 08-api-design, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+          - { track: 22-web-security, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+      - title: "Ngày 6 · React & State"
+        goal: Rendering model, hooks, memoization; server state vs client state.
+        items:
+          - { track: 09-react, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+          - { track: 10-state-management, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+      - title: "Ngày 7 · Next.js & Browser + tổng ôn tuần 1"
+        goal: App Router, RSC, caching/rendering; critical rendering path, Core Web Vitals. Cuối ngày dùng Random ôn các câu ≤2 trong tuần.
+        items:
+          - { track: 11-nextjs, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+          - { track: 12-browser-web-perf, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+      - title: "Ngày 8 · SQL & PostgreSQL"
+        goal: Index & planner, MVCC, isolation levels, locking, migration an toàn, connection pooling.
+        items:
+          - { track: 13-sql-postgres, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+      - title: "Ngày 9 · Multi-tenancy & NoSQL/Search"
+        goal: Mô hình tenancy, RLS, tenant context; Elasticsearch mapping/query, DynamoDB key design.
+        items:
+          - { track: 14-multi-tenancy, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+          - { track: 15-nosql-search, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+      - title: "Ngày 10 · Caching & Kafka"
+        goal: Cache patterns & failure modes; Kafka partition/consumer group/delivery semantics/outbox.
+        items:
+          - { track: 16-caching, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+          - { track: 17-messaging-kafka, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+      - title: "Ngày 11 · Distributed Systems & Microservices"
+        goal: CAP/consistency, idempotency, saga, timeout/retry; service boundaries, data ownership.
+        items:
+          - { track: 18-distributed-systems, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+          - { track: 19-microservices, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+      - title: "Ngày 12 · Design Patterns & System Design"
+        goal: SOLID, Clean/Hexagonal, CQRS, outbox; khung phỏng vấn system design và các bài kinh điển.
+        items:
+          - { track: 20-design-patterns, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+          - { track: 21-system-design, read: [TL;DR, Cheat sheet] }
+      - title: "Ngày 13 · Authentication & Authorization"
+        goal: Session vs JWT, OAuth2 flows, OIDC, PKCE, refresh rotation, RBAC/ABAC multi-tenant.
+        items:
+          - { track: 23-auth-identity, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+      - title: "Ngày 14 · AWS & DevOps + tổng ôn tuần 2"
+        goal: IAM, VPC, compute/data services; container, CI/CD, IaC. Cuối ngày dùng Random ôn các câu ≤2 của tuần.
+        items:
+          - { track: 24-aws, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+          - { track: 25-devops-cicd, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+      - title: "Ngày 15 · Observability & Testing"
+        goal: Logs/metrics/traces, SLO, incident response; test pyramid, contract test, flaky test.
+        items:
+          - { track: 26-observability, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+          - { track: 27-testing, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+      - title: "Ngày 16 · AI-assisted & Engineering Practices"
+        goal: Dùng AI an toàn trong team; code review, tech debt, estimation, mentoring.
+        items:
+          - { track: 28-ai-assisted-engineering, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+          - { track: 29-engineering-practices, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+      - title: "Ngày 17 · Scenarios: Scale & Large Data"
+        goal: Quá tải, memory leak, peak ×1000; pagination, export, xử lý dữ liệu lớn.
+        items:
+          - { track: 31-scenario-performance-scale, read: [TL;DR, Khung trả lời, Cheat sheet] }
+          - { track: 32-scenario-large-data, read: [TL;DR, Cheat sheet] }
+      - title: "Ngày 18 · Scenarios: Files & Migration"
+        goal: Upload/download/streaming; migration zero-downtime, zero data loss.
+        items:
+          - { track: 33-scenario-files-streaming, read: [TL;DR, Cheat sheet] }
+          - { track: 34-scenario-migration-zero-loss, read: [TL;DR, Cheat sheet] }
+      - title: "Ngày 19 · Scenarios: Concurrency & Project Deep-Dive"
+        goal: Race condition, idempotency, reliability; kể lại project thật với số liệu và trade-off.
+        items:
+          - { track: 35-scenario-concurrency-reliability, read: [TL;DR, Cheat sheet] }
+          - { track: 99-project-deep-dive, read: [TL;DR, Cheat sheet] }
+      - title: "Ngày 20 · Behavioral (STAR)"
+        goal: Chuẩn bị 6–8 STAR stories dùng lại được cho nhiều câu hỏi; luyện nói thành tiếng.
+        items:
+          - { track: 30-behavioral, read: [TL;DR, Khái niệm cốt lõi, Cheat sheet] }
+      - title: "Ngày 21 · Mock interview tổng hợp"
+        goal: Một buổi mock trộn các câu hay bị hỏi nhất. Bấm giờ, trả lời thành tiếng, sau đó ôn bằng Random với pool *Chưa vững (≤2)*.
+        items:
+          - { track: 05-nodejs, take: 2, read: [] }
+          - { track: 11-nextjs, take: 2, read: [] }
+          - { track: 13-sql-postgres, take: 2, read: [] }
+          - { track: 16-caching, take: 2, read: [] }
+          - { track: 17-messaging-kafka, take: 2, read: [] }
+          - { track: 21-system-design, take: 2, read: [] }
+          - { track: 23-auth-identity, take: 2, read: [] }
+          - { track: 99-project-deep-dive, take: 3, read: [] }

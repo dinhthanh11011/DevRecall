@@ -31,3 +31,20 @@ body {
   background: transparent;
   padding: 0;
 }
+
+/* Section anchors (questions link to them); clear the sticky header. */
+.prose h2[id],
+.prose h3[id] {
+  scroll-margin-top: 5rem;
+}
+.prose h2[id]:target,
+.prose h3[id]:target {
+  border-radius: 0.25rem;
+  background: #e0f2fe;
+}
+@media (prefers-color-scheme: dark) {
+  .prose h2[id]:target,
+  .prose h3[id]:target {
+    background: #082f49;
+  }
+}

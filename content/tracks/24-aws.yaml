@@ -6,6 +6,18 @@ status: drafted
 summary: IAM, VPC, compute (EC2/ECS/Lambda), ALB/API Gateway, S3/CloudFront, RDS/Aurora, SQS/SNS, observability — theo tình huống phỏng vấn cho một app Node/Next.js.
 cvLinked: false
 prerequisites: []
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - aws-001
+  - aws-003
+  - aws-020
+  - aws-015
+  - aws-023
+  - aws-005
+  - aws-038
+  - aws-044
+  - aws-047
+  - aws-060
 overview: |-
   ## TL;DR
 

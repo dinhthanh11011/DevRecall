@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { getAllSlugs, getNeighbours, getTrack } from "@/lib/content";
+import { getAllSlugs, getNeighbours, getTrack, getTrackData } from "@/lib/content";
 import { Markdown } from "@/components/Markdown";
 import { QuestionList } from "@/components/QuestionList";
 import { StatusBadge } from "@/components/Badges";
@@ -22,7 +22,8 @@ export async function generateMetadata(props: PageProps<"/tracks/[slug]">): Prom
 export default async function TrackPage(props: PageProps<"/tracks/[slug]">) {
   const { slug } = await props.params;
   const track = getTrack(slug);
-  if (!track) notFound();
+  const data = getTrackData(slug);
+  if (!track || !data) notFound();
   const { prev, next } = getNeighbours(slug);
 
   return (
@@ -47,6 +48,12 @@ export default async function TrackPage(props: PageProps<"/tracks/[slug]">) {
           >
             Practice this track
           </Link>
+          <Link
+            href={`/random?tracks=${track.slug}`}
+            className="rounded-lg border border-zinc-300 px-3 py-1.5 hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
+          >
+            🎲 Random câu hỏi
+          </Link>
           <a href="#questions" className="rounded-lg border border-zinc-300 px-3 py-1.5 dark:border-zinc-700">
             Jump to questions ({track.questions.length})
           </a>
@@ -54,7 +61,7 @@ export default async function TrackPage(props: PageProps<"/tracks/[slug]">) {
       </header>
 
       <section className="rounded-xl border border-zinc-200 bg-white p-6 dark:border-zinc-800 dark:bg-zinc-900">
-        <Markdown>{track.overview}</Markdown>
+        <Markdown anchors>{track.overview}</Markdown>
       </section>
 
       {(track.references.length > 0 || track.notionRefs.length > 0) && (
@@ -74,7 +81,7 @@ export default async function TrackPage(props: PageProps<"/tracks/[slug]">) {
 
       <section id="questions" className="scroll-mt-16 space-y-4">
         <h2 className="text-2xl font-semibold">Interview Questions</h2>
-        <QuestionList questions={track.questions} />
+        <QuestionList questions={data.questions} />
       </section>
 
       <nav className="flex justify-between gap-4 border-t border-zinc-200 pt-6 text-sm dark:border-zinc-800">

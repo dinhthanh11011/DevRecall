@@ -6,6 +6,16 @@ status: drafted
 summary: Local vs global vs server state, Redux Toolkit & RTK Query, TanStack Query (cache, staleTime, invalidation), Zustand/Context, optimistic updates, real-time data vào cache, SSR store per request.
 cvLinked: true
 prerequisites: [09-react]
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - state-management-001
+  - state-management-006
+  - state-management-014
+  - state-management-025
+  - state-management-029
+  - state-management-035
+  - state-management-038
+  - state-management-040
 overview: |-
   ## TL;DR
 

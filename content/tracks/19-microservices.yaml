@@ -5,6 +5,16 @@ tier: 5
 status: drafted
 summary: Monolith vs modular monolith vs microservices, DDD bounded contexts, strangler fig, backward compatibility & contract testing, database-per-service, sync vs async, API gateway/BFF, service mesh, tracing, distributed monolith.
 cvLinked: true
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - microservices-001
+  - microservices-003
+  - microservices-025
+  - microservices-015
+  - microservices-036
+  - microservices-011
+  - microservices-026
+  - microservices-042
 overview: |-
   ## TL;DR
 

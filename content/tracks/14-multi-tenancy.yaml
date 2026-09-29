@@ -6,6 +6,16 @@ status: drafted
 summary: Silo/pool/bridge, tenant context propagation, Postgres RLS, tenant-aware cache, noisy neighbor, per-tenant migration, chống cross-tenant leak.
 cvLinked: true
 prerequisites: []
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - multi-tenancy-002
+  - multi-tenancy-012
+  - multi-tenancy-009
+  - multi-tenancy-033
+  - multi-tenancy-003
+  - multi-tenancy-021
+  - multi-tenancy-025
+  - multi-tenancy-038
 overview: |-
   ## TL;DR
 

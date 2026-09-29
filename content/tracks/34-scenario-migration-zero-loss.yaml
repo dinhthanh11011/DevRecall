@@ -6,6 +6,16 @@ status: drafted
 summary: "Mock interview tình huống production: đổi schema Postgres không downtime (lock queue, CONCURRENTLY, NOT VALID), backfill bảng lớn, đổi DB engine bằng snapshot + CDC, strangler fig cho legacy, outbox, drain Kafka backlog 10M, durability knobs và cutover/rollback."
 cvLinked: true
 prerequisites: [13-sql-postgres, 17-messaging-kafka, 25-devops-cicd]
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - scenario-migration-001
+  - scenario-migration-030
+  - scenario-migration-028
+  - scenario-migration-013
+  - scenario-migration-011
+  - scenario-migration-014
+  - scenario-migration-048
+  - scenario-migration-056
 overview: |-
   ## TL;DR
 

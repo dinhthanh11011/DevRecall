@@ -5,6 +5,18 @@ tier: 4
 status: drafted
 summary: Cache patterns, invalidation, stampede/penetration/hot key, Redis internals, Redis vs Memcached, HTTP/CDN cache, multi-tenant cache keys.
 cvLinked: true
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - caching-001
+  - caching-033
+  - caching-015
+  - caching-016
+  - caching-006
+  - caching-032
+  - caching-042
+  - caching-047
+  - caching-049
+  - caching-056
 overview: |-
   ## TL;DR
 

@@ -6,6 +6,16 @@ status: drafted
 summary: Logs/metrics/traces, structured logging & correlation ID, OpenTelemetry, RED/USE, SLI/SLO/error budget, alert theo triệu chứng, load testing (k6), capacity planning, debug production BE/DB/FE, incident & postmortem.
 cvLinked: true
 prerequisites: []
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - observability-001
+  - observability-006
+  - observability-005
+  - observability-003
+  - observability-012
+  - observability-023
+  - observability-024
+  - observability-034
 overview: |-
   ## TL;DR
 

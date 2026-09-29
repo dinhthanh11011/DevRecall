@@ -11,11 +11,13 @@ A senior full-stack interview prep app: a zero-to-hero roadmap of tracks, each w
 
 ## Layout
 - `content/roadmap.yaml`: tiers → track ids (the learning order).
-- `content/tracks/<NN-slug>.yaml`: one track: overview (Markdown) + questions.
+- `content/tracks/<NN-slug>.yaml`: one track: overview (Markdown) + `essentials` (must-know ids) + questions.
+- `content/study-plans.yaml`: review plans (1 day / 7 days / 3 weeks) built from `essentials`.
 - `src/lib/schema.ts`: zod schema (the single source of truth for content shape).
 - `src/lib/load.ts`: fs loader (used by the app at build time and by scripts).
 - `src/lib/content.ts`: app-facing queries (server only).
-- `src/app/`: routes: `/`, `/tracks/[slug]`, `/practice`, `/progress`, `/search`.
+- `src/lib/sections.ts`: splits overviews into anchored sections and matches each question to the rows/bullets that teach it ("Kiến thức liên quan").
+- `src/app/`: routes: `/`, `/tracks/[slug]`, `/plans`, `/plans/[id]`, `/random`, `/practice` (`?tracks=`, `?ids=`), `/progress`, `/search`, `/data/[slug]` (static JSON).
 - `scripts/validate.ts`, `scripts/progress.ts`.
 
 ## Commands

@@ -6,6 +6,16 @@ status: drafted
 summary: "Khi nào NoSQL, DynamoDB single-table, MongoDB essentials, Elasticsearch: inverted index, analyzer, mapping, shard, reindex với alias, sync DB → ES và drift."
 cvLinked: true
 prerequisites: []
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - nosql-search-006
+  - nosql-search-020
+  - nosql-search-029
+  - nosql-search-016
+  - nosql-search-003
+  - nosql-search-026
+  - nosql-search-040
+  - nosql-search-042
 overview: |-
   ## TL;DR
 

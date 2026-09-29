@@ -7,6 +7,7 @@ How to write a DevRecall track. Every contributor, human or AI, follows this. Th
 - One file per track: `content/tracks/<NN-slug>.yaml`. The schema lives in [`src/lib/schema.ts`](../src/lib/schema.ts).
 - Question ids are `<slug>-<NNN>` (e.g. `nodejs-017`). **Never renumber or reuse an id**, because learners' progress is keyed on it. New questions get the next free number. A deleted id stays retired.
 - `status`: `planned` (stub) → `drafted` (meets targets, not fact-checked) → `reviewed` (a human fact-checked it).
+- `essentials`: the track's must-know question ids (⭐ trọng điểm), **highest priority first**: 8 ids, or 10 if the track has ≥ 60 questions. Study plans take the first N, so the first 4 must be the highest-yield. Mix levels and prefer practical questions without `verify: true`.
 - Check your work with `npm run validate -- --track <NN-slug>`, then `npm run progress` to refresh `PROGRESS.md`.
 
 ## 2. Language
@@ -43,6 +44,7 @@ Types: `concept · compare · scenario · debug · design · output · gotcha ·
 - **`followUp`**: the *next* question a real interviewer asks. This is what builds depth.
 - **`redFlags`**: what a mid-level answer sounds like, so learners avoid it.
 - **`verify: true`**: set it for any version-dependent or uncertain fact (Next.js caching defaults, React 19 APIs, Node versions, AWS limits, Kafka KRaft). Wrong hints are worse than none.
+- **`learn`** (optional): the exact h2/h3 heading of the overview section that teaches this card. The app links every question to the overview automatically (BM25 over table rows and bullets, see `src/lib/sections.ts`). Set `learn` only when that automatic match is wrong.
 - Prefer **production scenarios** and **gotchas** over textbook trivia. Every Easy question should lead into something deeper.
 - Behavioral cards: the `hint` gives a STAR skeleton, the numbers to mention, and a reflection line.
 
@@ -57,6 +59,8 @@ This is Markdown rendered above the questions. Structure:
 5. `## Pitfalls`: bullets.
 6. `## Cheat sheet`: bullets for fast review.
 
+Headings become anchors (`sec-<slug>`) that questions and study plans link to, so **renaming a heading breaks `learn` and `study-plans.yaml` references**. The validator catches this. Put the teachable facts in table rows and bullets: that's what gets excerpted under a question as *Kiến thức liên quan*.
+
 Mermaid tips: use `flowchart TD/LR` or `sequenceDiagram`, and quote labels that contain special characters (`A["x < y"]`).
 
 ## 7. Sources
@@ -64,3 +68,8 @@ Mermaid tips: use `flowchart TD/LR` or `sequenceDiagram`, and quote labels that 
 - `notionRefs`: the author's personal notes (Notion). **They're personal notes and may be wrong or outdated.** Use them for context and terminology, never as the source of truth. If a note contradicts current official docs, follow the docs and record the discrepancy in `PROGRESS.md › Notion corrections`.
 - `references`: official docs first (MDN, nodejs.org, react.dev, nextjs.org, postgresql.org, kafka.apache.org, AWS docs, RFCs, OWASP).
 - For Next.js, the docs for the installed version live in `node_modules/next/dist/docs/`. Read them before writing Next.js content.
+
+## 8. Study plans (`content/study-plans.yaml`)
+
+- A plan has days, and each day lists items `{ track, take?, read?, extra? }`. `take` is the first N `essentials` (default: all), `read` is overview headings (default: TL;DR + Cheat sheet), and `extra` is additional question ids.
+- The validator checks tracks, headings and ids. Keep each day at about 15–35 questions.

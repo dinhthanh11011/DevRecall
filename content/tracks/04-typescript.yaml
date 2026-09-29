@@ -6,6 +6,16 @@ status: drafted
 summary: Structural typing, generics, narrowing, conditional/mapped types, satisfies, type erasure & runtime validation, tsconfig và các gotcha khi scale codebase.
 cvLinked: true
 prerequisites: []
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - typescript-007
+  - typescript-010
+  - typescript-001
+  - typescript-003
+  - typescript-011
+  - typescript-031
+  - typescript-029
+  - typescript-037
 overview: |-
   ## TL;DR
 

@@ -5,6 +5,16 @@ tier: 8
 status: drafted
 summary: "Dùng Claude Code/Cursor có trách nhiệm: khi nào AI giúp/hại, review output, context engineering, rủi ro bảo mật (prompt injection, secret leak), ownership và đo hiệu quả."
 cvLinked: true
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - ai-assisted-engineering-001
+  - ai-assisted-engineering-002
+  - ai-assisted-engineering-004
+  - ai-assisted-engineering-010
+  - ai-assisted-engineering-011
+  - ai-assisted-engineering-021
+  - ai-assisted-engineering-031
+  - ai-assisted-engineering-038
 overview: |-
   ## TL;DR
 

@@ -6,6 +6,16 @@ status: drafted
 summary: SOLID, GoF trong TypeScript, DI, Clean/Hexagonal architecture, DDD tactical, CQRS — và khi nào KHÔNG dùng.
 cvLinked: false
 prerequisites: []
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - design-patterns-001
+  - design-patterns-005
+  - design-patterns-027
+  - design-patterns-030
+  - design-patterns-023
+  - design-patterns-038
+  - design-patterns-021
+  - design-patterns-042
 overview: |-
   ## TL;DR
 

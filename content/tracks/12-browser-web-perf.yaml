@@ -6,6 +6,16 @@ status: drafted
 summary: Critical rendering path, Core Web Vitals (LCP, INP, CLS), code splitting, HTTP caching, service worker, storage, XSS trong React, CSP, thay đổi third-party cookie.
 cvLinked: true
 prerequisites: []
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - browser-web-perf-001
+  - browser-web-perf-013
+  - browser-web-perf-009
+  - browser-web-perf-023
+  - browser-web-perf-028
+  - browser-web-perf-029
+  - browser-web-perf-006
+  - browser-web-perf-041
 overview: |-
   ## TL;DR
 

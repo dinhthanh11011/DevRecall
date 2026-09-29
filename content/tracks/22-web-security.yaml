@@ -6,6 +6,18 @@ status: drafted
 summary: OWASP Top 10:2025, XSS/CSRF/SQLi/SSRF, IDOR/BOLA, CSP, CORS, secrets, password hashing, supply chain, API security checklist.
 cvLinked: true
 prerequisites: []
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - web-security-008
+  - web-security-003
+  - web-security-013
+  - web-security-020
+  - web-security-019
+  - web-security-041
+  - web-security-018
+  - web-security-049
+  - web-security-051
+  - web-security-058
 overview: |-
   ## TL;DR
 

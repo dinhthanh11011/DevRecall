@@ -6,6 +6,18 @@ status: drafted
 summary: "Phương pháp phỏng vấn system design + bài toán kinh điển: rate limiter, chat, checkout, catalog ingestion, multi-tenant SaaS."
 cvLinked: true
 prerequisites: []
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - system-design-002
+  - system-design-014
+  - system-design-034
+  - system-design-013
+  - system-design-007
+  - system-design-023
+  - system-design-010
+  - system-design-038
+  - system-design-028
+  - system-design-043
 overview: |-
   ## TL;DR
 

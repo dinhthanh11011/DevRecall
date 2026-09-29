@@ -6,6 +6,16 @@ status: drafted
 summary: Mock interview production scenarios — upload 100MB đồng thời, presigned URL/POST, multipart & resumable, streaming qua backend với backpressure, validate file, download/Range/zip, SSE/NDJSON/LLM streaming, Socket.IO realtime ở scale, media pipeline và chi phí S3.
 cvLinked: true
 prerequisites: [05-nodejs, 24-aws]
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - scenario-files-001
+  - scenario-files-009
+  - scenario-files-022
+  - scenario-files-019
+  - scenario-files-036
+  - scenario-files-033
+  - scenario-files-047
+  - scenario-files-057
 overview: |-
   ## TL;DR
 

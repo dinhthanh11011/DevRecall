@@ -5,6 +5,16 @@ tier: 8
 status: drafted
 summary: "Story bank theo STAR cho senior full-stack: incident, conflict, ownership, failure, influence, trade-off dưới deadline, mentoring, feedback, why leaving — kèm red flags."
 cvLinked: false
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - behavioral-001
+  - behavioral-010
+  - behavioral-009
+  - behavioral-012
+  - behavioral-011
+  - behavioral-024
+  - behavioral-023
+  - behavioral-038
 overview: |-
   ## TL;DR
 

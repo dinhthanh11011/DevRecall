@@ -6,6 +6,18 @@ status: drafted
 summary: App Router vs Pages Router, Server/Client boundary, rendering (prerender, streaming, PPR), caching & revalidation theo từng version (14 → 15 → 16 Cache Components), Server Actions security, proxy (middleware cũ), auth, hydration, self-hosting — theo Next.js 16.
 cvLinked: true
 prerequisites: [09-react]
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - nextjs-002
+  - nextjs-022
+  - nextjs-003
+  - nextjs-029
+  - nextjs-006
+  - nextjs-043
+  - nextjs-035
+  - nextjs-019
+  - nextjs-054
+  - nextjs-058
 overview: |-
   ## TL;DR
 

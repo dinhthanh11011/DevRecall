@@ -1,11 +1,12 @@
 import Link from "next/link";
-import { getRoadmap, getStats } from "@/lib/content";
+import { getRoadmap, getStats, getStudyPlans } from "@/lib/content";
 import { StatusBadge } from "@/components/Badges";
 import { OverallProgress, TrackProgress } from "@/components/ProgressBar";
 
 export default function Home() {
   const roadmap = getRoadmap();
   const stats = getStats();
+  const plans = getStudyPlans();
 
   return (
     <div className="space-y-12">
@@ -26,6 +27,30 @@ export default function Home() {
         </div>
         <div className="max-w-md">
           <OverallProgress total={stats.questions} />
+        </div>
+      </section>
+
+      <section className="space-y-3">
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <h2 className="text-xl font-semibold">Học nhanh phần trọng điểm</h2>
+          <Link href="/random" className="text-sm text-sky-700 hover:underline dark:text-sky-400">
+            🎲 Hoặc bốc một câu ngẫu nhiên →
+          </Link>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-3">
+          {plans.map((p) => (
+            <Link
+              key={p.id}
+              href={`/plans/${p.id}`}
+              className="group rounded-xl border border-zinc-200 bg-white p-4 transition hover:border-sky-400 dark:border-zinc-800 dark:bg-zinc-900 dark:hover:border-sky-700"
+            >
+              <h3 className="font-medium group-hover:text-sky-700 dark:group-hover:text-sky-400">{p.title}</h3>
+              <p className="mt-1 line-clamp-2 text-sm text-zinc-600 dark:text-zinc-400">{p.summary}</p>
+              <p className="mt-2 text-xs text-zinc-500">
+                {p.days.length} {p.days.length > 1 ? "ngày/buổi" : "buổi"} · {p.totalQuestions} câu ⭐
+              </p>
+            </Link>
+          ))}
         </div>
       </section>
 

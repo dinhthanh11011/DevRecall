@@ -5,6 +5,18 @@ tier: 8
 status: drafted
 summary: "Interviewer đào sâu vào từng dự án trên CV: multi-tenant e-commerce, monolith → microservices, banking SPA, real-time finance — chuỗi prove-it cho từng claim, STAR template và số liệu cần thu thập."
 cvLinked: true
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - project-deep-dive-001
+  - project-deep-dive-008
+  - project-deep-dive-014
+  - project-deep-dive-015
+  - project-deep-dive-012
+  - project-deep-dive-010
+  - project-deep-dive-036
+  - project-deep-dive-027
+  - project-deep-dive-049
+  - project-deep-dive-056
 overview: |-
   ## TL;DR
 

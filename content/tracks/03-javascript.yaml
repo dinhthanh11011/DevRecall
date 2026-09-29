@@ -6,6 +6,16 @@ status: drafted
 summary: Closures, this, prototypes, event loop, promises/async, modules, memory, number/date gotchas — kèm output-prediction puzzles và debug thực tế.
 cvLinked: true
 prerequisites: []
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - javascript-005
+  - javascript-001
+  - javascript-004
+  - javascript-006
+  - javascript-003
+  - javascript-010
+  - javascript-011
+  - javascript-013
 overview: |-
   ## TL;DR
 

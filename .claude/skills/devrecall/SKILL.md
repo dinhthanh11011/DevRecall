@@ -16,6 +16,7 @@ State lives in files, not in chat history, so any new window can continue from t
 - Pick the next item from `PROGRESS.md`: a `planned` track, a `drafted` track under target, or an unchecked feature.
 - Follow `docs/CONTENT_GUIDE.md` exactly (schema, language split, targets, card format). The sample is `content/tracks/03-javascript.yaml`.
 - Never renumber question ids. New questions take the next free number.
+- Keep each track's `essentials:` list (8–10 must-know ids, priority order) current. Don't rename overview headings casually: `learn:` and `content/study-plans.yaml` reference them.
 - Big files: write in chunks (Write the first part, then append with a Bash heredoc), and validate after each chunk.
 - Run `npm run validate -- --track <id>` until it reports 0 errors and 0 warnings, then `npm run progress`, then add a Work log line (ISO date · what · next).
 

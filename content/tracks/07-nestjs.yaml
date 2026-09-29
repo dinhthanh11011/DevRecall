@@ -6,6 +6,16 @@ status: drafted
 summary: Modules, DI & injection scopes (chi phí request scope), request lifecycle middleware → guard → interceptor → pipe → handler → interceptor → filter, custom decorators, microservices transports, testing, circular deps.
 cvLinked: false
 prerequisites: [04-typescript, 06-express]
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - nestjs-009
+  - nestjs-012
+  - nestjs-003
+  - nestjs-010
+  - nestjs-025
+  - nestjs-029
+  - nestjs-020
+  - nestjs-037
 overview: |-
   ## TL;DR
 

@@ -6,6 +6,16 @@ status: drafted
 summary: Docker cho Node (multi-stage, non-root, PID 1 & signal), Kubernetes basics, thiết kế pipeline, rolling/blue-green/canary, feature flags, migration trong pipeline, Terraform/CDK, GitOps.
 cvLinked: false
 prerequisites: []
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - devops-cicd-001
+  - devops-cicd-005
+  - devops-cicd-006
+  - devops-cicd-019
+  - devops-cicd-011
+  - devops-cicd-016
+  - devops-cicd-027
+  - devops-cicd-037
 overview: |-
   ## TL;DR
 

@@ -6,6 +6,16 @@ status: drafted
 summary: Middleware chain, async error handling (Express 4 vs 5), security middleware, trust proxy, cấu trúc app lớn, graceful shutdown, Express vs Fastify vs NestJS.
 cvLinked: true
 prerequisites: [05-nodejs]
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - express-001
+  - express-003
+  - express-025
+  - express-022
+  - express-017
+  - express-016
+  - express-029
+  - express-036
 overview: |-
   ## TL;DR
 

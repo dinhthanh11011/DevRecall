@@ -5,6 +5,16 @@ tier: 0
 status: drafted
 summary: "Big-O thực dụng và các bài toán backend hay gặp: LRU, rate limiter, top-K, debounce/throttle, promise pool, trie, topo sort, interval — viết bằng TypeScript."
 cvLinked: false
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - dsa-010
+  - dsa-011
+  - dsa-037
+  - dsa-018
+  - dsa-012
+  - dsa-026
+  - dsa-004
+  - dsa-040
 overview: |-
   ## TL;DR
 

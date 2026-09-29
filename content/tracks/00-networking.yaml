@@ -5,6 +5,16 @@ tier: 0
 status: drafted
 summary: TCP/IP, DNS, HTTP/1.1/2/3, TLS, CDN, load balancer, proxy, VPN, WebSocket/SSE, CORS — nhìn từ góc backend production.
 cvLinked: false
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - networking-001
+  - networking-010
+  - networking-017
+  - networking-007
+  - networking-028
+  - networking-018
+  - networking-030
+  - networking-043
 overview: |-
   ## TL;DR
 

@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import YAML from "yaml";
-import { roadmapSchema, trackSchema, type Roadmap, type Track } from "./schema";
+import { roadmapSchema, studyPlansSchema, trackSchema, type Roadmap, type StudyPlans, type Track } from "./schema";
 
 export const CONTENT_DIR = path.join(process.cwd(), "content");
 export const TRACKS_DIR = path.join(CONTENT_DIR, "tracks");
@@ -12,6 +12,11 @@ export class ContentError extends Error {}
 export function readRoadmap(): Roadmap {
   const raw = YAML.parse(fs.readFileSync(path.join(CONTENT_DIR, "roadmap.yaml"), "utf8"));
   return roadmapSchema.parse(raw);
+}
+
+export function readStudyPlans(): StudyPlans {
+  const raw = YAML.parse(fs.readFileSync(path.join(CONTENT_DIR, "study-plans.yaml"), "utf8"));
+  return studyPlansSchema.parse(raw);
 }
 
 export function trackFiles(): string[] {

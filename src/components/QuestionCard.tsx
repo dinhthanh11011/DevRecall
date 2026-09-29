@@ -3,7 +3,9 @@
 import { useEffect, useState } from "react";
 import type { Question } from "@/lib/schema";
 import { RATINGS, clearRating, rate, useProgress, type Rating } from "@/lib/progress";
-import { Chip, LevelBadge } from "./Badges";
+import type { RichQuestion } from "@/lib/types";
+import { Chip, EssentialBadge, LevelBadge } from "./Badges";
+import { LearnPanel } from "./LearnPanel";
 import { Markdown } from "./Markdown";
 
 export function RatingButtons({ id, onRated }: { id: string; onRated?: (r: Rating) => void }) {
@@ -65,7 +67,7 @@ export function Answer({ q }: { q: Question }) {
   );
 }
 
-export function QuestionCard({ q, index }: { q: Question; index: number }) {
+export function QuestionCard({ q, index }: { q: RichQuestion; index: number }) {
   const [open, setOpen] = useState(false);
   const rating = useProgress()[q.id]?.r;
 
@@ -94,6 +96,7 @@ export function QuestionCard({ q, index }: { q: Question; index: number }) {
             <span className="font-mono text-xs text-zinc-400">Q{index}</span>
             <LevelBadge level={q.level} />
             <Chip>{q.type}</Chip>
+            {q.essential && <EssentialBadge />}
             {q.verify && <Chip>⚠ verify</Chip>}
           </span>
           <span className="block font-medium leading-snug">
@@ -110,6 +113,7 @@ export function QuestionCard({ q, index }: { q: Question; index: number }) {
       {open && (
         <div className="space-y-4 border-t border-zinc-100 p-4 pl-9 dark:border-zinc-800">
           <Answer q={q} />
+          <LearnPanel refs={q.refs} slug={q.id.replace(/-\d{3}$/, "")} samePage />
           <RatingButtons id={q.id} />
         </div>
       )}

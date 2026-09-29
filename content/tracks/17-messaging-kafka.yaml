@@ -5,6 +5,18 @@ tier: 5
 status: drafted
 summary: Partitions, consumer groups, ordering, delivery semantics, idempotency, outbox/CDC, DLQ, consumer lag, schema evolution, Kafka vs RabbitMQ/SQS, Node consumer pitfalls, Socket.IO scaling.
 cvLinked: true
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - messaging-kafka-002
+  - messaging-kafka-005
+  - messaging-kafka-021
+  - messaging-kafka-018
+  - messaging-kafka-013
+  - messaging-kafka-038
+  - messaging-kafka-039
+  - messaging-kafka-043
+  - messaging-kafka-051
+  - messaging-kafka-060
 overview: |-
   ## TL;DR
 

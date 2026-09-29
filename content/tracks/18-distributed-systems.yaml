@@ -5,6 +5,16 @@ tier: 5
 status: drafted
 summary: CAP/PACELC, consistency models, consensus (Raft), idempotency, retries/backoff/jitter, timeouts, circuit breaker, bulkhead, 2PC vs saga, distributed locks & fencing, clocks, consistent hashing.
 cvLinked: false
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - distributed-systems-001
+  - distributed-systems-034
+  - distributed-systems-017
+  - distributed-systems-014
+  - distributed-systems-005
+  - distributed-systems-032
+  - distributed-systems-024
+  - distributed-systems-042
 overview: |-
   ## TL;DR
 

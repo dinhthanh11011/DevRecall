@@ -6,6 +6,18 @@ status: drafted
 summary: V8 + libuv, event loop phases, thread pool, streams/backpressure, worker_threads vs cluster vs child_process, memory leak & heap snapshot, graceful shutdown, profiling, security.
 cvLinked: true
 prerequisites: [03-javascript]
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - nodejs-002
+  - nodejs-004
+  - nodejs-003
+  - nodejs-036
+  - nodejs-016
+  - nodejs-042
+  - nodejs-039
+  - nodejs-018
+  - nodejs-015
+  - nodejs-051
 overview: |-
   ## TL;DR
 

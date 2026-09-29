@@ -3,6 +3,7 @@ import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import type { ReactNode } from "react";
 import { Mermaid } from "./Mermaid";
+import { rehypeSectionIds } from "@/lib/sections";
 
 function textOf(node: ReactNode): string {
   if (typeof node === "string" || typeof node === "number") return String(node);
@@ -58,9 +59,12 @@ export function Markdown({
   children,
   compact = false,
   inline = false,
+  anchors = false,
 }: {
   children: string;
   compact?: boolean;
+  /** Give h2/h3 stable ids (`sec-…`) so questions can link to the section that teaches them. */
+  anchors?: boolean;
   /** Render paragraphs as <span> so the output is valid inside buttons/headings. */
   inline?: boolean;
 }) {
@@ -77,7 +81,10 @@ export function Markdown({
     <div className={`prose prose-zinc dark:prose-invert max-w-none ${compact ? "prose-sm" : ""} prose-pre:bg-zinc-900 prose-pre:text-zinc-100 prose-code:before:content-none prose-code:after:content-none`}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[[rehypeHighlight, { plainText: ["mermaid"], detect: false }]]}
+        rehypePlugins={[
+          [rehypeHighlight, { plainText: ["mermaid"], detect: false }],
+          ...(anchors ? [rehypeSectionIds] : []),
+        ]}
         components={components}
       >
         {children}

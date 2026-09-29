@@ -6,6 +6,16 @@ status: drafted
 summary: Test pyramid vs trophy, unit/integration/e2e/contract (Pact), Jest/Vitest, Supertest, React Testing Library, Playwright, test doubles, testcontainers, flaky tests, TDD, coverage, test auth & tenant isolation, test Kafka consumer, mutation testing.
 cvLinked: true
 prerequisites: []
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - testing-001
+  - testing-003
+  - testing-007
+  - testing-011
+  - testing-014
+  - testing-029
+  - testing-028
+  - testing-036
 overview: |-
   ## TL;DR
 

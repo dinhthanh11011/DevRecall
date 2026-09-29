@@ -1,17 +1,24 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import type { Question } from "@/lib/schema";
 import { LEVELS, LEVEL_LABELS, type Level } from "@/lib/constants";
 import { RATINGS, rate, useProgress, type ProgressMap, type Rating } from "@/lib/progress";
-import { Chip, LevelBadge } from "@/components/Badges";
+import { loadTrack, slugOf } from "@/lib/trackData";
+import type { RichQuestion, Section } from "@/lib/types";
+import { Chip, EssentialBadge, LevelBadge } from "@/components/Badges";
+import { LearnPanel } from "@/components/LearnPanel";
 import { Markdown } from "@/components/Markdown";
 import { Answer, RatingButtons } from "@/components/QuestionCard";
 
 type TierOption = { id: number; title: string; tracks: { slug: string; title: string; total: number }[] };
 type Pool = "all" | "unrated" | "weak" | "not-strong";
-type Card = Question & { slug: string; trackTitle: string };
+type Card = RichQuestion & {
+  slug: string;
+  trackTitle: string;
+  sections: Section[];
+  references: { title: string; url: string }[];
+};
 
 const POOLS: { value: Pool; label: string }[] = [
   { value: "all", label: "Tất cả" },
@@ -44,7 +51,10 @@ export function PracticeSession({ tiers }: { tiers: TierOption[] }) {
   const [selected, setSelected] = useState<Set<string>>(
     () => new Set((searchParams.get("tracks") ?? "").split(",").filter(Boolean)),
   );
+  // ?ids=a,b,c (from a study plan): a fixed deck, filters don't apply.
+  const [fixedIds, setFixedIds] = useState<string[]>(() => (searchParams.get("ids") ?? "").split(",").filter(Boolean));
   const [levels, setLevels] = useState<Set<Level>>(new Set());
+  const [essentialOnly, setEssentialOnly] = useState(false);
   const [pool, setPool] = useState<Pool>("not-strong");
   const [size, setSize] = useState(10);
   const [deck, setDeck] = useState<Card[] | null>(null);
@@ -57,23 +67,25 @@ export function PracticeSession({ tiers }: { tiers: TierOption[] }) {
   const allSlugs = tiers.flatMap((t) => t.tracks.map((x) => x.slug));
 
   async function start() {
-    const slugs = selected.size ? [...selected] : allSlugs;
+    const fixed = fixedIds.length > 0;
+    const slugs = fixed ? [...new Set(fixedIds.map(slugOf))] : selected.size ? [...selected] : allSlugs;
     setLoading(true);
     setError(undefined);
     try {
-      const data = await Promise.all(
-        slugs.map((s) =>
-          fetch(`/data/${s}`).then((r) => {
-            if (!r.ok) throw new Error(`Failed to load ${s}`);
-            return r.json() as Promise<{ slug: string; title: string; questions: Question[] }>;
-          }),
-        ),
+      const data = await Promise.all(slugs.map(loadTrack));
+      const cards: Card[] = data.flatMap((t) =>
+        t.questions.map((q) => ({ ...q, slug: t.slug, trackTitle: t.title, sections: t.sections, references: t.references })),
       );
-      const cards = data.flatMap((t) => t.questions.map((q) => ({ ...q, slug: t.slug, trackTitle: t.title })));
-      const filtered = cards.filter(
-        (c) => (levels.size === 0 || levels.has(c.level)) && inPool(pool, progress, c.id),
-      );
-      setDeck(shuffle(filtered).slice(0, size));
+      if (fixed) {
+        const byId = new Map(cards.map((c) => [c.id, c]));
+        setDeck(shuffle(fixedIds.flatMap((id) => byId.get(id) ?? [])));
+      } else {
+        const filtered = cards.filter(
+          (c) =>
+            (levels.size === 0 || levels.has(c.level)) && (!essentialOnly || c.essential) && inPool(pool, progress, c.id),
+        );
+        setDeck(shuffle(filtered).slice(0, size));
+      }
       setPos(0);
       setRevealed(false);
       setResults({});
@@ -85,6 +97,16 @@ export function PracticeSession({ tiers }: { tiers: TierOption[] }) {
   }
 
   const card = deck?.[pos];
+
+  const autoStarted = useRef(false);
+  useEffect(() => {
+    if (fixedIds.length && !autoStarted.current) {
+      autoStarted.current = true;
+      void start();
+    }
+    // Run once on mount for plan decks.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const advance = useCallback(() => {
     setRevealed(false);
@@ -133,6 +155,19 @@ export function PracticeSession({ tiers }: { tiers: TierOption[] }) {
         ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
         : "border border-zinc-300 text-zinc-600 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
     }`;
+
+  if (!deck && fixedIds.length) {
+    return (
+      <div className="space-y-3 rounded-xl border border-zinc-200 bg-white p-6 dark:border-zinc-800 dark:bg-zinc-900">
+        <p className="text-zinc-600 dark:text-zinc-400">
+          {error ?? `Đang tải ${fixedIds.length} câu của lộ trình…`}
+        </p>
+        <button type="button" onClick={() => setFixedIds([])} className="text-sm underline">
+          Chọn bộ lọc khác
+        </button>
+      </div>
+    );
+  }
 
   if (!deck) {
     return (
@@ -189,6 +224,17 @@ export function PracticeSession({ tiers }: { tiers: TierOption[] }) {
                 {LEVEL_LABELS[l]}
               </button>
             ))}
+          </div>
+        </fieldset>
+        <fieldset className="space-y-2">
+          <legend className="text-sm font-semibold">Chỉ câu trọng điểm</legend>
+          <div className="flex flex-wrap gap-2">
+            <button type="button" className={pill(!essentialOnly)} onClick={() => setEssentialOnly(false)}>
+              Tất cả câu
+            </button>
+            <button type="button" className={pill(essentialOnly)} onClick={() => setEssentialOnly(true)}>
+              ⭐ Chỉ trọng điểm
+            </button>
           </div>
         </fieldset>
         <fieldset className="space-y-2">
@@ -257,7 +303,14 @@ export function PracticeSession({ tiers }: { tiers: TierOption[] }) {
           <button type="button" onClick={start} className="rounded-lg bg-sky-600 px-4 py-2 font-medium text-white hover:bg-sky-700">
             New session, same settings
           </button>
-          <button type="button" onClick={() => setDeck(null)} className="rounded-lg border border-zinc-300 px-4 py-2 dark:border-zinc-700">
+          <button
+            type="button"
+            onClick={() => {
+              setFixedIds([]);
+              setDeck(null);
+            }}
+            className="rounded-lg border border-zinc-300 px-4 py-2 dark:border-zinc-700"
+          >
             Change settings
           </button>
         </div>
@@ -271,7 +324,14 @@ export function PracticeSession({ tiers }: { tiers: TierOption[] }) {
         <span>
           {pos + 1} / {deck.length} · {card.trackTitle}
         </span>
-        <button type="button" onClick={() => setDeck(null)} className="underline">
+        <button
+          type="button"
+          onClick={() => {
+            setFixedIds([]);
+            setDeck(null);
+          }}
+          className="underline"
+        >
           End session
         </button>
       </div>
@@ -282,6 +342,7 @@ export function PracticeSession({ tiers }: { tiers: TierOption[] }) {
         <div className="flex flex-wrap items-center gap-2">
           <LevelBadge level={card.level} />
           <Chip>{card.type}</Chip>
+          {card.essential && <EssentialBadge />}
           {card.verify && <Chip>⚠ verify</Chip>}
           {progress[card.id] && <Chip>last: {RATINGS[progress[card.id].r].label}</Chip>}
         </div>
@@ -305,6 +366,13 @@ export function PracticeSession({ tiers }: { tiers: TierOption[] }) {
         ) : (
           <div className="space-y-4 border-t border-zinc-100 pt-4 dark:border-zinc-800">
             <Answer q={card} />
+            <LearnPanel
+              refs={card.refs}
+              slug={card.slug}
+              trackTitle={card.trackTitle}
+              sections={card.sections}
+              references={card.references}
+            />
             <RatingButtons id={card.id} onRated={record} />
           </div>
         )}

@@ -1,14 +1,21 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import type { Question } from "@/lib/schema";
+import type { RichQuestion } from "@/lib/types";
 import { LEVELS, LEVEL_LABELS, type Level } from "@/lib/constants";
 import { useProgress } from "@/lib/progress";
 import { QuestionCard } from "./QuestionCard";
 
-type Filter = "all" | "unrated" | "weak";
+type Filter = "all" | "essential" | "unrated" | "weak";
 
-export function QuestionList({ questions }: { questions: Question[] }) {
+const FILTER_LABELS: Record<Filter, string> = {
+  all: "All",
+  essential: "⭐ Trọng điểm",
+  unrated: "Chưa chấm",
+  weak: "Còn yếu (≤1)",
+};
+
+export function QuestionList({ questions }: { questions: RichQuestion[] }) {
   const progress = useProgress();
   const [levels, setLevels] = useState<Set<Level>>(new Set());
   const [filter, setFilter] = useState<Filter>("all");
@@ -21,6 +28,7 @@ export function QuestionList({ questions }: { questions: Question[] }) {
       .filter(({ q }) => levels.size === 0 || levels.has(q.level))
       .filter(({ q }) => {
         const r = progress[q.id]?.r;
+        if (filter === "essential") return q.essential;
         if (filter === "unrated") return r === undefined;
         if (filter === "weak") return r !== undefined && r <= 1;
         return true;
@@ -65,9 +73,9 @@ export function QuestionList({ questions }: { questions: Question[] }) {
             );
           })}
           <span className="mx-1 w-px bg-zinc-300 dark:bg-zinc-700" />
-          {(["all", "unrated", "weak"] as const).map((f) => (
+          {(["all", "essential", "unrated", "weak"] as const).map((f) => (
             <button key={f} type="button" className={pill(filter === f)} onClick={() => setFilter(f)}>
-              {f === "all" ? "All" : f === "unrated" ? "Chưa chấm" : "Còn yếu (≤1)"}
+              {FILTER_LABELS[f]}
             </button>
           ))}
         </div>

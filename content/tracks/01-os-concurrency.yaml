@@ -5,6 +5,16 @@ tier: 0
 status: drafted
 summary: Process/thread, concurrency vs parallelism, blocking vs non-blocking I/O, race condition, deadlock, signals, container limits — góc nhìn của một backend Node.js.
 cvLinked: false
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - os-concurrency-002
+  - os-concurrency-010
+  - os-concurrency-026
+  - os-concurrency-025
+  - os-concurrency-022
+  - os-concurrency-013
+  - os-concurrency-037
+  - os-concurrency-041
 overview: |-
   ## TL;DR
 

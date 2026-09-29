@@ -6,6 +6,18 @@ status: drafted
 summary: Mock interview tình huống production — 10k rps, peak ×1000, slow API, 3MB JSON, JSON.stringify block event loop, memory leak, CPU 100%, pool exhaustion, logs 100GB/ngày và log dữ liệu nhạy cảm.
 cvLinked: true
 prerequisites: [05-nodejs, 16-caching, 21-system-design]
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - scenario-scale-001
+  - scenario-scale-024
+  - scenario-scale-010
+  - scenario-scale-008
+  - scenario-scale-023
+  - scenario-scale-022
+  - scenario-scale-007
+  - scenario-scale-051
+  - scenario-scale-019
+  - scenario-scale-059
 overview: |-
   ## TL;DR
 

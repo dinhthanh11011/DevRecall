@@ -6,6 +6,18 @@ status: drafted
 summary: Mock interview tình huống production với dữ liệu lớn — pagination chậm ở trang sau, export/import hàng triệu row, xoá 10M row, backfill, query tự nhiên chậm, index vẫn chậm, 2 database, reporting trên OLTP, soft delete, partition & archive.
 cvLinked: true
 prerequisites: [13-sql-postgres, 08-api-design]
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - scenario-data-002
+  - scenario-data-003
+  - scenario-data-041
+  - scenario-data-042
+  - scenario-data-015
+  - scenario-data-033
+  - scenario-data-035
+  - scenario-data-007
+  - scenario-data-024
+  - scenario-data-060
 overview: |-
   ## TL;DR
 

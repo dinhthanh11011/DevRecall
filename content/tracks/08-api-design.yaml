@@ -6,6 +6,16 @@ status: drafted
 summary: REST semantics, idempotency, pagination, versioning, error format (RFC 9457), rate limiting, webhooks, GraphQL, gRPC — thiết kế API sống được qua nhiều năm và nhiều client.
 cvLinked: true
 prerequisites: []
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - api-design-001
+  - api-design-006
+  - api-design-025
+  - api-design-002
+  - api-design-012
+  - api-design-015
+  - api-design-031
+  - api-design-037
 overview: |-
   ## TL;DR
 

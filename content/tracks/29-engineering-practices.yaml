@@ -5,6 +5,16 @@ tier: 8
 status: drafted
 summary: "Git workflow, code review, tech debt, estimation, design doc/RFC/ADR, mentoring, làm việc với PO/QA/Design trong team phân tán, on-call và deprecation."
 cvLinked: false
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - engineering-practices-001
+  - engineering-practices-002
+  - engineering-practices-009
+  - engineering-practices-012
+  - engineering-practices-016
+  - engineering-practices-004
+  - engineering-practices-028
+  - engineering-practices-041
 overview: |-
   ## TL;DR
 

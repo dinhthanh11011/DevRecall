@@ -6,6 +6,18 @@ status: drafted
 summary: Indexes, EXPLAIN, transactions & isolation, MVCC/VACUUM, locking, pooling, replication, zero-downtime migrations — kèm so sánh với SQL Server.
 cvLinked: true
 prerequisites: []
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - sql-postgres-018
+  - sql-postgres-013
+  - sql-postgres-003
+  - sql-postgres-042
+  - sql-postgres-020
+  - sql-postgres-047
+  - sql-postgres-027
+  - sql-postgres-055
+  - sql-postgres-061
+  - sql-postgres-064
 overview: |-
   ## TL;DR
 

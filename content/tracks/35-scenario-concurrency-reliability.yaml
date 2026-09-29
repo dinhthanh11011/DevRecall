@@ -6,6 +6,16 @@ status: drafted
 summary: Mock interview tình huống production — oversell, double charge, rate limit, retry/circuit breaker, graceful shutdown trên K8s, webhook, idempotent consumer, deadlock, distributed lock, cron chạy 2 lần, OTP/MFA, race condition trong Node.
 cvLinked: true
 prerequisites: [13-sql-postgres, 17-messaging-kafka, 18-distributed-systems]
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - scenario-reliability-001
+  - scenario-reliability-002
+  - scenario-reliability-014
+  - scenario-reliability-031
+  - scenario-reliability-036
+  - scenario-reliability-027
+  - scenario-reliability-050
+  - scenario-reliability-057
 overview: |-
   ## TL;DR
 

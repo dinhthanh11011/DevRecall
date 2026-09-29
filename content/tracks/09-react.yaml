@@ -6,6 +6,18 @@ status: drafted
 summary: Rendering & reconciliation, hooks pitfalls, effects, memoization vs React Compiler, concurrent features, React 19 Actions (`use`, `useActionState`, `useOptimistic`), error boundaries, testing — theo React 19.2.
 cvLinked: true
 prerequisites: [03-javascript]
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - react-001
+  - react-013
+  - react-014
+  - react-036
+  - react-016
+  - react-024
+  - react-011
+  - react-045
+  - react-051
+  - react-059
 overview: |-
   ## TL;DR
 

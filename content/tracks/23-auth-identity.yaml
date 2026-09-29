@@ -6,6 +6,18 @@ status: drafted
 summary: Session vs JWT, refresh rotation/revocation, OAuth 2.0 flows + PKCE, OIDC, SSO/SAML, passkeys, RBAC vs ABAC vs ReBAC, tenant-scoped roles, policy engines.
 cvLinked: true
 prerequisites: []
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - auth-identity-002
+  - auth-identity-005
+  - auth-identity-016
+  - auth-identity-013
+  - auth-identity-014
+  - auth-identity-015
+  - auth-identity-035
+  - auth-identity-039
+  - auth-identity-052
+  - auth-identity-059
 overview: |-
   ## TL;DR
 
