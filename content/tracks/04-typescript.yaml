@@ -95,7 +95,7 @@ overview: |-
 
   ## Cheat sheet
 
-  - Assignability: mọi thứ → `unknown` ✅; `any` → mọi thứ ✅; `unknown` → type cụ thể ❌ (phải narrow); `never` → mọi thứ ✅; không gì → `never` (trừ `never`/`any`).
+  - Assignability: mọi thứ → `unknown` ✅; `any` → mọi thứ trừ `never` ✅; `unknown` → type cụ thể ❌ (phải narrow); `never` → mọi thứ ✅; không gì → `never`, kể cả `any` (`TS2322: Type 'any' is not assignable to type 'never'`).
   - Exhaustive: `default: { const _x: never = value; throw new Error(...) }`.
   - `satisfies` giữ literal type; annotation `: T` widen về `T`; `as T` bỏ qua check.
   - Tắt distributive: `[T] extends [U] ? X : Y`. Check `never`: `[T] extends [never]`.
@@ -127,7 +127,7 @@ questions:
     type: compare
     q: What is the difference between `any`, `unknown` and `never`? Which assignments compile?
     hint: |-
-      - `any`: tắt type check hoàn toàn, "lây" sang mọi biểu thức dùng nó; gán được **đi và đến** mọi type.
+      - `any`: tắt type check hoàn toàn, "lây" sang mọi biểu thức dùng nó; gán được **đi và đến** mọi type (ngoại lệ duy nhất: `any` không gán được vào `never`).
       - `unknown`: top type an toàn — mọi thứ gán **vào** được, nhưng muốn dùng (gọi method, gán sang `string`) phải narrow (`typeof`, `instanceof`, zod parse).
       - `never`: bottom type, tập rỗng — gán **đi** mọi type được, không gì gán **vào** được (trừ `never`).
       - `u = a` (any → unknown) là **hợp lệ**; `s = u` (unknown → string) là lỗi.
@@ -833,7 +833,7 @@ questions:
     hint: |-
       - Đọc release notes: TS 6.0 là bản "cầu nối" đổi default (`strict`, `module`, `target`, `types: []`) và deprecate option cũ (`moduleResolution: node`, `baseUrl`, `target: es5`...); TS 7 là compiler native (verify chi tiết).
       - Ghi explicit mọi option trong tsconfig base trước khi nâng → default đổi không làm vỡ ngầm.
-      - Kiểm tra tool phụ thuộc API compiler: ts-jest, typescript-eslint, ts-morph, plugin transformer, NestJS CLI.
+      - Kiểm tra tool phụ thuộc API compiler: ts-jest, typescript-eslint, ts-morph, plugin transformer, NestJS CLI. Package `typescript@7` không còn export compiler API JS (`ts.createProgram`), nên các tool này cần một bản TS 6 song song (vd qua `overrides`) cho tới khi hỗ trợ TS 7 (verify).
       - Rollout: nâng một package leaf trước, CI matrix, so sánh `.d.ts` output (API không đổi), rồi nâng dần.
       - Đo lợi ích (thời gian CI, IDE) để justify.
     followUp: Which tools in your stack depend on the TypeScript compiler API and might block the upgrade?

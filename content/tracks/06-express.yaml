@@ -20,7 +20,7 @@ overview: |-
   ## TL;DR
 
   - Express là một **router + chuỗi middleware** mỏng trên `http` của Node. Mọi thứ (body parsing, auth, CORS, logging, error handling) đều là middleware chạy **theo thứ tự đăng ký**.
-  - **Express 5** (5.0 ra 09/2024, thành `latest` trên npm từ 5.1 — verify) thay đổi quan trọng: promise bị reject trong handler/middleware được **tự chuyển tới error handler**; cú pháp path mới (path-to-regexp v8: wildcard phải có tên `/*splat`, optional dùng `{}`); `req.query` chỉ là getter; `req.body` là `undefined` khi chưa có body parser; yêu cầu Node 18+.
+  - **Express 5** (5.0 ra 09/2024, thành `latest` trên npm từ 5.1 — verify) thay đổi quan trọng: promise bị reject trong handler/middleware được **tự chuyển tới error handler**; cú pháp path mới (path-to-regexp v8: wildcard phải có tên `/*splat`, optional dùng `{}`); `req.query` chỉ là getter; `req.body` là `undefined` khi body parser không parse request (v4 là `{}`); yêu cầu Node 18+.
   - Senior interview hỏi: thứ tự middleware, xử lý lỗi async, `trust proxy`, bảo mật (helmet, CORS, rate limit, body size), cấu trúc codebase lớn, graceful shutdown, và khi nào chọn Fastify/NestJS.
 
   ## Khái niệm cốt lõi
@@ -92,7 +92,7 @@ overview: |-
   ## Pitfalls
 
   - Quên `return` sau `res.json()` trong nhánh lỗi → "Cannot set headers after they are sent".
-  - Express 4 + async handler không có wrapper → rejection bị nuốt, request treo.
+  - Express 4 + async handler không có wrapper → rejection không tới error middleware: request treo, và Node 15+ crash vì `unhandledRejection`.
   - Error middleware khai báo 3 tham số → Express coi là middleware thường.
   - Đặt `express.json()` sau router, hoặc CORS sau route → không có tác dụng.
   - `trust proxy` sai: `req.ip` là IP load balancer → rate limit chặn tất cả user cùng lúc, hoặc cho phép client giả `X-Forwarded-For`.
@@ -205,7 +205,7 @@ questions:
     hint: |-
       - `req.params`: từ path pattern (`/orders/:id`), luôn là string.
       - `req.query`: từ query string, parse bởi query parser (mặc định "simple" trong v5 — verify); giá trị có thể là string, mảng, hoặc object tuỳ parser.
-      - `req.body`: chỉ có khi có body parser (`express.json()`, `express.urlencoded()`); Express 5 để `undefined` khi chưa parse (v4 là `{}`).
+      - `req.body`: chỉ có khi có body parser (`express.json()`, `express.urlencoded()`); không có parser thì `undefined` ở cả v4 và v5. Có parser nhưng request không có body/sai `Content-Type`: v4 là `{}`, v5 là `undefined`.
       - Express 5: `req.query` là **getter**, không gán lại được.
       - Tất cả đều là **input không tin cậy** → validate + ép kiểu.
     followUp: A client sends `?status=paid&status=shipped`. What type does your handler receive, and how do you validate it?
@@ -249,7 +249,7 @@ questions:
     q: How do you serve static files safely and efficiently with Express?
     hint: |-
       - `express.static(root, options)`: set `maxAge`/`immutable` cho asset có hash trong tên, ETag/Last-Modified tự động, `index: false` nếu không muốn trả `index.html`.
-      - An toàn: chỉ serve thư mục chuyên dụng (không phải project root), v5 mặc định **ignore dotfiles** (`.env`, `.git`).
+      - An toàn: chỉ serve thư mục chuyên dụng (không phải project root). v4 đã bỏ qua **file** dấu chấm (`.env`) nhưng vẫn serve file **trong thư mục** dấu chấm (`.git/config`, `.well-known/`); v5 mặc định bỏ qua cả hai (`dotfiles: "ignore"`).
       - Production: static/CDN tốt hơn (S3 + CloudFront, Nginx) — không tốn event loop Node cho file.
       - File do user upload: không serve cùng origin với app nếu có thể (XSS qua HTML/SVG), set `Content-Disposition`, `X-Content-Type-Options: nosniff`.
     followUp: Why is serving user-uploaded SVGs from your main domain dangerous?
@@ -308,7 +308,7 @@ questions:
       app.use(errorHandler);
       ```
     hint: |-
-      - `ordersRouter` mount **trước** `express.json()` → `req.body` undefined (v5) / `{}` (v4) trong mọi route orders.
+      - `ordersRouter` mount **trước** `express.json()` → `req.body` là `undefined` (cả v4 lẫn v5) trong mọi route orders.
       - `cors` đăng ký sau orders → response orders thiếu header CORS; preflight `OPTIONS` tới orders không được trả đúng.
       - `authenticate` sau orders → **orders không được bảo vệ**.
       - Fix thứ tự: helmet → cors → json → auth → routers → 404 → errorHandler.
@@ -550,7 +550,7 @@ questions:
     hint: |-
       - `next()` ở cuối chạy **ngay lập tức** (đồng bộ) → handler chạy trước khi kiểm tra quyền xong → request bị cấm vẫn được xử lý (**lỗ hổng authorization**).
       - Trong `.then`: thiếu `return` sau 403 → `next()` được gọi lần nữa → handler chạy lại/ghi response lần 2 → headers sent.
-      - Promise không có `.catch` → lỗi DB thành unhandled rejection.
+      - Promise không có `.catch` → lỗi DB, và cả `ERR_HTTP_HEADERS_SENT` ném bên trong `.then`, thành unhandled rejection → Node 15+ **crash process**.
       - Fix: `async (req, res, next) => { const perms = await ...; if (!perms.includes(perm)) return next(new ForbiddenError()); next(); }` (Express 5 bắt rejection; v4 cần wrapper).
     followUp: How would you write a test that would have caught the authorization bypass?
     tags: [auth, middleware, debug]
@@ -586,7 +586,7 @@ questions:
       });
       ```
     hint: |-
-      - Express 5 định nghĩa `req.query` là **getter** trên prototype (không có setter) → gán lại trong strict mode (ES module/TS output) throw TypeError.
+      - Express 5 định nghĩa `req.query` là **getter** trên prototype (không có setter), parse lại mỗi lần đọc → gán lại trong strict mode (ES module/TS output) throw TypeError; trong CJS sloppy mode phép gán **lặng lẽ không có tác dụng**; `req.query.x = ...` cũng bị mất ở lần đọc sau.
       - Một số middleware cũ (sanitizer, query normalizer) gán `req.query` → phải nâng version hoặc thay.
       - Fix: lưu kết quả vào nơi khác (`res.locals.query`), hoặc cấu hình `app.set("query parser", fn)` để parse/sanitize ngay từ đầu; validate bằng schema thay vì "sanitize" chung chung.
       - `req.body` vẫn gán được (không phải getter).
@@ -685,7 +685,7 @@ questions:
     type: gotcha
     q: You use `AsyncLocalStorage` in middleware for requestId/tenantId, but some log lines lose the context. Why, and how do you fix it?
     hint: |-
-      - Context gắn với async resource tạo **bên trong** `als.run(...)`; nếu code chạy qua queue/pool khởi tạo **ngoài** request (connection pool callback, EventEmitter singleton, batching lib như DataLoader) → callback chạy trong context của nơi khác/không có.
+      - Context gắn với async resource tạo **bên trong** `als.run(...)`; nếu callback đi qua queue/pool khởi tạo **ngoài** request (connection pool callback, batching lib như DataLoader, EventEmitter singleton được emit từ socket/timer của thư viện thay vì từ trong request) → callback chạy trong context của nơi khác/không có. (`emit` gọi từ trong request thì listener vẫn thấy context.)
       - Middleware gọi `next()` **bên ngoài** `als.run` → handler không có context.
       - Fix: `als.run(store, next)` đúng cách; `AsyncResource.bind(fn)` cho callback đi qua lib; ưu tiên lib hỗ trợ ALS/OTel; với background job/consumer phải tự tạo context mới.
       - Không dùng `enterWith` trong middleware (rò context sang request sau trên cùng tick).

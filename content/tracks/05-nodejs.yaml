@@ -341,6 +341,7 @@ questions:
       - Major chẵn (even) trở thành **LTS**; major lẻ chỉ là "Current" ngắn hạn. LTS gồm giai đoạn Active rồi Maintenance, tổng khoảng 30 tháng (verify lịch cụ thể).
       - Production: dùng **Active LTS** (ở thời điểm 2026 là Node 24; Node 22 đang Maintenance; Node 20 đã EOL — verify trên trang release).
       - Upgrade theo lịch, không để chạy version EOL (không có security patch).
+      - Từ Node 27 (alpha 10/2026, release 4/2027): mỗi năm một major, mọi major đều lên LTS; Node 26 là bản cuối theo mô hình chẵn/lẻ (verify).
       - Pin version ở `.nvmrc`/`engines`/Docker base image digest.
     followUp: What breaks most often when you jump two Node majors?
     verify: true
@@ -517,7 +518,7 @@ questions:
     q: Explain HTTP keep-alive timeouts on a Node server behind a load balancer. Why do mismatched values cause intermittent 502s?
     hint: |-
       - LB (vd AWS ALB, idle timeout mặc định 60s) giữ connection keep-alive tới Node và tái sử dụng.
-      - Node `server.keepAliveTimeout` mặc định **5s** (verify): Node đóng socket idle sau 5s. Nếu LB gửi request mới đúng lúc Node đang đóng → LB nhận reset → **502**.
+      - Node `server.keepAliveTimeout` mặc định **5s** (verify): Node đóng socket idle sau 5s (Node 24 cộng thêm `keepAliveTimeoutBuffer` 1s, header `Keep-Alive: timeout=5` không đổi). Nếu LB gửi request mới đúng lúc Node đang đóng → LB nhận reset → **502**.
       - Rule: `keepAliveTimeout` của backend **lớn hơn** idle timeout của LB (vd 65s), và `headersTimeout` > `keepAliveTimeout`.
       - Liên quan: `requestTimeout` (mặc định 300s từ Node 18 — verify) chống slowloris.
     example: |-
@@ -570,7 +571,7 @@ questions:
     type: concept
     q: How do you measure event loop health in production? Explain event loop delay vs event loop utilization.
     hint: |-
-      - **Event loop delay** (`perf_hooks.monitorEventLoopDelay()`): histogram độ trễ giữa lúc timer "nên" chạy và lúc thật sự chạy → p99 cao = có callback dài block loop.
+      - **Event loop delay** (`perf_hooks.monitorEventLoopDelay()`): histogram độ trễ giữa lúc timer "nên" chạy và lúc thật sự chạy → p99/max cao = có callback dài block loop (giá trị gồm cả `resolution`: loop rảnh vẫn ra ≈ resolution).
       - **Event loop utilization** (`performance.eventLoopUtilization()`): tỉ lệ thời gian loop bận vs idle → gần 1 = CPU-saturated, nên scale/offload.
       - ELU là tín hiệu autoscale tốt hơn CPU% cho Node (CPU% gồm cả GC/thread pool).
       - Export qua Prometheus/OTel (`prom-client` có sẵn default metrics).
@@ -862,8 +863,9 @@ questions:
         health.ready = false;
         await sleep(5_000);                        // let the LB stop routing
         const force = setTimeout(() => { server.closeAllConnections(); process.exit(1); }, 20_000).unref();
-        await new Promise<void>((r) => server.close(() => r()));
-        server.closeIdleConnections();
+        const closed = new Promise<void>((r) => server.close(() => r()));
+        const sweep = setInterval(() => server.closeIdleConnections(), 500); // sockets that go idle after close()
+        await closed; clearInterval(sweep);
         await Promise.allSettled([consumer.disconnect(), db.end(), redis.quit()]);
         clearTimeout(force);
         process.exit(0);

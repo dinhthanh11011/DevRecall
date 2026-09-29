@@ -544,7 +544,7 @@ questions:
     hint: |-
       - `PaymentsModule` không `exports: [PaymentsService]` → provider private, `OrdersModule` import module nhưng không thấy provider.
       - Các nguyên nhân khác của cùng lỗi: quên `imports`; thêm `PaymentsService` vào `providers` của `OrdersModule` (tạo instance thứ hai, và kéo theo dependency của nó); circular import làm class `undefined` lúc decorator chạy (lỗi hiện `?` hoặc `undefined` ở index); dùng `import type` làm mất metadata; token string/symbol không khớp.
-      - Fix: `exports: [PaymentsService]`.
+      - Fix: `exports: [PaymentsService]`. (Nest 12 in lỗi là "... is available in the OrdersModule module."; bản cũ ghi "context".)
     followUp: The error shows `undefined` instead of a class name at index [0]. What does that usually indicate?
     tags: [di, modules, debug]
   - id: nestjs-026
@@ -639,11 +639,12 @@ questions:
     type: scenario
     q: After making the logger request-scoped, the nightly `@Cron` job and the Kafka consumer start failing with undefined dependencies. Why, and how do you fix it?
     hint: |-
-      - Cron/consumer/WebSocket gateway không có HTTP request → không có context để tạo provider request-scoped; docs nói rõ gateway, Passport strategy, cron controller **không nên** dùng request-scoped provider.
+      - Cron/consumer không có HTTP request → không có context để tạo provider request-scoped (chạy thật trên Nest 12: `REQUEST` là `undefined` → `Cannot read properties of undefined (reading 'headers')`); docs Injection scopes nói gateway, Passport strategy, cron controller phải là singleton (migration guide Nest 12 ghi WebSocket gateway bắt đầu hỗ trợ request-scoped provider — verify).
       - Provider phụ thuộc logger request-scoped cũng thành request-scoped → service dùng trong job hỏng theo.
       - Fix: logger singleton đọc context từ AsyncLocalStorage (set context ở middleware cho HTTP, ở đầu handler cho job/consumer); hoặc TRANSIENT logger (context theo class) thay vì theo request.
       - Nếu buộc phải: `ContextIdFactory.create()` + `moduleRef.resolve(X, contextId)` để tạo scope thủ công cho job.
     followUp: How do you give each Kafka message its own correlation id in logs?
+    verify: true
     tags: [scopes, cron, kafka, scenario]
   - id: nestjs-031
     level: hard
@@ -652,7 +653,7 @@ questions:
     hint: |-
       - Bật `app.enableShutdownHooks()` (không có → hook không chạy khi SIGTERM).
       - `beforeApplicationShutdown`: readiness=false, chờ LB gỡ endpoint vài giây, dừng consumer fetch/commit offset message đã xử lý xong, dừng nhận job mới.
-      - `app.close()` đóng HTTP server (chờ in-flight; keep-alive idle cần được đóng — adapter/Node version quyết định, verify), rồi `onApplicationShutdown` đóng DB/Redis/producer.
+      - `app.close()` đóng HTTP server, rồi `onApplicationShutdown` đóng DB/Redis/producer. Đo thật (Nest 12.1.1, Node 24): kết nối keep-alive đang bận lúc đóng làm `onApplicationShutdown` trễ ~3 s (tới khi client đóng socket); `forceCloseConnections: true` hết trễ nhưng **cắt** request đang chạy → drain trước, hoặc trả `Connection: close` khi đang shutdown.
       - Hard timeout < `terminationGracePeriodSeconds`; `CMD ["node", "dist/main.js"]` để nhận signal.
       - Consumer idempotent vì at-least-once — re-process khi crash là **bình thường**, phải an toàn.
     followUp: Why does re-processing still happen occasionally even with a perfect shutdown?
@@ -664,7 +665,7 @@ questions:
     q: How do exceptions behave in a Nest microservice (e.g., Kafka `@EventPattern`) compared to HTTP, and what does that mean for retries?
     hint: |-
       - Context là `rpc` → `HttpException` không có ý nghĩa HTTP; dùng `RpcException` và filter RPC (`BaseRpcExceptionFilter`) nếu cần định dạng lỗi.
-      - Với event handler, exception quyết định hành vi commit/retry của transport (vd Kafka: có thể không commit và retry/đứng partition, tuỳ cấu hình và version — verify) → poison message có thể chặn partition.
+      - Với event handler, exception quyết định hành vi commit/retry của transport. Đo thật (Nest 12.1.1 + kafkajs + Kafka 3.9.1): handler throw → offset không commit, kafkajs retry rồi restart consumer, message lỗi chạy lại 21 lần trong 15 s và message sau nó trong partition không bao giờ chạy → poison message chặn partition (verify với version của bạn).
       - Thiết kế: handler tự bắt lỗi, phân loại transient (retry có giới hạn/backoff) vs permanent (DLQ), idempotent; đừng dựa vào mặc định của transport mà không test.
       - Cân nhắc dùng client Kafka trực tiếp khi cần kiểm soát offset chi tiết.
     followUp: How would you implement a retry topic + DLQ pattern with Nest's Kafka transport?
