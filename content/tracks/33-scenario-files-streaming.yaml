@@ -1,0 +1,1223 @@
+id: 33-scenario-files-streaming
+slug: scenario-files
+title: "Scenarios: File Upload, Download & Streaming"
+tier: 9
+status: drafted
+summary: Mock interview production scenarios — upload 100MB đồng thời, presigned URL/POST, multipart & resumable, streaming qua backend với backpressure, validate file, download/Range/zip, SSE/NDJSON/LLM streaming, Socket.IO realtime ở scale, media pipeline và chi phí S3.
+cvLinked: true
+prerequisites: [05-nodejs, 24-aws]
+overview: |-
+  ## TL;DR
+
+  - Quy tắc số 1: **bytes không đi qua API server nếu không bắt buộc**. Client upload/download thẳng với object storage (S3) bằng **presigned URL/POST** hoặc **CloudFront signed URL/cookie**; API chỉ ký, kiểm quyền, lưu metadata.
+  - Khi bytes **bắt buộc** đi qua backend: **stream end-to-end** (busboy → `@aws-sdk/lib-storage` `Upload`), giới hạn size **trong lúc stream**, abort khi client ngắt, và hiểu memory thật = `partSize × queueSize × số upload đồng thời`, không phải "64KB".
+  - Upload không "xong" khi client nói xong: dùng **state machine** trong DB (`pending → uploaded → scanned → ready | rejected`), xác nhận bằng `HeadObject`/S3 event, xử lý nặng (scan, thumbnail, transcode) qua **queue + worker idempotent**.
+  - Validate như kẻ tấn công: không tin `Content-Type`/extension, sniff magic bytes, re-encode ảnh, giới hạn giải nén, key do server sinh, serve từ **domain riêng** + `Content-Disposition` + `nosniff`.
+  - Streaming response (NDJSON, SSE, LLM tokens, Socket.IO) chết vì **buffering ở giữa** (proxy, compression), **slow consumer** và **reconnect không resync**. Luôn có heartbeat, sequence number, và chiến lược drop/coalesce.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Presigned PUT | URL ký SigV4 cho phép PUT đúng 1 key, trong TTL | `getSignedUrl(s3, new PutObjectCommand({Bucket, Key}), { expiresIn: 300 })` |
+  | Presigned POST | Form POST + **policy** có điều kiện (size, content-type prefix, key prefix) | `["content-length-range", 1, 104857600]` |
+  | Multipart upload | Chia object thành part (≥5 MiB trừ part cuối, tối đa 10,000 part), upload song song, `Complete` bằng danh sách ETag | 100 MB → 10 part × 10 MB |
+  | Resumable upload | Lưu `uploadId` + part đã xong, `ListParts` để tiếp tục | Browser đóng tab, mở lại upload tiếp part 7 |
+  | Backpressure | Consumer chậm báo producer dừng (`write()` trả `false` → chờ `'drain'`) | S3 chậm → busboy ngừng đọc socket → TCP window co lại |
+  | `highWaterMark` | Ngưỡng buffer nội bộ của stream trước khi báo "đầy" | `fs.createReadStream` mặc định 64 KiB |
+  | `pipeline()` | Nối stream + propagate error + destroy tất cả khi lỗi/abort | `await pipeline(s3Body, gzip, res)` |
+  | Range request | Client xin một đoạn byte → server trả `206 Partial Content` | `Range: bytes=0-1048575` |
+  | NDJSON | Mỗi dòng một JSON object, parse được từng dòng | `{"id":1}\n{"id":2}\n` |
+  | SSE | `text/event-stream` một chiều server→client, tự reconnect với `Last-Event-ID` | `id: 42\ndata: {...}\n\n` |
+  | Conflation / coalesce | Gộp nhiều update của cùng key, chỉ gửi bản mới nhất cho client chậm | Giá AAPL đổi 50 lần/s, gửi 4 lần/s |
+  | Magic bytes | Chữ ký đầu file xác định format thật | PNG bắt đầu `89 50 4E 47` |
+
+  ## Cơ chế hoạt động
+
+  ### Direct-to-S3 upload với confirm + async processing
+
+  ```mermaid
+  sequenceDiagram
+    participant C as Browser
+    participant A as API
+    participant D as DB
+    participant S as S3 (quarantine bucket)
+    participant Q as SQS
+    participant W as Worker
+    C->>A: POST /uploads {name, size, type}
+    A->>A: auth, quota, validate size/type khai báo
+    A->>D: INSERT upload(status='pending', key=uuid)
+    A-->>C: presigned POST (content-length-range, Content-Type, key)
+    C->>S: POST file (thẳng, không qua API)
+    S-->>Q: ObjectCreated event (at-least-once)
+    C->>A: POST /uploads/:id/complete
+    A->>S: HeadObject (size, ETag, ContentType)
+    A->>D: UPDATE status='uploaded' WHERE status='pending'
+    Q->>W: message
+    W->>S: GetObject (stream) → magic bytes, AV scan, re-encode
+    W->>D: UPDATE status='ready' hoặc 'rejected' (idempotent)
+    Note over S: Lifecycle: xoá object pending > 24h, AbortIncompleteMultipartUpload 1-7 ngày
+  ```
+
+  ### Upload bắt buộc qua backend — streaming với backpressure
+
+  ```mermaid
+  flowchart LR
+    N["nginx / ALB<br/>client_max_body_size<br/>proxy_request_buffering off"] --> B["busboy<br/>limits.fileSize, files=1"]
+    B -->|"file stream"| V["Transform: sniff magic bytes<br/>+ hash + đếm bytes"]
+    V --> U["lib-storage Upload<br/>partSize × queueSize buffer"]
+    U --> S3[("S3 multipart")]
+    U -. "S3 chậm → buffer đầy" .-> V
+    V -. "pause" .-> B
+    B -. "ngừng đọc socket<br/>TCP backpressure" .-> N
+    X["req 'close' / 'limit'"] -->|"upload.abort()"| U
+  ```
+
+  ### Realtime stream (Socket.IO) với resync
+
+  ```mermaid
+  sequenceDiagram
+    participant P as Price feed
+    participant K as Kafka/Redis Streams
+    participant G as WS Gateway (N node)
+    participant C as Client
+    P->>K: tick(symbol, seq)
+    K->>G: fan-out tới node có subscriber
+    G->>G: conflate theo symbol nếu client chậm
+    G-->>C: {symbol, price, seq: 1001}
+    Note over C: mất mạng 10s
+    C->>G: reconnect + lastSeq=1001
+    alt gap nhỏ, còn trong buffer
+      G-->>C: replay 1002..1050
+    else gap lớn
+      G-->>C: snapshot (seq=2000) rồi delta tiếp
+    end
+  ```
+
+  ## Khung trả lời
+
+  Dùng cho mọi câu "file lớn / streaming trong production":
+
+  1. **Hỏi lại con số**: kích thước file (p50/p99/max), số upload/download đồng thời, client (browser/mobile/server), SLA, data nhạy cảm không, có yêu cầu compliance bắt bytes đi qua mình không.
+  2. **Tính memory/bandwidth trên giấy**: `concurrent × buffered bytes`. 100 × 100 MB buffered = 10 GB; 100 × (5 MB × 4) lib-storage = 2 GB; 100 × 64 KB stream thuần = 6.4 MB.
+  3. **Đưa bytes ra khỏi API**: presigned POST/PUT, multipart presigned từng part, CloudFront cho download.
+  4. **Nếu phải qua backend**: stream end-to-end, size limit lúc stream, abort + cleanup, giới hạn ở proxy/LB, admission control (số upload đồng thời/pod → 429/503).
+  5. **Trạng thái & bất đồng bộ**: state machine DB, event → queue → worker idempotent, không serve trước khi scan xong.
+  6. **Bảo mật**: magic bytes, re-encode, zip/decompression limits, key server-generated, domain riêng, `nosniff`, `Content-Disposition`.
+  7. **Vận hành & chi phí**: lifecycle rules, incomplete multipart, request cost, egress, metrics (bytes in-flight, upload fail rate, p99 duration), alert.
+
+  ## Trade-offs
+
+  | Cách upload | Memory API | Enforce size | Validate trước khi lưu | Resumable | Phức tạp | Hợp khi |
+  |---|---|---|---|---|---|---|
+  | Multer `memoryStorage` | Toàn bộ file × N | `limits.fileSize` | Có | Không | Thấp | File nhỏ (avatar < 5 MB), traffic thấp |
+  | Multer `diskStorage` | Thấp, nhưng tốn disk tạm | Có | Có (đọc lại từ disk) | Không | Thấp | Cần CLI xử lý file local |
+  | busboy → lib-storage | `partSize × queueSize` mỗi upload | Có, lúc stream | Có (inline) | Không (trừ tự làm) | Trung bình | Compliance bắt đi qua backend |
+  | Presigned PUT | ~0 | **Không** (chỉ ký header) | Sau khi upload | Không | Thấp | File vừa, client tin cậy tương đối |
+  | Presigned POST | ~0 | **Có** (`content-length-range`) | Sau khi upload | Không | Thấp | Browser form upload, cần chặn size |
+  | Multipart presigned từng part | ~0 | Qua số part × part size + check khi Complete | Sau khi upload | **Có** | Cao | File > 100 MB, mạng yếu |
+  | tus protocol (tusd/Uppy) | Tuỳ server | Có (`Upload-Length`, max-size) | Có hook | **Có**, chuẩn hoá | Trung bình | Cần resumable đa nền tảng, không lock vào S3 API |
+
+  | Streaming response | Hướng | Reconnect | Qua proxy | Hợp khi |
+  |---|---|---|---|---|
+  | Chunked + NDJSON | Server → client, 1 request | Tự làm (cursor) | Dễ bị buffer | Export lớn, batch API |
+  | SSE | Server → client | Built-in `Last-Event-ID` | Cần tắt buffering, HTTP/1.1 giới hạn ~6 connection/host | LLM tokens, notification, dashboard |
+  | WebSocket / Socket.IO | Hai chiều | Tự làm (Socket.IO có connection state recovery) | Cần Upgrade, sticky session | Trading, chat, collaborative |
+
+  ## Pitfalls
+
+  - Tin rằng "dùng Multer là stream": `memoryStorage` giữ nguyên file trong `file.buffer`; `diskStorage` ghi ra disk. `file.stream` không có trong engine built-in.
+  - Presigned PUT **không giới hạn size được** — cần presigned POST hoặc kiểm tra sau upload + xoá.
+  - `PQueue({ concurrency: 5 })` trong handler chỉ giới hạn việc xử lý; 500 request vẫn đang mở socket và nhận bytes. Admission control phải ở LB/proxy hoặc trước khi đọc body.
+  - Dùng `.pipe()` cho download S3 → client abort thì S3 socket không bị destroy → leak connection trong pool của SDK (mặc định `maxSockets` 50 — verify).
+  - Không có `AbortIncompleteMultipartUpload` → part rác tính tiền storage vô thời hạn và **không hiện** trong `ListObjects`.
+  - Serve file user upload từ cùng domain app với `Content-Type` do client gửi → SVG/HTML chạy script = stored XSS.
+  - Zip-on-the-fly: status 200 đã gửi, lỗi giữa chừng → file zip hỏng mà client không biết.
+  - SSE/NDJSON bị `compression()` hoặc nginx `proxy_buffering on` gom lại → client nhận một cục ở cuối.
+  - Socket.IO server `emit` cho client chậm → buffer của socket phình vô hạn → OOM ở giờ mở cửa thị trường.
+
+  ## Cheat sheet
+
+  - S3: single PUT ≤ 5 GiB; multipart part 5 MiB–5 GiB, ≤ 10,000 part; object tối đa 5 TiB (AWS có thông báo nâng lên 50 TB cuối 2025 — verify). Presigned URL tối đa 7 ngày (SigV4), nhưng hết hạn sớm hơn nếu ký bằng temporary credentials.
+  - Part size cho file lớn: `ceil(size / 10000)` làm tròn lên ≥ 5 MiB; 100 GB → ≥ ~10.5 MB/part.
+  - `@aws-sdk/lib-storage` `Upload`: mặc định `partSize` 5 MiB, `queueSize` 4 → ~20 MB buffer mỗi upload (verify). Có `upload.abort()` và event `httpUploadProgress`.
+  - Proxy/LB: nginx `client_max_body_size` mặc định 1m, `proxy_request_buffering on` mặc định; ALB idle timeout mặc định 60s; API Gateway payload 10 MB; Lambda sync invoke 6 MB request/response (verify).
+  - Node streams: `highWaterMark` mặc định 64 KiB cho byte stream từ Node 22 (trước đó 16 KiB), 16 object cho object mode; `fs.createReadStream` 64 KiB (verify). Luôn `await pipeline(...)` từ `node:stream/promises`.
+  - Validate: `file-type` đọc magic bytes; `sharp` re-encode + `limitInputPixels`; unzip giới hạn tổng bytes, số entry, ratio, và chặn `../`.
+  - Download: presigned GET TTL ngắn + `ResponseContentDisposition`; CloudFront signed **cookies** cho HLS (nhiều segment), signed **URL** cho 1 file.
+  - Realtime: sticky session (khi có polling), Redis/Streams adapter, heartbeat, `seq` mỗi message, snapshot + delta khi gap lớn, conflate cho client chậm.
+notionRefs:
+  - title: Mock Questions — Technical - Page 1
+    url: https://app.notion.com/p/2c4ef77f8ab2802cba3de5b0d2d34dda
+  - title: Mock Questions — Topic
+    url: https://app.notion.com/p/2ddef77f8ab28030a76fcbaaa3dde966
+references:
+  - title: Amazon S3 — Uploading and copying objects using multipart upload (limits)
+    url: https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
+  - title: Amazon S3 — Sharing objects with presigned URLs
+    url: https://docs.aws.amazon.com/AmazonS3/latest/userguide/ShareObjectPreSignedURL.html
+  - title: Amazon S3 — Browser-based uploads using POST (POST policy)
+    url: https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-HTTPPOSTConstructPolicy.html
+  - title: Amazon S3 — Configuring a lifecycle rule to abort incomplete multipart uploads
+    url: https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpu-abort-incomplete-mpu-lifecycle-config.html
+  - title: Amazon S3 — Checking object integrity (checksums)
+    url: https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html
+  - title: Amazon S3 — Event notifications
+    url: https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventNotifications.html
+  - title: AWS SDK for JavaScript v3 — lib-storage
+    url: https://github.com/aws/aws-sdk-js-v3/tree/main/lib/lib-storage
+  - title: AWS SDK for JavaScript v2 — end-of-support announcement
+    url: https://aws.amazon.com/blogs/developer/announcing-end-of-support-for-aws-sdk-for-javascript-v2/
+  - title: Amazon CloudFront — Serving private content with signed URLs and signed cookies
+    url: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/PrivateContent.html
+  - title: Elastic Load Balancing — ALB connection idle timeout
+    url: https://docs.aws.amazon.com/elasticloadbalancing/latest/application/application-load-balancers.html#connection-idle-timeout
+  - title: API Gateway quotas
+    url: https://docs.aws.amazon.com/apigateway/latest/developerguide/limits.html
+  - title: AWS Lambda quotas
+    url: https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html
+  - title: Node.js — Stream API
+    url: https://nodejs.org/api/stream.html
+  - title: Node.js — Backpressuring in streams
+    url: https://nodejs.org/en/learn/modules/backpressuring-in-streams
+  - title: Node.js — Web Streams API
+    url: https://nodejs.org/api/webstreams.html
+  - title: MDN — HTTP range requests
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Range_requests
+  - title: MDN — Using server-sent events
+    url: https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events
+  - title: MDN — Content-Disposition
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Disposition
+  - title: RFC 9110 — HTTP Semantics (Range, 206, 416)
+    url: https://www.rfc-editor.org/rfc/rfc9110
+  - title: WHATWG HTML — Server-sent events
+    url: https://html.spec.whatwg.org/multipage/server-sent-events.html
+  - title: OWASP — File Upload Cheat Sheet
+    url: https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html
+  - title: nginx — ngx_http_proxy_module (proxy_request_buffering, proxy_buffering)
+    url: https://nginx.org/en/docs/http/ngx_http_proxy_module.html
+  - title: Multer README (storage engines, file object)
+    url: https://github.com/expressjs/multer
+  - title: busboy
+    url: https://github.com/mscdex/busboy
+  - title: tus resumable upload protocol
+    url: https://tus.io/protocols/resumable-upload
+  - title: Socket.IO — Redis adapter / Connection state recovery
+    url: https://socket.io/docs/v4/connection-state-recovery
+  - title: Apple — HTTP Live Streaming
+    url: https://developer.apple.com/streaming/
+questions:
+  - id: scenario-files-001
+    level: easy
+    type: scenario
+    q: "An upload endpoint uses Multer with the default memory storage. Marketing runs a campaign and 100 users upload 100 MB videos at the same time. What happens to a pod with a 2 GB memory limit, and what is your first fix?"
+    hint: |-
+      (1) Tính trước: 100 × 100 MB = **10 GB Buffer** giữ đồng thời trong RAM (Buffer nằm ngoài V8 heap nên `--max-old-space-size` không cứu) → pod OOMKilled, mọi request khác trên pod cũng chết, K8s restart → retry của client lại dồn vào.
+      (2) Nguyên nhân: `memoryStorage` đọc hết multipart body vào `file.buffer` trước khi handler chạy.
+      (3) Fix theo ưu tiên: ngay lập tức giới hạn `limits.fileSize` + số upload đồng thời (429) → đúng hướng: **client upload thẳng S3 bằng presigned POST/multipart**, API chỉ nhận metadata → nếu bắt buộc qua backend thì stream (busboy → lib-storage).
+      (4) Con số: stream thuần ~64 KB/upload, lib-storage ~20 MB/upload (5 MB × 4), buffer toàn bộ = 100 MB/upload.
+    followUp: "You switch to streaming through the backend. Recompute memory for 100 concurrent uploads with `@aws-sdk/lib-storage` defaults."
+    redFlags:
+      - "Just raise the pod memory limit to 16 GB"
+      - "Increase --max-old-space-size (Buffers live outside the V8 heap)"
+    tags: [upload, memory, multer]
+  - id: scenario-files-002
+    level: easy
+    type: compare
+    q: "Product wants to cap uploads at 100 MB. A teammate proposes a presigned PUT URL. Can that enforce the limit? What would you use instead?"
+    hint: |-
+      (1) Presigned PUT ký method + key + (tuỳ chọn) một số header như `Content-Type`; nó **không có điều kiện về size** → client có thể PUT tới 5 GiB (giới hạn single PUT). Ký `ContentLength` vào URL cũng chỉ ép đúng một con số, không phải khoảng, và dễ vỡ.
+      (2) **Presigned POST** có **policy document** với condition `["content-length-range", min, max]`, `["starts-with", "$Content-Type", "image/"]`, `["starts-with", "$key", "uploads/<userId>/"]`; S3 tự reject nếu vi phạm.
+      (3) Dù dùng gì vẫn **verify sau**: `HeadObject` ở bước confirm hoặc worker từ S3 event, xoá nếu vượt.
+      (4) Multipart: giới hạn qua số part bạn chịu ký × part size, và check tổng size trước `CompleteMultipartUpload`.
+    example: |-
+      ```ts
+      import { createPresignedPost } from "@aws-sdk/s3-presigned-post";
+
+      const { url, fields } = await createPresignedPost(s3, {
+        Bucket: "uploads-quarantine",
+        Key: `u/${userId}/${crypto.randomUUID()}`,
+        Conditions: [
+          ["content-length-range", 1, 100 * 1024 * 1024],
+          ["starts-with", "$Content-Type", "video/"],
+        ],
+        Fields: { "Content-Type": declaredType },
+        Expires: 300, // seconds
+      });
+      // browser: FormData(fields..., file LAST) → POST url
+      ```
+    followUp: "The file field in the POST form is placed before the policy fields. What happens?"
+    redFlags:
+      - "Check file.size in the browser and trust it"
+      - "Presigned PUT enforces size because we sign Content-Type"
+    verify: true
+    tags: [s3, presigned-post, upload]
+  - id: scenario-files-003
+    level: easy
+    type: scenario
+    q: "Users on bad mobile networks complain that a 4 GB download restarts from zero every time the connection drops. What HTTP feature fixes that and what must your endpoint return?"
+    hint: |-
+      (1) **Range requests**: server quảng cáo `Accept-Ranges: bytes`; client gửi `Range: bytes=2147483648-`; server trả **`206 Partial Content`** + `Content-Range: bytes 2147483648-4294967295/4294967296` + `Content-Length` của đoạn.
+      (2) Cần validator để không ghép nhầm 2 phiên bản file: `ETag`/`Last-Modified` + client gửi `If-Range`; file đổi thì server trả `200` full.
+      (3) Range ngoài kích thước → `416 Range Not Satisfiable` + `Content-Range: bytes */<size>`.
+      (4) Dễ nhất: redirect sang **presigned S3 GET / CloudFront** — cả hai hỗ trợ Range sẵn; tự proxy thì phải forward `Range` xuống `GetObjectCommand({ Range })`.
+    followUp: "Your download goes through a Node proxy with `compression()` enabled. What breaks with Range?"
+    redFlags:
+      - "Split the file into zip parts manually"
+      - "Returns 200 with the whole body when a Range header is sent"
+    tags: [download, range, http]
+  - id: scenario-files-004
+    level: easy
+    type: gotcha
+    q: "Users can upload attachments and other users can open them in the browser. Which response headers do you set when serving those files, and why?"
+    hint: |-
+      (1) `Content-Type` do **server** quyết định (từ magic bytes đã verify), không echo từ client.
+      (2) `X-Content-Type-Options: nosniff` → browser không tự "đoán" HTML/script từ nội dung.
+      (3) `Content-Disposition: attachment; filename="invoice.pdf"; filename*=UTF-8''...` cho mọi thứ không phải ảnh an toàn → tải về thay vì render (chặn SVG/HTML chạy script).
+      (4) Serve từ **domain riêng** (vd `usercontent-example.net`, không chung cookie/origin với app) + `Content-Security-Policy: sandbox` / `default-src 'none'` nếu phải inline. Với S3 presigned GET dùng `ResponseContentDisposition` / `ResponseContentType`.
+    followUp: "Why is a separate registrable domain better than a subdomain like `files.app.com`?"
+    redFlags:
+      - "Only checks the file extension on upload"
+      - "Serves uploads from the same origin as the app with the client-provided Content-Type"
+    tags: [security, download, xss]
+  - id: scenario-files-005
+    level: easy
+    type: gotcha
+    q: "Finance asks why the S3 bill for the uploads bucket keeps growing even though `ListObjects` shows only 200 GB. What do you check first?"
+    hint: |-
+      (1) **Incomplete multipart uploads**: part đã upload nhưng chưa `Complete`/`Abort` vẫn tính tiền storage và **không hiện** trong `ListObjects`. Kiểm tra bằng `ListMultipartUploads` hoặc S3 Storage Lens (metric incomplete MPU bytes).
+      (2) Fix: lifecycle rule `AbortIncompleteMultipartUpload` `DaysAfterInitiation: 1–7`.
+      (3) Thủ phạm khác: bucket bật **versioning** → noncurrent versions (cần `NoncurrentVersionExpiration`), object `pending` không bao giờ confirm (lifecycle theo prefix/tag), delete markers.
+      (4) Kèm: request cost (PUT ~ $0.005/1k, GET ~ $0.0004/1k ở us-east-1 — verify) và egress thường lớn hơn storage.
+    example: |-
+      ```json
+      {
+        "Rules": [
+          { "ID": "abort-mpu", "Status": "Enabled", "Filter": {},
+            "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 3 } },
+          { "ID": "expire-pending", "Status": "Enabled",
+            "Filter": { "Tag": { "Key": "status", "Value": "pending" } },
+            "Expiration": { "Days": 1 } }
+        ]
+      }
+      ```
+    followUp: "How would you expire objects that were uploaded but never confirmed, without touching confirmed ones?"
+    verify: true
+    tags: [s3, cost, lifecycle]
+  - id: scenario-files-006
+    level: easy
+    type: compare
+    q: "You need to stream LLM tokens from your backend to a chat UI. SSE or WebSocket? Justify in one minute."
+    hint: |-
+      (1) Luồng là **một chiều** server→client cho mỗi câu hỏi; request của user là một HTTP POST bình thường → **SSE** (hoặc fetch streaming đọc `ReadableStream`) là đủ, đơn giản, đi qua HTTP infra/auth/cookie sẵn có.
+      (2) SSE: `text/event-stream`, tự reconnect, `Last-Event-ID`; nhược: `EventSource` chỉ GET, không set header tuỳ ý → nhiều team dùng `fetch()` + parse SSE thủ công để POST body và gửi `Authorization`.
+      (3) WebSocket khi cần **hai chiều liên tục**: interrupt/cancel giữa chừng qua cùng kênh, voice realtime, collaborative editing.
+      (4) Cả hai đều cần: tắt proxy buffering, heartbeat, và **huỷ upstream LLM call** khi client đóng (tiết kiệm token = tiền).
+    followUp: "The user closes the tab mid-answer. How does your server notice and what must it do?"
+    redFlags:
+      - "WebSocket is always faster so always use it"
+      - "Ignores cancelling the upstream model call"
+    tags: [sse, websocket, llm]
+  - id: scenario-files-007
+    level: easy
+    type: concept
+    q: "In a direct-to-S3 design, why keep an upload row with a status column instead of inserting the file record only after the client says it is done?"
+    hint: |-
+      (1) Cần **ràng buộc key với user/tenant trước khi ký** (key do server sinh, lưu DB) để bước confirm kiểm được "key này là của bạn".
+      (2) Client có thể không bao giờ gọi confirm (đóng tab, crash) → row `pending` + TTL giúp dọn object mồ côi; S3 event có thể đến **trước** confirm.
+      (3) State machine: `pending → uploaded → scanning → ready | rejected | expired`; chỉ `ready` mới được serve/attach vào business entity. Update có điều kiện (`WHERE status='pending'`) để idempotent.
+      (4) Có số liệu vận hành: tỉ lệ upload bỏ dở, thời gian scan, lỗi theo client.
+    example: |-
+      ```sql
+      CREATE TABLE upload (
+        id uuid PRIMARY KEY,
+        tenant_id uuid NOT NULL,
+        owner_id uuid NOT NULL,
+        s3_key text NOT NULL UNIQUE,
+        declared_size bigint NOT NULL,
+        declared_type text NOT NULL,
+        status text NOT NULL CHECK (status IN ('pending','uploaded','scanning','ready','rejected','expired')),
+        sha256 text,
+        created_at timestamptz NOT NULL DEFAULT now()
+      );
+      UPDATE upload SET status = 'uploaded' WHERE id = $1 AND owner_id = $2 AND status = 'pending';
+      ```
+    followUp: "The S3 event arrives before the client calls confirm. Does your state machine handle it?"
+    tags: [upload, state-machine, db]
+  - id: scenario-files-008
+    level: easy
+    type: concept
+    q: "Recite the S3 multipart upload limits, then pick a part size for a 200 GB database backup upload."
+    hint: |-
+      (1) Part: tối thiểu **5 MiB** (trừ part cuối), tối đa **5 GiB**; tối đa **10,000 part**; part number 1–10000. Object tối đa 5 TiB (AWS thông báo nâng lên 50 TB cuối 2025 — verify). Single PUT tối đa 5 GiB; AWS khuyên multipart khi > 100 MB.
+      (2) 200 GB / 10,000 = 20 MB → chọn ≥ **32 MiB** (chừa dư, số part ~6,400).
+      (3) Trade-off: part to → ít request (rẻ hơn), nhưng retry 1 part tốn hơn và buffer RAM lớn hơn (`partSize × queueSize`); part nhỏ → nhiều request, overhead.
+      (4) Song song 4–10 part tuỳ bandwidth; mỗi part có checksum riêng.
+    followUp: "Why is the ETag of a multipart object not the MD5 of the file, and how do you verify integrity then?"
+    verify: true
+    tags: [s3, multipart]
+  - id: scenario-files-009
+    level: medium
+    type: design
+    q: "Walk me through a direct-to-S3 upload flow end to end. What exactly does your confirm endpoint check before marking the file as uploaded?"
+    hint: |-
+      (1) `POST /uploads` → auth, quota, validate size/type **khai báo** → server sinh key `t/<tenant>/<uuid>` → INSERT `pending` → trả presigned POST (hoặc multipart) TTL 5–15 phút.
+      (2) Client upload thẳng S3 (bucket quarantine, không public).
+      (3) `POST /uploads/:id/complete`: row thuộc user + `status='pending'`; `HeadObject(key)` tồn tại; `ContentLength` ≤ limit và ≈ declared; `ContentType`/metadata khớp; (nếu có) checksum khớp giá trị client gửi → `UPDATE ... WHERE status='pending'` → publish job scan.
+      (4) Không tin confirm là đủ: S3 `ObjectCreated` → SQS cũng kích hoạt cùng logic (idempotent) để phòng client không gọi confirm. Magic bytes + AV scan ở worker, chỉ `ready` mới serve.
+    followUp: "Where do you enforce the per-tenant storage quota when bytes never touch your API?"
+    redFlags:
+      - "Confirm endpoint just trusts the key and size sent by the client"
+      - "Makes the bucket public-read so the frontend can display files immediately"
+    tags: [upload, s3, design]
+  - id: scenario-files-010
+    level: medium
+    type: debug
+    q: "Code review: this presigned URL helper is from an old service and is being copied into a new NestJS service. What is wrong with it today?"
+    example: |-
+      ```ts
+      import AWS from "aws-sdk";
+      const s3 = new AWS.S3();
+
+      export async function getUploadUrl(fileName: string) {
+        return s3.getSignedUrlPromise("putObject", {
+          Bucket: "uploads",
+          Key: `videos/${fileName}`,
+          ContentType: "video/mp4",
+          Expires: 3600,
+        });
+      }
+      ```
+    hint: |-
+      (1) **AWS SDK v2** (`aws-sdk`) đã **end-of-support từ 2025-09-08** (maintenance từ 2024-09-08) → không nhận bản vá; dùng v3: `getSignedUrl` từ `@aws-sdk/s3-request-presigner` + `PutObjectCommand`, `expiresIn` (giây).
+      (2) Key lấy từ `fileName` của client → ghi đè file người khác, path lạ, ký tự đặc biệt; phải sinh `uuid` + prefix theo tenant/user, lưu tên gốc vào DB.
+      (3) TTL 1 giờ quá dài cho upload; 5–15 phút là đủ.
+      (4) Presigned PUT **không giới hạn size** → dùng presigned POST với `content-length-range` nếu cần chặn size. Không có auth/quota check trước khi ký.
+    followUp: "The new URL signed with `ContentType` returns `403 SignatureDoesNotMatch` from the browser. Why?"
+    redFlags:
+      - "Only comments on the promise style"
+    verify: true
+    tags: [s3, sdk-v3, debug]
+  - id: scenario-files-011
+    level: medium
+    type: debug
+    q: "Browser multipart upload with presigned part URLs: every part returns 200, but `CompleteMultipartUpload` fails because the ETags array is full of `null`. Here is the bucket CORS config."
+    example: |-
+      ```json
+      [
+        {
+          "AllowedOrigins": ["https://app.example.com"],
+          "AllowedMethods": ["PUT", "POST", "GET"],
+          "AllowedHeaders": ["*"],
+          "MaxAgeSeconds": 3000
+        }
+      ]
+      ```
+    hint: |-
+      (1) Thiếu `"ExposeHeaders": ["ETag"]` → browser chặn JS đọc header `ETag` từ response cross-origin (không phải CORS-safelisted header) → `xhr.getResponseHeader("ETag")` = `null`.
+      (2) Fix: thêm `ExposeHeaders: ["ETag"]` (và `x-amz-checksum-*` nếu dùng checksum). Lưu ý ETag có dấu nháy kép, gửi nguyên văn khi Complete.
+      (3) Cách khác không phụ thuộc CORS: backend gọi `ListParts(uploadId)` để lấy ETag rồi tự `Complete` — cũng là cách để resume.
+      (4) Kiểm thêm: `AllowedOrigins` phải khớp chính xác scheme+host; preflight bị cache `MaxAgeSeconds`.
+    followUp: "Would you let the browser call CompleteMultipartUpload itself or do it server side? Why?"
+    tags: [s3, cors, multipart, debug]
+  - id: scenario-files-012
+    level: medium
+    type: scenario
+    q: "Your thumbnail worker consumes S3 ObjectCreated events via SQS. Ops sees some images processed twice and a few never processed. Explain and fix."
+    hint: |-
+      (1) S3 event notification là **at-least-once**, có thể **trùng** và **không đảm bảo thứ tự**; rất hiếm khi mất nhưng event có thể bị bỏ lỡ nếu config/permission sai hoặc SQS message vào DLQ/hết retention.
+      (2) Xử lý trùng: worker **idempotent** — output key xác định (`thumbs/<uploadId>/256.webp`), `UPDATE upload SET status='ready' WHERE id=$1 AND status IN ('uploaded','scanning')`, hoặc bảng `processed(event_key, version_id/sequencer)`.
+      (3) Không được xử lý: visibility timeout < thời gian xử lý → message quay lại/đến DLQ; bắt lỗi nhưng ack; kiểm DLQ + alarm. Thêm **reconciler** định kỳ: row `uploaded` quá 15 phút chưa `ready` → enqueue lại.
+      (4) Dùng `sequencer` trong event để bỏ event cũ hơn khi cùng key bị ghi đè.
+    followUp: "Why would you prefer EventBridge over direct S3 → SQS notifications, or not?"
+    redFlags:
+      - "S3 events are exactly-once so no dedup is needed"
+    tags: [s3, events, idempotency]
+  - id: scenario-files-013
+    level: medium
+    type: debug
+    q: "A colleague says this NestJS endpoint streams 150 MB uploads to S3 with only ~64 KB of RAM per request. Is that true?"
+    example: |-
+      ```ts
+      @Post("upload")
+      @UseInterceptors(FileInterceptor("file", { limits: { fileSize: 150 * 1024 * 1024 } }))
+      upload(@UploadedFile() file: Express.Multer.File) {
+        return s3.upload({ Bucket, Key: `v/${file.originalname}`, Body: file.stream }).promise();
+      }
+      ```
+    hint: |-
+      (1) **Không**. `FileInterceptor` dùng Multer; không truyền `storage` → **memoryStorage**: toàn bộ file đã nằm trong `file.buffer` **trước khi** handler chạy. `diskStorage` thì ghi ra disk và cho `file.path`. Engine built-in **không populate `file.stream`** → `Body: undefined`.
+      (2) `s3.upload().promise()` là **SDK v2** (end-of-support 2025-09-08); v3 dùng `Upload` từ `@aws-sdk/lib-storage`. Key từ `originalname` = path traversal/ghi đè.
+      (3) Streaming thật: dùng **busboy** trực tiếp (hoặc custom Multer storage engine, nơi `_handleFile` nhận `file.stream`) → `new Upload({ client, params: { Body: fileStream } })`; hoặc Fastify + `@fastify/multipart` `request.file()`.
+      (4) RAM thật khi stream qua lib-storage ≈ `partSize × queueSize` (mặc định 5 MiB × 4 ≈ 20 MB/upload — verify), không phải 64 KB.
+    followUp: "Write the busboy version and show where you enforce the size limit and abort on disconnect."
+    redFlags:
+      - "Agrees it streams because the limit is set"
+      - "Thinks fileSize limit prevents memory buffering"
+    verify: true
+    tags: [nestjs, multer, streaming, debug]
+  - id: scenario-files-014
+    level: medium
+    type: scenario
+    q: "Compliance requires every upload to pass through your backend (inline DLP scan). Show how you stream a multipart upload into S3 without buffering the whole file."
+    hint: |-
+      (1) Parse bằng **busboy** (`limits: { files: 1, fileSize }`), lấy `file` stream ngay khi field đến.
+      (2) Pipe qua Transform kiểm tra (magic bytes, DLP, hash) rồi vào `Upload` của `@aws-sdk/lib-storage` — nó tự chia multipart, backpressure: part queue đầy → không đọc tiếp → busboy pause → socket ngừng đọc.
+      (3) Khi `file.on('limit')` hoặc `req` `close` trước khi xong → `upload.abort()` (gọi `AbortMultipartUpload`) và trả 413/499; không để part rác.
+      (4) Memory ≈ `partSize × queueSize` mỗi upload + buffer của Transform; giới hạn số upload đồng thời mỗi pod (vd 20) để RAM ≤ 20 × 20 MB = 400 MB.
+    example: |-
+      ```ts
+      import busboy from "busboy";
+      import { Upload } from "@aws-sdk/lib-storage";
+      import { PassThrough } from "node:stream";
+
+      app.post("/upload", (req, res) => {
+        const bb = busboy({ headers: req.headers, limits: { files: 1, fileSize: 150 * 1024 * 1024 } });
+        bb.on("file", (_name, file, info) => {
+          const body = new PassThrough();
+          const upload = new Upload({
+            client: s3,
+            params: { Bucket, Key: `q/${crypto.randomUUID()}`, Body: body, ContentType: "application/octet-stream" },
+            partSize: 8 * 1024 * 1024,
+            queueSize: 2,
+          });
+          file.on("limit", () => { upload.abort(); res.status(413).end(); });
+          req.on("close", () => { if (!res.writableEnded) upload.abort(); });
+          file.pipe(body);
+          upload.done().then(() => res.status(201).json({ ok: true })).catch(() => { if (!res.headersSent) res.status(500).end(); });
+        });
+        req.pipe(bb);
+      });
+      ```
+    followUp: "Where does backpressure actually stop the client from sending more bytes — at which layer?"
+    redFlags:
+      - "Writes to /tmp then uploads (without discussing disk limits)"
+      - "No abort path when the client disconnects"
+    verify: true
+    tags: [busboy, lib-storage, streaming]
+  - id: scenario-files-015
+    level: medium
+    type: gotcha
+    q: "You moved to streaming uploads with `@aws-sdk/lib-storage`, but pods still hit 2 GB RSS during peak with ~100 concurrent uploads. Why?"
+    hint: |-
+      (1) `Upload` buffer mỗi part trong RAM để có thể retry/tính checksum: mặc định **partSize 5 MiB × queueSize 4** ≈ 20 MB/upload (verify) → 100 upload ≈ 2 GB. "Stream" ≠ "64 KB".
+      (2) Cộng thêm: TLS buffers, busboy/Transform highWaterMark, retry giữ part cũ.
+      (3) Fix: giảm `queueSize` (1–2) khi nhiều upload đồng thời, cân nhắc partSize ↔ số part; **giới hạn upload đồng thời mỗi pod** (semaphore trước khi đọc body, vượt thì 503 + `Retry-After`); scale ngang theo metric "bytes in-flight".
+      (4) Tốt nhất: đưa upload ra khỏi backend (presigned multipart) — memory API ≈ 0.
+    followUp: "Which metric would you autoscale upload pods on — CPU, memory, or something else?"
+    redFlags:
+      - "Streams always use constant 64 KB memory"
+    verify: true
+    tags: [lib-storage, memory]
+  - id: scenario-files-016
+    level: medium
+    type: gotcha
+    q: "To protect the server, someone wrapped S3 uploads in `new PQueue({ concurrency: 5 })` inside the upload handler. During a spike, memory still explodes. Why doesn't this help?"
+    example: |-
+      ```ts
+      const queue = new PQueue({ concurrency: 5 });
+      app.post("/upload", upload.single("file"), (req, res) => {
+        queue.add(() => uploadToS3(req.file!.buffer)).then(() => res.sendStatus(201));
+      });
+      ```
+    hint: |-
+      (1) PQueue chỉ giới hạn **số job đang chạy**; 500 request vẫn được accept, Multer vẫn đọc **toàn bộ** body vào RAM, rồi file nằm chờ trong queue → memory = 500 × size. Queue còn **kéo dài** thời gian giữ buffer.
+      (2) Admission control phải xảy ra **trước khi đọc body**: đếm upload in-flight/pod, vượt ngưỡng → `503`/`429` + `Retry-After` ngay (client chưa gửi body nếu dùng `Expect: 100-continue`), giới hạn ở nginx (`limit_conn`), ALB/WAF rate limit, và giới hạn trên client (Uppy concurrency).
+      (3) Chuyển sang stream (không buffer) hoặc presigned upload.
+      (4) Nếu vẫn cần queue: bounded queue (reject khi đầy), không unbounded.
+    followUp: "How would you implement a per-pod upload semaphore that also releases correctly when the client disconnects?"
+    redFlags:
+      - "Increase concurrency to 50 so the queue drains faster"
+    tags: [admission-control, concurrency]
+  - id: scenario-files-017
+    level: medium
+    type: scenario
+    q: "Uploads through your API work for small files, but anything above ~6 MB fails in one environment, ~10 MB in another, and ~1 GB uploads fail after exactly 60 seconds in a third. Map each symptom to a layer."
+    hint: |-
+      (1) **~6 MB** → Lambda: payload sync invoke 6 MB request/response (verify) — base64 còn làm file nhỏ hơn ~4.5 MB đã fail.
+      (2) **~10 MB** → API Gateway payload limit 10 MB (REST và HTTP API — verify).
+      (3) **60 s** → ALB **idle timeout mặc định 60 s** (hoặc nginx `proxy_read_timeout`/`client_body_timeout` 60 s): khi nginx `proxy_request_buffering on` buffer hết body mới gửi upstream, hoặc backend im lặng quá lâu. Node `server.requestTimeout` mặc định 300 s (Node 18+ — verify) cũng có thể cắt.
+      (4) Fix đúng: cả 3 → **presigned upload** thẳng S3. Nếu buộc phải qua: tăng idle timeout có kiểm soát, `proxy_request_buffering off`, `client_max_body_size` hợp lý (mặc định 1m).
+    followUp: "Why is raising every timeout to 1 hour a bad idea?"
+    redFlags:
+      - "Blames the network and asks users to retry"
+    verify: true
+    tags: [limits, lambda, api-gateway, alb]
+  - id: scenario-files-018
+    level: medium
+    type: gotcha
+    q: "Your upload API accepts only PNG/JPEG. It checks the extension and the `Content-Type` header. A pentester still uploads an HTML file. How, and what do you do instead?"
+    hint: |-
+      (1) Extension và `Content-Type` (cả header multipart part) đều do client đặt → giả mạo trivial: `evil.png` với `Content-Type: image/png` chứa `<script>`.
+      (2) Sniff **magic bytes** (vd lib `file-type` đọc ~4 KB đầu): PNG `89 50 4E 47 0D 0A 1A 0A`, JPEG `FF D8 FF`. Allowlist theo format thật.
+      (3) Magic bytes vẫn chưa đủ (polyglot: file vừa là JPEG vừa chứa HTML/JS) → **re-encode** bằng `sharp` sang format chuẩn, strip metadata; serve với `Content-Type` từ server + `nosniff` + domain riêng.
+      (4) Với presigned upload: sniff ở worker sau khi upload, object ở quarantine tới khi pass.
+    example: |-
+      ```ts
+      import { fileTypeFromBuffer } from "file-type"; // ESM-only
+
+      const head = await readFirstBytes(s3Stream, 4100);
+      const ft = await fileTypeFromBuffer(head);
+      if (!ft || !["image/png", "image/jpeg"].includes(ft.mime)) throw new RejectedUpload("type");
+      ```
+    followUp: "How do you sniff magic bytes in a streaming pipeline without buffering the whole file?"
+    redFlags:
+      - "Validate with a regex on the filename"
+    verify: true
+    tags: [validation, security, magic-bytes]
+  - id: scenario-files-019
+    level: medium
+    type: scenario
+    q: "A support ticket shows that opening a user-uploaded SVG avatar in a new tab runs JavaScript on your app domain. Walk through the fix."
+    hint: |-
+      (1) SVG là XML có thể chứa `<script>`, `onload=`, `<foreignObject>` HTML → mở trực tiếp (top-level navigation) trên origin app = **stored XSS**, đọc được cookie/localStorage/CSRF token. (`<img src=svg>` không chạy script, nhưng mở tab thì có.)
+      (2) Ngay: serve uploads từ **domain riêng** (không chung site/cookie), `Content-Disposition: attachment` cho SVG, `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; sandbox`, `X-Content-Type-Options: nosniff`.
+      (3) Gốc: không cho SVG làm avatar hoặc **rasterize** sang PNG/WebP bằng `sharp`; nếu phải giữ SVG thì sanitize (DOMPurify với profile SVG) — nhưng rasterize an toàn hơn.
+      (4) Rà lại các type khác: HTML, XML, PDF có JS, `.html` đổi tên.
+    followUp: "Why is `Content-Type: image/svg+xml` plus CSP on the same domain still weaker than a separate domain?"
+    redFlags:
+      - "Strip the word script with a regex"
+    tags: [security, svg, xss]
+  - id: scenario-files-020
+    level: medium
+    type: debug
+    q: "This on-prem file service writes uploads to disk. Find the vulnerability and fix it."
+    example: |-
+      ```ts
+      import path from "node:path";
+      import fs from "node:fs";
+
+      bb.on("file", (_field, file, info) => {
+        const target = path.join("/data/uploads", req.user.tenantId, info.filename);
+        file.pipe(fs.createWriteStream(target));
+      });
+      ```
+    hint: |-
+      (1) **Path traversal**: `info.filename` = `../../../etc/cron.d/x` hoặc `..\\..\\` → `path.join` chuẩn hoá và thoát khỏi thư mục tenant, ghi đè file hệ thống / file tenant khác.
+      (2) Còn: trùng tên ghi đè file cũ, tên chứa null byte/ký tự điều khiển/Unicode RTL, không giới hạn size (đầy disk), `.pipe` không xử lý lỗi (file dở dang không bị xoá).
+      (3) Fix: **không dùng tên client làm path** — `const target = path.join(base, tenantId, crypto.randomUUID())`; lưu `originalName` đã sanitize vào DB để hiển thị/`Content-Disposition`; nếu buộc dùng tên thì `path.resolve` rồi kiểm `startsWith(base + path.sep)`.
+      (4) `await pipeline(file, fs.createWriteStream(target, { flags: "wx" }))` + xoá file khi lỗi hoặc `file.truncated`.
+    followUp: "The same bug in a zip extraction feature has a name. What is it and how do you prevent it?"
+    redFlags:
+      - "Replace '../' with '' once (bypassable with '....//')"
+    tags: [path-traversal, security, debug]
+  - id: scenario-files-021
+    level: medium
+    type: scenario
+    q: "Customers download private invoices (PDF). Currently the API reads from S3 and returns the bytes. Traffic is growing. How do you redesign, and what about links that get forwarded?"
+    hint: |-
+      (1) API chỉ **kiểm quyền rồi ký presigned GET** TTL ngắn (30–300 s) và trả `302`/JSON URL; bytes đi thẳng S3 (hoặc CloudFront signed URL để có cache edge + WAF).
+      (2) Đặt `ResponseContentDisposition: attachment; filename="INV-2026-001.pdf"` và `ResponseContentType` khi ký → tên file đúng, không render lạ.
+      (3) Link bị forward: trong TTL thì **ai cũng dùng được** (bearer URL) → TTL ngắn, ký ngay khi user bấm (không nhúng sẵn trong email), không log full URL, CloudFront có thể giới hạn IP (custom policy) nếu cần.
+      (4) Audit: log sự kiện "signed download" (user, object, time) ở API vì S3 không biết user là ai (bật S3 server access log/CloudTrail data events nếu cần).
+    followUp: "Your presigned URLs sometimes expire after 1 hour even though you set 12 hours. Why?"
+    redFlags:
+      - "Make invoices public with unguessable UUID keys and no expiry"
+    tags: [download, presigned-get, security]
+  - id: scenario-files-022
+    level: medium
+    type: debug
+    q: "A download proxy endpoint makes memory spike when users fetch 2 GB exports, and aborted downloads keep S3 connections busy. Review it."
+    example: |-
+      ```ts
+      app.get("/exports/:id/download", async (req, res) => {
+        const obj = await s3.send(new GetObjectCommand({ Bucket, Key: keyFor(req.params.id) }));
+        const bytes = await obj.Body!.transformToByteArray();
+        res.setHeader("Content-Type", "application/zip");
+        res.send(Buffer.from(bytes));
+      });
+      ```
+    hint: |-
+      (1) `transformToByteArray()` đọc **toàn bộ** 2 GB vào RAM (và `Buffer.from` có thể copy thêm lần nữa) → OOM; còn vượt giới hạn Buffer tối đa ở vài version.
+      (2) Fix: stream — `await pipeline(obj.Body as Readable, res)` (từ `node:stream/promises`); `pipeline` destroy S3 body khi client abort → trả socket về pool. `.pipe()` thì **không** destroy source khi `res` đóng → socket S3 treo tới timeout, pool cạn (`maxSockets`).
+      (3) Forward `Range` → `GetObjectCommand({ Range })`, trả `206` + `Content-Range`; set `Content-Length` từ `ContentLength`, `ETag`, `Content-Disposition`.
+      (4) Tốt hơn nữa: không proxy — redirect sang presigned GET/CloudFront.
+    followUp: "How do you log a failed download when the error happens after headers were already sent?"
+    redFlags:
+      - "Increase the pod memory"
+      - "Use res.write in a loop without checking the return value"
+    tags: [download, streaming, debug]
+  - id: scenario-files-023
+    level: medium
+    type: compare
+    q: "For private content, compare S3 presigned GET, CloudFront signed URLs and CloudFront signed cookies. Which do you use for a private HLS course video?"
+    hint: |-
+      (1) **S3 presigned GET**: ký bằng IAM credential, 1 URL = 1 object, không cache edge, tối đa 7 ngày (ngắn hơn nếu temp creds). Hợp: file đơn lẻ, ít traffic.
+      (2) **CloudFront signed URL**: ký bằng key pair của **key group** (không dùng root key cũ), canned policy (1 URL, hết hạn) hoặc custom policy (wildcard path, IP range, start time); có cache edge, OAC khoá bucket.
+      (3) **Signed cookies**: 1 lần set cookie cho cả path `/courses/42/*` → hợp **HLS/DASH** vì playlist tham chiếu hàng trăm segment `.ts`/`.m4s`, không thể ký từng URL trong manifest (hoặc phải rewrite manifest).
+      (4) Trade-off: cookie cần domain CloudFront là subdomain của site (cookie domain), CORS/`SameSite`; URL dễ share hơn → TTL ngắn.
+    followUp: "How would you revoke access for a user whose subscription ended five minutes ago?"
+    tags: [cloudfront, signed-url, hls]
+  - id: scenario-files-024
+    level: medium
+    type: scenario
+    q: "Users upload 5 GB raw footage from a browser. The upload dies at 80% when the laptop sleeps and they must start over. Design resumable uploads on S3."
+    hint: |-
+      (1) Server `CreateMultipartUpload` → lưu `uploadId`, key, part size, owner vào DB (row `uploading`).
+      (2) Client xin presigned URL **từng part** (hoặc theo batch) → PUT song song 3–6 part, retry từng part với backoff; lưu progress local (IndexedDB: `uploadId`, part đã xong).
+      (3) Resume: client gửi `uploadId` → server gọi **`ListParts`** (nguồn sự thật, không tin client) → trả part còn thiếu → tiếp tục. File phải là **cùng file** (so kích thước + `lastModified` + hash vài MB đầu).
+      (4) Xong: server `CompleteMultipartUpload` với danh sách `{PartNumber, ETag}`; lifecycle `AbortIncompleteMultipartUpload` dọn upload bỏ dở; presigned part TTL ngắn nhưng xin lại được.
+    followUp: "Would you use tus instead? What changes on the server side?"
+    redFlags:
+      - "Store the whole file in localStorage to resume"
+    tags: [multipart, resumable, upload]
+  - id: scenario-files-025
+    level: medium
+    type: debug
+    q: "An export endpoint tries to stream a JSON array of 1M orders. Clients get invalid JSON, and sometimes the server logs `write after end`. What's wrong?"
+    example: |-
+      ```ts
+      app.get("/orders/export", (req, res) => {
+        const stream = db.streamOrders();
+        res.write("[");
+        stream.on("data", (row) => {
+          res.write(JSON.stringify(row));
+        });
+        res.end("]");
+      });
+      ```
+    hint: |-
+      (1) `res.end("]")` chạy **ngay** (đồng bộ) trước khi event `data` nào tới → mọi `write` sau đó là `write after end`.
+      (2) Không có dấu phẩy giữa các object → JSON không hợp lệ; không kiểm `res.write()` trả `false` → không backpressure, buffer phình; không xử lý lỗi DB giữa chừng hay client abort.
+      (3) Fix: dùng **NDJSON** (`application/x-ndjson`, mỗi dòng 1 object) qua `pipeline(dbStream, toNdjson, res)`; hoặc nếu phải là JSON array thì Transform tự chèn `[`, `,`, `]` ở `transform`/`flush`.
+      (4) Lỗi giữa chừng sau khi đã gửi 200 → không đổi status được: `res.destroy(err)` để client thấy connection bị cắt, hoặc ghi dòng trailer `{"error":...}`; export rất lớn → background job + file S3.
+    followUp: "How does the client parse NDJSON incrementally with `fetch`?"
+    tags: [ndjson, streaming, debug]
+  - id: scenario-files-026
+    level: medium
+    type: scenario
+    q: "Your dashboard uses SSE. Users with 7 tabs open say the 7th tab never loads anything, and after a deploy all clients miss events that happened during the restart. Explain both."
+    hint: |-
+      (1) **HTTP/1.1**: browser giới hạn ~**6 connection/host** (Chrome/Firefox); mỗi SSE giữ 1 connection mãi → tab thứ 7 (và cả XHR khác tới cùng host) bị treo. Fix: HTTP/2 (multiplex, mặc định ~100 stream) ở edge, hoặc 1 connection chia sẻ giữa các tab (`SharedWorker`/`BroadcastChannel`).
+      (2) Mất event khi restart: SSE tự reconnect và gửi header **`Last-Event-ID`** chỉ khi server đã gửi `id:` cho mỗi event. Server phải lưu event gần đây (Redis Stream/DB, vd 5 phút) và **replay từ id đó**; gap quá xa → gửi snapshot.
+      (3) Gửi `retry: 3000` để điều khiển reconnect; thêm jitter phía server để tránh reconnect storm sau deploy.
+      (4) Heartbeat comment `: ping\n\n` mỗi 15–30 s để proxy/LB không cắt idle (ALB 60 s).
+    example: |-
+      ```text
+      retry: 3000
+      id: 1842
+      event: order-updated
+      data: {"orderId":"o_1","status":"shipped"}
+
+      : ping
+      ```
+    followUp: "How do you replay events per user fairly without loading the whole event history on every reconnect?"
+    verify: true
+    tags: [sse, reconnect, http2]
+  - id: scenario-files-027
+    level: medium
+    type: design
+    q: "While streaming an upload to S3 you must compute a SHA-256, count bytes, and reject non-PDF files based on the first bytes. Design the Transform stream."
+    hint: |-
+      (1) Một `Transform` (hoặc 2 nhỏ) nằm giữa source và `Upload`: trong `transform(chunk, enc, cb)` → `hash.update(chunk)`, `bytes += chunk.length`; khi chưa đủ 5 byte đầu thì gom vào buffer nhỏ, đủ rồi kiểm `%PDF-` → sai thì `cb(new Error("type"))` → `pipeline` huỷ toàn bộ + `upload.abort()`.
+      (2) Vượt size → `cb(err)` ngay (không đợi hết file). `flush(cb)` → ghi `sha256` ra ngoài (event/closure) để lưu DB.
+      (3) Phải gọi `cb` **đúng 1 lần** mỗi chunk; không làm async không await trong transform (mất backpressure). Không cần object mode — đây là byte stream.
+      (4) SHA-256 trên CPU ~ vài trăm MB/s mỗi core → 1 GB tốn vài giây CPU; nhiều upload đồng thời cân nhắc S3 checksum (`ChecksumAlgorithm: "SHA256"`/CRC32) thay vì tự hash.
+    example: |-
+      ```ts
+      import { Transform } from "node:stream";
+      import { createHash } from "node:crypto";
+
+      export function inspect(maxBytes: number) {
+        const hash = createHash("sha256");
+        let seen = 0; let head = Buffer.alloc(0); let checked = false;
+        const t = new Transform({
+          transform(chunk: Buffer, _enc, cb) {
+            seen += chunk.length;
+            if (seen > maxBytes) return cb(new Error("too_large"));
+            if (!checked) {
+              head = Buffer.concat([head, chunk]).subarray(0, 5);
+              if (head.length >= 5) {
+                checked = true;
+                if (head.toString("latin1") !== "%PDF-") return cb(new Error("not_pdf"));
+              }
+            }
+            hash.update(chunk);
+            cb(null, chunk);
+          },
+          flush(cb) { t.emit("digest", hash.digest("hex"), seen); cb(); },
+        });
+        return t;
+      }
+      ```
+    followUp: "If the Transform errors, what exactly happens to the S3 multipart upload that is in progress?"
+    tags: [transform, streams, checksum]
+  - id: scenario-files-028
+    level: medium
+    type: scenario
+    q: "Product wants a progress bar, a cancel button, and automatic retry for large browser uploads. How do you implement each?"
+    hint: |-
+      (1) **Progress**: `fetch()` chưa có upload progress event chuẩn → dùng `XMLHttpRequest.upload.onprogress` (loaded/total), hoặc với multipart tự cộng bytes của part đã xong + part đang chạy. `lib-storage` phía Node có `httpUploadProgress`.
+      (2) **Cancel**: `AbortController` (fetch) / `xhr.abort()` cho request đang chạy + gọi API huỷ → server `AbortMultipartUpload`, row `cancelled`.
+      (3) **Retry**: theo **part**, exponential backoff + jitter, giới hạn số lần; lỗi 4xx (403 URL hết hạn) → xin URL mới rồi retry; 5xx/network → retry. Idempotent vì PUT cùng part number ghi đè.
+      (4) Integrity: gửi checksum mỗi part (`Content-MD5` hoặc `x-amz-checksum-crc32` ký trong URL) để S3 reject part hỏng. Thư viện sẵn: Uppy (`@uppy/aws-s3` multipart, tus).
+    followUp: "Progress hits 100% but the server says the file is not ready for another 40 seconds. How do you communicate that state to the user?"
+    verify: true
+    tags: [ux, progress, retry]
+  - id: scenario-files-029
+    level: hard
+    type: scenario
+    q: "An exam platform: 5,000 students submit 50-200 MB project archives in the last 10 minutes before a hard 23:59 deadline. Last term the API fell over at 23:55. What do you change?"
+    hint: |-
+      (1) Tính: 5,000 × ~100 MB = 500 GB trong 10 phút ≈ **830 MB/s ≈ 6.7 Gbps** vào. Không API fleet nào nên gánh bytes này → **presigned multipart thẳng S3** (S3 scale theo prefix: ~3,500 PUT/s mỗi prefix — verify; key có prefix phân tán).
+      (2) Deadline công bằng: ghi `submitted_at` **lúc cấp presigned URL/khởi tạo upload** (server time), cho phép hoàn tất muộn thêm N phút; không để deadline phụ thuộc vào tốc độ mạng lúc 23:59.
+      (3) API chỉ còn phần nhẹ: sign, confirm (`HeadObject`), ghi DB — vẫn cần rate limit per user, connection pool DB đủ cho ~vài trăm confirm/s, retry idempotent (idempotency key theo `uploadId`).
+      (4) Scan/giải nén/chấm điểm qua queue, worker autoscale theo queue depth; load test trước với profile burst; dashboard: sign QPS, complete fail rate, queue lag.
+    followUp: "A student claims they clicked submit at 23:58 but your system shows no upload. What evidence do you have and what would you add?"
+    redFlags:
+      - "Scale API pods to 200 so they can receive the files"
+      - "Extends the deadline without addressing the architecture"
+    verify: true
+    tags: [capacity, upload, burst]
+  - id: scenario-files-030
+    level: hard
+    type: debug
+    q: "A 'Download all as ZIP' endpoint streams thousands of S3 objects with archiver. Users report corrupted ZIPs, and memory climbs on large folders. Review it."
+    example: |-
+      ```ts
+      app.get("/folders/:id/zip", async (req, res) => {
+        const keys = await listKeys(req.params.id); // 8,000 keys
+        const archive = archiver("zip");
+        archive.pipe(res);
+        for (const key of keys) {
+          const obj = await s3.send(new GetObjectCommand({ Bucket, Key: key }));
+          archive.append(obj.Body as Readable, { name: key });
+        }
+        archive.finalize();
+      });
+      ```
+    hint: |-
+      (1) Vòng `for` mở **8,000 GetObject gần như cùng lúc** (append chỉ xếp hàng, archiver đọc tuần tự) → 8,000 socket/stream mở, pool SDK cạn, S3 timeout body chưa đọc → entry hỏng; memory giữ buffer của từng body.
+      (2) Không lắng nghe `archive.on("error")`/`"warning"`; lỗi giữa chừng sau khi đã gửi `200` → client nhận zip **cụt** mà không biết (không có `Content-Length`). Phải `res.destroy(err)` để browser báo lỗi mạng thay vì lưu file hỏng.
+      (3) Fix: mở object **lười** — chỉ `GetObject` khi entry trước xong (append theo event `entry`, hoặc stream factory), giới hạn song song 1–4; `archiver("zip", { zlib: { level: 0 } })` cho file đã nén (jpg, mp4) để tiết kiệm CPU; `req.on("close")` → `archive.abort()`; `name` sanitize (không `../`). Tổng > 4 GB hoặc > 65,535 entry cần ZIP64 (archiver `forceZip64` — verify).
+      (4) Folder lớn: **async job** tạo zip lên S3 (multipart) rồi gửi presigned link — resume được, không giữ connection hàng chục phút.
+    followUp: "How would you tell the user which files failed without breaking the whole archive?"
+    redFlags:
+      - "Wrap it in try/catch and send res.status(500) (headers already sent)"
+    verify: true
+    tags: [zip, archiver, streaming, debug]
+  - id: scenario-files-031
+    level: hard
+    type: scenario
+    q: "Uploads stream through your backend into S3. After a week, `ListMultipartUploads` shows 40,000 in-progress uploads and pods show growing socket counts. What is leaking?"
+    hint: |-
+      (1) Client ngắt giữa chừng (mobile, tab đóng) → `req` emit `aborted`/`close`, nhưng code chỉ `file.pipe(body)` → `Upload.done()` treo hoặc reject mà **không `abort()`** → multipart dở dang ở S3 + socket tới S3 giữ tới timeout.
+      (2) Chứng minh: correlate log `req close before finish` với `CreateMultipartUpload` không có `Complete`/`Abort`; metric active sockets của SDK agent; `ListMultipartUploads` theo thời gian tạo.
+      (3) Fix: `pipeline(file, inspect, body)` + `req.once("close", () => !done && upload.abort())`, abort cả khi validate fail; set `requestHandler` timeout cho S3 client; **lifecycle `AbortIncompleteMultipartUpload`** làm lưới an toàn (1–3 ngày).
+      (4) Test: integration test cắt connection giữa chừng (`req.destroy()` ở client) và assert không còn upload in-progress.
+    followUp: "How do you distinguish in logs and metrics between a client abort and a server-side failure?"
+    redFlags:
+      - "Only relies on the lifecycle rule and ignores the socket leak"
+    tags: [abort, multipart, leak]
+  - id: scenario-files-032
+    level: hard
+    type: debug
+    q: "Your streaming upload enforces a 50 MB limit with busboy, yet 200 MB files end up in S3 as 50 MB objects and are marked ready. Why?"
+    example: |-
+      ```ts
+      const bb = busboy({ headers: req.headers, limits: { fileSize: 50 * 1024 * 1024 } });
+      bb.on("file", (_n, file) => {
+        const upload = new Upload({ client: s3, params: { Bucket, Key: key, Body: file } });
+        upload.done().then(() => markReady(key)).then(() => res.sendStatus(201));
+      });
+      req.pipe(bb);
+      ```
+    hint: |-
+      (1) Khi chạm `fileSize`, busboy **không lỗi**: nó emit `'limit'`, đặt `file.truncated = true`, rồi **kết thúc stream bình thường** → `Upload` thấy EOF, `Complete` một object 50 MB cắt cụt → hỏng nhưng được đánh dấu ready.
+      (2) Fix: `file.on("limit", () => { upload.abort(); file.resume(); reply 413 })`, và trước `markReady` kiểm `file.truncated`. Không tin `Content-Length` header (có thể thiếu với chunked, hoặc nói dối) — nhưng dùng nó để **reject sớm** nếu > limit trước khi đọc body.
+      (3) `@fastify/multipart` mặc định `throwFileSizeLimit: true` → ném `RequestFileTooLargeError` (verify); Multer ném `LIMIT_FILE_SIZE` — mỗi lib hành xử khác, phải đọc docs.
+      (4) Chặn thêm ở nginx `client_max_body_size` để bytes vượt không tới Node.
+    followUp: "The client sends Expect: 100-continue. How can you reject an oversized upload before any body bytes are sent?"
+    redFlags:
+      - "Assumes hitting the limit throws an error automatically"
+    verify: true
+    tags: [busboy, limits, debug]
+  - id: scenario-files-033
+    level: hard
+    type: scenario
+    q: "Users can upload a ZIP of product images that your worker extracts. A 40 KB upload just filled a worker's 20 GB disk. What happened and how do you harden extraction?"
+    hint: |-
+      (1) **Zip bomb**: nén tỉ lệ cực cao (hoặc zip lồng zip, overlapping entries) → 40 KB giải ra hàng GB/TB. Kèm rủi ro **zip slip** (`../../` trong tên entry), symlink entry, hàng triệu entry nhỏ (inode).
+      (2) Không tin header `uncompressedSize` trong central directory (giả được) → đếm **bytes thực sự giải ra** khi stream, dừng khi vượt tổng (vd 500 MB), giới hạn **số entry** (vd 1,000), **ratio** (vd > 100:1 → reject), không giải đệ quy archive lồng, không theo symlink.
+      (3) Mỗi entry: sanitize path (resolve + kiểm prefix), ghi vào thư mục tạm riêng với quota, hoặc stream thẳng từng entry lên S3 thay vì disk; chạy trong container giới hạn disk/memory/time (ephemeral storage limit).
+      (4) Cũng áp dụng cho `Content-Encoding: gzip` request body và ảnh (decompression bomb pixel) — giới hạn bytes sau giải nén.
+    followUp: "Your API accepts gzip-compressed JSON request bodies. Where is the same bomb risk and how do you cap it?"
+    redFlags:
+      - "Check the ZIP file size before extracting and call it safe"
+    tags: [zip-bomb, security, validation]
+  - id: scenario-files-034
+    level: hard
+    type: scenario
+    q: "Your thumbnail worker (sharp) occasionally OOMs on a 2 MB PNG, and users complain their uploaded photos reveal their home location. Address both."
+    hint: |-
+      (1) **Decompression bomb ảnh**: PNG 2 MB có thể khai báo 50,000 × 50,000 px → decode = 50k×50k×4 byte ≈ **10 GB**. `sharp` có `limitInputPixels` (mặc định ~268 MP = 16383×16383 — verify) → đặt thấp hơn theo nghiệp vụ (vd 40 MP) và đọc `metadata()` trước khi resize.
+      (2) **EXIF GPS**: ảnh điện thoại chứa toạ độ, model máy, thời gian. Re-encode bằng sharp **mặc định bỏ metadata** (trừ khi gọi `withMetadata()`/`keepMetadata()`), nhưng nhớ áp `rotate()` theo EXIF orientation trước khi bỏ.
+      (3) Re-encode (sang WebP/AVIF/JPEG mới) cũng phá **polyglot** và payload giấu trong chunk lạ; serve bản re-encode, giữ bản gốc ở bucket private (hoặc xoá).
+      (4) Worker: giới hạn concurrency sharp (`sharp.concurrency`, UV threadpool), memory limit container, timeout mỗi job, message quá hạn → DLQ.
+    followUp: "Should you keep the original upload after generating the sanitized version? Consider legal, cost, and security."
+    redFlags:
+      - "Strip EXIF on the client and trust it"
+    verify: true
+    tags: [images, sharp, exif, security]
+  - id: scenario-files-035
+    level: hard
+    type: design
+    q: "Design malware scanning for user uploads so that nothing is downloadable before it is scanned, and explain what happens when the scanner is down for an hour."
+    hint: |-
+      (1) Upload vào **bucket quarantine** (không ai GET trực tiếp được, chỉ worker); row `uploaded`. Event → queue → scanner (ClamAV trên ECS/Lambda container, hoặc GuardDuty Malware Protection for S3 — verify phạm vi/giá) → sạch: copy sang bucket `clean` + `status='ready'`; bẩn: tag `infected`, chuyển bucket `quarantine-infected`, notify, audit.
+      (2) API chỉ ký GET cho row `ready` → không có đường tắt (kể cả UI preview).
+      (3) Scanner down: message nằm trong queue (retention đủ dài, vd 4 ngày), status `scanning` hiển thị "đang kiểm tra" cho user; **fail closed** (không tự chuyển ready); alarm theo queue age; khi phục hồi worker autoscale xả backlog; message lỗi lặp → DLQ + manual review.
+      (4) Chi tiết: signature DB update thường xuyên (freshclam), giới hạn size scan (file > giới hạn scanner → policy riêng), archive lồng, timeouts; rescan định kỳ file cũ khi có signature mới là tuỳ chọn.
+    followUp: "Business asks to show the file immediately to the uploader while the scan runs. Is there a safe way?"
+    redFlags:
+      - "Scan synchronously in the upload request for 1 GB files"
+      - "Fail open: mark ready if the scanner times out"
+    verify: true
+    tags: [malware, security, pipeline]
+  - id: scenario-files-036
+    level: hard
+    type: debug
+    q: "An import pipeline reads a CSV stream and inserts rows. Memory grows linearly and the DB pool is exhausted, even though it 'uses streams'. Find the bug."
+    example: |-
+      ```ts
+      const toDb = new Transform({
+        objectMode: true,
+        transform(row, _enc, cb) {
+          db.insert("items", row); // returns a Promise
+          cb();
+        },
+      });
+      await pipeline(fs.createReadStream(file), csvParser(), toDb, new Writable({ objectMode: true, write(_c, _e, cb) { cb(); } }));
+      ```
+    hint: |-
+      (1) `transform` gọi `cb()` **ngay** mà không await insert → stream nghĩ chunk đã xử lý xong → đọc tiếp tốc độ disk → hàng trăm nghìn Promise insert đang chờ, pool DB (vd 10 connection) cạn, query xếp hàng trong RAM → **mất backpressure**. Promise reject còn bị nuốt (unhandled rejection).
+      (2) Fix: `async transform(row, _e, cb) { try { await db.insert(...); cb(); } catch (e) { cb(e); } }` — hoặc tốt hơn **batch** 500–1,000 row rồi `INSERT ... VALUES (...), (...)`/`COPY FROM STDIN` (Postgres), `flush()` ghi batch cuối.
+      (3) Cách hiện đại: `for await (const batch of batched(parser))` với concurrency giới hạn (p-limit 4).
+      (4) Transform cuối là Writable rỗng → dùng Writable trực tiếp cho sink. Object mode `highWaterMark` mặc định 16 object; đo `process.memoryUsage().rss` + pool wait để chứng minh fix.
+    followUp: "How much faster is COPY than batched INSERT for 5 million rows, and what are its downsides (triggers, error handling)?"
+    redFlags:
+      - "Increase the DB pool size to 200"
+    tags: [streams, backpressure, debug]
+  - id: scenario-files-037
+    level: hard
+    type: gotcha
+    q: "In a Next.js route handler you return an S3 object as a Response. Downloads work, but memory rises under load and cancelled downloads keep S3 connections open. What is going on with Web Streams vs Node streams?"
+    hint: |-
+      (1) Route handler dùng **Web Streams** (`ReadableStream`); SDK v3 trên Node trả `Body` là Node `Readable` (`IncomingMessage`) — bọc sai (vd `new Response(await body.transformToByteArray())`) = buffer toàn bộ; tự viết `new ReadableStream({ start(c) { body.on("data", d => c.enqueue(d)) } })` = **bỏ qua backpressure** (enqueue vô hạn).
+      (2) Đúng: `Readable.toWeb(body)` (tôn trọng pull/backpressure) hoặc `body.transformToWebStream()`; khi client huỷ, `ReadableStream.cancel()` → destroy Node stream → trả socket.
+      (3) Chuyển ngược: `Readable.fromWeb(webStream)`; `pipeline` từ `node:stream/promises` nhận được cả Web streams ở Node mới (verify).
+      (4) Lưu ý runtime Edge không có Node streams/SDK đầy đủ; file lớn vẫn nên redirect presigned URL thay vì proxy qua Next.
+    example: |-
+      ```ts
+      import { Readable } from "node:stream";
+      export async function GET(req: Request) {
+        const obj = await s3.send(new GetObjectCommand({ Bucket, Key }), { abortSignal: req.signal });
+        return new Response(Readable.toWeb(obj.Body as Readable) as ReadableStream, {
+          headers: { "Content-Type": obj.ContentType ?? "application/octet-stream", "Content-Length": String(obj.ContentLength) },
+        });
+      }
+      ```
+    followUp: "Where does `req.signal` fire when the browser cancels, and what does passing it to the SDK change?"
+    verify: true
+    tags: [web-streams, nextjs, streaming]
+  - id: scenario-files-038
+    level: hard
+    type: scenario
+    q: "At market open, your Socket.IO price server's memory jumps from 400 MB to 3 GB and some clients see prices 20 seconds late. Ticks come in at 5,000/s. Diagnose and fix."
+    hint: |-
+      (1) **Slow consumers**: `socket.emit` luôn xếp message vào buffer của từng socket (engine.io `writeBuffer`/TCP send buffer); client mạng yếu đọc chậm → buffer phình, message cũ vẫn gửi theo thứ tự → client thấy giá trễ 20 s. 5,000 tick/s × 10k client = 50M message/s là không khả thi nếu gửi hết.
+      (2) Đo: per-socket buffered bytes (`socket.conn.transport` / ws `bufferedAmount`), event loop lag, message/s outbound, GC.
+      (3) Fix: **conflation** — mỗi client chỉ giữ giá mới nhất mỗi symbol, flush theo nhịp (vd 250 ms) thay vì mỗi tick; `socket.volatile.emit` (bỏ nếu không gửi được); chỉ gửi symbol client subscribe (room theo symbol); ngưỡng buffer vượt → drop/disconnect client chậm; payload nhỏ (delta, số thay vì chuỗi, binary/msgpack parser).
+      (4) Giá realtime là dữ liệu "last value wins" → drop an toàn; **order/fill events thì không** → kênh riêng có seq và replay.
+    followUp: "Which data on this platform can be dropped or coalesced, and which must be delivered exactly in order? How do you separate them?"
+    redFlags:
+      - "Add more RAM and a bigger instance"
+      - "Queue every tick per client in Redis"
+    verify: true
+    tags: [socketio, backpressure, realtime]
+  - id: scenario-files-039
+    level: hard
+    type: design
+    q: "After a WiFi drop of 30 seconds, a trading client reconnects and shows a wrong account balance until refresh. Design reconnect and resync."
+    hint: |-
+      (1) Mỗi stream (per account / per symbol) có **sequence number** tăng đơn điệu từ nguồn (không phải từ từng gateway node). Client lưu `lastSeq`.
+      (2) Reconnect: gửi `{ stream, lastSeq }` → server replay từ buffer (Redis Stream/Kafka, giữ vài phút) nếu gap nhỏ; gap lớn hoặc buffer đã trôi → gửi **snapshot** (balance hiện tại + seq) rồi delta tiếp. Client **bỏ delta có seq ≤ snapshot.seq**, phát hiện gap (seq nhảy) → xin resync.
+      (3) Socket.IO v4.6+ có **Connection State Recovery** (khôi phục room + missed packets trong `maxDisconnectionDuration`) nhưng phụ thuộc adapter (Redis Streams adapter hỗ trợ, adapter Redis pub/sub thường không — verify) và không thay thế seq ở tầng business.
+      (4) UI: đánh dấu "stale" khi mất kết nối > N giây, reconnect backoff + jitter để tránh reconnect storm khi gateway restart.
+    followUp: "Your gateway restarts and 100k clients reconnect within 2 seconds. What protects the backend snapshot service?"
+    redFlags:
+      - "Rely on Socket.IO auto-reconnect alone"
+      - "Send the full state on every message"
+    verify: true
+    tags: [socketio, reconnect, sequence]
+  - id: scenario-files-040
+    level: hard
+    type: scenario
+    q: "You scaled a Socket.IO cluster from 4 to 40 nodes with the Redis adapter, but Redis CPU is at 100% and per-node CPU did not drop. Why, and what do you change?"
+    hint: |-
+      (1) Redis adapter (pub/sub) **broadcast mọi emit tới mọi node**: 1 tick × 40 node = 40 lần deliver, mỗi node deserialize rồi mới biết không ai trong room → chi phí tăng tuyến tính theo số node; Redis pub/sub cũng single-threaded cho fan-out.
+      (2) Fix: **sharded pub/sub** (Redis 7 `SPUBLISH`, `@socket.io/redis-adapter` với `createShardedAdapter` — verify) theo channel/room để node chỉ nhận room có subscriber; hoặc thiết kế gateway tự subscribe topic theo symbol (Kafka/NATS subject) chỉ khi có client local.
+      (3) Giảm lượng: conflate ở upstream (gửi 4 update/s/symbol thay vì 50), gom batch nhiều symbol mỗi message.
+      (4) Nhắc: cần sticky session khi dùng HTTP long-polling (hoặc ép `transports: ["websocket"]`), heartbeat, và giới hạn connection/node (~vài chục nghìn tuỳ payload).
+    followUp: "Estimate messages per second through Redis before and after sharding for 2,000 symbols at 10 updates/s."
+    verify: true
+    tags: [socketio, redis-adapter, scale]
+  - id: scenario-files-041
+    level: hard
+    type: scenario
+    q: "Your WebSocket gateway shows 80k connections in metrics but only 30k active users, and some mobile users stop receiving updates without any disconnect event. Explain."
+    hint: |-
+      (1) **Half-open connections**: mobile đổi mạng/NAT timeout, TCP không gửi FIN → server vẫn nghĩ connection sống (tính trong metric, giữ memory, nhận emit vào buffer) còn client đã "chết"; client thì chưa phát hiện nên không reconnect.
+      (2) Cần **heartbeat hai chiều ở tầng application**: Socket.IO có ping/pong (`pingInterval` 25 s, `pingTimeout` 20 s mặc định — verify); ws thuần phải tự ping và `terminate()` nếu không pong. Client phát hiện không nhận ping trong N giây → reconnect.
+      (3) Căn timeout với LB: ALB idle timeout 60 s, nginx `proxy_read_timeout` 60 s mặc định → heartbeat < idle timeout, nếu không LB cắt connection im lặng.
+      (4) Metric: connections vs authenticated active sessions, disconnect reasons, pong latency; TCP keepalive OS (2 giờ mặc định) quá chậm để dựa vào.
+    followUp: "How do you roll out a new gateway version without disconnecting 80k clients at once?"
+    verify: true
+    tags: [websocket, heartbeat, mobile]
+  - id: scenario-files-042
+    level: hard
+    type: scenario
+    q: "Your LLM chat endpoint streams tokens via SSE. In production users see the whole answer appear at once after 20 seconds, and your model bill is higher than the number of completed answers suggests. Investigate."
+    hint: |-
+      (1) Buffering: nginx `proxy_buffering on` (fix: `X-Accel-Buffering: no` hoặc `proxy_buffering off` cho route), `compression()` middleware gom chunk (loại trừ `text/event-stream` hoặc gọi `res.flush()`), CDN/API Gateway buffer response (REST API Gateway không stream — dùng Lambda response streaming/Function URL hoặc ALB — verify).
+      (2) Bill cao: client đóng tab/bấm stop nhưng server **không huỷ** upstream call → model vẫn sinh hết token. Fix: `req.on("close")` → `AbortController.abort()` truyền vào SDK call; log tokens của request bị huỷ.
+      (3) Headers đúng: `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `Connection: keep-alive` (HTTP/1.1), gửi `res.flushHeaders()` sớm, heartbeat comment khi model "suy nghĩ" lâu để LB không cắt.
+      (4) Timeout: idle/total timeout mỗi tầng phải > thời gian sinh dài nhất; retry khi rớt giữa chừng = sinh lại (tốn tiền) → cân nhắc lưu partial output + resume.
+    followUp: "The user reconnects mid-answer. Do you regenerate, replay from a buffer, or show a partial answer? What are the costs?"
+    redFlags:
+      - "Switch to WebSocket and the buffering goes away"
+    verify: true
+    tags: [sse, llm, buffering]
+  - id: scenario-files-043
+    level: hard
+    type: design
+    q: "Video uploads trigger transcoding jobs that take 2-30 minutes. You see the same video transcoded three times and a job that loops forever. Design the job processing properly."
+    hint: |-
+      (1) Nguyên nhân: SQS **visibility timeout** (vd 5 phút) < thời gian transcode → message hiện lại, worker khác lấy → chạy trùng; job luôn crash (file lỗi) → retry vô hạn nếu không có `maxReceiveCount` → DLQ.
+      (2) Fix: gia hạn visibility định kỳ (`ChangeMessageVisibility` heartbeat) hoặc dùng orchestrator (Step Functions, MediaConvert job + EventBridge); **redrive policy** maxReceiveCount 3–5 → DLQ + alarm.
+      (3) **Idempotent**: job key = `uploadId + preset + version`; output key xác định (`hls/<uploadId>/v2/720p/...`); claim job bằng `UPDATE jobs SET status='running', lease_until=now()+interval '10 min' WHERE id=$1 AND (status='queued' OR lease_until < now())`; ghi `ready` chỉ khi mọi rendition xong.
+      (4) Cost/ops: spot instances cho worker, ưu tiên queue (premium vs free), giới hạn độ dài/độ phân giải input, ffprobe validate trước khi transcode.
+    followUp: "How do you reprocess 2 million existing videos with a new preset without starving new uploads?"
+    redFlags:
+      - "Set visibility timeout to 12 hours and move on"
+    verify: true
+    tags: [transcoding, queue, idempotency]
+  - id: scenario-files-044
+    level: hard
+    type: compare
+    q: "Your course platform serves 1080p MP4 files directly with Range requests. Users on slow networks buffer constantly. Why move to HLS/DASH, and what changes in storage and delivery?"
+    hint: |-
+      (1) MP4 progressive: 1 bitrate cố định (vd 5 Mbps) → mạng 2 Mbps thì buffer mãi; seek cần `moov` atom ở đầu (faststart). **ABR (HLS/DASH)**: transcode ra nhiều rendition (240p–1080p), cắt segment 2–6 s, manifest (`.m3u8`/`.mpd`); player chọn bitrate theo bandwidth đo được, đổi giữa chừng.
+      (2) Storage: nhiều rendition ≈ 1.5–2× dung lượng gốc; nhiều object nhỏ → nhiều GET request (rẻ nhưng đếm được); CMAF (fMP4) dùng chung cho HLS + DASH.
+      (3) Delivery: CloudFront cache segment rất tốt (immutable, TTL dài), manifest TTL ngắn nếu live; bảo vệ bằng **signed cookies** (không ký từng segment), DRM nếu cần chống tải.
+      (4) Pipeline: MediaConvert/ffmpeg worker, thumbnails sprite, trạng thái `transcoding → ready`.
+    followUp: "How would you estimate monthly CloudFront egress cost for 10k students watching 2 hours of video per week?"
+    verify: true
+    tags: [hls, video, cdn]
+  - id: scenario-files-045
+    level: hard
+    type: scenario
+    q: "A customer says a 3 GB file downloaded from your platform is corrupt, though the upload succeeded. After upgrading the AWS SDK v3, uploads to your S3-compatible storage in another region also started failing. How do integrity checks fit in?"
+    hint: |-
+      (1) Integrity end-to-end: client tính checksum từng part (`Content-MD5` hoặc `x-amz-checksum-crc32/crc32c/sha256/crc64nvme`) → S3 verify và reject part hỏng; lưu **full-object checksum** (CRC64NVME hỗ trợ full-object cho multipart — verify) hoặc SHA-256 riêng trong DB để client verify khi download.
+      (2) ETag multipart = MD5 của các MD5 part + `-N`, **không** phải MD5 file → đừng so với md5sum.
+      (3) SDK v3 (từ đầu 2025) **mặc định thêm CRC32 checksum** cho upload (`requestChecksumCalculation: "WHEN_SUPPORTED"` — verify) → nhiều S3-compatible (MinIO bản cũ, một số provider) và presigned flow cũ báo lỗi; set `requestChecksumCalculation/responseChecksumValidation: "WHEN_REQUIRED"` cho các endpoint đó.
+      (4) Corrupt khi download: thường do proxy cắt giữa chừng (không có `Content-Length` → client không biết), resume ghép sai phiên bản (thiếu `If-Range`) → kiểm log bytes sent vs size.
+    followUp: "How would you let a customer verify a download themselves?"
+    verify: true
+    tags: [checksum, integrity, sdk-v3]
+  - id: scenario-files-046
+    level: hard
+    type: debug
+    q: "This hand-written Range handler serves videos from disk. Safari refuses to play them and some requests crash the process. Find the bugs."
+    example: |-
+      ```ts
+      app.get("/media/:id", async (req, res) => {
+        const file = pathFor(req.params.id);
+        const { size } = await fs.promises.stat(file);
+        const [s, e] = (req.headers.range ?? "bytes=0-").replace("bytes=", "").split("-");
+        const start = Number(s);
+        const end = e ? Number(e) : size;
+        res.writeHead(206, {
+          "Content-Range": `bytes ${start}-${end}/${size}`,
+          "Content-Length": end - start,
+          "Content-Type": "video/mp4",
+        });
+        fs.createReadStream(file, { start, end }).pipe(res);
+      });
+      ```
+    hint: |-
+      (1) **Off-by-one**: range là **inclusive**; `end` mặc định phải là `size - 1`, `Content-Length = end - start + 1`. `createReadStream` `end` cũng inclusive. Sai → Safari (rất khắt khe, gửi `bytes=0-1` trước) từ chối.
+      (2) Không có `Range` thì phải trả **200** full + `Accept-Ranges: bytes`, không phải 206. Range không hợp lệ/ngoài size (`start >= size`, `bytes=-500` suffix, multi-range `0-1,5-9`) → `416` + `Content-Range: bytes */size`; `Number("abc")` = NaN → createReadStream throw.
+      (3) `.pipe` không xử lý lỗi (ENOENT → crash/unhandled 'error'), không destroy khi client abort → fd leak; dùng `await pipeline(...)` + try/catch.
+      (4) Thêm `ETag`/`Last-Modified`, hỗ trợ `If-Range`; và hỏi: sao không để S3/CloudFront hay `res.sendFile` (có sẵn Range) làm việc này?
+    followUp: "What does the suffix range `bytes=-500` mean, and how should the server answer?"
+    tags: [range, http, debug]
+  - id: scenario-files-047
+    level: senior
+    type: design
+    q: "Design a multi-tenant file service: 1M uploads/day, files up to 5 GB, per-tenant quotas, virus scanning, previews, and tenant data isolation. Walk me through the architecture and the numbers."
+    hint: |-
+      (1) Số: 1M/ngày ≈ 12/s trung bình, peak ×10 ≈ 120 sign/s → API nhẹ; bytes (giả sử avg 20 MB) ≈ 20 TB/ngày → **không qua API**, presigned POST (≤ 100 MB) / multipart presigned (lớn hơn).
+      (2) Thành phần: Upload API (sign, confirm, quota), DB metadata (state machine, partition theo tenant/tháng), S3 quarantine → scan worker → clean bucket, preview/thumbnail workers, CloudFront download với signed URL/cookie, lifecycle (abort MPU, pending expire, IA/Glacier theo tuổi).
+      (3) Isolation: key prefix `t/<tenantId>/`, IAM/bucket policy theo prefix cho worker, mọi query DB có `tenant_id`, KMS key per tenant (tuỳ yêu cầu), không bao giờ nhận key từ client.
+      (4) Quota: reserve ở bước sign (`used + reserved + declared ≤ quota` trong transaction), trừ thật ở confirm theo `HeadObject`, release reservation khi expire. Observability: sign→ready latency, fail rate theo bước, bytes/tenant, cost/tenant.
+    followUp: "One tenant uploads 40% of all bytes and slows scanning for everyone. How do you add fairness?"
+    redFlags:
+      - "Starts with the database schema and never discusses where the bytes flow"
+    tags: [system-design, upload, multi-tenant]
+  - id: scenario-files-048
+    level: senior
+    type: design
+    q: "Users want 'Download all' for project folders up to 50 GB and 100k files. On-the-fly streaming ZIP or asynchronous export? Defend your choice and the edge cases."
+    hint: |-
+      (1) On-the-fly (archiver/`zip-stream`, STORE không nén): không tốn storage, bắt đầu tải ngay; nhược: connection giữ hàng giờ (LB/proxy timeout, deploy cắt ngang), **không resume được** (không có Content-Length/Range), lỗi giữa chừng = file hỏng, chiếm 1 pod.
+      (2) Async export: job → worker stream từng object vào **multipart upload** zip lên S3 → presigned link + email/notification; resume được (Range), cache lại cho lần sau, retry job; nhược: tốn storage tạm (lifecycle 7 ngày), trễ vài phút.
+      (3) Lai: < 1 GB/1k file → stream trực tiếp; lớn hơn → async. Hoặc chia thành nhiều zip ≤ 4 GB (tránh vấn đề ZIP64 trên một số unzip cũ), hoặc cho client tải manifest + desktop sync.
+      (4) Edge: tên file trùng/unicode, file bị xoá trong lúc export (snapshot danh sách + versionId), quyền đổi giữa chừng, cost egress 50 GB × số lần tải.
+    followUp: "How do you make the async export idempotent if the user clicks Download all five times?"
+    verify: true
+    tags: [zip, export, design]
+  - id: scenario-files-049
+    level: senior
+    type: open
+    q: "You inherit a real-time market data service on Socket.IO: 100k clients, 2,000 symbols, p99 latency 3 s at market open, and the cloud bill doubled. You have one quarter. What is your plan?"
+    hint: |-
+      (1) Đo trước: latency theo từng chặng (feed → broker → gateway → client, cần timestamp trong message), outbound msg/s, bytes/client, buffered bytes, Redis adapter traffic, connection churn, cost breakdown (compute vs egress vs Redis).
+      (2) Quick wins: conflation per symbol per client (4–10 Hz), chỉ gửi symbol đã subscribe, payload gọn (delta, binary), bỏ polling fallback nếu client hỗ trợ WS, compression cân nhắc (permessage-deflate tốn CPU/memory mỗi connection).
+      (3) Kiến trúc: tách **market data (lossy, last-value)** khỏi **account events (lossless, seq + replay)**; fan-out theo topic (sharded pub/sub/NATS), gateway stateless với snapshot service; autoscale theo connections + outbound msg/s; drop client chậm.
+      (4) Rủi ro & rollout: shadow traffic, canary theo % client, SLO (p99 < 500 ms), feature flag cho conflation rate; cân nhắc managed (API Gateway WebSocket, vendor pub/sub) với so sánh cost per connection-minute.
+    followUp: "Which metric would convince you the redesign worked, and which would tell you to roll back?"
+    tags: [realtime, socketio, senior]
+  - id: scenario-files-050
+    level: senior
+    type: scenario
+    q: "The S3 + CloudFront bill for user media doubled in three months while stored bytes grew only 20%. Lead the cost investigation."
+    hint: |-
+      (1) Phân rã bill theo usage type (Cost Explorer, CUR): storage theo class, requests (PUT/COPY/POST/LIST vs GET), data transfer out (Internet, cross-region, NAT Gateway!), CloudFront requests/egress, KMS requests.
+      (2) Thủ phạm hay gặp: multipart part size nhỏ (5 MiB) → PUT request tăng; LIST định kỳ của job; download proxy qua EC2 đi **NAT Gateway** (phí xử lý mỗi GB) thay vì VPC gateway endpoint; cache hit ratio CloudFront thấp do query string/cookie vào cache key; presigned S3 GET bỏ qua CDN; noncurrent versions; incomplete MPU; KMS request mỗi object (dùng S3 Bucket Key).
+      (3) Storage class: lifecycle sang Standard-IA sau 30 ngày (tối thiểu 30 ngày + 128 KB billable/object), Intelligent-Tiering (object < 128 KB không auto-tier), Glacier cho archive — tính cả phí retrieval (verify).
+      (4) Guardrails: budget alarms, tag cost theo tenant/feature, Storage Lens dashboard, review hàng tháng.
+    followUp: "Moving thumbnails (20 KB each, 500M objects) to Standard-IA: good or bad idea? Do the math."
+    verify: true
+    tags: [cost, s3, cloudfront]
+  - id: scenario-files-051
+    level: senior
+    type: open
+    q: "For resumable uploads across web, iOS and Android, would you build on raw S3 multipart, adopt the tus protocol, or write your own chunked upload API? What drives the decision?"
+    hint: |-
+      (1) **S3 multipart presigned**: bytes không qua server, rẻ, scale sẵn; nhưng client phải hiểu S3 (ETag, CORS, part rules), lock-in S3 API, logic resume tự viết mỗi platform.
+      (2) **tus**: protocol mở (`POST` create, `HEAD` lấy `Upload-Offset`, `PATCH` gửi tiếp), client lib sẵn (tus-js-client, TUSKit, tus-android), server tusd có S3 backend + hooks (pre-create auth, post-finish) — nhưng bytes đi qua tusd (cần scale fleet đó, bandwidth).
+      (3) **Tự viết**: chỉ khi có yêu cầu đặc biệt (mã hoá E2E theo chunk, dedup content-addressed kiểu Dropbox) — chi phí bảo trì cao nhất.
+      (4) Tiêu chí: ai trả bandwidth, compliance (bytes phải qua mình?), số platform, team size, storage có thể đổi (R2/GCS/MinIO), yêu cầu scan inline.
+    followUp: "How would content-addressed chunking (dedup) change your storage and privacy model?"
+    tags: [tus, resumable, trade-offs]
+  - id: scenario-files-052
+    level: senior
+    type: design
+    q: "On-prem constraint: no direct client-to-storage access, every byte must pass through your Node service for inline encryption. Support 200 concurrent 1 GB uploads on pods with 2 GB RAM. Design it."
+    hint: |-
+      (1) Ngân sách memory: 2 GB pod − ~300 MB baseline → ~1.5 GB cho upload → 200 upload/N pod. Với partSize 8 MB × queueSize 1 + buffer cipher ≈ 10 MB/upload → ~150 upload/pod an toàn → tối thiểu 2 pod + dư (4–6 pod) vì peak/rolling deploy.
+      (2) Pipeline: LB (idle timeout đủ, không buffer body) → nginx `proxy_request_buffering off`, `client_max_body_size 1100m` → busboy → `crypto.createCipheriv('aes-256-gcm')` Transform (GCM auth tag ở cuối, lưu riêng; hoặc envelope encryption với data key từ KMS/Vault per file) → lib-storage tới MinIO/S3-compatible.
+      (3) Admission: semaphore per pod, vượt → `503 Retry-After`; LB least-connections (không round-robin) vì request dài; graceful shutdown chờ upload đang chạy (terminationGracePeriod dài hoặc drain + client resume).
+      (4) Resumable: chunk API riêng (mỗi chunk 8–16 MB là request ngắn, dễ retry, hợp LB timeout) thay vì 1 request 1 GB; metric bytes in-flight, throughput/pod, 5xx theo lý do.
+    followUp: "AES-GCM over a 1 GB stream: what are the pitfalls with authentication tags and chunked resumable uploads?"
+    verify: true
+    tags: [streaming, encryption, capacity]
+  - id: scenario-files-053
+    level: senior
+    type: design
+    q: "Design the media processing pipeline (thumbnails, previews, video transcoding) for a marketplace with free and paid sellers, with retries, poison files, and cost control."
+    hint: |-
+      (1) Event (S3/confirm) → **router** → queue theo loại việc & priority (image-fast, video-paid, video-free) → worker pool riêng autoscale theo queue depth/age (KEDA/ECS target tracking); ảnh nhanh (sharp, giây) tách khỏi video (phút, CPU/GPU, spot).
+      (2) Job model: `media_job(upload_id, preset, version, status, attempts, lease_until)`, output key xác định → idempotent, reprocess bằng cách bump version.
+      (3) Poison file: ffprobe/sharp metadata validate trước; timeout theo độ dài media; maxReceiveCount → DLQ → trạng thái `failed` hiển thị cho seller + nút re-upload; không retry vô hạn.
+      (4) Cost: giới hạn độ dài/độ phân giải theo plan, preset ít rendition cho free, spot + checkpoint, lifecycle xoá bản gốc sau khi transcode (nếu chính sách cho phép), đo cost/phút video.
+    followUp: "A new preset must be applied to 10 million existing images. How do you backfill without hurting live traffic?"
+    tags: [media, pipeline, queue]
+  - id: scenario-files-054
+    level: senior
+    type: open
+    q: "You are asked to security-review a new file upload and sharing feature before launch. What is your threat model and checklist?"
+    hint: |-
+      (1) Tài sản & kẻ tấn công: file của tenant khác (IDOR), app origin (XSS), server (RCE qua parser, path traversal, SSRF khi "upload from URL"), hạ tầng (DoS/cost: size, zip bomb, pixel bomb, request flood), người dùng khác (malware phân phối qua link của bạn).
+      (2) Upload: auth + quota trước khi ký, key server sinh, presigned POST có size/type, quarantine + scan, magic bytes + re-encode, giới hạn giải nén, sandbox các parser (ImageMagick/ffmpeg/PDF) trong container ít quyền, "upload from URL" chặn IP nội bộ/metadata endpoint (169.254.169.254).
+      (3) Download/share: kiểm quyền mỗi lần ký, TTL ngắn, share link có expiry + revoke (token trong DB, không chỉ presigned), domain riêng, `Content-Disposition`, `nosniff`, CSP sandbox, không public bucket, Block Public Access bật.
+      (4) Vận hành: audit log, rate limit, alert khi tỉ lệ infected tăng, retention/xoá theo luật (GDPR), pentest case list theo OWASP File Upload Cheat Sheet.
+    followUp: "Which one item on this list would you refuse to launch without, and why?"
+    tags: [security, threat-model, upload]
+  - id: scenario-files-055
+    level: senior
+    type: design
+    q: "Accountants export 5 million transaction rows as CSV from PostgreSQL. The current endpoint builds the file in memory and times out. Stream it directly, or run a background job? Show how you would do each."
+    hint: |-
+      (1) Stream trực tiếp: `COPY (SELECT ...) TO STDOUT WITH (FORMAT csv, HEADER)` qua `pg-copy-streams` → `pipeline(copyStream, gzip, res)`; memory ổn định, DB làm việc serialize (nhanh nhất). Nhược: giữ transaction/connection suốt thời gian tải (client chậm = connection pool bị giữ, snapshot giữ lâu → cản VACUUM), không resume, timeout LB.
+      (2) Background job: worker chạy cùng `COPY`/keyset pagination (`WHERE id > $last ORDER BY id LIMIT 10000`) → gzip → multipart lên S3 → presigned link + notify; resume được, không giữ connection theo tốc độ client, retry job.
+      (3) Chọn: < ~50 MB & nhanh → stream; lớn/không đoán được → job. Luôn chạy trên **read replica**, statement_timeout riêng, giới hạn export đồng thời mỗi tenant.
+      (4) SQL Server: không có `COPY TO STDOUT` — dùng `bcp`/SSIS hoặc stream từ `tedious` với `request.pause()/resume()` để có backpressure; MySQL `SELECT ... INTO OUTFILE` ghi file trên DB server (cần quyền, không hợp managed DB).
+    example: |-
+      ```ts
+      import { to as copyTo } from "pg-copy-streams";
+      import { pipeline } from "node:stream/promises";
+      import { createGzip } from "node:zlib";
+
+      if (!/^[0-9a-f-]{36}$/i.test(tenantId)) throw new Error("bad tenant id"); // COPY has no bind params
+      const client = await replicaPool.connect();
+      try {
+        await client.query("SET statement_timeout = '10min'");
+        const src = client.query(copyTo(
+          "COPY (SELECT id, booked_at, amount, currency FROM txn WHERE tenant_id = '" + tenantId + "') TO STDOUT WITH (FORMAT csv, HEADER)"
+        ));
+        res.setHeader("Content-Type", "text/csv");
+        res.setHeader("Content-Encoding", "gzip");
+        res.setHeader("Content-Disposition", 'attachment; filename="transactions.csv"');
+        await pipeline(src, createGzip(), res);
+      } finally { client.release(); }
+      // NOTE: COPY does not accept bind parameters — tenantId must be a validated UUID (or use a view/temp function).
+      ```
+    followUp: "COPY can't take bind parameters. How do you avoid SQL injection while keeping COPY's speed?"
+    verify: true
+    tags: [export, postgres, streaming]
+  - id: scenario-files-056
+    level: senior
+    type: scenario
+    q: "Users in Southeast Asia and Europe upload 2 GB files to a bucket in us-east-1 and complain it takes 40 minutes. Data residency rules also apply to EU customers. What do you propose?"
+    hint: |-
+      (1) Đo: throughput thực tế (Mbps) theo region, RTT, số part song song; TCP qua đường dài với 1 connection bị giới hạn bởi RTT → **multipart song song 6–10 part** thường cải thiện nhiều.
+      (2) **S3 Transfer Acceleration** (upload vào edge CloudFront gần nhất rồi đi backbone AWS) — tốn thêm phí/GB, chỉ tính khi thực sự nhanh hơn (verify giá); hoặc CloudFront trước upload.
+      (3) Data residency: bucket **theo region của tenant** (eu-central-1 cho EU), API chọn bucket theo tenant khi ký; metadata DB cũng phải tuân thủ nếu chứa PII; không replicate EU data ra ngoài (CRR chỉ trong EU).
+      (4) Trade-off: nhiều bucket = nhiều config/lifecycle/IAM → IaC module hoá; download từ CloudFront gần user; theo dõi p95 upload duration theo region làm SLO.
+    followUp: "An EU tenant's file is shared with a US user. Where is it served from, and does that violate residency?"
+    verify: true
+    tags: [global, s3, residency]
+  - id: scenario-files-057
+    level: cv
+    type: behavioral
+    q: "Tell me about a time you had to make large file uploads or exports reliable in production. What broke, what did you change, and how did you measure the result?"
+    hint: |-
+      STAR:
+      - **S**: tính năng upload/export file lớn (kích thước, số user đồng thời), triệu chứng (OOM, timeout, 413, file hỏng).
+      - **T**: mục tiêu đo được (vd không còn OOM, p95 upload < X phút, fail rate < 1%).
+      - **A**: đo trước (memory/pod, lỗi theo layer), chuyển sang presigned/multipart hoặc streaming có backpressure, giới hạn size/concurrency, state machine + worker, lifecycle cleanup.
+      - **R**: con số trước/sau (RSS từ 2 GB → 200 MB, fail rate, cost).
+      Reflection: cái bạn sẽ làm khác (load test burst sớm hơn, abort path, alert incomplete MPU).
+    followUp: "What was the one failure mode you only discovered after launch?"
+    redFlags:
+      - "No numbers, no before/after"
+      - "Takes credit for the whole team's work without saying what they personally did"
+    tags: [behavioral, upload]
+  - id: scenario-files-058
+    level: cv
+    type: behavioral
+    q: "Tell me about a time a real-time stream (WebSocket/Socket.IO/SSE) misbehaved under load or after reconnects. How did you find the cause and what did you change?"
+    hint: |-
+      STAR:
+      - **S**: loại dữ liệu (giá, trạng thái, notification), số connection, triệu chứng (dữ liệu trễ, mất update sau reconnect, memory tăng, reconnect storm).
+      - **T**: SLO (latency, không mất event quan trọng).
+      - **A**: instrument (timestamp theo chặng, buffered bytes, disconnect reason), giả lập mạng xấu, thêm seq + snapshot/replay, conflation cho data lossy, heartbeat/timeout khớp LB, adapter/sticky session khi scale.
+      - **R**: con số (p99 từ 3 s → 300 ms, memory ổn định, không còn ticket "số dư sai").
+      Reflection: tách kênh lossy vs lossless ngay từ thiết kế.
+    followUp: "How did you test reconnect behaviour before shipping, not just after incidents?"
+    redFlags:
+      - "Only says 'we used Socket.IO auto-reconnect'"
+    tags: [behavioral, realtime]

