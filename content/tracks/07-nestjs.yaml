@@ -1,0 +1,831 @@
+id: 07-nestjs
+slug: nestjs
+title: NestJS
+tier: 2
+status: drafted
+summary: Modules, DI & injection scopes (chi phí request scope), request lifecycle middleware → guard → interceptor → pipe → handler → interceptor → filter, custom decorators, microservices transports, testing, circular deps.
+cvLinked: false
+prerequisites: [04-typescript, 06-express]
+overview: |-
+  ## TL;DR
+
+  - NestJS là framework **opinionated** trên Node: module + **DI container** + decorator, chạy trên HTTP adapter **Express** (mặc định) hoặc **Fastify**. Bản chất vẫn là Express/Fastify bên dưới.
+  - Nắm chắc **request lifecycle**: middleware → guards → interceptors (trước) → pipes → handler → interceptors (sau) → exception filters. Nhiều ghi chú trên mạng đặt pipe trước interceptor — **sai** theo docs chính thức.
+  - DI có 3 scope: **DEFAULT (singleton)**, **REQUEST**, **TRANSIENT**. Request scope **lan ngược lên** chuỗi dependency (controller, service phụ thuộc cũng thành request-scoped) → tốn chi phí khởi tạo mỗi request; dùng durable providers hoặc AsyncLocalStorage/CLS khi cần context.
+  - Microservices module: transport TCP, Redis, NATS, MQTT, RabbitMQ, Kafka, gRPC, custom; `@MessagePattern` (request-response) vs `@EventPattern` (event).
+  - Version (verify): Nest 11 dùng **Express 5** mặc định cho platform-express (cú pháp route wildcard mới); Nest 12 chuyển core package sang **ESM-only** và nâng yêu cầu Node.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Module | Đơn vị đóng gói: `imports`, `controllers`, `providers`, `exports` | `@Module({ providers: [OrdersService], exports: [OrdersService] })` |
+  | Provider | Thứ được DI container tạo và inject (class, value, factory) | `@Injectable() class OrdersService` |
+  | Injection token | Khoá tra cứu provider: class, string, symbol | `@Inject("PAYMENT_CLIENT")` |
+  | Middleware | Như Express middleware, chạy trước route handler, không biết handler nào sẽ chạy | Logging, raw body |
+  | Guard | `canActivate()` → cho qua hay không (authz), biết `ExecutionContext` | `RolesGuard` đọc metadata `@Roles()` |
+  | Interceptor | Bọc handler (RxJS), chạy trước + sau | Logging thời gian, map response, timeout, cache |
+  | Pipe | Validate/transform **argument** của handler | `ValidationPipe`, `ParseIntPipe` |
+  | Exception filter | Bắt exception, tạo response | `@Catch(HttpException)` |
+  | Custom decorator | Metadata (`SetMetadata`/`Reflector.createDecorator`) hoặc param decorator | `@CurrentUser()` |
+  | Dynamic module | Module cấu hình được lúc import | `ConfigModule.forRoot()`, `forRootAsync` |
+
+  ## Cơ chế hoạt động
+
+  ### Request lifecycle
+
+  ```mermaid
+  flowchart TD
+    IN["Incoming request"] --> MW["Middleware<br/>(global -> module-bound)"]
+    MW --> G["Guards<br/>(global -> controller -> route)"]
+    G -- "false / throw" --> F
+    G --> IB["Interceptors - before next.handle()<br/>(global -> controller -> route)"]
+    IB --> P["Pipes<br/>(global -> controller -> route -> param)"]
+    P -- "validation error" --> F
+    P --> H["Route handler -> services"]
+    H --> IA["Interceptors - after<br/>(route -> controller -> global, RxJS)"]
+    H -- "throw" --> F["Exception filters<br/>(route -> controller -> global;<br/>first match handles it)"]
+    IA --> OUT["Response"]
+    F --> OUT
+  ```
+
+  - Guard chạy **sau** middleware nên biết handler/metadata (`context.getHandler()`), middleware thì không.
+  - Filter được chọn từ mức **thấp nhất** (route) lên global; filter đã bắt thì exception không truyền tiếp lên filter khác.
+
+  ### DI & scope bubbling
+
+  ```mermaid
+  flowchart LR
+    C["OrdersController<br/>(becomes REQUEST)"] --> S["OrdersService<br/>(becomes REQUEST)"]
+    S --> R["OrdersRepository<br/>(becomes REQUEST)"]
+    R --> L["TenantContext<br/>scope: REQUEST"]
+    S --> CACHE["CacheService<br/>(DEFAULT singleton, unaffected)"]
+  ```
+
+  - Một provider REQUEST ở "đáy" → mọi thứ phụ thuộc vào nó (trực tiếp hoặc gián tiếp) phải tạo lại **mỗi request**.
+  - TRANSIENT không lan kiểu này: mỗi consumer nhận instance riêng.
+
+  ### Bootstrap & shutdown hooks
+
+  ```mermaid
+  sequenceDiagram
+    participant App as NestFactory
+    participant M as Modules/Providers
+    App->>M: resolve dependency graph, instantiate providers
+    App->>M: onModuleInit()
+    App->>M: onApplicationBootstrap()
+    App->>App: listen()
+    Note over App: SIGTERM (needs app.enableShutdownHooks()) or app.close()
+    App->>M: onModuleDestroy()
+    App->>M: beforeApplicationShutdown(signal)
+    App->>App: close connections (HTTP server, microservice transports)
+    App->>M: onApplicationShutdown(signal)
+  ```
+
+  ## Trade-offs
+
+  | Chủ đề | Lựa chọn A | Lựa chọn B | Ghi chú |
+  |---|---|---|---|
+  | Request context | REQUEST-scoped provider (inject `REQUEST`) | AsyncLocalStorage / `nestjs-cls` | Scope gây chi phí + lan ngược; ALS rẻ hơn nhưng "ngầm" |
+  | Global enhancer | `app.useGlobalGuards(new X())` | Provider `APP_GUARD` trong module | `APP_*` được DI inject dependency; `useGlobal*` tạo ngoài container |
+  | Validation | `class-validator` + `ValidationPipe` | Schema (zod/Standard Schema) pipe | class-validator dựa decorator + metadata; schema gọn, dùng chung FE |
+  | Adapter | Express | Fastify | Fastify nhanh hơn, nhưng middleware Express không dùng trực tiếp được |
+  | Microservice | Transport của Nest (`@nestjs/microservices`) | Dùng client lib trực tiếp (kafkajs, amqplib) | Nest trừu tượng hoá, nhưng giấu bớt control (commit offset, retry) |
+  | Circular dep | `forwardRef()` | Refactor tách module/event | `forwardRef` là băng keo, không phải thiết kế |
+
+  ## Pitfalls
+
+  - Nhớ sai thứ tự lifecycle (pipe trước interceptor) → đặt logic ở sai tầng.
+  - Provider dùng ở module khác nhưng quên `exports` hoặc quên `imports` → "Nest can't resolve dependencies".
+  - Request-scoped logger/tenant context inject vào repository → toàn bộ graph thành request-scoped → latency và GC tăng; và **không dùng được** trong cron, Kafka consumer, WebSocket gateway.
+  - `app.useGlobalGuards(new AuthGuard())` → guard không có DI (Reflector, ConfigService undefined).
+  - `ValidationPipe` không bật `whitelist`/`forbidNonWhitelisted` → mass assignment; không bật `transform` → `@Query() page: number` vẫn là string.
+  - Nested DTO thiếu `@ValidateNested()` + `@Type(() => X)` → object con không được validate.
+  - `import type` cho class dùng ở constructor → mất metadata `design:paramtypes` → DI không resolve.
+  - Quên `app.enableShutdownHooks()` → `onModuleDestroy`/`onApplicationShutdown` không chạy khi nhận SIGTERM.
+  - Barrel file (`index.ts`) gây circular import → dependency `undefined` lúc decorator chạy.
+
+  ## Cheat sheet
+
+  - Lifecycle: **MW → Guard → Interceptor(before) → Pipe → Handler → Interceptor(after) → Filter (khi có lỗi)**.
+  - Custom provider: `useClass` · `useValue` · `useFactory` + `inject` · `useExisting` (alias). Async factory = await trước khi app start.
+  - `APP_GUARD` / `APP_INTERCEPTOR` / `APP_PIPE` / `APP_FILTER` để đăng ký global enhancer có DI.
+  - Scope: `@Injectable({ scope: Scope.REQUEST })`; durable: `{ scope: Scope.REQUEST, durable: true }` + `ContextIdFactory.apply(strategy)`.
+  - Testing: `Test.createTestingModule({...}).overrideProvider(X).useValue(mock).compile()`; scoped provider lấy bằng `moduleRef.resolve()` chứ không phải `get()`.
+  - Microservices: `@MessagePattern` (có response) · `@EventPattern` (fire-and-forget); hybrid app = `app.connectMicroservice()` + `startAllMicroservices()`.
+  - Circular: `forwardRef(() => OtherModule)` ở cả hai phía + `@Inject(forwardRef(() => OtherService))`.
+notionRefs:
+  - title: NestJS
+    url: https://app.notion.com/p/2b2ef77f8ab28080a3fafff2610f6abf
+references:
+  - title: NestJS — Request lifecycle
+    url: https://docs.nestjs.com/faq/request-lifecycle
+  - title: NestJS — Providers
+    url: https://docs.nestjs.com/providers
+  - title: NestJS — Modules
+    url: https://docs.nestjs.com/modules
+  - title: NestJS — Custom providers
+    url: https://docs.nestjs.com/fundamentals/custom-providers
+  - title: NestJS — Injection scopes
+    url: https://docs.nestjs.com/fundamentals/injection-scopes
+  - title: NestJS — Circular dependency
+    url: https://docs.nestjs.com/fundamentals/circular-dependency
+  - title: NestJS — Lifecycle events
+    url: https://docs.nestjs.com/fundamentals/lifecycle-events
+  - title: NestJS — Dynamic modules
+    url: https://docs.nestjs.com/fundamentals/dynamic-modules
+  - title: NestJS — Testing
+    url: https://docs.nestjs.com/fundamentals/testing
+  - title: NestJS — Guards
+    url: https://docs.nestjs.com/guards
+  - title: NestJS — Interceptors
+    url: https://docs.nestjs.com/interceptors
+  - title: NestJS — Pipes / Validation
+    url: https://docs.nestjs.com/techniques/validation
+  - title: NestJS — Custom decorators
+    url: https://docs.nestjs.com/custom-decorators
+  - title: NestJS — Microservices overview
+    url: https://docs.nestjs.com/microservices/basics
+  - title: NestJS — Kafka transport
+    url: https://docs.nestjs.com/microservices/kafka
+  - title: NestJS — Migration guide
+    url: https://docs.nestjs.com/migration-guide
+questions:
+  - id: nestjs-001
+    level: easy
+    type: concept
+    q: What is NestJS, and how does it relate to Express and Fastify?
+    hint: |-
+      - Framework Node/TypeScript opinionated: module, DI container, decorator (controller, provider), các "enhancer" (guard, pipe, interceptor, filter).
+      - HTTP chạy trên **platform adapter**: `@nestjs/platform-express` (mặc định) hoặc `@nestjs/platform-fastify` → vẫn truy cập được `req/res` gốc và middleware của nền tảng.
+      - Lợi ích: convention chung cho team lớn, testability nhờ DI, nhiều module chính thức (config, TypeORM/Prisma integration, microservices, GraphQL, schedule).
+      - Chi phí: abstraction + decorator/metadata, learning curve, "magic" khi debug DI.
+    followUp: What is the practical impact of switching the adapter from Express to Fastify in an existing Nest app?
+    redFlags:
+      - "NestJS replaces Express and doesn't use it"
+    tags: [basics, adapters]
+  - id: nestjs-002
+    level: easy
+    type: concept
+    q: Explain `imports`, `controllers`, `providers` and `exports` in `@Module()`. What does `@Global()` do and why use it sparingly?
+    hint: |-
+      - `providers`: provider thuộc module (tạo bởi container, mặc định **private** trong module).
+      - `exports`: provider (hoặc module được re-export) mà module khác được dùng khi `imports` module này.
+      - `imports`: module mà module này cần provider được export từ đó.
+      - `controllers`: controller được đăng ký route.
+      - `@Global()`: provider export của module có mặt ở mọi nơi mà không cần import — tiện cho config/logger nhưng làm **ẩn dependency**, khó tách module sau này.
+    example: |-
+      ```ts
+      @Module({
+        imports: [DatabaseModule],
+        controllers: [OrdersController],
+        providers: [OrdersService, OrdersRepository],
+        exports: [OrdersService], // repository stays private to this module
+      })
+      export class OrdersModule {}
+      ```
+    followUp: Two modules both list the same service in `providers`. How many instances exist, and why is that a bug?
+    tags: [modules]
+  - id: nestjs-003
+    level: easy
+    type: concept
+    q: How does dependency injection work in Nest? What is an injection token?
+    hint: |-
+      - Container đọc metadata constructor (`design:paramtypes` do TypeScript emit với `emitDecoratorMetadata`) để biết cần inject gì; resolve đệ quy, mặc định singleton.
+      - **Token** = khoá tra cứu: class (phổ biến nhất), string hoặc symbol (với `@Inject(TOKEN)`), dùng cho interface/giá trị không phải class.
+      - Interface TypeScript **bị xoá khi compile** → không làm token được; dùng abstract class hoặc symbol.
+      - Lợi ích: thay implementation (test, môi trường) mà không sửa consumer.
+    example: |-
+      ```ts
+      export const PAYMENT_GATEWAY = Symbol("PAYMENT_GATEWAY");
+      export interface PaymentGateway { charge(amountMinor: number, token: string): Promise<string> }
+      @Module({ providers: [{ provide: PAYMENT_GATEWAY, useClass: StripeGateway }] })
+      export class PaymentsModule {}
+      @Injectable()
+      export class CheckoutService {
+        constructor(@Inject(PAYMENT_GATEWAY) private readonly gateway: PaymentGateway) {}
+      }
+      ```
+    followUp: 'Why can''t you write `constructor(private gateway: PaymentGateway)` when `PaymentGateway` is an interface?'
+    tags: [di, providers]
+  - id: nestjs-004
+    level: easy
+    type: concept
+    q: How do controllers map routes and extract input? What are DTOs for?
+    hint: |-
+      - `@Controller("orders")` + `@Get(":id")`, `@Post()`...; param decorator `@Param("id")`, `@Query()`, `@Body()`, `@Headers()`, `@Req()`.
+      - DTO = class mô tả shape input (kèm decorator validate nếu dùng class-validator) → dùng với `ValidationPipe`.
+      - Return value được serialize thành JSON (status mặc định 200, POST là 201); `@HttpCode()` để đổi.
+      - Inject `@Res()` → bạn **tự** quản response và mất một số tính năng (interceptor map response) trừ khi `passthrough: true`.
+    followUp: What do you lose when you inject `@Res()` in a Nest handler?
+    tags: [controllers, dto]
+  - id: nestjs-005
+    level: easy
+    type: concept
+    q: How does `ValidationPipe` work, and what do `whitelist`, `forbidNonWhitelisted` and `transform` do?
+    hint: |-
+      - Global `ValidationPipe` dùng `class-transformer` biến plain object thành instance DTO rồi `class-validator` validate → lỗi thành `BadRequestException` (400).
+      - `whitelist: true`: loại bỏ property không có decorator validate → chống mass assignment.
+      - `forbidNonWhitelisted: true`: thay vì loại bỏ, trả 400 khi có property lạ.
+      - `transform: true`: trả về instance DTO và convert kiểu primitive theo type (vd param `id: number`); `transformOptions.enableImplicitConversion` cho property trong DTO.
+    example: |-
+      ```ts
+      app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }));
+      export class CreateOrderDto {
+        @IsString() sku!: string;
+        @IsInt() @Min(1) quantity!: number;
+      }
+      ```
+    followUp: A client sends `{"sku":"A","quantity":1,"tenantId":"other"}`. What happens with and without `whitelist`?
+    tags: [pipes, validation]
+  - id: nestjs-006
+    level: easy
+    type: concept
+    q: What is a guard, and what happens when `canActivate` returns `false`?
+    hint: |-
+      - Guard implement `CanActivate`, nhận `ExecutionContext` (biết class + handler → đọc metadata như `@Roles()`), trả `boolean | Promise<boolean> | Observable<boolean>`.
+      - Trả `false` → Nest throw `ForbiddenException` (403). Muốn 401 hoặc message khác → tự `throw new UnauthorizedException()`.
+      - Dùng cho authentication/authorization; chạy sau middleware, trước interceptor/pipe.
+      - `ExecutionContext` hoạt động cho HTTP, RPC, WebSocket (`switchToHttp/Rpc/Ws`) → guard có thể dùng chung.
+    followUp: Why is a guard a better place for role checks than middleware in Nest?
+    tags: [guards, auth]
+  - id: nestjs-007
+    level: easy
+    type: concept
+    q: How does exception handling work in Nest by default, and how do you customize it?
+    hint: |-
+      - Built-in exception layer: `HttpException` (và subclass `NotFoundException`, `BadRequestException`...) → response JSON `{ statusCode, message }`; exception không nhận diện được → 500 "Internal server error".
+      - Custom: class implement `ExceptionFilter` với `@Catch(Type)`; `@Catch()` không tham số bắt tất cả.
+      - Bind ở route/controller (`@UseFilters`) hoặc global (`useGlobalFilters` hoặc provider `APP_FILTER`).
+      - Filter nhận `ArgumentsHost` → chọn context (HTTP/RPC/WS) để trả lỗi đúng định dạng.
+    followUp: Your domain layer throws `OrderNotFoundError` (not an HttpException). How do you map it to 404 without coupling the domain to Nest?
+    tags: [exception-filters]
+  - id: nestjs-008
+    level: easy
+    type: concept
+    q: List Nest's lifecycle hooks in order and give a real use for each. What does `enableShutdownHooks()` do?
+    hint: |-
+      - Startup: `onModuleInit` (sau khi dependency của module resolve xong — warm cache, kiểm tra kết nối) → `onApplicationBootstrap` (mọi module đã init — bắt đầu consumer, scheduler).
+      - Shutdown: `onModuleDestroy` → `beforeApplicationShutdown(signal)` (drain, dừng nhận việc mới) → `onApplicationShutdown(signal)` (đóng kết nối cuối cùng).
+      - Hook chạy khi gọi `app.close()`; để chạy khi nhận **SIGTERM/SIGINT** phải bật `app.enableShutdownHooks()` (tốn listener signal, nên chỉ bật ở process chính).
+      - Hook có thể `async` — Nest chờ promise.
+      - Thứ tự giữa các module có thể thay đổi theo version (Nest 12 ghi chú thay đổi thứ tự theo cấp — verify).
+    followUp: Your Kafka consumer keeps processing after SIGTERM and messages are half-processed. Which hook would you use and what would it do?
+    verify: true
+    tags: [lifecycle, shutdown]
+  - id: nestjs-009
+    level: medium
+    type: concept
+    q: Describe the exact order of the Nest request lifecycle, including the order within each level (global, controller, route).
+    hint: |-
+      - Middleware (global → module) → **Guards** (global → controller → route) → **Interceptors trước** `next.handle()` (global → controller → route) → **Pipes** (global → controller → route → param) → handler → **Interceptors sau** (ngược lại: route → controller → global) → **Exception filters** nếu có lỗi (route → controller → global, filter đầu tiên khớp xử lý).
+      - Hệ quả: interceptor đo thời gian **bao cả** pipe validation; pipe lỗi vẫn đi qua interceptor (dạng error trong Observable).
+      - Guard không thấy dữ liệu đã transform bởi pipe (body còn thô).
+    followUp: A logging interceptor reports 2 ms for a request that returned 400 from validation. Does that match the lifecycle? Why?
+    redFlags:
+      - "Pipes run before interceptors"
+      - "Filters run before the handler"
+    tags: [lifecycle]
+  - id: nestjs-010
+    level: medium
+    type: compare
+    q: For each requirement, choose middleware, guard, interceptor, pipe or filter — raw body for webhook signature, role check, response envelope, parse `:id` to number, map domain errors to HTTP, request timing.
+    hint: |-
+      - Raw body cho webhook signature → **middleware**/body parser config (`rawBody: true` khi tạo app) — phải có trước khi JSON parse.
+      - Role check → **guard** (đọc metadata `@Roles`).
+      - Response envelope `{ data, meta }` → **interceptor** (`map`).
+      - `:id` → number → **pipe** (`ParseIntPipe`).
+      - Domain error → HTTP → **exception filter**.
+      - Request timing → **interceptor** (hoặc middleware nếu muốn đo cả guard; `res.on("finish")`).
+    followUp: Why can't a guard reliably read a validated, transformed DTO?
+    tags: [lifecycle, design]
+  - id: nestjs-011
+    level: medium
+    type: concept
+    q: Explain `useClass`, `useValue`, `useFactory` and `useExisting` custom providers with a real use case for each.
+    hint: |-
+      - `useClass`: chọn implementation theo môi trường (`provide: MailService, useClass: env === "test" ? FakeMail : SesMail`).
+      - `useValue`: hằng số, config object, mock trong test.
+      - `useFactory` + `inject: [ConfigService]`: tạo client cần config/async (Redis client, Kafka producer) — factory `async` được await **trước khi app khởi động**.
+      - `useExisting`: alias một token sang provider đã có (hai token cùng một instance).
+      - Lưu ý: factory async chậm (kết nối DB) làm chậm startup; lỗi ở đây làm app không start (fail fast — tốt).
+    example: |-
+      ```ts
+      {
+        provide: "REDIS",
+        useFactory: async (cfg: ConfigService) => {
+          const client = createClient({ url: cfg.getOrThrow("REDIS_URL") });
+          await client.connect();
+          return client;
+        },
+        inject: [ConfigService],
+      }
+      ```
+    followUp: How do you make sure the Redis client created by that factory is closed on shutdown?
+    tags: [providers, di]
+  - id: nestjs-012
+    level: medium
+    type: compare
+    q: Compare DEFAULT, REQUEST and TRANSIENT scopes. When is each appropriate?
+    hint: |-
+      - **DEFAULT**: singleton cho cả app — mặc định, nhanh nhất; phải stateless (không lưu dữ liệu request trong field!).
+      - **REQUEST**: instance mới mỗi request, inject được `REQUEST`; GC sau request. Lan ngược lên mọi consumer. Dùng khi thật sự cần (vd per-tenant connection mà không dùng durable).
+      - **TRANSIENT**: mỗi consumer nhận instance riêng (không share) — vd logger có context theo class dùng nó.
+      - Docs khuyến cáo mặc định singleton; request scope có chi phí (tạo lại graph mỗi request).
+    followUp: A singleton service stores `this.currentTenant = req.tenantId`. What happens under concurrent load?
+    redFlags:
+      - "Request scope is needed to access the request anywhere"
+    tags: [di, scopes]
+  - id: nestjs-013
+    level: medium
+    type: concept
+    q: What are dynamic modules? Explain `forRoot`, `forRootAsync`, `register` and `forFeature`, and how `ConfigurableModuleBuilder` helps.
+    hint: |-
+      - Dynamic module: method static trả `DynamicModule` (`{ module, providers, exports, imports }`) → module cấu hình được khi import.
+      - Convention: `forRoot` (cấu hình một lần cho app, thường global), `register` (cấu hình mỗi lần import), `forFeature` (bổ sung theo feature, vd repository của entity), `*Async` với `useFactory`/`inject` khi config cần provider khác.
+      - `ConfigurableModuleBuilder` sinh sẵn `forRoot/forRootAsync` + token options → ít boilerplate.
+    example: |-
+      ```ts
+      @Module({})
+      export class HttpClientModule {
+        static register(opts: { baseUrl: string; timeoutMs: number }): DynamicModule {
+          return {
+            module: HttpClientModule,
+            providers: [{ provide: HTTP_OPTS, useValue: opts }, HttpClient],
+            exports: [HttpClient],
+          };
+        }
+      }
+      ```
+    followUp: Two feature modules call `HttpClientModule.register()` with different base URLs. Do they share an instance?
+    tags: [modules, dynamic-modules]
+  - id: nestjs-014
+    level: medium
+    type: concept
+    q: Build a `@Roles()` metadata decorator plus a guard, and a `@CurrentUser()` param decorator. How do they work?
+    hint: |-
+      - Metadata decorator: `Reflector.createDecorator<string[]>()` (Nest mới) hoặc `SetMetadata("roles", roles)`; guard dùng `reflector.getAllAndOverride(Roles, [ctx.getHandler(), ctx.getClass()])` để route override controller.
+      - Param decorator: `createParamDecorator((data, ctx) => ctx.switchToHttp().getRequest().user)`.
+      - Gộp nhiều decorator: `applyDecorators(UseGuards(AuthGuard, RolesGuard), Roles(...))`.
+      - Pipe chạy trên giá trị param decorator trả về (nếu `validateCustomDecorators` bật cho ValidationPipe).
+    example: |-
+      ```ts
+      export const Roles = Reflector.createDecorator<string[]>();
+      @Injectable()
+      export class RolesGuard implements CanActivate {
+        constructor(private readonly reflector: Reflector) {}
+        canActivate(ctx: ExecutionContext) {
+          const roles = this.reflector.getAllAndOverride(Roles, [ctx.getHandler(), ctx.getClass()]);
+          if (!roles?.length) return true;
+          const user = ctx.switchToHttp().getRequest().user;
+          return roles.some((r) => user?.roles?.includes(r));
+        }
+      }
+      export const CurrentUser = createParamDecorator((_: unknown, ctx: ExecutionContext) =>
+        ctx.switchToHttp().getRequest().user);
+      ```
+    followUp: How do you make "authenticated by default, `@Public()` to opt out" work globally?
+    verify: true
+    tags: [decorators, guards]
+  - id: nestjs-015
+    level: medium
+    type: concept
+    q: How do interceptors work with RxJS? Write one that adds a timeout and logs duration.
+    hint: |-
+      - `intercept(ctx, next)` trả Observable; code trước `next.handle()` chạy trước handler, operator trên stream chạy **sau** (`map`, `tap`, `catchError`, `timeout`).
+      - Dùng: logging/metrics, map response envelope, cache (`CacheInterceptor`), timeout, serialize.
+      - `timeout()` chỉ ngừng **chờ** kết quả — handler/DB query vẫn chạy tiếp; cần AbortSignal xuống dưới nếu muốn huỷ thật.
+      - Handler trả Promise → Nest chuyển thành Observable.
+    example: |-
+      ```ts
+      @Injectable()
+      export class TimingInterceptor implements NestInterceptor {
+        intercept(ctx: ExecutionContext, next: CallHandler) {
+          const start = performance.now();
+          return next.handle().pipe(
+            timeout(5_000),
+            catchError((e) => throwError(() => (e instanceof TimeoutError ? new RequestTimeoutException() : e))),
+            finalize(() => logger.info({ route: ctx.getHandler().name, ms: performance.now() - start })),
+          );
+        }
+      }
+      ```
+    followUp: After the timeout fires, what is the database doing, and how would you stop it?
+    tags: [interceptors, rxjs]
+  - id: nestjs-016
+    level: medium
+    type: compare
+    q: "`app.useGlobalGuards(new AuthGuard())` vs registering `{ provide: APP_GUARD, useClass: AuthGuard }` — what's the difference?"
+    hint: |-
+      - `useGlobal*` trong `main.ts`: instance tạo **ngoài DI container** → không inject được `Reflector`, `ConfigService`, repository (trừ khi truyền tay); không áp dụng cho microservice/hybrid gateway theo cùng cách.
+      - `APP_GUARD` (và `APP_PIPE`, `APP_INTERCEPTOR`, `APP_FILTER`) trong một module: guard là provider → có DI đầy đủ, vẫn áp dụng global.
+      - Nhiều `APP_GUARD` chạy theo thứ tự đăng ký.
+      - Test e2e: global enhancer trong `main.ts` **không** được áp dụng khi test tạo app từ `AppModule` → test bỏ sót auth/validation; `APP_*` thì có.
+    followUp: Your e2e tests pass but production rejects the same request with 400. What might be configured differently?
+    tags: [guards, di, testing]
+  - id: nestjs-017
+    level: medium
+    type: concept
+    q: How do you unit test a service and e2e test a controller in Nest?
+    hint: |-
+      - Unit: `Test.createTestingModule({ providers: [OrdersService, { provide: OrdersRepository, useValue: mockRepo }] }).compile()` → `module.get(OrdersService)`. Hoặc khởi tạo class trực tiếp `new OrdersService(mockRepo)` — nhanh hơn, đủ cho logic thuần.
+      - Override: `.overrideProvider(X).useValue(...)`, `.overrideGuard(AuthGuard).useValue({ canActivate: () => true })`.
+      - E2E: import `AppModule`, `createNestApplication()`, áp dụng **cùng** global pipes/filters như `main.ts` (tách hàm `configureApp(app)`), `supertest(app.getHttpServer())`; DB thật trong container.
+      - Scoped provider: `await module.resolve(X)` (không phải `get`).
+    followUp: What's the downside of overriding the auth guard in every e2e test?
+    tags: [testing]
+  - id: nestjs-018
+    level: medium
+    type: concept
+    q: How do you manage configuration in Nest and fail fast on missing environment variables?
+    hint: |-
+      - `ConfigModule.forRoot({ isGlobal: true, validate })` — validate bằng schema (Joi truyền thống; Nest mới hỗ trợ Standard Schema như zod — verify) → app không start nếu thiếu biến.
+      - Typed config: `registerAs("db", () => ({...}))` + `ConfigType<typeof dbConfig>`; `configService.getOrThrow()`.
+      - Không đọc `process.env` rải rác trong service → khó test, không validate.
+      - Secret từ secret manager qua env/file mount; không log config.
+    followUp: How would you support config that changes at runtime (feature flags) without restarting?
+    verify: true
+    tags: [config]
+  - id: nestjs-019
+    level: medium
+    type: design
+    q: Design a global exception filter that maps domain errors, validation errors and unknown errors into a consistent response. What does `ArgumentsHost` give you?
+    hint: |-
+      - `@Catch()` bắt tất cả; phân loại: `HttpException` (giữ status), domain error (map theo `code` → 404/409/422), lỗi DB (unique violation → 409), còn lại 500 + log stack.
+      - `ArgumentsHost.getType()` → `"http" | "rpc" | "ws"` → response khác nhau (HTTP JSON, RPC throw `RpcException`, WS emit).
+      - Kèm `requestId`; không lộ stack/SQL; format ổn định (vd Problem Details).
+      - Có thể extend `BaseExceptionFilter` để giữ hành vi mặc định cho case không xử lý.
+      - Đăng ký bằng `APP_FILTER` để có DI (logger).
+    followUp: Why does the same filter behave incorrectly when a Kafka message handler throws?
+    tags: [exception-filters, design]
+  - id: nestjs-020
+    level: medium
+    type: compare
+    q: How would you implement JWT authentication in Nest — Passport strategy vs a custom guard?
+    hint: |-
+      - `@nestjs/passport` + `passport-jwt`: strategy chuẩn, nhiều provider OAuth có sẵn (Google), `AuthGuard("jwt")`; thêm một tầng abstraction.
+      - Custom guard với `@nestjs/jwt`/`jose`: verify token trực tiếp, kiểm soát rõ (JWKS cache, alg cố định, claim tenant) — code ít "magic".
+      - Cả hai: gắn user vào `request.user`, global guard + `@Public()` opt-out, sau đó `RolesGuard`/policy guard.
+      - Lưu ý: Passport strategy không nên request-scoped (docs cảnh báo); kiểm tra revoke/đổi quyền nếu cần.
+    followUp: Where do you check that the tenant in the JWT matches the tenant in the URL?
+    tags: [auth, guards, passport]
+  - id: nestjs-021
+    level: medium
+    type: compare
+    q: What transports does `@nestjs/microservices` support, and what's the difference between `@MessagePattern` and `@EventPattern`?
+    hint: |-
+      - Transport built-in: TCP, Redis, NATS, MQTT, RabbitMQ, Kafka, gRPC; có thể viết custom transport.
+      - `@MessagePattern`: **request-response** — client `send()` trả Observable kết quả (với Kafka cần reply topic, `subscribeToResponseOf`).
+      - `@EventPattern`: **event**, fire-and-forget — client `emit()`, không chờ phản hồi.
+      - Kafka/RabbitMQ đảm bảo bền; TCP/Redis pub-sub thì không (message mất nếu consumer offline).
+      - Request-response qua broker tăng latency và coupling — cân nhắc HTTP/gRPC cho query đồng bộ.
+    followUp: Why is request-response over Kafka usually a smell?
+    tags: [microservices, transports]
+  - id: nestjs-022
+    level: medium
+    type: concept
+    q: How do you run an HTTP API and a Kafka consumer in the same Nest application (hybrid app), and when shouldn't you?
+    hint: |-
+      - `const app = await NestFactory.create(AppModule); app.connectMicroservice<MicroserviceOptions>({ transport: Transport.KAFKA, options }); await app.startAllMicroservices(); await app.listen(3000);`
+      - Global enhancer đăng ký qua `useGlobal*` không tự áp dụng cho microservice (option `inheritAppConfig`) — dùng `APP_*` providers.
+      - Không nên khi: consumer tốn CPU/throughput cao làm chậm API (chung event loop), cần scale độc lập, deploy độc lập.
+      - Tách thành hai entrypoint (cùng codebase, khác `main`) là thỏa hiệp phổ biến.
+    followUp: Your consumer lag grows only during API traffic peaks. What's the connection?
+    verify: true
+    tags: [microservices, hybrid, kafka]
+  - id: nestjs-023
+    level: medium
+    type: gotcha
+    q: How does `ClassSerializerInterceptor` with `@Exclude()` work, and how can it still leak sensitive fields?
+    hint: |-
+      - Interceptor gọi `instanceToPlain` trên giá trị trả về → áp dụng `@Exclude()`/`@Expose()`/`@Transform()` trên **class instance**.
+      - Leak: handler trả **plain object** (từ `repo.find` raw, spread `{...user}`, query builder raw) → decorator không có tác dụng → `passwordHash` lộ ra.
+      - An toàn hơn: map explicit sang response DTO (whitelist field), hoặc `excludeExtraneousValues: true` với `@Expose()`.
+      - Chi phí: serialize class-transformer tốn CPU với response lớn.
+    followUp: How would you add a test that fails if any endpoint returns a field named `passwordHash`?
+    tags: [serialization, security]
+  - id: nestjs-024
+    level: medium
+    type: compare
+    q: What changes when you switch a Nest app from the Express adapter to Fastify?
+    hint: |-
+      - Hiệu năng HTTP layer tốt hơn; nhưng middleware Express (`helmet`, `multer`, `passport` session...) không cắm trực tiếp — dùng plugin `@fastify/*` tương ứng.
+      - Kiểu `req/res` khác (`FastifyRequest`/`FastifyReply`); code dùng `@Req()/@Res()` kiểu Express phải sửa.
+      - Listen mặc định chỉ `localhost` → trong container cần `app.listen(3000, "0.0.0.0")`.
+      - Upload, raw body, cookie, CORS cấu hình qua plugin; một số lib Nest chỉ hỗ trợ Express.
+      - Chỉ đáng làm khi đo thấy HTTP layer là bottleneck.
+    followUp: How do you measure whether the adapter is actually your bottleneck?
+    tags: [adapters, fastify, performance]
+  - id: nestjs-025
+    level: hard
+    type: debug
+    q: The app fails at startup with `Nest can't resolve dependencies of the OrdersService (?, ConfigService). Please make sure that the argument PaymentsService at index [0] is available in the OrdersModule context.` Find the cause.
+    example: |-
+      ```ts
+      @Module({ providers: [PaymentsService] })
+      export class PaymentsModule {}
+
+      @Module({
+        imports: [PaymentsModule],
+        providers: [OrdersService],
+      })
+      export class OrdersModule {}
+      ```
+    hint: |-
+      - `PaymentsModule` không `exports: [PaymentsService]` → provider private, `OrdersModule` import module nhưng không thấy provider.
+      - Các nguyên nhân khác của cùng lỗi: quên `imports`; thêm `PaymentsService` vào `providers` của `OrdersModule` (tạo instance thứ hai, và kéo theo dependency của nó); circular import làm class `undefined` lúc decorator chạy (lỗi hiện `?` hoặc `undefined` ở index); dùng `import type` làm mất metadata; token string/symbol không khớp.
+      - Fix: `exports: [PaymentsService]`.
+    followUp: The error shows `undefined` instead of a class name at index [0]. What does that usually indicate?
+    tags: [di, modules, debug]
+  - id: nestjs-026
+    level: hard
+    type: debug
+    q: "`UsersService` and `AuthService` depend on each other and the app crashes at startup. You add `forwardRef` and it starts, but `this.authService` is sometimes `undefined`. Explain."
+    example: |-
+      ```ts
+      @Injectable()
+      export class UsersService {
+        constructor(@Inject(forwardRef(() => AuthService)) private auth: AuthService) {
+          this.auth.registerHook(this); // called in the constructor
+        }
+      }
+      @Injectable()
+      export class AuthService {
+        constructor(@Inject(forwardRef(() => UsersService)) private users: UsersService) {}
+      }
+      ```
+    hint: |-
+      - Circular dependency: container không biết tạo cái nào trước. `forwardRef` cho phép resolve, nhưng thứ tự khởi tạo **không xác định** → trong constructor, dependency bên kia có thể chưa sẵn sàng.
+      - Không dùng dependency circular trong constructor; chuyển logic sang `onModuleInit`.
+      - Circular giữa **module** cũng cần `forwardRef(() => OtherModule)` ở cả hai `imports`.
+      - Fix đúng: tách phần chung ra service thứ ba, đảo dependency (event/callback), hoặc gộp nếu thực ra là một concept. Cũng kiểm tra barrel file gây circular import ở mức file.
+      - Request-scoped provider + circular dependency → dễ dẫn tới lỗi undefined (docs cảnh báo).
+    followUp: What design smell does a circular dependency between users and auth usually point to?
+    tags: [di, circular-dependency, debug]
+  - id: nestjs-027
+    level: hard
+    type: debug
+    q: The global guard throws `Cannot read properties of undefined (reading 'getAllAndOverride')`. Why?
+    example: |-
+      ```ts
+      // main.ts
+      const app = await NestFactory.create(AppModule);
+      app.useGlobalGuards(new RolesGuard(undefined as any)); // colleague "fixed" a compile error
+      // roles.guard.ts
+      @Injectable()
+      export class RolesGuard implements CanActivate {
+        constructor(private readonly reflector: Reflector) {}
+        canActivate(ctx: ExecutionContext) {
+          const roles = this.reflector.getAllAndOverride(Roles, [ctx.getHandler(), ctx.getClass()]);
+          return !roles || matches(roles, ctx);
+        }
+      }
+      ```
+    hint: |-
+      - `new RolesGuard(...)` tạo instance **ngoài DI container** → `Reflector` không được inject (ở đây `undefined`).
+      - Fix: đăng ký `{ provide: APP_GUARD, useClass: RolesGuard }` trong một module (DI đầy đủ), hoặc truyền `app.get(Reflector)` vào constructor.
+      - `APP_GUARD` cũng áp dụng trong e2e test tạo app từ `AppModule` — cấu hình trong `main.ts` thì không.
+      - Bài học: `as any` để "sửa" lỗi compile thường che bug runtime.
+    followUp: Which order do multiple `APP_GUARD` providers run in, and why does it matter for auth then roles?
+    tags: [guards, di, debug]
+  - id: nestjs-028
+    level: hard
+    type: debug
+    q: 'Requests like `?page=2` are rejected with "page must be an integer number", and nested address fields are never validated. Fix the DTOs and pipe config.'
+    example: |-
+      ```ts
+      class ListOrdersQuery {
+        @IsOptional() @IsInt() page?: number;
+      }
+      class AddressDto { @IsString() line1!: string; @IsPostalCode("any") zip!: string }
+      class CreateOrderDto { address!: AddressDto }
+
+      @Get() list(@Query() q: ListOrdersQuery) { return this.svc.list((q.page ?? 1) * 10 - 10); }
+      // main.ts
+      app.useGlobalPipes(new ValidationPipe());
+      ```
+    hint: |-
+      - Query string luôn là string; không có `transform: true` (+ `enableImplicitConversion` hoặc `@Type(() => Number)`) → `page` vẫn là `"2"` nên `@IsInt()` **fail**; nếu "sửa" bằng cách bỏ validator thì `q.page + 1` thành `"21"` (nối chuỗi).
+      - Nested object cần `@ValidateNested()` + `@Type(() => AddressDto)` → không có thì `address` không được validate (và không thành instance).
+      - Bật `whitelist`/`forbidNonWhitelisted` để chặn field lạ.
+      - Kiểm tra giới hạn: `@Min(1)`, `@Max(100)` cho `pageSize` để chặn query khổng lồ.
+    followUp: What's risky about `enableImplicitConversion` for boolean query params like `?active=false`?
+    tags: [validation, pipes, debug]
+  - id: nestjs-029
+    level: hard
+    type: concept
+    q: A request-scoped `TenantContext` was injected into the repository. Latency and GC time went up across the API. Explain the mechanics and your options.
+    hint: |-
+      - Request scope **lan ngược**: repository → service → controller đều thành request-scoped → mỗi request tạo lại cả cây instance (và các provider phụ thuộc), thêm allocation + GC; docs ghi nhận chi phí này (app thiết kế tốt vẫn thêm vài % latency).
+      - Options:
+        - Truyền `tenantId` **explicit** qua tham số method (rõ ràng, test dễ).
+        - AsyncLocalStorage (`nestjs-cls`) — singleton đọc context hiện tại, không tạo graph mới.
+        - **Durable providers** + `ContextIdStrategy` gom theo tenant → mỗi tenant một sub-tree dùng lại (hợp cho per-tenant connection/config); đánh đổi memory theo số tenant.
+      - Đo trước/sau (latency p99, heap, instance count).
+    followUp: With durable providers keyed by tenant, what happens to memory with 5,000 tenants?
+    tags: [scopes, performance, multi-tenant]
+  - id: nestjs-030
+    level: hard
+    type: scenario
+    q: After making the logger request-scoped, the nightly `@Cron` job and the Kafka consumer start failing with undefined dependencies. Why, and how do you fix it?
+    hint: |-
+      - Cron/consumer/WebSocket gateway không có HTTP request → không có context để tạo provider request-scoped; docs nói rõ gateway, Passport strategy, cron controller **không nên** dùng request-scoped provider.
+      - Provider phụ thuộc logger request-scoped cũng thành request-scoped → service dùng trong job hỏng theo.
+      - Fix: logger singleton đọc context từ AsyncLocalStorage (set context ở middleware cho HTTP, ở đầu handler cho job/consumer); hoặc TRANSIENT logger (context theo class) thay vì theo request.
+      - Nếu buộc phải: `ContextIdFactory.create()` + `moduleRef.resolve(X, contextId)` để tạo scope thủ công cho job.
+    followUp: How do you give each Kafka message its own correlation id in logs?
+    tags: [scopes, cron, kafka, scenario]
+  - id: nestjs-031
+    level: hard
+    type: scenario
+    q: During rolling deploys on Kubernetes, a Nest API drops in-flight requests and the Kafka consumer re-processes messages. Design the shutdown sequence.
+    hint: |-
+      - Bật `app.enableShutdownHooks()` (không có → hook không chạy khi SIGTERM).
+      - `beforeApplicationShutdown`: readiness=false, chờ LB gỡ endpoint vài giây, dừng consumer fetch/commit offset message đã xử lý xong, dừng nhận job mới.
+      - `app.close()` đóng HTTP server (chờ in-flight; keep-alive idle cần được đóng — adapter/Node version quyết định, verify), rồi `onApplicationShutdown` đóng DB/Redis/producer.
+      - Hard timeout < `terminationGracePeriodSeconds`; `CMD ["node", "dist/main.js"]` để nhận signal.
+      - Consumer idempotent vì at-least-once — re-process khi crash là **bình thường**, phải an toàn.
+    followUp: Why does re-processing still happen occasionally even with a perfect shutdown?
+    verify: true
+    tags: [shutdown, kubernetes, kafka, scenario]
+  - id: nestjs-032
+    level: hard
+    type: gotcha
+    q: How do exceptions behave in a Nest microservice (e.g., Kafka `@EventPattern`) compared to HTTP, and what does that mean for retries?
+    hint: |-
+      - Context là `rpc` → `HttpException` không có ý nghĩa HTTP; dùng `RpcException` và filter RPC (`BaseRpcExceptionFilter`) nếu cần định dạng lỗi.
+      - Với event handler, exception quyết định hành vi commit/retry của transport (vd Kafka: có thể không commit và retry/đứng partition, tuỳ cấu hình và version — verify) → poison message có thể chặn partition.
+      - Thiết kế: handler tự bắt lỗi, phân loại transient (retry có giới hạn/backoff) vs permanent (DLQ), idempotent; đừng dựa vào mặc định của transport mà không test.
+      - Cân nhắc dùng client Kafka trực tiếp khi cần kiểm soát offset chi tiết.
+    followUp: How would you implement a retry topic + DLQ pattern with Nest's Kafka transport?
+    verify: true
+    tags: [microservices, kafka, error-handling]
+  - id: nestjs-033
+    level: hard
+    type: scenario
+    q: A Nest Kafka consumer group keeps rebalancing and lag grows after you added a slow external API call inside the handler. What's happening and how do you fix it?
+    hint: |-
+      - Handler chậm → consumer không poll/heartbeat kịp trong giới hạn (`sessionTimeout`, `maxPollInterval`/rebalance timeout tuỳ client) → broker coi là chết → rebalance → partition chuyển chủ → message xử lý lại → càng chậm (vòng xoáy).
+      - Fix: timeout cho call ngoài; giảm batch/`maxBytes`; tách xử lý chậm sang queue/topic khác; tăng partition + instance; điều chỉnh timeout hợp lý; idempotent vì bị xử lý lại.
+      - Quan sát: log rebalance, consumer lag theo partition, thời gian xử lý mỗi message.
+      - Ordering: song song hoá trong partition phá thứ tự theo key — chỉ song song theo key khác nhau.
+    followUp: You need per-customer ordering but 10x throughput. How do you parallelize safely?
+    verify: true
+    tags: [kafka, microservices, scenario]
+  - id: nestjs-034
+    level: hard
+    type: concept
+    q: Where does Nest add overhead compared to plain Express, and how do you keep a Nest API fast (including cold starts on serverless)?
+    hint: |-
+      - Runtime: lớp router/enhancer (guard, interceptor, pipe mỗi request), class-transformer/class-validator (tốn CPU với payload lớn), request-scoped provider.
+      - Startup: scan module, resolve DI, load nhiều package → cold start chậm trên Lambda; giảm bằng lazy-loading module (`LazyModuleLoader`), bundle (webpack/esbuild), giữ app instance giữa các invocation.
+      - Tối ưu: global pipe nhẹ (schema validation), tránh interceptor nặng cho route nóng, Fastify adapter nếu HTTP layer là bottleneck, cache.
+      - Luôn **đo** — thường DB/network chiếm phần lớn latency, không phải framework.
+    followUp: Your Nest Lambda takes 2.5s to cold start. What do you measure first?
+    tags: [performance, serverless]
+  - id: nestjs-035
+    level: hard
+    type: gotcha
+    q: How do you test request-scoped or transient providers, and why does `moduleRef.get()` fail for them?
+    hint: |-
+      - `get()` chỉ trả instance **static** (singleton); với REQUEST/TRANSIENT sẽ throw — dùng `await moduleRef.resolve(X)` (mỗi lần resolve có thể là instance mới theo contextId).
+      - Muốn cùng instance: tạo `const contextId = ContextIdFactory.create()` rồi `resolve(X, contextId)` nhiều lần.
+      - Giả lập `REQUEST`: `moduleRef.registerRequestByContextId(fakeReq, contextId)`.
+      - Test e2e mới bắt được lỗi scope thực tế (provider bị bubbled).
+    followUp: How would you detect in CI that a change accidentally made a hot controller request-scoped?
+    tags: [testing, scopes]
+  - id: nestjs-036
+    level: hard
+    type: concept
+    q: What changed in recent Nest major versions (11 and 12) that affects upgrades — Express 5, route syntax, ESM, testing stack?
+    hint: |-
+      - Nest 11: `@nestjs/platform-express` dùng **Express 5** → route wildcard kiểu mới (`*splat`/`{*splat}` thay cho `*`), `forRoutes("*")` của middleware cũng đổi cú pháp; query parser mặc định khác (verify).
+      - Nest 12 (theo migration guide): core package **ESM-only** (app CJS vẫn dùng được nhờ `require(esm)` trên Node 20.19+/22.12+), yêu cầu Node mới hơn, dự án ESM mặc định Vitest thay Jest, `@nestjs/config` validate theo Standard Schema, thứ tự lifecycle hook theo cấp module có thể thay đổi (verify toàn bộ).
+      - Chiến lược: đọc migration guide, nâng từng major, chạy e2e đầy đủ, kiểm tra lib bên thứ ba tương thích.
+    followUp: Which parts of your codebase would you grep first before upgrading Nest to a version on Express 5?
+    verify: true
+    tags: [upgrade, versions]
+  - id: nestjs-037
+    level: senior
+    type: design
+    q: Design a modular monolith in NestJS that could later be split into microservices. How do you enforce module boundaries?
+    hint: |-
+      - Module theo **bounded context** (Orders, Catalog, Checkout, Identity); mỗi module export **public API** hẹp (facade service), không export repository.
+      - Không cho module khác đụng bảng/entity của mình (lint rule cấm import path nội bộ — eslint boundaries/dependency-cruiser; schema DB tách theo module).
+      - Giao tiếp giữa module: gọi facade (sync) hoặc domain event in-process (`EventEmitter2`/CQRS) → sau này thay bằng Kafka mà không đổi consumer nhiều; outbox cho event cần bền.
+      - Shared kernel tối thiểu (types, auth context); tránh `@Global()` tràn lan.
+      - Kiểm chứng: đồ thị dependency không có vòng; test contract giữa module.
+    followUp: Which module would you extract first, and what signal tells you it's time?
+    tags: [architecture, modular-monolith, design]
+  - id: nestjs-038
+    level: senior
+    type: design
+    q: Design multi-tenancy in a Nest API — tenant resolution, context propagation, and per-tenant database access. Compare approaches.
+    hint: |-
+      - Resolution: guard/middleware lấy tenant từ **JWT claim** (đối chiếu subdomain/header nếu có), từ chối nếu không khớp.
+      - Propagation: (a) tham số explicit; (b) CLS/AsyncLocalStorage; (c) request-scoped `TenantContext` (đắt, lan ngược); (d) durable providers theo tenant.
+      - Data: shared schema + `tenant_id` + RLS (PostgreSQL `SET app.tenant_id` mỗi transaction) · schema-per-tenant · DB-per-tenant (durable provider giữ connection/pool theo tenant — lưu ý giới hạn connection).
+      - Cross-cutting: cache key có tenant, queue message mang tenant, job chạy theo tenant set context thủ công.
+      - Test tự động chống truy cập chéo tenant.
+    followUp: With connection pools per tenant, how do you avoid exhausting database connections as tenants grow?
+    tags: [multi-tenant, design, scopes]
+  - id: nestjs-039
+    level: senior
+    type: open
+    q: A team asks whether to start a new service in NestJS or plain Express. How do you decide?
+    hint: |-
+      Không có đáp án duy nhất:
+      - Nest khi: nhiều dev/team cùng codebase, domain phức tạp, muốn convention + DI + testing chuẩn, cần microservices/GraphQL/queue tích hợp nhanh.
+      - Express (hoặc Fastify) khi: service nhỏ, lambda/edge, team nhỏ kỷ luật, cần kiểm soát tối đa, tránh decorator/metadata.
+      - Yếu tố: kinh nghiệm team (Nest cần hiểu DI, lifecycle), chuẩn hoá tổ chức, khả năng tuyển dụng, chi phí upgrade major.
+      - Quyết định bằng spike/POC nhỏ + tiêu chí đo (thời gian làm feature mẫu, dễ test), ghi ADR.
+    followUp: What would make you regret choosing Nest two years later?
+    tags: [architecture, open]
+  - id: nestjs-040
+    level: senior
+    type: design
+    q: Design authorization in Nest for a B2B platform — RBAC plus resource-level rules like "staff can edit orders only in their own store".
+    hint: |-
+      - Tầng 1 (coarse): global auth guard + `@RequirePermissions("order:update")` metadata + guard kiểm tra permission của role.
+      - Tầng 2 (resource/ABAC): policy (CASL hoặc policy function) cần **dữ liệu resource** → check trong service sau khi load resource, hoặc guard load resource (tốn thêm query, trùng lặp).
+      - Query-level: list endpoint phải lọc theo scope (store/tenant) ở query, không lọc sau khi lấy.
+      - Permission nguồn: code (tĩnh, type-safe) vs DB (tenant tự định nghĩa role) → cache + invalidation.
+      - Audit log, test ma trận quyền (role × action × ownership).
+    followUp: Where do you put the check so that a new endpoint cannot forget it?
+    tags: [authorization, rbac, design]
+  - id: nestjs-041
+    level: senior
+    type: open
+    q: Nest relies on legacy TypeScript decorators and `reflect-metadata`. What are the long-term trade-offs given TC39 standard decorators and Node's type stripping?
+    hint: |-
+      - Nest dùng `experimentalDecorators` + `emitDecoratorMetadata` (parameter decorator, `design:paramtypes`) — standard decorators (TS 5.0+) không có parameter decorator và không emit metadata type.
+      - Hệ quả: cần compiler hỗ trợ legacy decorator (tsc, swc), không chạy trực tiếp bằng Node type stripping; `isolatedModules`/`import type` dễ làm mất metadata.
+      - Rủi ro dài hạn: phụ thuộc feature "experimental"; nhưng hệ sinh thái lớn nên ít khả năng bị bỏ đột ngột.
+      - Giảm rủi ro: giữ domain logic thuần TS (không decorator), Nest chỉ ở lớp ngoài; validation bằng schema thay vì class-validator nếu muốn bớt decorator.
+    followUp: If you had to leave Nest someday, which parts of your code would be hardest to move?
+    verify: true
+    tags: [decorators, typescript, open]
+  - id: nestjs-042
+    level: cv
+    type: design
+    q: You haven't run NestJS in production, but you built RBAC and permission middleware in Express. How would you port that design to Nest guards and decorators?
+    hint: |-
+      Câu trả lời mạnh (trung thực về kinh nghiệm):
+      - Nói rõ: đã làm ở Express (mô tả cơ chế thật), Nest là mapping kiến thức + POC nếu có.
+      - Mapping: middleware verify JWT → global `AuthGuard` (APP_GUARD) + `@Public()`; `requirePermission("x")` → metadata decorator + `PermissionsGuard` đọc bằng `Reflector`; check ownership/tenant vẫn ở service/query.
+      - Lợi ích Nest: guard biết handler/metadata, áp dụng chung cho HTTP/RPC/WS; test bằng `overrideGuard`.
+      - Cẩn thận: lifecycle (guard chạy trước pipe → body chưa validate), DI cho guard, không dùng request scope cho guard.
+    followUp: Your Express middleware loaded permissions from Redis. Where does that dependency live in the Nest version?
+    redFlags:
+      - Claims production Nest experience that the candidate doesn't have
+    tags: [cv, rbac, guards]
+  - id: nestjs-043
+    level: cv
+    type: design
+    q: You introduced Redis caching on hot APIs in Express. In Nest, would you use `CacheInterceptor` or explicit caching in services? Why?
+    hint: |-
+      - `CacheInterceptor` (`@nestjs/cache-manager`): cache theo route/URL, nhanh để bật — nhưng key mặc định không biết **tenant/user/permission**, chỉ cache GET, khó invalidate theo entity.
+      - Explicit cache-aside trong service (inject Redis client): key có tenant + entity + version, invalidate khi ghi, chống stampede — giống cách đã làm ở Express (điền chi tiết thật của bạn).
+      - Có thể custom `trackBy()` của interceptor để thêm tenant vào key cho response công khai theo tenant.
+      - Đo hit ratio và độ tươi dữ liệu.
+    followUp: How would you invalidate cached product lists when a single product's price changes?
+    tags: [cv, caching, interceptors]
+  - id: nestjs-044
+    level: cv
+    type: behavioral
+    q: Tell me about a NestJS proof of concept you built (or would build) to evaluate it for your team. What did you test and what did you conclude?
+    hint: |-
+      STAR — trung thực: nếu đã có POC thì kể thật, nếu chưa thì nói kế hoạch POC:
+      - Phạm vi POC: 1–2 endpoint thật (vd Address Management), auth guard, validation, một Kafka consumer, test unit + e2e.
+      - Tiêu chí đánh giá: thời gian làm feature so với Express, độ dễ test, hiệu năng (latency overhead đo bằng load test), độ khó onboarding, tương thích lib hiện có.
+      - Kết quả/khuyến nghị (điền kết quả thật của bạn): áp dụng cho service mới? giữ Express cho service cũ?
+      - Reflection: rủi ro (lifecycle, request scope, decorator) và cách giảm.
+    followUp: What would convince you NOT to adopt Nest after the POC?
+    redFlags:
+      - Invents production metrics for a framework never shipped
+    tags: [cv, poc, behavioral]
+  - id: nestjs-045
+    level: cv
+    type: design
+    q: Your Express microservices talk over Kafka. If you rewrote one consumer with `@nestjs/microservices`, what would change and what would you keep custom?
+    hint: |-
+      - Thay đổi: `@EventPattern("topic")` + DI cho handler, `ClientKafka.emit()` cho producer, hybrid app hoặc entrypoint riêng.
+      - Giữ/kiểm tra kỹ: idempotency (dedupe theo event id), retry/DLQ policy, commit offset sau khi xử lý, thứ tự theo key, graceful shutdown — xem transport Nest có cho kiểm soát đủ không; nếu không, dùng client Kafka trực tiếp bọc trong provider.
+      - Schema/contract event dùng chung và validate runtime ở consumer.
+      - Kinh nghiệm thật ở Express (điền chi tiết) là nền để so sánh.
+    followUp: Which Kafka behavior would you verify first in a Nest POC before trusting it in production?
+    verify: true
+    tags: [cv, kafka, microservices]
+  - id: nestjs-046
+    level: cv
+    type: design
+    q: How would you migrate an existing Express service to Nest incrementally without a big-bang rewrite?
+    hint: |-
+      - Nest chạy trên Express: `NestFactory.create(AppModule, new ExpressAdapter(existingExpressApp))` → mount router cũ và Nest controller trong cùng process; hoặc gateway route dần sang service Nest mới (strangler).
+      - Chuyển theo feature: bắt đầu với module ít phụ thuộc; bọc service cũ thành provider (`useValue`/`useFactory`) để Nest inject.
+      - Giữ chung: auth token format, error response format, logging/requestId (ALS), config.
+      - Test: characterization test (supertest) chạy trên cả route cũ và mới trước khi chuyển.
+      - Cẩn thận Express 5 dưới Nest 11+ nếu app cũ còn Express 4 (route syntax, middleware) — verify.
+    followUp: What's your exit criterion for removing the legacy Express routers entirely?
+    verify: true
+    tags: [cv, migration]

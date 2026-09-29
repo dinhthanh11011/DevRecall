@@ -1,0 +1,880 @@
+id: 02-dsa
+slug: dsa
+title: Data Structures & Algorithms for Seniors
+tier: 0
+status: drafted
+summary: "Big-O thực dụng và các bài toán backend hay gặp: LRU, rate limiter, top-K, debounce/throttle, promise pool, trie, topo sort, interval — viết bằng TypeScript."
+cvLinked: false
+overview: |-
+  ## TL;DR
+
+  - Senior interview hiếm khi hỏi cây đỏ-đen; họ hỏi **cài đặt một primitive production** (LRU cache, rate limiter, promise pool, debounce) và **lý do chọn cấu trúc dữ liệu** cho một workload thật.
+  - Big-O là để **so sánh khi n lớn**; ngoài đời còn hằng số, cache locality, allocation/GC, và **I/O** (một query N+1 đắt hơn mọi vòng lặp O(n²) trên 100 phần tử).
+  - Bộ công cụ tối thiểu: **hash map, array, heap, deque, trie, graph (BFS/DFS/topo sort), sliding window, two pointers, binary search, interval merge**, cộng các cấu trúc xác suất (**Bloom filter, HyperLogLog**).
+  - Biết cấu trúc nào đang nằm **bên trong** công cụ bạn dùng: B-tree (index DB), skip list (Redis sorted set), hash ring (sharding), inverted index (Elasticsearch).
+
+  ## Khái niệm cốt lõi
+
+  | Cấu trúc / kỹ thuật | Một câu | Ví dụ backend |
+  |---|---|---|
+  | Hash map (`Map`) | Tra cứu trung bình O(1), `Map` trong JS giữ **thứ tự chèn** | Dedupe, index theo id, LRU |
+  | Dynamic array | Truy cập O(1), push amortized O(1), chèn/xoá đầu O(n) | Buffer, batch |
+  | Deque / ring buffer | Thêm/bớt hai đầu O(1) | Queue job, sliding window log |
+  | Binary heap | Lấy min/max O(1), push/pop O(log n) | Top-K, scheduler, merge k sorted |
+  | Trie | Cây theo ký tự, tra prefix O(độ dài key) | Autocomplete, routing theo path |
+  | Graph + BFS/DFS | Duyệt quan hệ; BFS cho đường ngắn nhất không trọng số | Dependency, permission inheritance |
+  | Topological sort | Thứ tự tuyến tính của DAG, phát hiện cycle | Build order, migration order |
+  | Sliding window | Duy trì cửa sổ trên stream thay vì tính lại | Rate limit, moving average |
+  | Binary search | O(log n) trên dữ liệu **có thứ tự** (hoặc hàm đơn điệu) | Tìm version lỗi, cursor pagination |
+  | B-tree / B+tree | Cây nhiều nhánh tối ưu cho disk page | Index PostgreSQL/SQL Server |
+  | Bloom filter | "Chắc chắn không có" hoặc "có thể có", tốn ít bộ nhớ | Chặn lookup key không tồn tại |
+  | HyperLogLog | Đếm distinct xấp xỉ với vài KB | Unique visitors (`PFCOUNT`) |
+
+  ## Cơ chế hoạt động
+
+  ### Chọn cấu trúc dữ liệu cho một yêu cầu
+
+  ```mermaid
+  flowchart TD
+    A["Thao tác chính là gì?"] --> B{"Tra cứu theo key?"}
+    B -- có --> C{"Cần thứ tự / range?"}
+    C -- không --> H["Hash map"]
+    C -- "có, in-memory" --> T["Sorted array + binary search<br/>hoặc balanced tree / skip list"]
+    C -- "có, trên disk" --> BT["B+tree (DB index)"]
+    B -- không --> D{"Luôn cần min/max hoặc top-K?"}
+    D -- có --> HP["Heap / priority queue"]
+    D -- không --> E{"Theo prefix chuỗi?"}
+    E -- có --> TR["Trie"]
+    E -- không --> F{"FIFO / hai đầu?"}
+    F -- có --> DQ["Deque / ring buffer"]
+    F -- không --> G{"Quan hệ phụ thuộc?"}
+    G -- có --> GR["Graph + BFS/DFS/topo sort"]
+    G -- không --> AR["Array"]
+  ```
+
+  ### LRU cache = hash map + thứ tự truy cập
+
+  ```mermaid
+  flowchart LR
+    subgraph Map["Map (insertion order = recency)"]
+      direction LR
+      K1["oldest: sku-1"] --> K2["sku-7"] --> K3["sku-3"] --> K4["newest: sku-9"]
+    end
+    G["get(sku-7)"] -- "delete + set lại → cuối" --> K4
+    S["set khi đầy"] -- "xoá key đầu tiên (oldest)" --> K1
+  ```
+
+  Trong JS, `Map` giữ thứ tự chèn nên `delete` + `set` đưa key về cuối, và `map.keys().next().value` là key cũ nhất → mọi thao tác O(1) mà không cần tự viết doubly linked list.
+
+  ### Token bucket rate limiter
+
+  ```mermaid
+  sequenceDiagram
+    participant C as Client
+    participant L as Limiter (capacity 10, refill 5/s)
+    C->>L: request (t=0, tokens=10)
+    L-->>C: allow (tokens=9)
+    Note over L: tokens = min(cap, tokens + elapsed × rate)
+    C->>L: 12 requests burst
+    L-->>C: 9 allow, 3 reject (429 + Retry-After)
+  ```
+
+  ## Trade-offs
+
+  | Bài toán | Cách A | Cách B | Chọn khi |
+  |---|---|---|---|
+  | Top-K trên n phần tử | Sort toàn bộ O(n log n) | Min-heap kích thước K: O(n log K) | K ≪ n hoặc dữ liệu là stream |
+  | Rate limit | Fixed window counter: rẻ, burst ở ranh giới | Sliding window log: chính xác, tốn memory | Token bucket khi cần cho phép burst có kiểm soát |
+  | Membership | `Set`: chính xác, O(n) memory | Bloom filter: false positive, rất ít memory | Hàng trăm triệu key, chấp nhận sai một chiều |
+  | Distinct count | `Set`: chính xác | HyperLogLog: sai ~1%, vài KB | Analytics quy mô lớn |
+  | Queue in-memory | `Array.shift()`: có thể O(n) | Ring buffer / head index: O(1) | Queue lớn, throughput cao |
+  | Autocomplete | `LIKE 'abc%'` với index | Trie in-memory / search engine (edge n-gram) | Tập từ nhỏ vs lớn/đa ngôn ngữ |
+  | Dedupe stream | Lưu hết id | TTL window / Bloom | Tuỳ yêu cầu chính xác |
+
+  ## Pitfalls
+
+  - `[10, 9, 1].sort()` → `[1, 10, 9]` — sort mặc định so sánh **chuỗi**; luôn truyền comparator.
+  - `arr.includes`/`indexOf` trong vòng lặp → O(n²) ẩn; đổi sang `Set`.
+  - `Array.shift()` trên queue lớn, `arr.splice(0, 1)` trong vòng lặp.
+  - Đệ quy sâu (cây 100k node, DFS) → `RangeError: Maximum call stack size exceeded`; dùng stack tường minh.
+  - Object làm hash map với key từ user (`__proto__`, `constructor`) → dùng `Map` hoặc `Object.create(null)`.
+  - Tối ưu Big-O mà quên I/O: N+1 query, gọi Redis trong vòng lặp thay vì `MGET`/pipeline.
+  - Rate limiter/LRU in-memory trên nhiều pod → mỗi pod một trạng thái riêng.
+
+  ## Cheat sheet
+
+  - Hash map: get/set O(1) trung bình, O(n) worst · Heap: push/pop O(log n), peek O(1), heapify O(n) · Binary search: O(log n).
+  - Sort so sánh: tối thiểu O(n log n); `Array.prototype.sort` **stable** từ ES2019.
+  - Top-K lớn nhất → **min**-heap size K; K nhỏ nhất → max-heap.
+  - Interval merge: sort theo `start`, gộp nếu `next.start <= cur.end` → O(n log n).
+  - Topo sort (Kahn): đếm in-degree, queue các node in-degree 0; nếu output < số node → có cycle.
+  - Debounce: chạy **sau khi ngừng** gọi X ms · Throttle: chạy **tối đa một lần** mỗi X ms.
+  - Promise pool: N worker cùng kéo từ một iterator chung; giữ kết quả theo **index**.
+  - Amortized O(1): push vào dynamic array (thỉnh thoảng resize O(n) nhưng trung bình vẫn O(1)).
+notionRefs:
+  - title: Giải thuật
+    url: https://app.notion.com/p/2d8ef77f8ab280a2858ac2e4085e54aa
+references:
+  - title: MDN — Map
+    url: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Map
+  - title: MDN — Array.prototype.sort()
+    url: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Array/sort
+  - title: MDN — Set methods (union, intersection…)
+    url: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Set
+  - title: Redis — Sorted sets
+    url: https://redis.io/docs/latest/develop/data-types/sorted-sets/
+  - title: Redis — HyperLogLog
+    url: https://redis.io/docs/latest/develop/data-types/probabilistic/hyperloglogs/
+  - title: Redis — Bloom filter
+    url: https://redis.io/docs/latest/develop/data-types/probabilistic/bloom-filter/
+  - title: PostgreSQL — Index types (B-tree, GIN, GiST…)
+    url: https://www.postgresql.org/docs/current/indexes-types.html
+  - title: V8 blog — Getting things sorted in V8 (TimSort)
+    url: https://v8.dev/blog/array-sort
+  - title: Stripe — Scaling your API with rate limiters
+    url: https://stripe.com/blog/rate-limiters
+questions:
+  - id: dsa-001
+    level: easy
+    type: concept
+    q: Why does Big-O alone not tell you which of two implementations is faster in production? Give a concrete example.
+    hint: |-
+      - Big-O mô tả **tốc độ tăng** khi n → ∞, bỏ hằng số và term nhỏ. Với n nhỏ, O(n²) có hằng số thấp có thể nhanh hơn O(n log n).
+      - Yếu tố thật: cache locality (array liên tục vs linked list rải rác), allocation/GC, số lần I/O.
+      - Ví dụ: vòng lặp O(n) gọi `await db.findById` → n round-trip (N+1) chậm hơn nhiều so với một query `WHERE id = ANY($1)` rồi join in-memory O(n).
+      - Senior: đo (profile, benchmark với dữ liệu thật) trước khi tối ưu.
+    followUp: Your endpoint loops over 200 items and calls Redis for each. What data-structure/batching change do you make?
+    tags: [big-o, performance]
+  - id: dsa-002
+    level: easy
+    type: gotcha
+    q: What does `[10, 9, 1, 100].sort()` return in JavaScript, and why? What's the correct way to sort numbers, and is the sort stable?
+    example: |-
+      ```ts
+      [10, 9, 1, 100].sort();              // ?
+      [10, 9, 1, 100].sort((a, b) => a - b); // ?
+      ```
+    hint: |-
+      - Không có comparator → phần tử được chuyển **sang chuỗi** và so sánh theo UTF-16 → `[1, 10, 100, 9]`.
+      - Đúng: `(a, b) => a - b` → `[1, 9, 10, 100]`. Với chuỗi có dấu/đa ngôn ngữ dùng `localeCompare` hoặc `Intl.Collator`.
+      - `sort` **mutate** mảng gốc; dùng `toSorted()` (ES2023) để không đổi mảng.
+      - Stable từ ES2019 (V8 dùng TimSort) → sort nhiều khoá bằng cách sort lần lượt hoặc comparator kết hợp.
+    followUp: Why is `(a, b) => a > b` a broken comparator even though it "seems to work"?
+    tags: [sort, javascript, gotcha]
+  - id: dsa-003
+    level: easy
+    type: compare
+    q: '`Map` vs plain object vs `Set` in JavaScript — when do you use each as a hash table?'
+    hint: |-
+      - `Map`: key bất kỳ kiểu (object, number không bị ép sang string), giữ **thứ tự chèn**, `size` O(1), không dính prototype → mặc định cho hash map động.
+      - Object: key chỉ string/symbol; key số nguyên được sắp tăng dần trước; key từ user có thể đụng `__proto__` (prototype pollution) → chỉ dùng cho record có shape cố định hoặc `Object.create(null)`.
+      - `Set`: membership/dedupe O(1); ES2025 có `union`, `intersection`, `difference`.
+      - Serialize: object → JSON trực tiếp; `Map` cần `Object.fromEntries`/mảng entries.
+    followUp: Why does using a user-supplied string as an object key open a security hole?
+    verify: true
+    tags: [hash-map, javascript]
+  - id: dsa-004
+    level: easy
+    type: compare
+    q: Debounce vs throttle — define both and give a UI and a backend use case for each.
+    hint: |-
+      - Debounce: chỉ chạy sau khi **ngừng** gọi đủ X ms (reset timer mỗi lần gọi). UI: search box gọi API khi user ngừng gõ 300ms. Backend: gộp nhiều event "product updated" liên tiếp thành một lần reindex.
+      - Throttle: chạy **tối đa một lần mỗi X ms** bất kể gọi bao nhiêu. UI: scroll/resize handler. Backend: gửi progress update, log sampling.
+      - Biến thể: leading vs trailing edge; `maxWait` để debounce không bị trì hoãn vô hạn.
+    followUp: Implement a debounce that returns a promise resolving with the last call's result.
+    tags: [debounce, throttle]
+  - id: dsa-005
+    level: easy
+    type: concept
+    q: What is a binary heap, and why is it the right structure for a job scheduler or top-K?
+    hint: |-
+      - Cây nhị phân hoàn chỉnh lưu trong **array** (con của i là 2i+1, 2i+2), thoả heap property (cha ≤ con với min-heap).
+      - `peek` O(1), `push`/`pop` O(log n) (sift up/down), build từ mảng O(n).
+      - Scheduler: luôn lấy job có `runAt`/priority nhỏ nhất mà không cần sort lại toàn bộ.
+      - Top-K: giữ min-heap K phần tử → O(n log K), memory O(K) — chạy được trên stream.
+      - JS không có heap built-in → tự viết hoặc thư viện; Redis sorted set là lựa chọn phân tán.
+    followUp: How would you support "cancel job X" efficiently in a heap-based scheduler?
+    tags: [heap, priority-queue]
+  - id: dsa-006
+    level: easy
+    type: concept
+    q: What is amortized O(1), using `Array.prototype.push` as the example?
+    hint: |-
+      - Dynamic array cấp phát capacity dư; push thường O(1); khi đầy thì cấp vùng lớn hơn (thường ×1.5–2) và **copy** O(n).
+      - Vì capacity tăng theo cấp số nhân, tổng chi phí n lần push là O(n) → trung bình O(1) mỗi lần = **amortized**.
+      - Khác "average case": amortized là đảm bảo trên **chuỗi** thao tác, không phụ thuộc phân phối input.
+      - Hệ quả thực tế: có thể có latency spike ở một lần push lớn; pre-size nếu biết trước kích thước.
+    followUp: Why is `unshift` not amortized O(1) on a plain array?
+    tags: [big-o, array]
+  - id: dsa-007
+    level: easy
+    type: concept
+    q: When is binary search applicable beyond "find a number in a sorted array"? Give two engineering examples.
+    hint: |-
+      - Điều kiện: không gian tìm kiếm có **tính đơn điệu** (predicate false…false true…true).
+      - `git bisect`: tìm commit gây bug trong O(log n) lần build/test.
+      - Tìm giá trị cấu hình tối ưu: batch size lớn nhất không bị timeout, concurrency lớn nhất không lỗi.
+      - DB: B-tree index về bản chất là tìm kiếm theo thứ tự; keyset pagination `WHERE (created_at, id) < ($1, $2)`.
+      - Sai lầm phổ biến: off-by-one ở biên `lo/hi`, vòng lặp vô hạn khi `mid` không tiến.
+    followUp: Write a lower-bound binary search that returns the first index with `arr[i] >= x`.
+    tags: [binary-search]
+  - id: dsa-008
+    level: easy
+    type: concept
+    q: What is a trie, and when would you use one instead of a database `LIKE 'prefix%'` query?
+    hint: |-
+      - Trie: cây mà mỗi cạnh là một ký tự; tìm prefix O(L) (L = độ dài prefix), liệt kê tất cả từ có prefix bằng DFS từ node đó.
+      - Dùng khi: tập từ vừa memory (vài chục nghìn tag, category, command), cần latency cực thấp in-process, hoặc routing path (router HTTP dùng radix tree).
+      - DB `LIKE 'abc%'` dùng được B-tree index (PostgreSQL cần `text_pattern_ops` nếu collation không phải C) — đủ cho đa số.
+      - Tập lớn, fuzzy, đa ngôn ngữ, ranking → search engine (Elasticsearch completion suggester / edge n-gram).
+    followUp: How would you rank autocomplete suggestions by popularity inside the trie?
+    verify: true
+    tags: [trie, search]
+  - id: dsa-009
+    level: easy
+    type: compare
+    q: BFS vs DFS — which do you use to find the shortest chain of category parents, and which to detect a cycle?
+    hint: |-
+      - BFS (queue): duyệt theo lớp → tìm **đường ngắn nhất** trên graph không trọng số (số hop ít nhất giữa hai category, "bạn của bạn").
+      - DFS (stack/đệ quy): đi sâu trước → phát hiện **cycle** (gặp node đang ở trạng thái "visiting"), topo sort, liệt kê cây con.
+      - Cả hai O(V + E); phải có `visited` để không lặp vô hạn trên graph có cycle.
+      - Đệ quy DFS trên cây sâu → stack overflow; dùng stack tường minh.
+    followUp: Your category table has a bad row that makes a category its own ancestor. How does a recursive SQL CTE behave, and how do you guard it?
+    tags: [graph, bfs, dfs]
+  - id: dsa-010
+    level: medium
+    type: design
+    q: Implement an LRU cache with O(1) `get` and `set` in TypeScript. Why does a `Map` alone suffice in JavaScript?
+    example: |-
+      ```ts
+      class LRU<K, V> {
+        private map = new Map<K, V>();
+        constructor(private max: number) {}
+        get(key: K): V | undefined {
+          if (!this.map.has(key)) return undefined;
+          const v = this.map.get(key)!;
+          this.map.delete(key);   // move to the "newest" end
+          this.map.set(key, v);
+          return v;
+        }
+        set(key: K, value: V) {
+          if (this.map.has(key)) this.map.delete(key);
+          else if (this.map.size >= this.max) {
+            this.map.delete(this.map.keys().next().value!); // oldest
+          }
+          this.map.set(key, value);
+        }
+      }
+      ```
+    hint: |-
+      - Cổ điển: hash map (key → node) + **doubly linked list** (thứ tự dùng) → move-to-front và evict tail đều O(1).
+      - JS `Map` giữ thứ tự chèn và `delete`/`set`/lấy key đầu tiên đều O(1) → đóng vai cả hai.
+      - Lưu ý `has` rồi `get` khi value có thể là `undefined`; production thêm TTL, giới hạn theo **bytes** chứ không chỉ số item, và metric hit rate.
+      - Nhiều pod → mỗi pod LRU riêng (L1) + Redis (L2).
+    followUp: Add a per-entry TTL without scanning the whole map. What changes?
+    tags: [lru, cache, hash-map]
+  - id: dsa-011
+    level: medium
+    type: design
+    q: Implement a token-bucket rate limiter. How does it differ from a fixed-window counter?
+    example: |-
+      ```ts
+      class TokenBucket {
+        private tokens: number;
+        private last = Date.now();
+        constructor(private capacity: number, private refillPerSec: number) {
+          this.tokens = capacity;
+        }
+        tryRemove(cost = 1): boolean {
+          const now = Date.now();
+          this.tokens = Math.min(this.capacity, this.tokens + ((now - this.last) / 1000) * this.refillPerSec);
+          this.last = now;
+          if (this.tokens < cost) return false;
+          this.tokens -= cost;
+          return true;
+        }
+      }
+      ```
+    hint: |-
+      - Token bucket: bucket tối đa `capacity` token, nạp lại đều `rate`/s (tính **lazy** theo thời gian trôi qua, không cần timer); mỗi request lấy 1 token → cho phép **burst** tới capacity, trung bình bị giới hạn bởi rate.
+      - Fixed window (`INCR key:minute`): rẻ, nhưng burst gấp đôi ở ranh giới (59s và 61s).
+      - Sliding window log: chính xác, lưu mọi timestamp → memory O(limit). Sliding window counter: nội suy giữa 2 window, xấp xỉ tốt và rẻ.
+      - Phân tán: state trong Redis, thao tác bằng Lua script cho atomic; key theo user/tenant/API key.
+    followUp: Make this limiter work across 10 pods with Redis. Why must it be a Lua script (or equivalent atomic operation)?
+    tags: [rate-limiter, design]
+  - id: dsa-012
+    level: medium
+    type: design
+    q: Write a promise pool that runs async tasks with at most N in flight and returns results in input order.
+    example: |-
+      ```ts
+      async function pool<T, R>(items: T[], limit: number, fn: (x: T, i: number) => Promise<R>): Promise<R[]> {
+        const results = new Array<R>(items.length);
+        let next = 0;
+        async function worker() {
+          while (next < items.length) {
+            const i = next++;            // claim index before awaiting
+            results[i] = await fn(items[i], i);
+          }
+        }
+        await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+        return results;
+      }
+      ```
+    hint: |-
+      - Ý tưởng: N "worker" cùng kéo từ một chỉ số chung; vì JS single-threaded, `next++` trước `await` là an toàn (không có data race).
+      - Giữ **thứ tự** bằng cách ghi theo index, không `push`.
+      - Lỗi: bản trên fail-fast (một task reject → `Promise.all` reject, các worker khác vẫn chạy tiếp). Muốn gom lỗi → lưu `{status, value|reason}` như `allSettled`.
+      - Production: thêm `AbortSignal` để ngừng lấy task mới khi lỗi, retry có backoff, và chọn N theo tài nguyên đích (DB pool size, rate limit của API).
+    followUp: How would you turn this into an async iterator that yields results as they complete, for a 10-million-row input that doesn't fit in memory?
+    tags: [promise-pool, concurrency]
+  - id: dsa-013
+    level: medium
+    type: design
+    q: Find the top 10 most-viewed products from a stream of 50 million view events. Compare the approaches.
+    hint: |-
+      - Đếm: hash map `productId → count` O(n) thời gian, O(distinct) memory.
+      - Chọn top-K: min-heap size K → O(d log K) thay vì sort toàn bộ O(d log d); hoặc quickselect O(d) trung bình.
+      - Quá nhiều distinct key cho memory → xấp xỉ: **Count-Min Sketch** + heap, hoặc Space-Saving/Misra-Gries (heavy hitters).
+      - Hệ thống thật: Redis sorted set (`ZINCRBY`, `ZREVRANGE 0 9`), hoặc aggregation ở data warehouse / stream processor theo window.
+      - Hỏi lại yêu cầu: realtime hay theo ngày? chấp nhận sai số?
+    example: |-
+      ```ts
+      // count then keep a min-heap of size k (MinHeap: any binary heap keyed by count)
+      const counts = new Map<string, number>();
+      for (const e of events) counts.set(e.productId, (counts.get(e.productId) ?? 0) + 1);
+      const heap = new MinHeap<[string, number]>((a, b) => a[1] - b[1]);
+      for (const entry of counts) {
+        heap.push(entry);
+        if (heap.size > 10) heap.pop();
+      }
+      ```
+    followUp: Top-10 must be per tenant and per hour. How does the data model change?
+    tags: [top-k, heap, streaming]
+  - id: dsa-014
+    level: medium
+    type: design
+    q: Merge overlapping time intervals — e.g. an employee's shifts `[[9,12],[11,14],[15,17]]` — and detect whether a new shift conflicts with existing ones.
+    example: |-
+      ```ts
+      type Interval = [start: number, end: number];
+      function merge(xs: Interval[]): Interval[] {
+        const s = [...xs].sort((a, b) => a[0] - b[0]);
+        const out: Interval[] = [];
+        for (const [st, en] of s) {
+          const last = out.at(-1);
+          if (last && st <= last[1]) last[1] = Math.max(last[1], en);
+          else out.push([st, en]);
+        }
+        return out;
+      }
+      merge([[9, 12], [11, 14], [15, 17]]); // [[9,14],[15,17]]
+      ```
+    hint: |-
+      - Merge: sort theo start O(n log n), quét một lần gộp khi `start <= lastEnd`.
+      - Conflict check một shift mới trên danh sách đã sort: binary search vị trí chèn rồi so với hàng xóm → O(log n); hai khoảng `[a,b)` và `[c,d)` chồng nhau khi `a < d && c < b`.
+      - Quyết định **biên**: `[9,12)` và `[12,15)` có chồng không? (half-open interval tránh nhập nhằng).
+      - DB: PostgreSQL có range type + `EXCLUDE USING gist` để DB tự chặn chồng lấn; SQL Server không có → check trong transaction với lock phù hợp.
+      - Timezone/DST: lưu UTC, hiển thị theo local.
+    followUp: Two managers assign overlapping shifts to the same employee at the same moment. How do you guarantee no overlap is stored?
+    verify: true
+    tags: [intervals, sort, scheduling]
+  - id: dsa-015
+    level: medium
+    type: design
+    q: Given services and their dependencies, produce a valid startup (or migration) order and report cycles. Implement it.
+    example: |-
+      ```ts
+      function topoSort(deps: Record<string, string[]>): string[] {
+        const indeg = new Map<string, number>();
+        const out = new Map<string, string[]>();
+        for (const [n, ds] of Object.entries(deps)) {
+          indeg.set(n, indeg.get(n) ?? 0);
+          for (const d of ds) {
+            indeg.set(n, (indeg.get(n) ?? 0) + 1);
+            indeg.set(d, indeg.get(d) ?? 0);
+            out.set(d, [...(out.get(d) ?? []), n]);
+          }
+        }
+        const q = [...indeg].filter(([, v]) => v === 0).map(([k]) => k);
+        const order: string[] = [];
+        for (let i = 0; i < q.length; i++) {
+          const n = q[i];
+          order.push(n);
+          for (const m of out.get(n) ?? []) {
+            indeg.set(m, indeg.get(m)! - 1);
+            if (indeg.get(m) === 0) q.push(m);
+          }
+        }
+        if (order.length !== indeg.size) throw new Error('cycle detected');
+        return order;
+      }
+      topoSort({ api: ['db', 'cache'], cache: [], db: [], worker: ['db'] });
+      // ['db', 'cache', 'worker', 'api']
+      ```
+    hint: |-
+      - Kahn's algorithm: tính in-degree, đưa node in-degree 0 vào queue, lấy ra và giảm in-degree của node phụ thuộc → O(V + E).
+      - Output ít hơn số node ⇒ có **cycle**; báo node còn in-degree > 0 để debug.
+      - Queue dùng index `i` thay cho `shift()` để tránh O(n) mỗi lần.
+      - Alternative: DFS với 3 màu (white/gray/black) — gặp gray là cycle.
+      - Ứng dụng: build order monorepo, thứ tự migration, thứ tự tính các field phụ thuộc.
+    followUp: How would you start independent services in parallel while still respecting dependencies?
+    tags: [graph, topological-sort]
+  - id: dsa-016
+    level: medium
+    type: concept
+    q: How does a sliding-window technique turn an O(n·k) computation into O(n)? Use "max sum of any k consecutive orders" or "requests in the last 60 s" as the example.
+    hint: |-
+      - Thay vì tính lại cửa sổ từ đầu, **cộng phần tử vào** và **trừ phần tử ra** khi cửa sổ trượt → mỗi phần tử được xử lý hằng số lần.
+      - Cửa sổ theo thời gian: deque các timestamp; khi có request mới, pop đầu những timestamp cũ hơn `now - 60s` → `length` là số request.
+      - Biến thể: cửa sổ co giãn (two pointers) cho "chuỗi con dài nhất thoả điều kiện".
+      - Max trong cửa sổ: **monotonic deque** → O(n).
+    example: |-
+      ```ts
+      function maxSumK(xs: number[], k: number) {
+        let sum = xs.slice(0, k).reduce((a, b) => a + b, 0);
+        let best = sum;
+        for (let i = k; i < xs.length; i++) {
+          sum += xs[i] - xs[i - k];
+          best = Math.max(best, sum);
+        }
+        return best;
+      }
+      ```
+    followUp: How would you compute p95 latency over a sliding 5-minute window without storing every sample?
+    tags: [sliding-window, two-pointers]
+  - id: dsa-017
+    level: medium
+    type: concept
+    q: How does a Bloom filter work, and where would it help in a backend that looks up product IDs in cache → DB?
+    hint: |-
+      - Bit array m bit + k hash function; `add` bật k bit, `mightContain` kiểm tra k bit → **không có false negative**, có false positive (tỉ lệ phụ thuộc m, k, n).
+      - Không xoá được (bản cơ bản); Counting Bloom / Cuckoo filter hỗ trợ xoá.
+      - Use case: chặn request cho ID **không tồn tại** trước khi chạm cache/DB (chống cache penetration — attacker gọi id ngẫu nhiên); tránh đọc disk không cần thiết (LSM tree như RocksDB/Cassandra dùng Bloom per SSTable).
+      - Redis Stack/Redis 8 có Bloom filter (`BF.ADD`, `BF.EXISTS`).
+    followUp: How do you size a Bloom filter for 10 million items at a 1% false-positive rate (order of magnitude)?
+    verify: true
+    tags: [bloom-filter, probabilistic, caching]
+  - id: dsa-018
+    level: medium
+    type: concept
+    q: Why do relational databases use B+trees for indexes instead of hash tables or binary search trees?
+    hint: |-
+      - Tối ưu cho **disk/page**: mỗi node là một page (8 KB ở PostgreSQL) chứa hàng trăm key → cây rất thấp (3–4 tầng cho hàng triệu row) → ít I/O.
+      - Leaf được sắp xếp và nối với nhau → **range scan**, `ORDER BY`, prefix của composite index hiệu quả.
+      - Hash index chỉ hỗ trợ `=`, không range/sort; BST nhị phân quá cao và node nhỏ → nhiều random I/O.
+      - Hệ quả thực tế: thứ tự cột trong composite index quan trọng (leftmost prefix); insert random key (UUIDv4) gây page split + phân mảnh hơn key tăng dần.
+    followUp: Why can UUIDv4 primary keys hurt insert performance in SQL Server clustered indexes more than UUIDv7?
+    tags: [b-tree, database, index]
+  - id: dsa-019
+    level: medium
+    type: debug
+    q: This in-memory job queue gets dramatically slower as the backlog grows to 200k items. Why, and how do you fix it?
+    example: |-
+      ```ts
+      const queue: Job[] = [];
+      export const enqueue = (j: Job) => queue.push(j);
+      export function dequeue(): Job | undefined {
+        return queue.shift();
+      }
+      export function remove(id: string) {
+        const i = queue.findIndex((j) => j.id === id);
+        if (i >= 0) queue.splice(i, 1);
+      }
+      ```
+    hint: |-
+      - `shift()` phải dời mọi phần tử còn lại → có thể **O(n)** mỗi lần dequeue (engine có tối ưu cho mảng nhỏ nhưng không đảm bảo với mảng lớn) → n dequeue = O(n²).
+      - `remove` = `findIndex` O(n) + `splice` O(n).
+      - Fix: ring buffer hoặc head index (`items[head++]`, compact định kỳ); `Map<id, Job>` + cờ `cancelled` (lazy deletion) để remove O(1).
+      - Lớn hơn: queue in-memory mất khi restart → dùng Redis/BullMQ, SQS, Kafka.
+    followUp: With lazy deletion, what's the memory risk and how do you bound it?
+    verify: true
+    tags: [queue, array, debug]
+  - id: dsa-020
+    level: medium
+    type: compare
+    q: What data structure backs Redis sorted sets, and why does it make leaderboards and delayed jobs cheap?
+    hint: |-
+      - Sorted set = **skip list** (thứ tự theo score, range O(log n + m)) + **hash table** (member → score O(1)); set nhỏ dùng encoding compact (listpack).
+      - Leaderboard: `ZINCRBY` O(log n), `ZREVRANGE 0 9` lấy top 10, `ZRANK` hạng user O(log n).
+      - Delayed job / scheduler: score = timestamp chạy; worker `ZRANGEBYSCORE key -inf now LIMIT` (atomic lấy + xoá bằng Lua hoặc `ZPOPMIN`).
+      - Sliding window rate limit: score = timestamp, `ZREMRANGEBYSCORE` bỏ cũ, `ZCARD` đếm.
+    followUp: Why do many teams pick a skip list over a balanced tree for this kind of structure?
+    tags: [redis, skip-list, sorted-set]
+  - id: dsa-021
+    level: medium
+    type: concept
+    q: What is consistent hashing, and what problem does it solve compared to `hash(key) % N`?
+    hint: |-
+      - `hash % N`: thêm/bớt một node → gần như **mọi key** đổi node → cache miss hàng loạt, di chuyển dữ liệu lớn.
+      - Consistent hashing: đặt node và key trên một vòng hash; key thuộc node gần nhất theo chiều kim đồng hồ → thêm/bớt node chỉ remap ~**1/N** key.
+      - **Virtual nodes** (mỗi node nhiều điểm trên vòng) giúp phân phối đều và chia tải khi node rời đi.
+      - Dùng trong: sharding cache (client-side Memcached), DynamoDB/Cassandra partitioning, LB theo session. Redis Cluster dùng biến thể **hash slot** (16384 slot) thay vì vòng.
+    followUp: How do you handle a hot key that consistent hashing still sends to a single node?
+    tags: [consistent-hashing, sharding]
+  - id: dsa-022
+    level: medium
+    type: design
+    q: Implement `debounce` correctly in TypeScript, preserving `this` and arguments, with a `cancel` method. Where do most hand-written versions go wrong?
+    example: |-
+      ```ts
+      function debounce<A extends unknown[]>(fn: (...args: A) => void, ms: number) {
+        let t: ReturnType<typeof setTimeout> | undefined;
+        const debounced = function (this: unknown, ...args: A) {
+          clearTimeout(t);
+          t = setTimeout(() => fn.apply(this, args), ms);
+        };
+        debounced.cancel = () => clearTimeout(t);
+        return debounced;
+      }
+      ```
+    hint: |-
+      - Lỗi phổ biến: tạo debounce **mới mỗi render** trong React (`onChange={debounce(...)}`) → mỗi lần là một timer riêng, không debounce gì cả → cần `useMemo`/`useRef` và cleanup khi unmount.
+      - Mất `this`/args khi dùng arrow function bên ngoài.
+      - Không có `cancel`/`flush` → gọi setState sau unmount, hoặc mất lần gọi cuối khi đóng trang.
+      - Search box: debounce **không** giải quyết race giữa các response cũ/mới → vẫn cần `AbortController` hoặc bỏ qua response cũ.
+    followUp: The user types "ip", then "iphone"; the "ip" response arrives last. How do you prevent stale results?
+    tags: [debounce, javascript, react]
+  - id: dsa-023
+    level: medium
+    type: concept
+    q: What's the difference between memoization (top-down DP) and tabulation (bottom-up DP)? Give a backend-flavoured example.
+    hint: |-
+      - DP áp dụng khi bài toán có **overlapping subproblems** + **optimal substructure**.
+      - Memoization: đệ quy + cache kết quả subproblem (Map); dễ viết, chỉ tính subproblem cần; rủi ro stack sâu.
+      - Tabulation: lặp theo thứ tự subproblem nhỏ → lớn, lưu bảng; không đệ quy, thường tối ưu memory được (chỉ giữ hàng trước).
+      - Ví dụ: tính giá tốt nhất khi áp nhiều loại voucher (knapsack biến thể), edit distance cho fuzzy match tên sản phẩm, chia batch tối ưu.
+      - Khác "chia để trị" (merge sort): subproblem **không** chồng nhau nên không cần cache.
+    followUp: Write the O(n·m) edit distance and say how to reduce memory to O(min(n, m)).
+    tags: [dynamic-programming, memoization]
+  - id: dsa-024
+    level: medium
+    type: output
+    q: What does this print, and what does it reveal about using objects as ordered maps?
+    example: |-
+      ```ts
+      const o: Record<string, string> = {};
+      o['b'] = 'x'; o['10'] = 'y'; o['a'] = 'z'; o['2'] = 'w';
+      console.log(Object.keys(o));
+
+      const m = new Map<string, string>([['b', 'x'], ['10', 'y'], ['a', 'z'], ['2', 'w']]);
+      console.log([...m.keys()]);
+      ```
+    hint: |-
+      - Object: `['2', '10', 'b', 'a']` — key dạng **integer index** được liệt kê trước theo thứ tự số tăng dần, sau đó string key theo thứ tự chèn.
+      - Map: `['b', '10', 'a', '2']` — đúng thứ tự chèn.
+      - Hệ quả: dùng object keyed by id số (`{ [productId]: ... }`) để giữ thứ tự từ API → **thứ tự bị đổi**; dùng `Map` hoặc mảng.
+      - JSON cũng không đảm bảo thứ tự key có nghĩa với bên nhận.
+    followUp: Why does this also matter when you build an LRU on a plain object?
+    tags: [hash-map, javascript, output]
+  - id: dsa-025
+    level: medium
+    type: design
+    q: Implement `throttle` with leading-edge execution and a trailing call, and explain when trailing matters.
+    example: |-
+      ```ts
+      function throttle<A extends unknown[]>(fn: (...a: A) => void, ms: number) {
+        let last = 0;
+        let pending: A | null = null;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        return (...args: A) => {
+          const now = Date.now();
+          const remaining = ms - (now - last);
+          if (remaining <= 0) {
+            last = now;
+            fn(...args);
+          } else {
+            pending = args;
+            timer ??= setTimeout(() => {
+              last = Date.now();
+              timer = undefined;
+              if (pending) fn(...pending);
+              pending = null;
+            }, remaining);
+          }
+        };
+      }
+      ```
+    hint: |-
+      - Leading: chạy ngay lần đầu (phản hồi tức thì). Trailing: đảm bảo **lần gọi cuối cùng** cũng được xử lý sau khi hết khoảng chờ.
+      - Thiếu trailing: resize/scroll dừng ở vị trí cuối nhưng UI không cập nhật theo giá trị cuối; gửi progress "99%" mà không bao giờ gửi "100%".
+      - Dùng `Date.now()` có thể lệch khi đồng hồ hệ thống đổi → `performance.now()` là monotonic.
+      - Có thể dùng `requestAnimationFrame` cho throttle theo frame trong browser.
+    followUp: Why should throttling to protect a backend API usually live on the server rather than only in the client?
+    tags: [throttle, javascript]
+  - id: dsa-026
+    level: hard
+    type: debug
+    q: This endpoint that attaches customer names to 5,000 orders takes 4 seconds. Find the complexity problems and fix them.
+    example: |-
+      ```ts
+      async function enrich(orders: Order[]) {
+        const out = [];
+        for (const o of orders) {
+          const customer = (await db.customers.findAll()).find((c) => c.id === o.customerId);
+          if (!out.some((x) => x.id === o.id)) out.push({ ...o, customerName: customer?.name });
+        }
+        return out;
+      }
+      ```
+    hint: |-
+      - `findAll()` **trong vòng lặp** → 5,000 query, mỗi query tải toàn bộ bảng customers (I/O là chi phí chính).
+      - `.find` trên mảng customers: O(n·c); `out.some` dedupe: O(n²).
+      - Fix: lấy distinct `customerId` → **một** query `WHERE id = ANY($1)` → `Map<id, Customer>` → join O(n); dedupe bằng `Set` các order id.
+      - Hoặc để DB làm `JOIN` luôn; phân trang nếu 5,000 là quá nhiều cho một response.
+    followUp: The customer lookup must also respect tenant isolation. Where does the tenant filter go, and why not only in the Map?
+    tags: [big-o, n-plus-one, debug]
+  - id: dsa-027
+    level: hard
+    type: debug
+    q: This recursive function that flattens a category tree works in tests but crashes on production data. Why, and how do you fix it?
+    example: |-
+      ```ts
+      type Node = { id: string; children: Node[] };
+      function collectIds(n: Node, acc: string[] = []): string[] {
+        acc.push(n.id);
+        for (const c of n.children) collectIds(c, acc);
+        return acc;
+      }
+      // prod: an imported tree is a 120,000-level-deep chain; one node references an ancestor
+      ```
+    hint: |-
+      - Độ sâu lớn → `RangeError: Maximum call stack size exceeded` (stack V8 giới hạn khoảng vài nghìn–vài chục nghìn frame tuỳ kích thước frame).
+      - Dữ liệu có **cycle** → đệ quy vô hạn (hoặc lặp vô hạn nếu đổi sang vòng lặp mà không có `visited`).
+      - Fix: duyệt bằng **stack tường minh** (`while (stack.length) { const n = stack.pop()!; ... }`) + `Set` visited; giới hạn độ sâu và báo lỗi dữ liệu.
+      - Tail call optimization không được V8 hỗ trợ trong thực tế → không dựa vào nó.
+    followUp: How would you validate on write that the category table never contains a cycle?
+    verify: true
+    tags: [recursion, graph, debug]
+  - id: dsa-028
+    level: hard
+    type: design
+    q: Design a sliding-window rate limiter in Redis that allows 100 requests per user per rolling 60 seconds, across many API pods.
+    example: |-
+      ```lua
+      -- KEYS[1] = rl:{userId}; ARGV = now_ms, window_ms, limit, request_id
+      redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1] - ARGV[2])
+      local n = redis.call('ZCARD', KEYS[1])
+      if n >= tonumber(ARGV[3]) then return 0 end
+      redis.call('ZADD', KEYS[1], ARGV[1], ARGV[4])
+      redis.call('PEXPIRE', KEYS[1], ARGV[2])
+      return 1
+      ```
+    hint: |-
+      - Sliding log bằng sorted set: score = timestamp; xoá entry ngoài window, đếm, thêm nếu còn quota — gói trong **Lua** để atomic giữa nhiều pod.
+      - Chi phí: memory O(limit) mỗi user; với limit lớn → sliding window **counter** (2 bucket liền kề, nội suy theo thời gian) rẻ hơn nhiều, sai số nhỏ.
+      - Member phải unique (request id), không dùng timestamp làm member (trùng ms bị ghi đè).
+      - Thời gian: dùng một nguồn (thời gian Redis `TIME` hoặc chấp nhận clock skew giữa pod).
+      - Trả `429` + `Retry-After`, header `RateLimit-*`; quyết định fail-open hay fail-closed khi Redis down.
+    followUp: Redis is down for 2 minutes. Do you fail open or fail closed for a login endpoint vs a product listing endpoint?
+    tags: [rate-limiter, redis, design]
+  - id: dsa-029
+    level: hard
+    type: design
+    q: Merge the paginated, already-sorted results of 8 Elasticsearch/DB shards into one globally sorted page of 20 items. What algorithm, and what's the pagination trap?
+    hint: |-
+      - K-way merge bằng min-heap: đưa phần tử đầu của mỗi shard vào heap, pop nhỏ nhất, push phần tử kế tiếp của shard đó → O(N log k).
+      - Trap: muốn trang thứ p cần lấy **top (p·20)** từ **mỗi** shard rồi merge → deep pagination tốn O(k·p·size) (lý do Elasticsearch giới hạn `from + size` bằng `index.max_result_window`).
+      - Giải pháp: **cursor/keyset** (`search_after` với sort key + tie-breaker unique), không dùng offset sâu.
+      - Tie-breaker ổn định (id) để không trùng/mất item giữa các trang.
+    followUp: Why must the sort key include a unique tie-breaker for `search_after` or keyset pagination to be correct?
+    verify: true
+    tags: [heap, pagination, elasticsearch]
+  - id: dsa-030
+    level: hard
+    type: scenario
+    q: Autocomplete over 2 million product names is slow with `ILIKE '%term%'`. Walk through your options from cheapest to most powerful.
+    hint: |-
+      - `ILIKE '%x%'` (wildcard đầu) **không** dùng được B-tree → full scan.
+      - Nếu chỉ cần prefix: `ILIKE 'x%'`/`LIKE` + index phù hợp (`text_pattern_ops`, hoặc cột lowercase).
+      - Substring/fuzzy trong PostgreSQL: extension `pg_trgm` + **GIN trigram index** → `ILIKE '%x%'` và similarity nhanh.
+      - Search engine (Elasticsearch): edge n-gram analyzer hoặc completion suggester (FST in-memory) — ranking, typo tolerance, đa ngôn ngữ, synonyms.
+      - Trie in-process cho tập nhỏ (tag/category), cache kết quả prefix phổ biến; debounce + cancel ở client.
+    followUp: How do you keep the search index consistent when products are updated in SQL Server/PostgreSQL?
+    verify: true
+    tags: [trie, search, index, scenario]
+  - id: dsa-031
+    level: hard
+    type: scenario
+    q: A dashboard shows "unique visitors per day" using `COUNT(DISTINCT user_id)` over a 3-billion-row events table and times out. What do you propose?
+    hint: |-
+      - Tính chính xác trên dữ liệu thô mỗi lần xem là O(n) memory/CPU lớn → **pre-aggregate** theo ngày (rollup table, materialized view) cập nhật incremental.
+      - Chấp nhận xấp xỉ → **HyperLogLog**: ~12 KB/counter trong Redis (`PFADD`/`PFCOUNT`), sai số chuẩn ~0.81%; **merge** được (`PFMERGE`) → unique theo tuần = hợp các ngày (không cộng số!).
+      - Warehouse (BigQuery/Snowflake/ClickHouse) có `APPROX_COUNT_DISTINCT`/HLL sketch.
+      - Hỏi business: có cần chính xác tuyệt đối (billing) hay xu hướng (analytics)?
+    followUp: Why can't you get weekly uniques by summing daily unique counts, and how do HLL sketches solve it?
+    verify: true
+    tags: [hyperloglog, probabilistic, analytics, scenario]
+  - id: dsa-032
+    level: hard
+    type: scenario
+    q: Your in-process LRU cache has a 95% hit rate on one pod but the DB still gets hammered after deploys and at the top of every hour. Analyse.
+    hint: |-
+      - Sau deploy: mọi pod khởi động với cache rỗng (cold start) → dồn DB; thêm pod ⇒ tổng hit rate giảm vì mỗi pod cache riêng.
+      - Đầu giờ: nhiều key cùng TTL → **hết hạn đồng loạt** → cache stampede. Fix: TTL có **jitter**, single-flight theo key, stale-while-revalidate (trả bản cũ, refresh nền).
+      - LRU bị **scan pollution**: một job duyệt toàn bộ catalog đẩy hot key ra; LFU/W-TinyLFU (như Caffeine) chống tốt hơn.
+      - Giải pháp tầng: L1 in-process nhỏ + L2 Redis chia sẻ; warm-up cache khi khởi động cho top key.
+    followUp: Would you choose LRU or LFU for a product catalog with a long tail and daily flash sales? Why?
+    tags: [lru, caching, scenario]
+  - id: dsa-033
+    level: hard
+    type: concept
+    q: Explain how a hash map degrades to O(n) and how that has been used as a denial-of-service attack.
+    hint: |-
+      - Nhiều key rơi vào **cùng bucket** (collision) → chuỗi dài → lookup O(n); n insert = O(n²).
+      - HashDoS: attacker gửi form/JSON với hàng nghìn key được chọn để collide khi hash function **dự đoán được** → server CPU 100%.
+      - Phòng: hash function có **seed ngẫu nhiên** mỗi process (SipHash; V8 dùng hash seed ngẫu nhiên cho string), giới hạn số field/kích thước body, Java HashMap chuyển bucket dài thành cây (O(log n)).
+      - Tương tự: regex ReDoS — input độc làm thuật toán rơi vào worst case.
+    followUp: What request-size and field-count limits would you put on a JSON API, and where (proxy, framework, app)?
+    verify: true
+    tags: [hash-map, security, complexity]
+  - id: dsa-034
+    level: hard
+    type: gotcha
+    q: Why is this regex a production risk, and how do you find and fix such patterns?
+    example: |-
+      ```ts
+      const EMAIL = /^([a-zA-Z0-9]+)*@example\.com$/;
+      EMAIL.test('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!'); // takes seconds or longer
+      ```
+    hint: |-
+      - Nested quantifier `(x+)*` + input không khớp → **catastrophic backtracking**: engine backtracking thử số cách chia chuỗi tăng theo cấp số mũ (ReDoS).
+      - JS regex chạy trên main thread → chặn event loop → một request làm treo cả server.
+      - Fix: viết lại không lồng quantifier (`/^[a-zA-Z0-9]+@example\.com$/`), giới hạn độ dài input trước khi match, lint (`eslint-plugin-regexp`, `safe-regex`), hoặc dùng engine linear-time (RE2 binding).
+    followUp: How would you detect that a slow regex was the cause from a CPU profile?
+    tags: [regex, complexity, security, gotcha]
+  - id: dsa-035
+    level: hard
+    type: design
+    q: Implement an LFU or TTL-aware eviction policy — or explain why you'd reach for W-TinyLFU instead of classic LRU for a hot catalog cache.
+    hint: |-
+      - LRU: chỉ nhìn **recency** → một lần quét lớn làm trôi hot key.
+      - LFU: nhìn **frequency** → giữ key phổ biến; cài đặt O(1) bằng Map key→node + Map freq→danh sách (LinkedHashSet), `minFreq`; nhược: key từng hot lâu không bị đẩy ra (cần aging/decay).
+      - W-TinyLFU: window LRU nhỏ cho key mới + main SLRU, admission bằng Count-Min Sketch tần suất (có aging) → hit rate cao với ít memory; Redis có `allkeys-lfu` (xấp xỉ, có decay).
+      - TTL: lazy expire khi đọc + sweeper định kỳ, hoặc heap theo `expiresAt`.
+    followUp: Redis LRU/LFU are approximate (sampling). What does that mean and why is it acceptable?
+    verify: true
+    tags: [cache, lfu, eviction]
+  - id: dsa-036
+    level: hard
+    type: design
+    q: Deduplicate webhook deliveries from a payment provider that retries for up to 3 days, at 5,000 events/second. Which data structure and why?
+    hint: |-
+      - Cần kiểm tra "đã xử lý event id này chưa" **chính xác** (không được false positive bỏ qua thanh toán thật) → Bloom filter **không** đủ một mình.
+      - Nguồn sự thật: bảng DB `processed_events(event_id PRIMARY KEY)` insert trong **cùng transaction** với side effect → unique constraint là dedupe atomic.
+      - Tăng tốc: Redis `SET event:<id> 1 NX EX 259200` (3 ngày) làm lớp chặn nhanh; Bloom filter chỉ để trả lời nhanh "chắc chắn chưa thấy".
+      - Memory: 5k/s × 3 ngày ≈ 1.3 tỷ id → tính dung lượng Redis/DB, partition theo ngày để xoá rẻ.
+    followUp: The side effect is a call to an external API that has no idempotency key. How do you avoid doing it twice?
+    tags: [idempotency, hash-set, design]
+  - id: dsa-037
+    level: hard
+    type: compare
+    q: Offset pagination vs keyset (cursor) pagination — what's the algorithmic cost of each and what correctness bugs does offset have?
+    hint: |-
+      - `OFFSET 100000 LIMIT 20`: DB vẫn phải **đọc và bỏ** 100k row → O(offset + limit) mỗi trang; trang sâu ngày càng chậm.
+      - Keyset: `WHERE (created_at, id) < ($1, $2) ORDER BY created_at DESC, id DESC LIMIT 20` → nhờ index B-tree là O(log n + limit) bất kể trang sâu.
+      - Correctness offset: có row mới chèn/xoá giữa hai lần gọi → **trùng hoặc mất** item.
+      - Keyset nhược: không nhảy tới trang N tuỳ ý, cần sort key ổn định + unique tie-breaker, cursor phải opaque (encode) và gắn tenant.
+      - SQL Server: row value comparison `(a, b) < (x, y)` không hỗ trợ → viết `a < x OR (a = x AND b < y)`.
+    followUp: Product owners insist on "jump to page 57". How do you satisfy that without deep-offset scans?
+    tags: [pagination, b-tree, database]
+  - id: dsa-038
+    level: hard
+    type: design
+    q: Find, among 1 million user permission sets, which users can access a resource given role inheritance (roles can inherit other roles). Model it and give the complexity.
+    hint: |-
+      - Mô hình: graph có hướng `role → parent role`; user có tập role; quyền = hợp các quyền trên mọi role reachable → **BFS/DFS** với visited (phòng cycle do cấu hình sai).
+      - Tính mỗi lần check: O(V + E) của subgraph role → chậm nếu gọi mỗi request.
+      - Tối ưu: **precompute transitive closure** (role → tập permission phẳng) khi role thay đổi (hiếm) và cache; check = lookup `Set` O(1).
+      - Invalidation: phiên bản (version) của role graph trong cache key; token JWT không nên chứa toàn bộ permission nếu thay đổi thường xuyên.
+      - Multi-tenant: graph theo tenant.
+    followUp: A role change must take effect within 5 seconds for all API pods. How do you propagate it?
+    tags: [graph, rbac, design]
+  - id: dsa-039
+    level: hard
+    type: concept
+    q: What is reservoir sampling, and when would you use it in a backend?
+    hint: |-
+      - Chọn **k mẫu ngẫu nhiên đều** từ stream có độ dài không biết trước, dùng O(k) memory, một lượt duyệt.
+      - Thuật toán R: giữ k phần tử đầu; với phần tử thứ i (i > k), chọn ngẫu nhiên j ∈ [0, i); nếu j < k thì thay reservoir[j].
+      - Use case: sample log/trace để debug, lấy mẫu request cho load test replay, kiểm tra chất lượng dữ liệu trên file import rất lớn mà không đọc vào memory.
+      - Phân tán: mỗi shard reservoir riêng rồi gộp có trọng số.
+    example: |-
+      ```ts
+      function reservoir<T>(stream: Iterable<T>, k: number): T[] {
+        const r: T[] = [];
+        let i = 0;
+        for (const x of stream) {
+          if (i < k) r.push(x);
+          else {
+            const j = Math.floor(Math.random() * (i + 1));
+            if (j < k) r[j] = x;
+          }
+          i++;
+        }
+        return r;
+      }
+      ```
+    followUp: Why is sampling the first k rows of a file a biased sample in practice?
+    tags: [sampling, streaming]
+  - id: dsa-040
+    level: senior
+    type: design
+    q: Design an in-memory + Redis two-level cache for product details used by 30 API pods, including eviction, invalidation and stampede protection.
+    hint: |-
+      Hướng trả lời mạnh:
+      - L1: LRU/W-TinyLFU in-process, size theo bytes, TTL ngắn (vài giây) → giảm round-trip Redis cho hot key.
+      - L2: Redis, TTL dài hơn + jitter; key có version/tenant (`p:{tenant}:{id}:v3`).
+      - Invalidation: khi ghi → xoá/cập nhật L2 và **broadcast** invalidation cho L1 (Redis pub/sub hoặc event bus); chấp nhận stale ≤ TTL L1 nếu mất message.
+      - Stampede: single-flight per key trong pod + lock/"early refresh" trong Redis; stale-while-revalidate.
+      - Metric: hit rate từng tầng, latency, memory; circuit breaker khi Redis chậm.
+    followUp: Which consistency guarantee can you actually promise the product team, in plain words?
+    tags: [cache, design, lru]
+  - id: dsa-041
+    level: senior
+    type: open
+    q: How much algorithmic depth do you expect from a senior full-stack engineer, and how do you decide when to hand-roll a data structure versus using a library or the database?
+    hint: |-
+      Không có đáp án duy nhất; đo judgment:
+      - Biết đủ để **nhận ra** bài toán (top-K, interval, graph, sliding window) và ước lượng chi phí ở quy mô thật.
+      - Mặc định dùng DB/Redis/thư viện đã được kiểm chứng (index, sorted set, `lru-cache`, `p-limit`) — ít bug, có người bảo trì.
+      - Tự viết khi: nhỏ, dễ test, nằm trên hot path với yêu cầu đặc thù, hoặc dependency quá nặng/không đáng tin.
+      - Luôn: test biên (rỗng, 1 phần tử, trùng, cực lớn), benchmark với dữ liệu thật, đọc complexity của API (`Array.shift`, `includes`).
+    followUp: Tell me about a time you replaced a hand-rolled structure with a library, or vice versa. What was the trigger?
+    tags: [judgment, open]
+  - id: dsa-042
+    level: senior
+    type: design
+    q: Design a scheduler for 10 million delayed jobs (e.g. "send reminder in 3 days") with at-least-once execution and horizontal scaling.
+    hint: |-
+      - Cấu trúc: priority queue theo `runAt` — một heap in-memory không đủ (mất khi restart, không share) → **persisted**: DB table có index `(run_at) WHERE status='pending'`, Redis sorted set (score = runAt), hoặc managed (SQS delay tối đa 15 phút, EventBridge Scheduler).
+      - Claim job: `SELECT ... WHERE run_at <= now() ORDER BY run_at LIMIT 100 FOR UPDATE SKIP LOCKED` → nhiều worker không đụng nhau.
+      - At-least-once: lease/visibility timeout, retry với backoff, handler **idempotent**.
+      - Scale: partition theo bucket thời gian/tenant; timing wheel cho độ chính xác cao ở quy mô rất lớn.
+      - Quan sát: lag = now − runAt của job cũ nhất.
+    followUp: How do you cancel or reschedule a single job efficiently in each of these storage choices?
+    verify: true
+    tags: [scheduler, heap, design]
+  - id: dsa-043
+    level: senior
+    type: open
+    q: An interviewer asks you to "optimize" a function from O(n log n) to O(n), but n is at most 500 and the function calls an external API. How do you respond?
+    hint: |-
+      - Chỉ ra **bottleneck thực**: với n ≤ 500, phần CPU là micro giây; network call là mili giây → tối ưu số lần gọi (batch, cache, song song có giới hạn) mới có ý nghĩa.
+      - Đề xuất đo: profile/trace cho thấy thời gian nằm ở đâu.
+      - Vẫn thể hiện được thuật toán O(n) nếu interviewer muốn — nhưng nói rõ trade-off về độ phức tạp code và khả năng đọc.
+      - Senior = ưu tiên theo impact, không theo độ đẹp của Big-O.
+    followUp: What would make you change your mind and optimize the algorithm anyway?
+    tags: [big-o, judgment, performance]
+  - id: dsa-044
+    level: senior
+    type: design
+    q: Design the data structures for a shopping-cart pricing engine that applies stackable promotions (percentage, buy-X-get-Y, tiered) deterministically.
+    hint: |-
+      - Biểu diễn promotion là **rule** có `priority`, `stackable`, điều kiện (predicate) và hành động; sort ổn định theo priority → kết quả **deterministic** (cùng input, cùng output trên mọi pod).
+      - Index rule theo SKU/category (`Map<sku, Rule[]>`) để không duyệt mọi rule cho mỗi item.
+      - Kết hợp tối ưu (chọn tập promotion tốt nhất khi loại trừ nhau) là bài toán tổ hợp → DP/knapsack cho giỏ nhỏ, hoặc heuristic + giới hạn rõ ràng.
+      - Tiền: số nguyên (minor units) hoặc decimal, quy tắc làm tròn cố định; lưu **breakdown** để giải thích cho khách và audit.
+      - Test: property-based test (tổng không âm, thứ tự item không đổi kết quả).
+    followUp: Why must money never be represented as a JavaScript `number` of dollars in this engine?
+    tags: [design, pricing, e-commerce]

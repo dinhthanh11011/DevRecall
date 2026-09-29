@@ -1,0 +1,1119 @@
+id: 11-nextjs
+slug: nextjs
+title: Next.js
+tier: 3
+status: drafted
+summary: App Router vs Pages Router, Server/Client boundary, rendering (prerender, streaming, PPR), caching & revalidation theo từng version (14 → 15 → 16 Cache Components), Server Actions security, proxy (middleware cũ), auth, hydration, self-hosting — theo Next.js 16.
+cvLinked: true
+prerequisites: [09-react]
+overview: |-
+  ## TL;DR
+
+  - **Next.js 16** (bản đang cài: 16.3) thay đổi nhiều so với kiến thức cũ: `middleware` đổi tên thành **`proxy`** (chạy Node.js runtime), `cookies()`/`headers()`/`params`/`searchParams` **chỉ còn async**, **Turbopack mặc định**, và mô hình cache mới **Cache Components** (`cacheComponents: true` + `'use cache'`, `cacheLife`, `cacheTag`, `updateTag`) — PPR trở thành mặc định khi bật nó.
+  - App Router mặc định là **Server Components**: code chạy trên server, không ship JS; chỉ phần có `'use client'` được hydrate. Ranh giới server/client là nơi sinh ra phần lớn bug (props không serializable, lộ dữ liệu, import nhầm module server).
+  - Caching là chủ đề hay bị hỏi nhất và **phụ thuộc version**: Next 14 cache `fetch` mặc định; Next 15 đảo lại (không cache mặc định); Next 16 thêm Cache Components opt-in. Luôn hỏi lại "version nào, có bật cacheComponents không".
+  - **Server Actions là public POST endpoint**: phải tự xác thực + phân quyền **trong từng action**, validate input, chỉ trả dữ liệu cần. Proxy chỉ là **optimistic check**.
+  - Self-hosting nhiều instance cần: shared cache handler (+ đồng bộ tag), `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY` chung, `deploymentId` chống version skew, proxy không buffer để streaming hoạt động.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Server Component | Render trên server thành RSC payload, không có state/effect, đọc DB trực tiếp được | `async function Page() { const o = await db.order.findMany() }` |
+  | Client Component | File có `'use client'` và mọi thứ nó import; được SSR rồi hydrate | nút Like dùng `useState` |
+  | RSC payload | Dạng serialize của cây Server Components + chỗ đặt Client Components + props | dùng cho navigation phía client |
+  | Prerender | Render lúc build/revalidate, kết quả được cache (static shell) | trang marketing |
+  | Dynamic rendering | Render lúc request vì dùng runtime data | trang đọc `cookies()` |
+  | Streaming | Gửi HTML theo từng `<Suspense>` boundary | `loading.tsx` → skeleton trước |
+  | PPR | Một route = static shell (prerender) + dynamic holes (stream) | header tĩnh + giỏ hàng động |
+  | `'use cache'` | Cache kết quả function/component; args thành cache key | `getProducts()` cache `hours` |
+  | Server Action | Server Function gọi qua `<form action>`/transition; là POST tới route | `createPost(formData)` |
+  | Proxy | Code chạy trước request tới route (rewrite, redirect, header) | redirect `/login` nếu thiếu cookie |
+
+  ## Cơ chế hoạt động
+
+  ### Server/Client boundary và first load
+
+  ```mermaid
+  sequenceDiagram
+    participant B as Browser
+    participant N as Next server
+    participant D as DB/API
+    B->>N: GET /orders
+    N->>D: Server Components fetch data
+    D-->>N: rows
+    N->>N: render Server Components -> RSC payload
+    N->>N: prerender HTML (Server + Client Components)
+    N-->>B: HTML (stream theo Suspense) + RSC payload inline
+    B->>B: hiển thị HTML ngay (chưa tương tác)
+    B->>N: tải JS của Client Components
+    B->>B: hydrate Client Components (gắn event)
+    Note over B,N: Navigation sau đó: chỉ fetch RSC payload (prefetch bởi Link)
+  ```
+
+  ### Cache Components (Next 16, `cacheComponents: true`) quyết định static shell
+
+  ```mermaid
+  flowchart TD
+    A["Component trong route lúc prerender"] --> B{"Dùng gì?"}
+    B -- "chỉ sync/pure, import module" --> S["Vào static shell"]
+    B -- "'use cache' (lifetime đủ dài)" --> S
+    B -- "cookies() / headers() / searchParams /<br/>fetch không cache / Date.now()" --> C{"Có Suspense bao ngoài?"}
+    C -- yes --> H["Fallback vào shell,<br/>nội dung stream lúc request"]
+    C -- no --> E["Dev/build báo lỗi 'blocking route'<br/>→ thêm Suspense hoặc use cache"]
+  ```
+
+  ### Mutation với Server Action (một round-trip)
+
+  ```mermaid
+  sequenceDiagram
+    participant C as Client (form)
+    participant A as Server Action
+    participant DB
+    C->>A: POST (action id + FormData)
+    A->>A: auth + authz + validate (BẮT BUỘC)
+    A->>DB: mutate
+    A->>A: updateTag / revalidatePath / refresh
+    A-->>C: một Flight response = return value + RSC payload mới của route
+    Note over C,A: revalidateTag(tag, 'max') là SWR: KHÔNG kèm re-render ngay
+  ```
+
+  ### Caching theo version (tóm tắt, cần verify với docs của version bạn dùng)
+
+  | | Next 14 | Next 15 | Next 16 (không bật cacheComponents) | Next 16 + `cacheComponents` |
+  |---|---|---|---|---|
+  | `fetch` mặc định | cached (`force-cache`) | **không** cache | không cache | không cache; dùng `'use cache'` |
+  | GET Route Handler | cached mặc định | **không** cache mặc định | không cache | theo mô hình prerender như page |
+  | Client router cache (page động) | 30s | 0s (`staleTimes.dynamic`) | 0s | theo `cacheLife.stale` (tối thiểu 30s) |
+  | Request APIs | sync | async (còn sync compat) | **chỉ async** | chỉ async |
+  | Công cụ cache non-fetch | `unstable_cache` | `unstable_cache` | `unstable_cache` | `'use cache'` + `cacheLife`/`cacheTag` |
+  | Segment config `dynamic`/`revalidate` | có | có | có | **lỗi** — thay bằng `use cache`/Suspense |
+
+  ## Trade-offs
+
+  | Quyết định | Lựa chọn | Đánh đổi |
+  |---|---|---|
+  | Server Component vs Client Component | Server mặc định; client chỉ ở lá cần tương tác | Client lớn → bundle lớn; server → không có state/effect, cần round-trip để cập nhật |
+  | Server Action vs Route Handler | Action cho mutation từ UI của chính app; Route Handler cho webhook, API public, client ngoài, GET cacheable | Action tuần tự trên client, gắn với build (action id); Route Handler phải tự lo CSRF/format |
+  | `use cache` vs Suspense stream | Cache khi dữ liệu dùng chung, chấp nhận cũ; stream khi phải tươi/theo user | Cache → nguy cơ stale & invalidation; stream → tốn server mỗi request |
+  | `revalidateTag` vs `updateTag` | SWR nền vs hết hạn ngay (read-your-writes) | `updateTag` chỉ trong Server Action, request đó chậm hơn |
+  | Vercel vs self-host | Managed (CDN, ISR, skew protection sẵn) vs tự quản | Self-host phải tự làm cache handler, streaming, skew, image |
+  | Proxy vs check trong DAL | Proxy: optimistic, rẻ, chạy mọi route | Không đủ để bảo mật; DAL gần dữ liệu mới là lớp thật |
+
+  ## Pitfalls
+
+  - Kiểm tra auth ở `page`/`layout` rồi nghĩ Server Action trong trang đó được bảo vệ — **không**, action là endpoint riêng.
+  - Layout không re-render khi navigate giữa các trang con → auth check trong layout không chạy lại.
+  - Truyền cả record DB (có `passwordHash`, `internalNote`) xuống Client Component → nằm trong RSC payload, xem được bằng DevTools.
+  - Gọi `redirect()`/`notFound()` bên trong `try` → bị `catch` nuốt (chúng hoạt động bằng cách throw).
+  - Đọc `cookies()` bên trong `'use cache'` → lỗi; phải đọc bên ngoài và truyền giá trị làm argument.
+  - `NEXT_PUBLIC_*` bị **inline lúc build** → một Docker image cho nhiều môi trường sẽ mang giá trị lúc build.
+  - Nhiều pod + cache mặc định (per instance) → `revalidateTag` chỉ xoá trên một pod.
+  - Proxy matcher quên loại `_next/static`, `_next/image` → auth redirect chặn cả CSS/JS.
+
+  ## Cheat sheet
+
+  - File conventions: `layout` · `page` · `loading` (Suspense) · `error` (client, boundary) · `global-error` (có `<html><body>`) · `not-found` · `template` (remount mỗi navigation) · `route` · `default` (bắt buộc cho parallel slot ở v16).
+  - `'use client'` = ranh giới module graph; `'use server'` = đánh dấu **Server Function** (không phải Server Component).
+  - Props server → client phải serializable; function chỉ được truyền nếu là Server Action.
+  - `cacheLife` profiles: `seconds`, `minutes`, `hours`, `days`, `weeks`, `max`, `default` (stale 5m / revalidate 15m / expire never).
+  - `revalidateTag(tag, 'max')` (v16 bắt buộc arg 2) · `updateTag(tag)` (chỉ Server Action) · `revalidatePath(path)` · `refresh()` (refetch router, không xoá cache).
+  - `connection()` = "chờ tới request" trước khi đọc `Math.random()`/env runtime.
+  - Proxy: Node.js runtime, một file `proxy.ts`, dùng `matcher`; không fetch cache; không dùng thay authorization.
+  - Server Action: `bodySizeLimit` mặc định 1MB, `allowedOrigins` khi sau reverse proxy, closure được mã hoá, ID đổi theo build.
+  - Self-host: `output: 'standalone'`, `cacheHandler`/`cacheHandlers`, `deploymentId`, `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY`, nginx `X-Accel-Buffering: no`, SIGTERM drain.
+notionRefs:
+  - title: NextJS
+    url: https://app.notion.com/p/2a5ef77f8ab2800c890efb8f1c003948
+references:
+  - title: Next.js — Server and Client Components
+    url: https://nextjs.org/docs/app/getting-started/server-and-client-components
+  - title: Next.js — Caching (Cache Components)
+    url: https://nextjs.org/docs/app/getting-started/caching
+  - title: Next.js — Caching and Revalidating (Previous Model)
+    url: https://nextjs.org/docs/app/guides/caching-without-cache-components
+  - title: Next.js — Revalidating
+    url: https://nextjs.org/docs/app/getting-started/revalidating
+  - title: Next.js — use cache directive
+    url: https://nextjs.org/docs/app/api-reference/directives/use-cache
+  - title: Next.js — Server Actions guide
+    url: https://nextjs.org/docs/app/guides/server-actions
+  - title: Next.js — Data Security
+    url: https://nextjs.org/docs/app/guides/data-security
+  - title: Next.js — Authentication
+    url: https://nextjs.org/docs/app/guides/authentication
+  - title: Next.js — Proxy (file convention)
+    url: https://nextjs.org/docs/app/api-reference/file-conventions/proxy
+  - title: Next.js — Self-Hosting
+    url: https://nextjs.org/docs/app/guides/self-hosting
+  - title: Next.js — How revalidation works
+    url: https://nextjs.org/docs/app/guides/how-revalidation-works
+  - title: Next.js — Upgrading to version 16
+    url: https://nextjs.org/docs/app/guides/upgrading/version-16
+  - title: Next.js — Migrating to Cache Components
+    url: https://nextjs.org/docs/app/guides/migrating-to-cache-components
+  - title: Next.js — Error Handling
+    url: https://nextjs.org/docs/app/getting-started/error-handling
+  - title: GitHub Advisory — CVE-2025-29927 (middleware authorization bypass)
+    url: https://github.com/advisories/GHSA-f82v-jwr5-mffw
+questions:
+  - id: nextjs-001
+    level: easy
+    type: compare
+    q: App Router vs Pages Router — what are the fundamental differences, and can they coexist?
+    hint: |-
+      - **Pages Router** (`pages/`): mọi page là Client Component được SSR; data qua `getServerSideProps`/`getStaticProps`/`getStaticPaths`; `_app`/`_document`; API routes `pages/api`.
+      - **App Router** (`app/`): mặc định **Server Components**, nested layouts giữ state khi navigate, streaming với Suspense, data fetch bằng `async` component, Server Actions, Route Handlers (`route.ts`), caching/revalidation tích hợp.
+      - Cùng tồn tại được trong một project (migrate từng route); route không được trùng giữa hai thư mục. Navigation giữa hai router là hard navigation.
+      - Pages Router vẫn được hỗ trợ nhưng tính năng mới tập trung ở App Router.
+    followUp: What breaks conceptually when you move a page using `getServerSideProps` and a global Redux store into the App Router?
+    tags: [app-router, pages-router, fundamentals]
+  - id: nextjs-002
+    level: easy
+    type: compare
+    q: When do you use a Server Component and when a Client Component? Give three examples of each.
+    hint: |-
+      - **Server**: fetch data gần nguồn (DB/API nội bộ), dùng secret/API key, render nội dung nặng thư viện (markdown, syntax highlight) mà không ship JS, SEO content.
+      - **Client**: state & event (`useState`, `onClick`), effect/lifecycle, browser API (`localStorage`, `window`, geolocation), custom hooks, thư viện chỉ chạy client (map, chart tương tác).
+      - Nguyên tắc: Server mặc định, **đẩy `'use client'` xuống lá** (nút, search box) thay vì đánh dấu cả layout.
+      - Client Component vẫn được SSR lần đầu (có HTML), sau đó hydrate.
+    followUp: Your whole layout became a Client Component because it has one search box. How do you restructure it?
+    tags: [rsc, fundamentals]
+  - id: nextjs-003
+    level: easy
+    type: concept
+    q: What exactly does the `'use client'` directive do? Does every client component need it?
+    hint: |-
+      - Đánh dấu **ranh giới** giữa module graph server và client: file đó **và mọi module nó import, mọi component nó render trực tiếp** vào client bundle.
+      - Không cần thêm vào từng component con — chỉ ở entry point của nhánh client.
+      - Không áp dụng cho Server Components được truyền vào qua `children`/props: chúng vẫn render trên server, client nhận kết quả đã render.
+      - Không phải "chỉ chạy trên client": Client Component vẫn chạy trên server lúc prerender/SSR → không truy cập `window` ngay trong render.
+      - `'use server'` khác hẳn: đánh dấu **Server Functions** (actions), không phải Server Component.
+    followUp: A third-party carousel uses `useState` but has no `'use client'`. What error do you get in a Server Component and how do you fix it?
+    tags: [rsc, use-client]
+  - id: nextjs-004
+    level: easy
+    type: concept
+    q: Name the App Router file conventions (`layout`, `page`, `loading`, `error`, `not-found`, `template`, `route`, `default`) and what each one does.
+    hint: |-
+      - `layout`: UI bao ngoài, **giữ state** và không re-render khi navigate giữa các con; root layout có `<html><body>`.
+      - `page`: UI của route, làm route public.
+      - `loading`: tự bọc `page` trong `<Suspense>` → skeleton khi navigate/stream.
+      - `error`: error boundary (phải là Client Component) cho segment; `global-error` cho root (tự khai báo `<html><body>`).
+      - `not-found`: UI khi gọi `notFound()` hoặc route không match.
+      - `template`: như layout nhưng **remount** mỗi navigation (reset state, chạy lại effect).
+      - `route`: Route Handler (GET/POST…) — không cùng cấp với `page`.
+      - `default`: fallback cho parallel route slot; Next 16 **bắt buộc** cho mọi slot (thiếu → build fail).
+    followUp: In what order are these nested for one segment, and why does it matter for error boundaries around layouts?
+    verify: true
+    tags: [app-router, file-conventions]
+  - id: nextjs-005
+    level: easy
+    type: compare
+    q: What is the difference between prerendering and dynamic rendering, and what makes a route dynamic?
+    hint: |-
+      - **Prerender**: render lúc build (hoặc revalidate), kết quả được cache/serve từ CDN.
+      - **Dynamic**: render mỗi request vì cần dữ liệu chỉ có lúc request.
+      - Kích hoạt dynamic: runtime API (`cookies()`, `headers()`, `searchParams`, `connection()`, `draftMode`), `params` không có trong `generateStaticParams`, fetch/DB không cache, giá trị không xác định (`Math.random()`, `Date.now()`).
+      - Mô hình cũ (không Cache Components): một chỗ dynamic làm **cả route** dynamic. Với Cache Components: chỉ phần trong `<Suspense>` là dynamic, phần còn lại vẫn vào static shell (PPR).
+    followUp: How can you tell in development whether a route is static or dynamic?
+    verify: true
+    tags: [rendering]
+  - id: nextjs-006
+    level: easy
+    type: concept
+    q: How do `loading.tsx` and `<Suspense>` enable streaming, and when is `loading.tsx` not enough?
+    hint: |-
+      - `loading.tsx` = `<Suspense fallback>` tự động bọc `page` của segment → navigation hiển thị skeleton ngay, layout vẫn tương tác được; còn cho phép **partial prefetch** route động.
+      - `<Suspense>` thủ công chi tiết hơn: phần ngoài boundary hiển thị ngay, từng phần chậm stream riêng.
+      - Không đủ khi: **layout** của chính segment đó đọc runtime/uncached data → nó nằm **ngoài** boundary của `loading` → chặn navigation. Fix: Suspense riêng quanh phần dynamic trong layout hoặc chuyển fetch xuống page.
+      - Streaming cần hạ tầng không buffer (nginx, LB).
+    followUp: Why do bots and crawlers receive a fully rendered page instead of a streamed shell?
+    tags: [streaming, suspense]
+  - id: nextjs-007
+    level: easy
+    type: compare
+    q: Route Handler vs Server Action — which do you use for what?
+    hint: |-
+      - **Server Action**: mutation khởi phát từ UI của chính app (form submit, nút) — tích hợp `useActionState`, progressive enhancement, trả kèm UI mới trong một round-trip, revalidate cache.
+      - **Route Handler** (`app/api/.../route.ts`): HTTP endpoint thật — webhook bên thứ ba, API cho mobile/đối tác, GET cần cache/CDN, streaming response, file download, OAuth callback.
+      - Action luôn là POST, dispatch **tuần tự** trên client, ID gắn với build → không làm public API.
+      - Cả hai đều phải tự auth + validate.
+    followUp: Why should you not fetch data for rendering by calling a Server Action from a Client Component?
+    tags: [server-actions, route-handlers]
+  - id: nextjs-008
+    level: easy
+    type: gotcha
+    q: How do environment variables work in Next.js, and what is the trap with `NEXT_PUBLIC_`?
+    hint: |-
+      - Mặc định biến môi trường **chỉ có ở server**. Biến có prefix `NEXT_PUBLIC_` được **inline vào JS bundle lúc `next build`** → xem được bởi bất kỳ ai, và **không đổi** khi chạy image ở môi trường khác.
+      - Biến không prefix mà import vào client code → bị thay bằng chuỗi rỗng (không lộ, nhưng code chạy sai).
+      - Một Docker image cho nhiều môi trường: đọc env **runtime** trên server (dynamic rendering; `await connection()` trước khi đọc `process.env` để không bị bake lúc prerender) rồi truyền xuống client khi cần.
+      - Next 16 đã **bỏ** `serverRuntimeConfig`/`publicRuntimeConfig`.
+      - Secret chỉ nên được đọc ở data access layer; dùng `server-only` cho module chứa secret.
+    followUp: Your staging image shows the production API URL in the browser. Why, and how do you redesign config?
+    verify: true
+    tags: [env, deployment, security]
+  - id: nextjs-009
+    level: easy
+    type: concept
+    q: What does `generateStaticParams` do, and what happens to params that were not returned by it?
+    hint: |-
+      - Trả danh sách params để **prerender lúc build** cho dynamic segment (`/products/[slug]`).
+      - Params không có trong danh sách: mặc định render **lúc request** lần đầu rồi cache (ISR); mô hình cũ có `dynamicParams = false` để trả 404.
+      - Với Cache Components: `dynamicParams` **không còn hỗ trợ** (build lỗi) — gọi `notFound()` khi param không hợp lệ; URL chưa biết được serve **App Shell** rồi nâng cấp nền; `generateStaticParams` phải trả ít nhất một param.
+      - Không cần prerender tất cả 1 triệu sản phẩm — chỉ top N, phần còn lại ISR.
+    followUp: Build time went from 3 to 40 minutes after adding every product to `generateStaticParams`. What do you change?
+    verify: true
+    tags: [rendering, isr, static]
+  - id: nextjs-010
+    level: easy
+    type: concept
+    q: How does `<Link>` prefetching work in the App Router, and when would you disable it?
+    hint: |-
+      - `<Link>` tự prefetch khi vào viewport (production): route tĩnh → prefetch đầy đủ; route động → bỏ qua hoặc prefetch một phần (tới `loading.tsx`/shell).
+      - Navigation là **client-side transition**: giữ layout chung, chỉ đổi phần khác, không reload trang.
+      - Next 16: layout dùng chung chỉ tải một lần, prefetch incremental phần chưa có → nhiều request nhỏ hơn.
+      - Tắt (`prefetch={false}`) cho danh sách link rất dài (bảng vô hạn), hoặc prefetch khi hover để giảm tải server.
+      - `<Link>` là Client Component: phải hydrate xong mới prefetch → bundle lớn làm chậm prefetch.
+    followUp: Every link in an infinite table triggers a server render during prefetch and your server CPU doubles. Options?
+    verify: true
+    tags: [navigation, prefetch]
+  - id: nextjs-011
+    level: easy
+    type: concept
+    q: What is `proxy.ts` in Next.js 16, how does it relate to `middleware.ts`, and what is it (not) for?
+    hint: |-
+      - Next 16 **đổi tên** `middleware` → `proxy` (file `proxy.ts`, export `proxy`); `middleware` bị deprecated; flag đổi tên (`skipMiddlewareUrlNormalize` → `skipProxyUrlNormalize`); có codemod.
+      - Proxy chạy **Node.js runtime** (không cấu hình được; muốn edge thì tạm giữ `middleware`).
+      - Dùng cho: rewrite (A/B test, multi-tenant theo host), redirect theo request, set header, optimistic auth redirect.
+      - Không dùng cho: data fetching chậm, session management/authorization đầy đủ (fetch cache options không có tác dụng trong proxy).
+      - Một file duy nhất mỗi project; dùng `matcher` để giới hạn route.
+    followUp: Why did the Next.js team rename it, and what does "proxy" imply about where it runs?
+    verify: true
+    tags: [proxy, middleware, nextjs-16]
+  - id: nextjs-012
+    level: easy
+    type: concept
+    q: What do `next/image` and `next/font` do for you, and what changed in Next 16 image defaults?
+    hint: |-
+      - `next/image`: resize/convert (WebP/AVIF) theo thiết bị, lazy loading, `srcset`, chống CLS bằng `width/height` hoặc `fill`; `priority`/preload cho ảnh LCP; remote image phải khai báo `remotePatterns`.
+      - `next/font`: self-host font lúc build (không gọi Google Fonts lúc runtime), `size-adjust` chống layout shift, preload.
+      - Next 16: `minimumCacheTTL` mặc định 4 giờ (trước 60s), `qualities` mặc định chỉ `[75]`, bỏ `16` khỏi `imageSizes`, chặn optimize IP local mặc định, tối đa 3 redirect, `images.domains` deprecated → `remotePatterns`, local image có query string cần `localPatterns.search`.
+    followUp: Your LCP image is lazy-loaded and LCP is 4 s. What do you change?
+    verify: true
+    tags: [images, fonts, performance, nextjs-16]
+  - id: nextjs-013
+    level: medium
+    type: gotcha
+    q: In Next.js 16, how must you access `params`, `searchParams`, `cookies()` and `headers()`, and why did this change?
+    hint: |-
+      - Tất cả là **Promise**: `const { slug } = await params`, `const q = (await searchParams).q`, `const c = await cookies()`. Next 15 đổi sang async nhưng còn sync compat (warning); **Next 16 xoá hẳn** truy cập sync.
+      - Lý do: cho phép framework prerender phần không cần request data và chỉ "chờ" khi thật sự đọc → nền tảng cho streaming/PPR; đọc càng sâu trong cây, static shell càng lớn.
+      - Có thể truyền promise xuống con và `await` trong `<Suspense>` thay vì await ở layout.
+      - Type helper: `PageProps<'/blog/[slug]'>`, `LayoutProps`, `RouteContext` (sinh bởi `next typegen`).
+      - Codemod: `npx @next/codemod@canary next-async-request-api .`.
+    example: |-
+      ```tsx
+      export default async function Page(props: PageProps<'/blog/[slug]'>) {
+        const { slug } = await props.params;
+        const { page = '1' } = await props.searchParams;
+        return <Post slug={slug} page={Number(page)} />;
+      }
+      ```
+    followUp: A layout awaits `params` at the top level. What does that do to the static shell, and how do you fix it?
+    verify: true
+    tags: [nextjs-16, async-apis]
+  - id: nextjs-014
+    level: medium
+    type: compare
+    q: How did caching defaults change between Next.js 14, 15 and 16? Why does it matter in an interview answer?
+    hint: |-
+      - **14**: `fetch` cache mặc định (`force-cache`), GET Route Handler cache mặc định, router cache giữ page động 30s → nhiều bug "dữ liệu không cập nhật".
+      - **15**: đảo lại — `fetch` **không** cache mặc định, GET handler không cache, `staleTimes.dynamic` = 0; request API async (còn sync compat).
+      - **16**: request API chỉ async; mô hình mới **Cache Components** opt-in (`cacheComponents: true`) với `'use cache'`/`cacheLife`/`cacheTag`/`updateTag`, PPR mặc định khi bật; mô hình cũ (fetch options, `unstable_cache`, segment config) vẫn dùng được khi **không** bật; `revalidateTag` bắt buộc argument thứ 2.
+      - Trả lời phỏng vấn: luôn nói rõ version + có bật cacheComponents không; tránh nói "Next cache fetch mặc định" như chân lý.
+    followUp: You upgrade from 14 to 15 and the database load triples. What happened?
+    verify: true
+    tags: [caching, versions]
+  - id: nextjs-015
+    level: medium
+    type: concept
+    q: How do `'use cache'`, `cacheLife` and `cacheTag` work with Cache Components? What becomes the cache key?
+    hint: |-
+      - `'use cache'` ở đầu function/component (hoặc đầu file) → cache **giá trị trả về** (serialized RSC). Dùng được ở mức data (`getProducts()`) hoặc UI (component/page).
+      - **Cache key** = build id + id của function + **arguments và biến closure** được serialize → input khác = entry khác. `children`/slot JSX truyền qua không ảnh hưởng key nếu không đọc trong body.
+      - `cacheLife('hours' | {stale, revalidate, expire})`: `stale` (client dùng không hỏi server), `revalidate` (server refresh nền), `expire` (quá hạn → chờ dữ liệu mới). Khuyến nghị luôn khai báo; thiếu thì dùng `default` (5m / 15m / never).
+      - `cacheTag('products')` để invalidate on-demand.
+      - Cache short-lived (`seconds`, `revalidate: 0`, `expire` < 5m) bị loại khỏi prerender → thành dynamic hole.
+      - Không đọc được `cookies()`/`headers()` bên trong; args phải serializable.
+    example: |-
+      ```ts
+      import { cacheLife, cacheTag } from 'next/cache';
+
+      export async function getProduct(tenantId: string, slug: string) {
+        'use cache';
+        cacheLife('hours');
+        cacheTag(`product:${tenantId}:${slug}`);
+        return db.product.findUnique({ where: { tenantId_slug: { tenantId, slug } } });
+      }
+      ```
+    followUp: Where is this cache stored by default on serverless vs a long-running Node server?
+    verify: true
+    tags: [caching, use-cache, nextjs-16]
+  - id: nextjs-016
+    level: medium
+    type: compare
+    q: "`revalidateTag` vs `updateTag` vs `revalidatePath` vs `refresh` in Next.js 16 — when do you use each?"
+    hint: |-
+      - `revalidateTag(tag, 'max')`: **stale-while-revalidate** — người sau vẫn thấy dữ liệu cũ trong lúc refresh nền; dùng trong Server Action **và** Route Handler (webhook CMS). Response của action **không** kèm re-render ngay. Next 16: dạng một argument deprecated.
+      - `updateTag(tag)`: **hết hạn ngay**, read-your-own-writes — user thấy thay đổi của mình trong chính response; **chỉ trong Server Action**.
+      - `revalidatePath('/orders')`: invalidate theo path (dựa trên soft tag của route); tiện khi không biết tag, dễ over-invalidate.
+      - `refresh()` (`next/cache`): refetch RSC của route hiện tại **không xoá cache** — khi view phụ thuộc state ngoài cache (VD đếm notification).
+      - Gọi revalidate **trước** `redirect()` (redirect throw, code sau không chạy).
+    followUp: A CMS webhook calls a Route Handler to update a blog post. Which API do you use, and why can't it be `updateTag`?
+    verify: true
+    tags: [caching, revalidation, nextjs-16]
+  - id: nextjs-017
+    level: medium
+    type: design
+    q: Write a Server Action for "update profile" with validation, auth, and error display using `useActionState`. What do you return on validation failure?
+    hint: |-
+      - Action: `'use server'` → `auth()` → validate `FormData` bằng schema (zod) → authorize (user chỉ sửa profile của mình, id lấy từ session không lấy từ form) → mutate → `updateTag`/`revalidatePath` → return.
+      - **Lỗi mong đợi** (validation, conflict) → **return** object `{ errors }` (không throw); `throw` dành cho lỗi bất ngờ → error boundary.
+      - Chỉ trả dữ liệu UI cần — không trả nguyên record DB (được serialize xuống client).
+      - Client: `useActionState(action, initialState)` → `[state, formAction, isPending]`; hiển thị `state.errors`.
+    example: |-
+      ```ts
+      'use server';
+      import { z } from 'zod';
+      import { updateTag } from 'next/cache';
+      import { verifySession } from '@/lib/dal';
+
+      const Schema = z.object({ displayName: z.string().min(2).max(50) });
+      export type State = { errors?: Record<string, string[]>; ok?: boolean };
+
+      export async function updateProfile(_prev: State, formData: FormData): Promise<State> {
+        const session = await verifySession(); // throws/redirects if not logged in
+        const parsed = Schema.safeParse({ displayName: formData.get('displayName') });
+        if (!parsed.success) return { errors: parsed.error.flatten().fieldErrors };
+        await db.user.update({ where: { id: session.userId }, data: parsed.data });
+        updateTag(`user:${session.userId}`);
+        return { ok: true };
+      }
+      ```
+    followUp: How does this form behave before JavaScript has loaded (progressive enhancement)?
+    verify: true
+    tags: [server-actions, forms, security]
+  - id: nextjs-018
+    level: medium
+    type: gotcha
+    q: What can and cannot be passed as props from a Server Component to a Client Component?
+    hint: |-
+      - Phải **serializable bởi React**: primitive, plain object/array, `Date`, `Map`/`Set`, `BigInt`, typed array, Promise (client đọc bằng `use()`), JSX/Server Component đã render, và **Server Actions** (function có `'use server'`).
+      - Không được: function thường/callback, class instance có method, Symbol không đăng ký, object có prototype riêng.
+      - Mọi prop nằm trong **RSC payload** gửi xuống browser → coi như public; chỉ truyền field cần (DTO), không truyền record DB có field nhạy cảm.
+      - React taint API (`experimental.taint`) chặn thêm một lớp cho object/value nhạy cảm.
+    followUp: How would you pass an `onSelect` handler to a Client Component from a Server Component?
+    verify: true
+    tags: [rsc, serialization, security]
+  - id: nextjs-019
+    level: medium
+    type: concept
+    q: How can a Client Component render Server Components inside it? Explain the `children` slot pattern.
+    hint: |-
+      - Client Component **không import** được Server Component (import vào client module graph → thành client).
+      - Nhưng có thể **nhận** Server Component qua `children` hoặc prop JSX: parent (Server Component) render `<Modal><Cart/></Modal>` — `Cart` render trên server, `Modal` (client) chỉ nhận kết quả đã render và đặt vào slot.
+      - Dùng cho: modal/tab/accordion client bao nội dung server; provider client bao cả app.
+      - RSC payload chứa output của `Cart` + placeholder cho `Modal`.
+    example: |-
+      ```tsx
+      // app/page.tsx (Server Component)
+      import Modal from './modal'; // 'use client'
+      import Cart from './cart';   // Server Component, reads DB
+      export default function Page() {
+        return <Modal><Cart /></Modal>;
+      }
+      ```
+    followUp: Why can't `Modal` pass props into `Cart`?
+    tags: [rsc, composition]
+  - id: nextjs-020
+    level: medium
+    type: concept
+    q: How do you use React Context (theme, auth, query client) in the App Router?
+    hint: |-
+      - Server Components **không** dùng được context. Tạo provider là Client Component (`'use client'`) nhận `children`, rồi render trong `layout` (Server Component).
+      - Đặt provider **càng sâu càng tốt** (bao `{children}` thay vì cả `<html>`) để Next tối ưu phần tĩnh.
+      - Dữ liệu server cho provider: fetch trong layout (server), truyền props xuống provider, hoặc truyền **promise** và `use()` bên trong.
+      - Instance mutable (QueryClient, Redux store) tạo **một lần trong provider** (`useState(() => new QueryClient())`), không ở module scope (rò giữa request).
+    followUp: Why must the QueryClient not be created at module scope in a file imported by the provider?
+    tags: [context, providers, rsc]
+  - id: nextjs-021
+    level: medium
+    type: compare
+    q: Compare fetch memoization, `React.cache`, `'use cache'` and `unstable_cache`. What is the scope of each?
+    hint: |-
+      - **Fetch memoization**: `fetch` GET cùng URL + options trong **một render pass/request** được dedupe tự động — không cache giữa request.
+      - **`React.cache(fn)`**: memo **per request** cho function bất kỳ (ORM/DB) → nhiều component gọi `getUser()` chỉ query một lần; không chia sẻ giữa request. Bị cô lập bên trong scope `'use cache'`.
+      - **`'use cache'`** (Cache Components): cache **giữa các request** (in-memory LRU mặc định, per instance; `'use cache: remote'` cho store dùng chung), có lifetime/tag; không qua deploy (key chứa build id).
+      - **`unstable_cache`** (mô hình cũ): cache kết quả async function giữa request với `tags`/`revalidate`; tồn tại qua deploy theo docs.
+      - Chọn: dedupe trong request → `React.cache`; dữ liệu dùng chung nhiều request → `'use cache'`.
+    followUp: You wrap `getCurrentUser` (reads cookies) in `'use cache'` to "make it faster". What happens?
+    verify: true
+    tags: [caching, react-cache]
+  - id: nextjs-022
+    level: medium
+    type: debug
+    q: This page takes 1.8 s to respond although each query takes ~600 ms. Why, and how do you fix it?
+    example: |-
+      ```tsx
+      export default async function Page(props: PageProps<'/users/[id]'>) {
+        const { id } = await props.params;
+        const user = await getUser(id);          // 600 ms
+        const orders = await getOrders(id);      // 600 ms
+        const recommendations = await getRecs(id); // 600 ms
+        return <Dashboard user={user} orders={orders} recs={recommendations} />;
+      }
+      ```
+    hint: |-
+      - **Waterfall tuần tự**: ba `await` nối nhau dù không phụ thuộc → 3 × 600 ms.
+      - Fix 1: khởi động song song `const [user, orders, recs] = await Promise.all([...])` (hoặc `allSettled` để một cái lỗi không làm hỏng trang).
+      - Fix 2 (tốt hơn cho UX): tách thành component con, mỗi cái fetch dữ liệu của mình trong `<Suspense>` riêng → phần nhanh hiển thị trước, recommendations stream sau.
+      - Dedupe khi nhiều component cần `getUser(id)`: `React.cache`.
+      - Cache dữ liệu ít đổi (`'use cache'` cho recommendations theo `id`).
+    followUp: Recommendations fail 5% of the time. How do you keep the rest of the page working?
+    tags: [data-fetching, performance, debug]
+  - id: nextjs-023
+    level: medium
+    type: concept
+    q: How does error handling work in the App Router — `error.tsx`, `global-error.tsx`, `not-found`, and component-level boundaries?
+    hint: |-
+      - Lỗi **mong đợi** → return value (Server Action + `useActionState`) hoặc render có điều kiện; `notFound()` → `not-found.tsx`.
+      - Lỗi **bất ngờ** → throw → `error.tsx` gần nhất (phải `'use client'`), nhận `error` và cách retry.
+      - `error.tsx` của segment **không bắt lỗi của `layout` cùng segment** (layout nằm ngoài boundary) → lỗi layout lên boundary cha; lỗi root layout → `global-error.tsx` (tự khai báo `<html><body>`).
+      - Component-level: `catchError` (`next/error`, stable từ 16.3) tạo boundary bọc bất kỳ phần nào, xử lý đúng `redirect()`/`notFound()` và reset khi navigate.
+      - Không bắt lỗi trong event handler → tự `try/catch` + state.
+      - Production: message lỗi Server Component bị ẩn, chỉ còn `digest` để tra log.
+    followUp: How do you correlate the `digest` shown to the user with your server logs?
+    verify: true
+    tags: [errors, error-boundary]
+  - id: nextjs-024
+    level: medium
+    type: concept
+    q: How do parallel routes and intercepting routes let you build a modal that has its own URL (e.g., photo feed → `/photo/123`)?
+    hint: |-
+      - **Parallel route**: slot `@modal` trong layout (`layout({ children, modal })`) render đồng thời với trang chính.
+      - **Intercepting route**: `@modal/(.)photo/[id]/page.tsx` bắt navigation client-side tới `/photo/123` và render trong slot modal, trong khi trang feed vẫn ở dưới.
+      - Truy cập trực tiếp/refresh `/photo/123` → không intercept → render trang `photo/[id]` đầy đủ.
+      - Back đóng modal (URL thay đổi); share link hoạt động.
+      - Next 16: mọi slot cần `default.tsx` (trả `null` hoặc `notFound()`), thiếu thì build fail.
+    followUp: After closing the modal and navigating elsewhere, the modal reappears. Which file is missing or wrong?
+    verify: true
+    tags: [routing, parallel-routes, intercepting-routes]
+  - id: nextjs-025
+    level: medium
+    type: concept
+    q: How do you set SEO metadata in the App Router, and what are the performance implications of `generateMetadata`?
+    hint: |-
+      - Static: `export const metadata = { title, description, openGraph }` trong layout/page; merge theo cây (con ghi đè), `title.template`.
+      - Dynamic: `export async function generateMetadata({ params })` — fetch dữ liệu (dedupe với page nhờ fetch memoization/`React.cache`).
+      - Truy cập dữ liệu không cache/runtime trong `generateMetadata` cũng tính là dynamic như page (với Cache Components cũng bị validate).
+      - File-based: `opengraph-image.tsx`, `sitemap.ts`, `robots.ts`, `icon`; Next 16: `params`/`id` của image function là Promise, `id` của sitemap là Promise.
+      - Bot nhận trang render đầy đủ (không stream) nên metadata luôn có trong HTML.
+    followUp: Your product page fetches the product twice (metadata + page). How do you verify and fix it?
+    verify: true
+    tags: [seo, metadata]
+  - id: nextjs-026
+    level: medium
+    type: concept
+    q: What is Partial Prerendering (PPR), and how do you enable it in Next.js 16?
+    hint: |-
+      - Một route gồm **static shell** (HTML + RSC prerender lúc build, serve từ CDN tức thì) + **dynamic holes** (nội dung trong `<Suspense>` stream lúc request) trong **cùng một response**.
+      - Next 16: bỏ flag `experimental.ppr` và `experimental_ppr`; PPR là hành vi mặc định khi bật **`cacheComponents: true`**.
+      - Cách đưa phần vào shell: code thuần/sync, `'use cache'`; phần runtime (`cookies()`, fetch không cache) phải nằm trong `<Suspense>` (nếu không, dev báo lỗi blocking route).
+      - Đẩy dynamic access **xuống sâu** → shell lớn hơn.
+      - Cần hạ tầng hỗ trợ streaming; không streaming → shell và dynamic đến cùng lúc, mất lợi thế TTFB.
+    followUp: Your CDN caches the whole HTML response. How does that interact with PPR's dynamic holes?
+    verify: true
+    tags: [ppr, rendering, nextjs-16]
+  - id: nextjs-027
+    level: medium
+    type: gotcha
+    q: With Cache Components enabled, why does rendering `Math.random()`, `Date.now()` or `crypto.randomUUID()` trigger an error, and what are the two fixes?
+    hint: |-
+      - Giá trị **không xác định** khác nhau mỗi lần chạy → Next cần biết bạn muốn "mỗi request một giá trị" hay "cache một giá trị"; nếu không nó sẽ bị bake vào static shell ngoài ý muốn.
+      - Fix 1 (mỗi request): `await connection()` trước khi tạo giá trị + bọc component trong `<Suspense>`.
+      - Fix 2 (dùng chung): đặt trong `'use cache'` → mọi user thấy cùng giá trị tới khi revalidate.
+      - `performance.now()` được coi là telemetry, không bị chặn.
+      - Code sync, import module, `fs.readFileSync` là "predictable" → vào shell tự động.
+    followUp: You render "Last updated 3 minutes ago" on a cached page. How do you keep it accurate?
+    verify: true
+    tags: [cache-components, rendering, nextjs-16]
+  - id: nextjs-028
+    level: medium
+    type: concept
+    q: Are Route Handlers cached? How do you make a `GET` handler cacheable in the previous model vs with Cache Components?
+    hint: |-
+      - Từ Next 15: Route Handler **không cache mặc định**; method khác GET không bao giờ cache.
+      - Mô hình cũ: opt-in bằng segment config `export const dynamic = 'force-static'` (+ `revalidate`).
+      - Cache Components: GET handler theo **mô hình prerender như page** — không dùng request/uncached data thì prerender lúc build; đọc `request.headers`, `cookies()`, DB không cache → chạy lúc request. Không đặt `'use cache'` trực tiếp trong body handler — tách ra helper function có `'use cache'`.
+      - Metadata route (`sitemap.ts`, `opengraph-image`) mặc định static.
+      - Webhook/POST: không cache, trả nhanh.
+    followUp: Your `/api/products` GET is hit 5,000 times per second. Next cache, CDN `Cache-Control`, or Redis — where do you cache?
+    verify: true
+    tags: [route-handlers, caching]
+  - id: nextjs-029
+    level: medium
+    type: design
+    q: What is the recommended authentication architecture in the App Router? Where do session checks live?
+    hint: |-
+      - **Session**: cookie `HttpOnly`, `Secure`, `SameSite=Lax`, chứa session id (database session) hoặc JWT đã mã hoá/ký (stateless); không để token ở localStorage.
+      - **Data Access Layer (DAL)**: module `server-only` với `verifySession()` (bọc `React.cache`) và các hàm lấy dữ liệu tự kiểm tra quyền, trả **DTO** tối thiểu. Mọi Server Component, Server Action, Route Handler đi qua DAL.
+      - **Proxy**: chỉ **optimistic check** (đọc cookie, redirect `/login`), không query DB (chạy cả trên prefetch).
+      - Không dựa vào **layout** để chặn (không re-render khi navigate, không chặn render của segment con/slot).
+      - Check gần dữ liệu và ở component render UI nhạy cảm.
+      - Thư viện: Auth.js, Better Auth, Clerk, WorkOS…
+    followUp: Why is a check in `proxy.ts` alone insufficient, even if its matcher covers every route?
+    tags: [auth, security, dal]
+  - id: nextjs-030
+    level: medium
+    type: gotcha
+    q: What are the common `matcher` mistakes in `proxy.ts`?
+    hint: |-
+      - Không có `matcher` → proxy chạy trên **mọi request**, kể cả `_next/static`, `_next/image`, file `public/` → auth redirect làm hỏng CSS/JS/ảnh, tốn CPU.
+      - Dùng negative lookahead để loại tài nguyên tĩnh: `'/((?!api|_next/static|_next/image|favicon.ico).*)'`.
+      - Giá trị `matcher` phải là **hằng số** phân tích tĩnh lúc build — biến bị bỏ qua.
+      - Proxy chạy cả với **prefetch** → logic nặng/DB làm prefetch chậm; có thể dùng `missing: [{ type: 'header', key: 'next-router-prefetch' }]` để bỏ qua prefetch.
+      - **Server Functions** là POST tới route nơi chúng dùng → matcher loại route đó thì action cũng không qua proxy; refactor chuyển action sang route khác có thể **âm thầm** mất coverage.
+    followUp: How do you unit test proxy logic?
+    verify: true
+    tags: [proxy, gotcha]
+  - id: nextjs-031
+    level: medium
+    type: gotcha
+    q: What changed about the build toolchain in Next.js 16 (Turbopack, `next lint`), and what breaks when upgrading?
+    hint: |-
+      - **Turbopack mặc định** cho cả `next dev` và `next build` (không cần `--turbopack`).
+      - Project có **custom `webpack` config** (kể cả do plugin thêm vào) → `next build` **fail** để tránh cấu hình sai; chọn: migrate sang option `turbopack`, chạy `--webpack`, hoặc `--turbopack` bỏ qua webpack config.
+      - `experimental.turbopack` → top-level `turbopack`; `resolve.fallback` → `turbopack.resolveAlias`; Sass `~` import không hỗ trợ.
+      - `next lint` bị **xoá**; `next build` không lint nữa → dùng ESLint CLI (flat config) hoặc Biome; codemod có sẵn.
+      - Node ≥ 20.9, TypeScript ≥ 5.1; bỏ `size`/`First Load JS` khỏi output build.
+    followUp: Your CI relied on `next build` failing on lint errors. What do you add back?
+    verify: true
+    tags: [nextjs-16, tooling, upgrade]
+  - id: nextjs-032
+    level: medium
+    type: concept
+    q: What is `after()` in Next.js, and what are the deployment caveats?
+    hint: |-
+      - `after(callback)` (`next/server`): chạy việc **sau khi response đã gửi** (log, analytics, sync nhẹ) mà không làm chậm user; dùng trong Server Component, Server Action, Route Handler, proxy.
+      - Vẫn chạy trong vòng đời request của server → trên serverless cần platform hỗ trợ `waitUntil`; self-host `next start` hỗ trợ đầy đủ.
+      - Graceful shutdown: gửi SIGTERM/SIGINT và **chờ drain** (10–30s) để callback pending chạy xong; kill ngay → mất việc.
+      - Không dùng cho việc quan trọng phải đảm bảo (gửi email thanh toán) → queue bền vững (outbox, job queue).
+    followUp: Why is `after()` not a replacement for a job queue?
+    verify: true
+    tags: [after, background-work, deployment]
+  - id: nextjs-033
+    level: medium
+    type: compare
+    q: When do you still fetch on the client (SWR/TanStack Query) in an App Router app?
+    hint: |-
+      - Dữ liệu **thay đổi liên tục theo tương tác** trên cùng màn hình: polling, infinite scroll, search-as-you-type, dashboard realtime.
+      - Dữ liệu chỉ client biết: theo vị trí, theo state client chưa có trên URL.
+      - Muốn cache client lâu, optimistic update phức tạp, offline.
+      - Pattern kết hợp: Server Component fetch lần đầu (hoặc prefetch + `HydrationBoundary`) → client library tiếp quản refetch/mutation.
+      - Tránh: gọi Route Handler của chính app từ Server Component (thêm một hop HTTP vô ích) — gọi thẳng DAL.
+    followUp: Why is calling your own `/api/*` route from a Server Component an anti-pattern?
+    tags: [data-fetching, client]
+  - id: nextjs-034
+    level: medium
+    type: gotcha
+    q: "What do you lose with `output: 'export'` (static export)?"
+    hint: |-
+      - Chỉ HTML/JS/CSS tĩnh — host ở S3/CDN bất kỳ, không cần Node server.
+      - Mất mọi thứ cần server lúc request: proxy, Server Actions, Route Handler động (chỉ GET static), ISR/revalidation, `cookies()`/`headers()`, dynamic route không có trong `generateStaticParams`, image optimization mặc định (cần custom loader), `'use cache'`.
+      - Hợp cho: docs, marketing, SPA thuần client gọi API riêng.
+      - Nếu cần một ít dynamic → cân nhắc Node server/`standalone` thay vì cố lách.
+    followUp: A static-exported SPA needs per-user redirects after login. Where does that logic go?
+    tags: [deployment, static-export]
+  - id: nextjs-035
+    level: hard
+    type: debug
+    q: The admin page redirects non-admins, yet a security review shows any logged-in user can delete records. Find the hole.
+    example: |-
+      ```tsx
+      // app/admin/page.tsx
+      import { auth } from '@/lib/auth';
+      import { redirect } from 'next/navigation';
+      import { deleteAllRecords } from './actions';
+
+      export default async function AdminPage() {
+        const session = await auth();
+        if (!session?.user?.isAdmin) redirect('/login');
+        return (
+          <form action={deleteAllRecords}>
+            <button>Delete all</button>
+          </form>
+        );
+      }
+
+      // app/admin/actions.ts
+      'use server';
+      export async function deleteAllRecords() {
+        await db.record.deleteMany();
+      }
+      ```
+    hint: |-
+      - Server Action là **endpoint POST riêng**, gọi trực tiếp được (chỉ cần action id — lấy từ bundle/HTML của bất kỳ trang nào dùng nó, hoặc một user admin để lộ). Check ở `page` chỉ quyết định **UI nào render**, không bảo vệ action.
+      - Fix: trong action gọi `auth()` + kiểm tra `isAdmin` (authorization, không chỉ authentication), tốt nhất đặt logic trong DAL `server-only` để mọi đường gọi đều qua check; audit log.
+      - Thêm: validate input, rate limit cho thao tác nguy hiểm, xác nhận hai bước.
+      - Action ID mã hoá/không đoán được chỉ giảm rủi ro, **không** phải cơ chế bảo mật.
+    followUp: How would you write an automated test that proves the action rejects non-admins?
+    redFlags:
+      - Says action IDs are secret so the action cannot be called
+      - Relies on the proxy matcher covering /admin
+    tags: [server-actions, security, debug]
+  - id: nextjs-036
+    level: hard
+    type: debug
+    q: A penetration tester finds password hashes and internal notes in the page source of the profile page. Where do they come from?
+    example: |-
+      ```tsx
+      // app/profile/[slug]/page.tsx
+      export default async function Page(props: PageProps<'/profile/[slug]'>) {
+        const { slug } = await props.params;
+        const user = await db.user.findUnique({ where: { slug } }); // full row
+        return <ProfileCard user={user} />; // 'use client' component
+      }
+      ```
+    hint: |-
+      - Props truyền cho **Client Component** được serialize vào **RSC payload** (inline trong HTML ở lần tải đầu, và trong response khi navigate) → mọi field của `user` (`passwordHash`, `internalNotes`, `email`) nằm ở client dù component chỉ hiển thị `name`.
+      - Fix: DAL trả **DTO** tối thiểu (`{ name, avatarUrl }`) với logic quyền (ai được xem email); Client Component nhận props hẹp; `import 'server-only'` cho module DB.
+      - Lớp phòng thủ thêm: React taint (`experimental_taintObjectReference`/`taintUniqueValue` với `experimental.taint`) để build/render lỗi khi object nhạy cảm đi xuống client.
+      - Cũng kiểm tra: return value của Server Action (cũng được serialize).
+    followUp: Why is marking the component `'use client'` the key detail here — would a Server Component rendering only `user.name` leak the hash?
+    tags: [security, rsc, data-exposure, debug]
+  - id: nextjs-037
+    level: hard
+    type: debug
+    q: With Cache Components enabled, this build passes but `next start` throws on the dashboard route. Why, and what is the fix?
+    example: |-
+      ```tsx
+      import { cookies } from 'next/headers';
+
+      async function getTenant() {
+        const tenantId = (await cookies()).get('tenant')?.value;
+        return db.tenant.findUnique({ where: { id: tenantId } });
+      }
+
+      export async function TenantBanner() {
+        'use cache';
+        const tenant = await getTenant();
+        return <Banner name={tenant?.name} />;
+      }
+      ```
+    hint: |-
+      - Scope `'use cache'` **không được** truy cập runtime API (`cookies()`, `headers()`, `searchParams`) — kể cả gián tiếp qua helper (`getTenant`) → lỗi `next-request-in-use-cache`. Trên route dynamic lỗi chỉ lộ lúc chạy, nên build có thể pass.
+      - Về logic: nếu được phép, cache key không chứa tenant → **mọi tenant thấy banner của tenant đầu tiên** (rò dữ liệu).
+      - Fix: đọc cookie **bên ngoài** (component không cache trong `<Suspense>`), truyền `tenantId` làm **argument** → thành một phần cache key: `<TenantBannerCached tenantId={id} />` với `'use cache'` + `cacheTag('tenant:' + id)`.
+      - Thay thế: `'use cache: private'` khi thực sự phải đọc runtime data bên trong (cache ở browser, không chia sẻ).
+    followUp: What is the risk of putting the session id (instead of the tenant id) into a shared cache key?
+    verify: true
+    tags: [cache-components, use-cache, debug, multi-tenancy]
+  - id: nextjs-038
+    level: hard
+    type: debug
+    q: After a successful create, the user is never redirected; instead the error toast shows "NEXT_REDIRECT". Why?
+    example: |-
+      ```ts
+      'use server';
+      import { redirect } from 'next/navigation';
+
+      export async function createOrder(_: State, formData: FormData): Promise<State> {
+        try {
+          const order = await orders.create(parse(formData));
+          revalidatePath('/orders');
+          redirect(`/orders/${order.id}`);
+        } catch (err) {
+          return { error: String(err) };
+        }
+      }
+      ```
+    hint: |-
+      - `redirect()` (và `notFound()`, `forbidden()`, `unauthorized()`) hoạt động bằng cách **throw** một error đặc biệt để framework xử lý; `catch` bắt luôn nó → trả về như lỗi thường.
+      - Fix: gọi `redirect` **ngoài** `try` (sau khi try thành công), hoặc trong catch gọi `unstable_rethrow(err)` trước khi xử lý lỗi thật.
+      - Gọi `revalidatePath`/`updateTag` **trước** `redirect` (code sau redirect không chạy).
+      - Đừng trả `String(err)` cho client — lộ chi tiết nội bộ; log server, trả message thân thiện + mã lỗi.
+    followUp: Where else does this "control-flow exception" pattern bite you (e.g., in data-fetching helpers)?
+    tags: [server-actions, redirect, debug]
+  - id: nextjs-039
+    level: hard
+    type: scenario
+    q: You self-host Next.js on 4 Kubernetes pods. After an admin updates a product, some users see the new price and others the old one for a long time. Explain and fix.
+    hint: |-
+      - Cache mặc định (ISR/data/`'use cache'`) nằm **trên disk/memory của từng pod**; `revalidateTag`/`revalidatePath` chỉ chạy trên **pod nhận request** → 3 pod còn lại vẫn phục vụ entry cũ tới khi tự hết hạn. Load balancer phân phối → user thấy khác nhau.
+      - Fix: **custom cache handler** dùng chung (Redis/S3) — `cacheHandler` (ISR/route cache, mô hình cũ) và `cacheHandlers` (cho `'use cache'`/`'use cache: remote'`); triển khai `updateTags()` (ghi sự kiện invalidate vào shared store) và `refreshTags()` (đọc trước mỗi request) để đồng bộ tag; tắt/giảm in-memory cache.
+      - Handler phải bắt lỗi: `get` lỗi → trả `undefined` (miss), `refreshTags` lỗi → không throw.
+      - Kiểm tra thêm: CDN phía trước có cache HTML/RSC khác TTL không; `Vary` được tôn trọng không.
+    followUp: Your Redis goes down. What should the cache handler do, and what do users experience?
+    verify: true
+    tags: [self-hosting, caching, kubernetes, scenario]
+  - id: nextjs-040
+    level: hard
+    type: scenario
+    q: Right after each deploy, a spike of "Failed to find Server Action" errors appears and some form submissions fail. What causes it and how do you mitigate?
+    hint: |-
+      - **Version skew**: browser đang chạy JS của build cũ gọi action id của build cũ; server mới không nhận ra (ID đổi theo build, và rotate tối đa mỗi 14 ngày).
+      - Nhiều instance mà **encryption key khác nhau** (mỗi build tự sinh) → instance này không giải mã được closure/reference của instance kia → cùng lỗi ngay cả khi không deploy.
+      - Mitigate: `deploymentId` → client gửi `x-deployment-id`, mismatch thì **hard navigation** tải build mới; `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY` (base64, 16/24/32 byte) **giống nhau** trên mọi instance; build một lần, promote image qua môi trường; rolling deploy, giữ asset build cũ trên CDN một thời gian; UI bắt lỗi và mời reload thay vì lỗi cứng.
+    followUp: Why must the same build (not a rebuild per environment) be promoted from staging to production?
+    verify: true
+    tags: [server-actions, deployment, version-skew, scenario]
+  - id: nextjs-041
+    level: hard
+    type: scenario
+    q: A page shows the hydration error only for users in certain countries and only on the order list. How do you track it down?
+    hint: |-
+      - Dấu hiệu "theo quốc gia" → **timezone/locale**: server render `toLocaleString()`/`Intl.DateTimeFormat()` với timezone của server (UTC), client render với timezone/locale browser → text khác → mismatch.
+      - Xác nhận: React 19 in diff chi tiết trong console dev; tái hiện bằng đổi timezone trong DevTools (Sensors) hoặc `TZ` env.
+      - Fix: format ở server với timezone **của user** (lưu trong profile/cookie) và truyền chuỗi đã format; hoặc render ngày chỉ trên client sau mount (component client-only / `useEffect`); hoặc `suppressHydrationWarning` cho **đúng node text** thời gian.
+      - Nguyên nhân khác cùng nhóm: số tiền `toLocaleString`, sort phụ thuộc locale (`localeCompare`), extension dịch trang (Google Translate sửa DOM).
+    followUp: How do you prevent a "flash" of the wrong theme (light/dark) before hydration?
+    tags: [hydration, i18n, scenario]
+  - id: nextjs-042
+    level: hard
+    type: scenario
+    q: Streaming works locally, but behind your nginx + load balancer the page arrives all at once after 3 seconds. Why?
+    hint: |-
+      - Proxy/LB **buffer** response: nginx mặc định `proxy_buffering on` → giữ chunk tới khi đủ/xong → mất streaming (Suspense fallback không bao giờ hiện, TTFB = thời gian render toàn bộ).
+      - Fix: header `X-Accel-Buffering: no` (có thể set qua `headers()` trong `next.config`) hoặc `proxy_buffering off` cho location đó; bảo đảm LB hỗ trợ chunked/HTTP2 streaming (một số tích hợp như ALB + Lambda buffer mặc định); tắt compression buffer ở tầng trung gian nếu nó gom chunk.
+      - Kiểm tra bằng `curl -N` xem chunk đến dần hay không.
+      - Nhắc thêm: bot/crawler luôn nhận trang render xong (không stream) — đừng nhầm khi test bằng user-agent bot.
+    followUp: Without streaming, what happens to PPR's static shell advantage?
+    verify: true
+    tags: [streaming, self-hosting, nginx, scenario]
+  - id: nextjs-043
+    level: hard
+    type: gotcha
+    q: Why is an authorization check inside a shared `layout.tsx` unsafe in the App Router?
+    hint: |-
+      - **Partial rendering**: khi navigate giữa các trang con, layout dùng chung **không re-render** → check trong layout không chạy lại (session hết hạn/role bị thu hồi vẫn xem được trang mới).
+      - Layout không kiểm soát việc render của `children`/parallel slots: segment con vẫn được router render và **có mặt trong RSC payload** kể cả khi layout "ẩn" nó → dữ liệu nhạy cảm vẫn đi xuống.
+      - Layout await auth ở top-level còn **chặn streaming** cả segment.
+      - Đúng: check trong DAL (mỗi lần lấy dữ liệu), trong page/leaf component render dữ liệu nhạy cảm, trong mỗi Server Action/Route Handler; layout chỉ nên lấy user để hiển thị (avatar).
+    followUp: Where does the check go for a parallel `@analytics` slot visible only to admins?
+    tags: [auth, security, layouts]
+  - id: nextjs-044
+    level: hard
+    type: gotcha
+    q: What was the March 2025 Next.js middleware vulnerability (CVE-2025-29927), and what architectural lesson does it teach?
+    hint: |-
+      - Middleware có thể bị **bỏ qua hoàn toàn** bằng cách gửi header nội bộ `x-middleware-subrequest` (dùng để chống vòng lặp đệ quy) → app chỉ dựa vào middleware để auth bị bypass.
+      - Ảnh hưởng bản self-host nhiều major; bản vá ở 15.2.3 / 14.2.25 / 13.5.9 / 12.3.5 (verify với advisory); mitigation tạm: chặn header đó ở reverse proxy/WAF.
+      - Bài học: **defense in depth** — proxy/middleware chỉ là optimistic check; authorization thật ở DAL/Server Action/Route Handler gần dữ liệu. Docs Next 16 nhấn mạnh đúng điều này.
+      - Quy trình: theo dõi advisory, có khả năng patch nhanh (dependency update tự động, test hồi quy).
+    followUp: How would you verify, in a running environment, that your app is not vulnerable to a similar header-based bypass?
+    verify: true
+    tags: [security, proxy, middleware, cve]
+  - id: nextjs-045
+    level: hard
+    type: gotcha
+    q: After enabling Cache Components, a dropdown stays open and a form keeps old input when the user navigates away and back. Why?
+    hint: |-
+      - Với Cache Components, Next **giữ route cũ bằng React `<Activity mode="hidden">`** thay vì unmount → `useState`, input, scroll **được giữ** khi quay lại; effect vẫn cleanup/re-run.
+      - Code cũ ngầm dựa vào unmount để reset (popover đóng, form trống) → hành vi đổi.
+      - Fix: reset tường minh — đóng popover trong cleanup của `useLayoutEffect`, reset form sau submit thành công, dùng `key` theo entity để remount khi cần; state thuộc URL thì đưa lên URL.
+      - Đây là thay đổi UX có chủ đích (back navigation nhanh, giữ state) — nhưng cần QA lại các flow.
+    followUp: Which kinds of components are most likely to misbehave under this change?
+    verify: true
+    tags: [cache-components, activity, state, nextjs-16]
+  - id: nextjs-046
+    level: hard
+    type: design
+    q: A shop layout awaits `params` and the user session at the top, making the whole page wait. How do you restructure it to maximize the static shell?
+    hint: |-
+      - Await ở top-level layout (params không có trong `generateStaticParams`, `cookies()`) → layout là dynamic → không vào shell; mọi `children` chờ theo.
+      - **Đẩy dynamic access xuống**: layout không `async`, truyền **promise** `params` xuống component con, `await` bên trong `<Suspense>`; phần tĩnh (nav, sidebar, footer) vào shell.
+      - User menu đọc session → component riêng trong `<Suspense fallback={<AvatarSkeleton/>}>`.
+      - Dữ liệu dùng chung ít đổi (category tree) → `'use cache'` + `cacheLife('days')`.
+      - Kết quả: shell tức thì từ CDN, chỉ vài ô stream.
+    example: |-
+      ```tsx
+      export default function Layout({ children, params }: LayoutProps<'/shop/[slug]'>) {
+        return (
+          <div>
+            <Sidebar />{/* static / cached */}
+            <Suspense fallback={<h1>Loading…</h1>}>
+              {params.then(({ slug }) => <ShopHeading slug={slug} />)}
+            </Suspense>
+            <Suspense fallback={<AvatarSkeleton />}><UserMenu /></Suspense>
+            {children}
+          </div>
+        );
+      }
+      ```
+    followUp: How do you verify what ended up in the static shell?
+    verify: true
+    tags: [ppr, performance, design]
+  - id: nextjs-047
+    level: hard
+    type: debug
+    q: The Docker image runs fine in staging but calls the staging API from production browsers, and a server-side feature flag never turns on. Why?
+    example: |-
+      ```ts
+      // lib/config.ts
+      export const API_URL = process.env.NEXT_PUBLIC_API_URL!;
+      export const NEW_CHECKOUT = process.env.FEATURE_NEW_CHECKOUT === 'true';
+
+      // app/checkout/page.tsx (prerendered at build)
+      import { NEW_CHECKOUT } from '@/lib/config';
+      export default function Page() {
+        return NEW_CHECKOUT ? <NewCheckout /> : <OldCheckout />;
+      }
+      ```
+    hint: |-
+      - `NEXT_PUBLIC_API_URL` bị **inline lúc `next build`** (build trong pipeline staging) → image mang giá trị staging mãi mãi.
+      - `FEATURE_NEW_CHECKOUT` đọc ở **module scope** trong trang **prerender** → giá trị lúc build bị bake vào HTML tĩnh; đổi env lúc chạy không có tác dụng.
+      - Fix: build **một** image, config runtime đọc trên server lúc request (`await connection()` trước khi đọc `process.env`, hoặc route dynamic) rồi truyền xuống client (props/context/`/config` endpoint); feature flag qua service flag có cache ngắn thay vì env.
+      - Giữ `NEXT_PUBLIC_*` chỉ cho giá trị thật sự cố định theo build.
+    followUp: How would you expose runtime public config to Client Components without an extra request?
+    verify: true
+    tags: [env, deployment, docker, debug]
+  - id: nextjs-048
+    level: hard
+    type: gotcha
+    q: Why are Server Actions a poor fit for parallel data loading, and what does "sequential dispatch" mean?
+    hint: |-
+      - Next dispatch Server Actions **tuần tự mỗi client**: action 2 chờ action 1 xong → `Promise.all([a(), b(), c()])` từ client vẫn chạy nối tiếp.
+      - Lý do: mỗi action có thể trả kèm RSC tree mới; tuần tự giữ UI nhất quán với kết quả.
+      - Hệ quả: dùng action để **đọc dữ liệu** (search-as-you-type, load widget) → chậm, xếp hàng sau mutation.
+      - Đúng: đọc dữ liệu trong Server Component (song song), hoặc Route Handler/GET cho client fetch; nếu cần song song nhiều việc trong mutation → làm song song **bên trong** một action.
+      - Ngoài ra action là POST → không cache HTTP.
+    followUp: A user double-clicks "Save" and two actions are queued. How do you avoid a duplicate write?
+    verify: true
+    tags: [server-actions, performance]
+  - id: nextjs-049
+    level: hard
+    type: gotcha
+    q: Why can a page render fine for users but fail for Googlebot under Cache Components/PPR?
+    hint: |-
+      - Browser nhận **static shell** (đã prerender lúc build) rồi stream phần động. Bot/crawler (nhận diện theo user-agent) thì **không** dùng shell: Next render **toàn trang lúc request** rồi gửi HTML hoàn chỉnh.
+      - Công việc "đã xong lúc build" cho user sẽ **chạy lại lúc request** cho bot → nếu shell dựa vào input chỉ có lúc build (file build-time, secret chỉ có ở CI, API nội bộ không truy cập được từ runtime), bot nhận lỗi.
+      - Fix: bảo đảm mọi dữ liệu shell cũng truy cập được lúc runtime; test bằng user-agent bot; theo dõi lỗi render theo UA.
+      - Hệ quả hiệu năng: bot không được hưởng tốc độ shell; cache cho bot nếu crawl nặng.
+    followUp: How do you test your SEO-critical pages the way a crawler sees them?
+    verify: true
+    tags: [seo, ppr, bots]
+  - id: nextjs-050
+    level: hard
+    type: design
+    q: Design routing for a multi-tenant storefront where each retailer has its own domain or subdomain, on one Next.js deployment.
+    hint: |-
+      - **Proxy** đọc `host` → map domain/subdomain → `tenantSlug` (bảng mapping cache ngắn), **rewrite** nội bộ sang `/[tenant]/…` (URL user không đổi); domain lạ → 404.
+      - Cây `app/[tenant]/…`: params tenant là một phần route → cache/prerender theo tenant (`generateStaticParams` cho tenant lớn, còn lại ISR).
+      - Mọi cache key/tag có tenant (`product:${tenant}:${slug}`); data layer lọc tenant từ context server, không từ client.
+      - Theme/branding per tenant (CSS variables từ config), metadata/SEO riêng (canonical theo domain), sitemap per tenant.
+      - Auth cookie scope theo domain; custom domain cần TLS tự động.
+      - Guide `multi-tenant` trong docs Next có ví dụ tham khảo.
+    followUp: A retailer changes their custom domain. What caches and routes must be updated?
+    tags: [multi-tenancy, routing, proxy, design]
+  - id: nextjs-051
+    level: senior
+    type: open
+    q: How would you migrate a large Pages Router app (getServerSideProps everywhere, Redux, API routes) to the App Router without a big-bang rewrite?
+    hint: |-
+      Đánh giá lập luận:
+      - Hai router cùng tồn tại → migrate **từng route**; bắt đầu từ trang ít phụ thuộc state client (marketing, detail read-only), đo trước/sau.
+      - Root layout mới + provider client (Redux, theme) bọc `children`; store per request.
+      - `getServerSideProps` → async Server Component + DAL; `getStaticProps` → cache (`'use cache'`/fetch cache) + `generateStaticParams`.
+      - API routes giữ nguyên (vẫn chạy), mutation mới dùng Server Actions khi hợp lý.
+      - Rủi ro: navigation giữa hai router là hard navigation; shared components phải tách client/server; thư viện CSS-in-JS runtime; auth phải hoạt động ở cả hai.
+      - Guardrails: lint cấm import server module vào client, test E2E flow chính.
+    followUp: Which pages would you deliberately leave on the Pages Router, and why?
+    tags: [migration, app-router, strategy]
+  - id: nextjs-052
+    level: senior
+    type: open
+    q: Your team runs Next 15 with heavy use of `fetch` cache options, `unstable_cache` and `export const revalidate`. Should you enable Cache Components after upgrading to 16? How would you roll it out?
+    hint: |-
+      - Nâng lên 16 **không bắt buộc** bật `cacheComponents`; mô hình cũ vẫn chạy. Bật nó là thay đổi mô hình (không phải rename): segment config `dynamic`/`revalidate`/`fetchCache` sẽ lỗi, `dynamicParams` không hỗ trợ, edge runtime không hỗ trợ, route giữ state bằng Activity.
+      - Lợi ích: PPR mặc định (shell tức thì), cache tường minh theo function/component, prefetch/instant navigation tốt hơn.
+      - Kế hoạch: upgrade 16 trước (async APIs, proxy, Turbopack), ổn định; rồi bật flag trên nhánh, xử lý từng insight (Suspense/`use cache`), dùng `instant: false` để tạm hoãn segment chưa sẵn sàng; map `unstable_cache` → `'use cache'` + `cacheLife`/`cacheTag`, `revalidateTag` thêm profile, cân nhắc `updateTag`.
+      - Self-host: `cacheHandlers` cho `'use cache: remote'`; kiểm tra cache không qua deploy.
+      - Đo: TTFB/LCP, số render server, bug stale.
+    followUp: Which of your pages would gain the least from Cache Components?
+    verify: true
+    tags: [cache-components, migration, nextjs-16]
+  - id: nextjs-053
+    level: senior
+    type: design
+    q: Design a production self-hosted deployment of Next.js 16 on Kubernetes behind a CDN. List everything you must configure that Vercel would otherwise handle.
+    hint: |-
+      - Build: `output: 'standalone'`, build **một lần**, promote image; `deploymentId` cố định theo release (skew protection).
+      - Multi-instance: `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY` chung; custom `cacheHandler` + `cacheHandlers` trên Redis/S3 với `updateTags`/`refreshTags`; tắt/giới hạn in-memory cache.
+      - Networking: reverse proxy (nginx) trước Node (slowloris, body size, rate limit), **tắt buffering** cho streaming, TLS, HTTP/2.
+      - CDN: tôn trọng `Cache-Control`/`Vary`, cache HTML và RSC cùng policy, không cache response `private`; asset `/_next/static` immutable (có thể `assetPrefix`), giữ asset build cũ một thời gian.
+      - Image optimization: sharp, giới hạn memory (glibc allocator), hoặc loader ngoài.
+      - Vận hành: readiness/liveness, SIGTERM drain 10–30s cho `after()`, HPA theo CPU/latency, OpenTelemetry (`instrumentation.ts`), log có request id.
+    followUp: How do you do a zero-downtime rolling deploy without users hitting "Failed to find Server Action"?
+    verify: true
+    tags: [self-hosting, kubernetes, deployment, design]
+  - id: nextjs-054
+    level: senior
+    type: open
+    q: Should the Next.js app talk to the database directly (DAL in Server Components) or go through a separate Node/Nest API? Argue both sides for a B2B2C platform.
+    hint: |-
+      - **DAL trực tiếp**: ít hop, ít latency, type chia sẻ, đơn giản cho team full-stack nhỏ; Next docs khuyến nghị DAL cho project mới.
+      - **API riêng**: nhiều client (mobile, đối tác, integration) cần cùng business logic; team backend riêng/ngôn ngữ khác; scale/deploy độc lập; tách trách nhiệm bảo mật; Next làm **BFF** (zero trust, forward token).
+      - Tiêu chí: số loại client, ownership tổ chức, yêu cầu compliance/audit, chỗ đặt logic multi-tenant/authorization (một nơi!), kỹ năng team.
+      - Hybrid phổ biến: API domain riêng + Next gọi qua `fetch` từ Server Components với cache tag; tránh logic nghiệp vụ nhân đôi.
+      - Next docs: chọn **một** cách tiếp cận data fetching và nhất quán để dễ audit.
+    followUp: If you choose the separate API, how do you pass the user's identity from Next to it securely?
+    tags: [architecture, bff, dal]
+  - id: nextjs-055
+    level: senior
+    type: design
+    q: You are asked to security-review a Next.js App Router codebase before launch. What is your checklist?
+    hint: |-
+      - **Server Actions**: mỗi action có authn + authz + validate (zod) + trả DTO; không nhận ownership từ client (IDOR); rate limit thao tác đắt; `bodySizeLimit`, `allowedOrigins` nếu sau proxy.
+      - **Data exposure**: props xuống Client Components là DTO; `server-only` cho DAL/secret; taint cho object nhạy cảm; `NEXT_PUBLIC_*` không chứa secret.
+      - **Auth**: cookie HttpOnly/Secure/SameSite; không dựa layout/proxy; session hết hạn và revoke.
+      - **Cache**: không `'use cache'`/CDN cache dữ liệu per user; key có tenant; `Cache-Control: private` cho trang cá nhân.
+      - **Headers**: CSP (nonce với proxy), HSTS, `X-Frame-Options`/`frame-ancestors`, tắt `poweredByHeader`.
+      - **Route Handlers/webhooks**: verify chữ ký, CSRF cho POST dùng cookie.
+      - **Dependencies**: phiên bản Next đã vá advisory; image `remotePatterns` chặt (SSRF), không bật `dangerouslyAllowLocalIP` bừa.
+    followUp: Which item on this list is most often missed in practice?
+    verify: true
+    tags: [security, review, checklist]
+  - id: nextjs-056
+    level: senior
+    type: design
+    q: For an e-commerce site, choose the rendering and caching strategy for home, category, product detail, search, cart and checkout pages. Justify each.
+    hint: |-
+      Không có một đáp án; lý lẽ mới quan trọng:
+      - **Home/category**: static shell + `'use cache'` nội dung chung (`cacheLife` giờ/ngày + tag từ CMS); cá nhân hoá (gợi ý, "xin chào") trong Suspense.
+      - **Product detail**: prerender top N (`generateStaticParams`) + ISR cho phần còn lại; giá/tồn kho thay đổi nhanh → cache ngắn hoặc stream; tag theo product để invalidate khi cập nhật.
+      - **Search**: dynamic theo `searchParams`; cache kết quả theo query (`'use cache'` với args) nếu hợp; client-side refinement.
+      - **Cart**: per user → không cache chung; stream/đọc cookie; optimistic UI.
+      - **Checkout**: luôn dynamic, không cache, Server Actions có idempotency, tính giá phía server.
+      - Multi-tenant: tenant trong mọi key.
+    followUp: A flash sale changes prices for 10,000 products at 12:00:00. How do you make every page correct within seconds?
+    verify: true
+    tags: [rendering, caching, ecommerce, design]
+  - id: nextjs-057
+    level: senior
+    type: design
+    q: How do you make a Next.js app observable in production — tracing server rendering, Server Actions and downstream calls?
+    hint: |-
+      - `instrumentation.ts` (`register()`) khởi tạo OpenTelemetry (`@vercel/otel` hoặc SDK Node) → Next tự tạo span cho render route, fetch, Route Handler; `onRequestError` hook để báo lỗi server tập trung (Sentry…).
+      - `instrumentation-client.ts` cho monitoring phía browser (Web Vitals, lỗi client).
+      - Propagate trace context sang API/DB (header `traceparent`); log có trace id; `digest` của lỗi Server Component để đối chiếu.
+      - Metric: latency theo route (TTFB, render time), cache hit/miss (log `NEXT_PRIVATE_DEBUG_CACHE` khi debug), tỷ lệ lỗi action, Web Vitals (LCP/INP/CLS) theo release.
+      - Alert theo SLO, dashboard theo tenant nếu multi-tenant.
+    followUp: A route's p95 doubled after a release but no errors. What spans do you look at first?
+    verify: true
+    tags: [observability, opentelemetry, production]
+  - id: nextjs-058
+    level: cv
+    type: design
+    q: On the multi-tenant B2B2C commerce platform you worked with React/Next.js. Which rendering strategy did storefront pages use, and why?
+    hint: |-
+      Câu trả lời mạnh:
+      - Nói rõ **version và router** thật (Pages hay App Router, Next 12/13/14/15…) — đừng mô tả tính năng của Next 16 nếu dự án không dùng.
+      - Mỗi loại trang dùng gì (SSR/SSG/ISR/CSR) và lý do (SEO, dữ liệu theo tenant, giá thay đổi).
+      - Cách xử lý tenant trong routing/caching, và cách invalidate khi retailer cập nhật.
+      - Số liệu: TTFB/LCP, tỷ lệ cache hit, tải server (điền số liệu thật của bạn).
+      - Nếu làm lại với Next 16 bạn đổi gì (PPR/Cache Components).
+    followUp: What would break if two tenants shared a cache entry by mistake, and how did you guard against it?
+    tags: [cv, rendering, multi-tenancy]
+  - id: nextjs-059
+    level: cv
+    type: scenario
+    q: You implemented JWT/OAuth including Google OAuth for the platform. In the Next.js frontend, where did tokens live, how was the session checked on server-rendered pages, and how did refresh work?
+    hint: |-
+      Gợi ý câu trả lời mạnh:
+      - Token ở **HttpOnly cookie** (không localStorage); access token ngắn hạn + refresh token (rotation) hoặc session id phía server.
+      - OAuth flow: redirect → callback (Route Handler/API route) → đổi code lấy token (PKCE) → tạo session nội bộ; `state` chống CSRF.
+      - SSR: đọc cookie trên server, verify, forward tới backend API; xử lý hết hạn (refresh phía server, tránh nhiều request refresh song song).
+      - Tenant + role trong session; logout xoá cookie + revoke.
+      - (Điền chi tiết thật của bạn: thư viện, thời hạn token, sự cố gặp phải.)
+    followUp: Two parallel server requests both find the access token expired and both try to refresh. What happens with refresh-token rotation?
+    tags: [cv, auth, oauth, jwt]
+  - id: nextjs-060
+    level: cv
+    type: design
+    q: You built Checkout end to end. If you rebuilt the checkout submit today in Next.js 16, would you use a Server Action or a Route Handler? Walk through the trade-offs using your real flow.
+    hint: |-
+      Câu trả lời mạnh:
+      - Mô tả flow thật (cart → address → shipping → payment → confirm) và điểm tích hợp (payment provider, webhook).
+      - Server Action: tích hợp form/`useActionState`, pending state, revalidate cart/order trong cùng round-trip; nhưng phải tự auth/authz/idempotency, gắn với build (version skew giữa lúc thanh toán!).
+      - Route Handler: hợp cho webhook của payment provider, client mobile dùng chung, kiểm soát HTTP (idempotency header, status code).
+      - Hybrid hợp lý: Action cho UI, logic nằm trong service/DAL dùng chung với Route Handler.
+      - (Điền chi tiết thật của bạn.)
+    followUp: The payment webhook arrives before the Server Action finishes writing the order. How is that race handled?
+    verify: true
+    tags: [cv, checkout, server-actions]
+  - id: nextjs-061
+    level: cv
+    type: scenario
+    q: You did production debugging across backend, database and frontend. Tell me about a slow or broken Next.js page and how you found which layer was at fault.
+    hint: |-
+      STAR:
+      - **S**: trang nào, triệu chứng (TTFB cao, hydration error, dữ liệu sai theo tenant), ai báo, ảnh hưởng.
+      - **A**: chia tầng — browser (Performance, network waterfall) → Next server (log/trace render, cache hit/miss) → API (trace, latency) → DB (slow query log, execution plan) → Redis/Elasticsearch; loại trừ giả thuyết; fix gốc.
+      - **R**: số liệu trước/sau (điền số liệu thật của bạn).
+      - Reflection: observability thêm vào để lần sau nhanh hơn.
+    followUp: What single piece of telemetry would have cut your investigation time in half?
+    tags: [cv, debugging, production, behavioral]
+  - id: nextjs-062
+    level: cv
+    type: design
+    q: The platform used Redis caching on the backend. How did that interact with caching in the Next.js layer and the browser? Where did you invalidate on writes?
+    hint: |-
+      Gợi ý:
+      - Vẽ các tầng: browser/router cache → CDN → Next server cache (ISR/fetch/`use cache`) → backend API → Redis → DB.
+      - Mỗi tầng TTL/invalidation ra sao; tránh "double caching" khó đoán (Next cache 1h trên dữ liệu Redis đã cache 10 phút → stale tới 70 phút).
+      - Invalidate khi ghi: backend xoá/cập nhật key Redis (cache-aside) + phát event → Next `revalidateTag` qua webhook/Route Handler.
+      - Key theo tenant ở mọi tầng.
+      - (Điền chi tiết thật của bạn: TTL, key design, incident stale.)
+    followUp: A retailer updates stock and customers can still add an out-of-stock item for a few minutes. Which layer do you fix first?
+    tags: [cv, caching, redis]
+  - id: nextjs-063
+    level: cv
+    type: scenario
+    q: You led legacy refactors. Have you migrated React SPA screens or Pages Router routes into Next.js App Router? How did you decide which components become Server vs Client Components?
+    hint: |-
+      Câu trả lời mạnh:
+      - Tiêu chí thật: component có state/effect/browser API → client; hiển thị dữ liệu, không tương tác → server; lá tương tác nhỏ tách riêng.
+      - Xử lý thư viện client-only (bọc `'use client'`), global store (provider per request), CSS-in-JS runtime.
+      - Rủi ro gặp phải: hydration mismatch, props không serializable, bundle không giảm như kỳ vọng.
+      - Kết quả đo được: JS gửi xuống, LCP (điền số liệu thật của bạn). Nếu chưa từng migrate, nói thật và mô tả cách bạn sẽ làm.
+    followUp: How did you prevent server-only modules from being imported into client components during the migration?
+    tags: [cv, migration, rsc, refactoring]
+  - id: nextjs-064
+    level: cv
+    type: behavioral
+    q: You use AI-assisted development. Next.js 16 changed many APIs (proxy, async request APIs, Cache Components). How do you stop an AI assistant from generating outdated Next.js code, and how do you verify its output?
+    hint: |-
+      Gợi ý câu trả lời mạnh:
+      - Ground assistant bằng **docs đúng version**: Next 16.2+ đóng gói docs trong `node_modules/next/dist/docs/` và có `AGENTS.md` trỏ tới đó (codemod `agents-md`); nêu version rõ trong prompt.
+      - Nhận diện output cũ: `middleware.ts`, `cookies()` sync, `revalidateTag(tag)` một arg, `experimental.ppr`, `next lint`, `getServerSideProps` trong App Router.
+      - Verify: type-check + build + test E2E, đọc diff như review PR, chạy codemod chính thức thay vì để AI sửa tay hàng loạt.
+      - Ví dụ thật: một lần AI sinh code sai và cách bạn phát hiện (điền ví dụ thật của bạn).
+    followUp: Where does AI assistance save you the most time on a Next.js codebase, and where do you not trust it at all?
+    verify: true
+    tags: [cv, ai-assisted, nextjs-16, behavioral]
+  - id: nextjs-065
+    level: cv
+    type: design
+    q: Your Elasticsearch-backed search was exposed in the storefront. How would you build the search results page in the App Router — server rendering, URL state, caching and SEO?
+    hint: |-
+      Câu trả lời mạnh:
+      - URL là nguồn state (`?q=&category=&page=`) → share/back hoạt động; `searchParams` async, đọc sâu trong `<Suspense>`.
+      - Server Component gọi search service (tenant filter bắt buộc), trả DTO; cache ngắn theo query nếu hợp (`'use cache'` với args, `cacheLife('minutes')`) hoặc không cache cho truy vấn dài đuôi.
+      - Client component cho ô search/facet: cập nhật URL bằng `router.replace` + transition (không spam history), debounce.
+      - SEO: `noindex` cho trang kết quả tuỳ ý, canonical cho trang category; tránh vô hạn URL tổ hợp facet.
+      - Số liệu thật: p95 search, tỷ lệ zero-result (điền số liệu thật của bạn).
+    followUp: How do you keep the input responsive while results for each keystroke stream in?
+    verify: true
+    tags: [cv, search, elasticsearch, url-state]

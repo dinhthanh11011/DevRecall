@@ -1,0 +1,772 @@
+id: 25-devops-cicd
+slug: devops-cicd
+title: Containers, CI/CD & IaC
+tier: 7
+status: drafted
+summary: Docker cho Node (multi-stage, non-root, PID 1 & signal), Kubernetes basics, thiết kế pipeline, rolling/blue-green/canary, feature flags, migration trong pipeline, Terraform/CDK, GitOps.
+cvLinked: false
+prerequisites: []
+overview: |-
+  ## TL;DR
+
+  - Interviewer muốn biết bạn **ship code an toàn và lặp lại được**: image nhỏ và an toàn, pipeline nhanh và đáng tin, deploy có đường lui, hạ tầng mô tả bằng code.
+  - Với Node, 80% câu hỏi Docker xoay quanh: **multi-stage build**, **layer caching** (`package*.json` trước, `npm ci`), **non-root user**, **PID 1 & SIGTERM** (graceful shutdown), `.dockerignore`.
+  - Kubernetes basics cần nói chắc: Pod/Deployment/Service/Ingress, **readiness vs liveness vs startup probe**, **requests/limits** và `OOMKilled`, HPA, ConfigMap/Secret.
+  - Deploy strategy là trade-off giữa **tốc độ rollback, chi phí, và blast radius**; DB migration là thứ quyết định bạn có rollback được hay không (**expand/contract**).
+  - IaC: Terraform **state** là trái tim (remote backend + locking + drift detection); GitOps = Git là source of truth, cluster tự **pull** trạng thái mong muốn.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Multi-stage build | Build ở stage có devDependencies, copy **chỉ artifact** sang stage runtime | Image từ ~1 GB xuống ~150 MB |
+  | Layer caching | Mỗi instruction là một layer; layer đổi → mọi layer sau build lại | `COPY package*.json` + `npm ci` trước `COPY . .` |
+  | PID 1 | Process đầu tiên trong container nhận signal, và kernel **không** áp default handler cho nó | `CMD npm start` → SIGTERM không tới `node` → bị SIGKILL sau grace period |
+  | Readiness probe | "Có nhận traffic được không?" — fail thì bị rút khỏi Service endpoints | Đang warm cache → chưa ready |
+  | Liveness probe | "Có cần restart không?" — fail thì kubelet restart container | Event loop treo hẳn |
+  | requests / limits | requests dùng để **schedule**; limits là **trần** (memory vượt → OOMKilled, CPU vượt → throttle) | `memory: 512Mi` limit, Node heap vượt → exit 137 |
+  | Rolling update | Thay dần pod cũ bằng pod mới | `maxSurge: 25%`, `maxUnavailable: 0` |
+  | Blue/green | Hai môi trường đầy đủ, đổi traffic một lần | Rollback = chuyển router về blue |
+  | Canary | Đẩy % traffic nhỏ sang bản mới, đo, rồi tăng dần | 5% → 25% → 100% nếu error rate ổn |
+  | Feature flag | Tách **deploy** (code lên prod) khỏi **release** (bật cho user) | Bật checkout mới cho 10% tenant |
+  | Terraform state | File ánh xạ resource trong code ↔ resource thật | Mất state = Terraform muốn tạo lại mọi thứ |
+  | GitOps | Agent trong cluster (Argo CD/Flux) reconcile theo Git | Merge PR = deploy; revert commit = rollback |
+
+  ## Cơ chế hoạt động
+
+  **Pipeline chuẩn cho một Node/Next.js service:**
+
+  ```mermaid
+  flowchart LR
+    PR["Pull request"] --> CI["CI: install (cache) → lint → typecheck → unit → integration (testcontainers)"]
+    CI --> B["Build image once<br/>tag = git SHA"]
+    B --> SCAN["Scan (CVE, secrets) + SBOM + sign"]
+    SCAN --> REG[("Registry")]
+    REG --> STG["Deploy staging<br/>+ migrate (expand)"]
+    STG --> E2E["Smoke / e2e"]
+    E2E --> GATE{"Approval / auto gate"}
+    GATE --> CAN["Prod canary 5%"]
+    CAN --> M{"SLO ok?<br/>(error rate, p95)"}
+    M -- "yes" --> FULL["100%"]
+    M -- "no" --> RB["Auto rollback"]
+    FULL --> CON["Later release: contract migration"]
+  ```
+
+  **Graceful shutdown của một pod:**
+
+  ```mermaid
+  sequenceDiagram
+    participant K as kubelet
+    participant EP as Endpoints / LB
+    participant C as Node container
+    K->>EP: pod Terminating → rút khỏi endpoints (bất đồng bộ)
+    K->>C: preStop hook (vd. sleep 5–10s)
+    K->>C: SIGTERM
+    C->>C: server.close() — ngừng nhận mới, xử lý nốt request, đóng DB pool
+    C-->>K: exit 0
+    Note over K,C: quá terminationGracePeriodSeconds (mặc định 30s) → SIGKILL
+  ```
+
+  ## Trade-offs
+
+  | Strategy | Rollback | Chi phí hạ tầng | Blast radius | Yêu cầu |
+  |---|---|---|---|---|
+  | Recreate | Chậm (deploy lại) | Thấp | 100% + downtime | Chấp nhận downtime |
+  | Rolling | Vừa (rollout undo) | Thấp (+surge) | Tăng dần, khó dừng giữa chừng có kiểm soát | Code cũ & mới chạy song song, schema tương thích |
+  | Blue/green | Tức thì (đổi router) | x2 trong lúc deploy | 100% khi switch | Stateless hoặc DB tương thích cả hai |
+  | Canary | Nhanh (dồn traffic về bản cũ) | Thấp | Nhỏ, có kiểm soát | Metric tốt theo version, tự động phân tích |
+  | Feature flag | Tức thì (tắt flag) | Không | Theo segment | Kỷ luật dọn flag, test cả hai nhánh |
+
+  | IaC | Mạnh | Yếu |
+  |---|---|---|
+  | Terraform/OpenTofu | Multi-cloud + SaaS provider, plan rõ ràng, ecosystem lớn | Tự quản state, HCL hạn chế logic |
+  | AWS CDK | TypeScript thật, construct tái sử dụng, sinh CloudFormation | Chỉ AWS (chủ yếu), CloudFormation chậm/giới hạn |
+  | CloudFormation | Native, state do AWS quản, rollback stack | YAML dài, ít trừu tượng |
+  | Pulumi | Ngôn ngữ thật, multi-cloud | Ecosystem nhỏ hơn Terraform |
+
+  ## Pitfalls
+
+  - `FROM node:latest` → build không tái lập; dùng tag cụ thể (hoặc digest) và cập nhật có chủ đích.
+  - `COPY . .` trước `npm install` → mỗi lần sửa code đều cài lại dependency; thiếu `.dockerignore` → copy cả `node_modules`, `.env`, `.git` vào image.
+  - Chạy container bằng **root**; secret trong `ENV`/`ARG` (lộ qua `docker history`) — dùng BuildKit secret mount.
+  - `CMD npm start` / shell form → signal không tới Node; không xử lý SIGTERM → cắt ngang request mỗi lần deploy.
+  - Liveness probe gọi DB → DB chậm làm restart **toàn bộ** pod (cascading failure).
+  - Không đặt memory limit hoặc đặt heap Node lớn hơn limit → OOMKilled.
+  - Build image riêng cho từng môi trường thay vì **build once, promote** cùng một digest.
+  - Migration phá vỡ tương thích (rename/drop cột) chạy cùng release code mới → không rollback được.
+  - Terraform state local / trong git; không có locking → hai người `apply` cùng lúc hỏng state.
+  - Feature flag không bao giờ được dọn → nợ kỹ thuật, tổ hợp nhánh không ai test.
+
+  ## Cheat sheet
+
+  - Dockerfile Node: multi-stage · `npm ci` · `--omit=dev` · `USER node` · `CMD ["node","server.js"]` (exec form) · `--init`/tini nếu cần reap zombie · `.dockerignore`.
+  - Next.js: `output: "standalone"` để image runtime chỉ chứa server tối thiểu.
+  - Probes: startup (khởi động chậm) → readiness (dependency cần thiết cho traffic) → liveness (chỉ process tự thân, rẻ).
+  - Exit code 137 = SIGKILL (thường OOMKilled); 143 = SIGTERM.
+  - HPA scale theo % **requests** → không có requests thì HPA CPU không hoạt động đúng.
+  - K8s Secret chỉ là base64 → bật encryption at rest, hoặc External Secrets / CSI driver.
+  - Pipeline: fail fast (lint/typecheck trước), cache dependency, song song hoá, artifact bất biến theo SHA.
+  - Rollback code phải luôn khả thi → migration expand trước, contract sau.
+  - Terraform: remote state + lock, `plan` trong PR, `apply` từ CI, drift detection định kỳ, module có version.
+  - 12-factor: config trong env, stateless process, logs ra stdout, dev/prod parity, disposability (start nhanh, shutdown êm).
+notionRefs:
+  - title: DevOps
+    url: https://app.notion.com/p/171ef77f8ab280e99b9befebd3cfab8a
+references:
+  - title: Docker — Multi-stage builds
+    url: https://docs.docker.com/build/building/multi-stage/
+  - title: Docker — Build cache
+    url: https://docs.docker.com/build/cache/
+  - title: Docker — Dockerfile reference (CMD / ENTRYPOINT exec form)
+    url: https://docs.docker.com/reference/dockerfile/
+  - title: Kubernetes — Configure liveness, readiness and startup probes
+    url: https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/
+  - title: Kubernetes — Resource management for pods and containers
+    url: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+  - title: Kubernetes — Pod lifecycle (termination)
+    url: https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination
+  - title: Kubernetes — Horizontal Pod Autoscaling
+    url: https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/
+  - title: Kubernetes — Deployments (rolling update)
+    url: https://kubernetes.io/docs/concepts/workloads/controllers/deployment/
+  - title: Terraform — State and locking
+    url: https://developer.hashicorp.com/terraform/language/state/locking
+  - title: Terraform — S3 backend
+    url: https://developer.hashicorp.com/terraform/language/backend/s3
+  - title: The Twelve-Factor App
+    url: https://12factor.net/
+  - title: OpenGitOps principles
+    url: https://opengitops.dev/
+  - title: GitHub Actions — OpenID Connect in AWS
+    url: https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services
+questions:
+  - id: devops-cicd-001
+    level: easy
+    type: concept
+    q: What is a multi-stage Docker build and why use it for a Node/TypeScript service?
+    hint: |-
+      Một Dockerfile có nhiều `FROM`; stage đầu có toolchain + devDependencies để `npm ci` và `tsc`/`next build`, stage cuối chỉ copy **artifact** (`dist/`, production `node_modules`) sang base image nhỏ.
+      Lợi ích: image nhỏ hơn (pull nhanh, scale nhanh), **ít attack surface** (không có compiler, devDependencies, source), không lộ file build.
+      Next.js: dùng `output: "standalone"` rồi copy `.next/standalone`, `.next/static`, `public`.
+    example: |-
+      ```dockerfile
+      FROM node:22-slim AS build
+      WORKDIR /app
+      COPY package*.json ./
+      RUN npm ci
+      COPY . .
+      RUN npm run build && npm prune --omit=dev
+
+      FROM node:22-slim
+      WORKDIR /app
+      ENV NODE_ENV=production
+      COPY --from=build --chown=node:node /app/dist ./dist
+      COPY --from=build --chown=node:node /app/node_modules ./node_modules
+      USER node
+      CMD ["node", "dist/server.js"]
+      ```
+    followUp: Would you pick an Alpine, slim or distroless base image for Node? What breaks with each?
+    tags: [docker, multi-stage, nodejs]
+  - id: devops-cicd-002
+    level: easy
+    type: concept
+    q: How does Docker layer caching work, and how should you order a Node Dockerfile to benefit from it?
+    hint: |-
+      Mỗi instruction tạo một layer; cache key phụ thuộc instruction + (với `COPY`/`ADD`) checksum file. Một layer thay đổi → **mọi layer phía sau** build lại.
+      Thứ tự đúng: base image → `COPY package.json package-lock.json` → `RUN npm ci` → `COPY . .` → build. Sửa code chỉ làm lại từ `COPY . .`.
+      Tăng tốc thêm: BuildKit cache mount (`RUN --mount=type=cache,target=/root/.npm npm ci`), cache registry trong CI (`--cache-from`/`--cache-to`), `.dockerignore` để file rác không làm vỡ cache.
+    followUp: Your CI builds never hit the cache even with a correct Dockerfile. Why?
+    tags: [docker, caching, ci]
+  - id: devops-cicd-003
+    level: easy
+    type: concept
+    q: Why should a container not run as root, and how do you do it for Node?
+    hint: |-
+      Nếu app bị RCE, root trong container + lỗ hổng runtime/kernel hoặc mount nguy hiểm → dễ leo quyền ra host; root còn ghi được mọi file trong container.
+      Image `node` chính thức có sẵn user `node` (uid 1000): `USER node`, `COPY --chown=node:node`. Không cần port < 1024 (listen 3000/8080).
+      Kubernetes: `securityContext: runAsNonRoot: true`, `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false`, drop capabilities.
+    followUp: With `readOnlyRootFilesystem`, your Next.js app crashes writing to `.next/cache`. What do you do?
+    tags: [docker, security, kubernetes]
+  - id: devops-cicd-004
+    level: easy
+    type: compare
+    q: Pod, Deployment, Service, Ingress — explain each in one line and how a request reaches your Node app.
+    hint: |-
+      - **Pod**: đơn vị nhỏ nhất, một hoặc vài container chung network/volume, **ephemeral** (IP thay đổi).
+      - **Deployment**: khai báo số replica + template → ReplicaSet → Pod; lo rolling update, rollback.
+      - **Service**: IP/DNS ổn định chọn Pod theo **label selector**, load balance tới pod **ready** (ClusterIP, NodePort, LoadBalancer).
+      - **Ingress** (hoặc Gateway API): route HTTP host/path từ ngoài vào Service, TLS; cần Ingress controller (nginx, ALB controller…).
+      Luồng: client → LB/Ingress controller → Service → Pod ready.
+    followUp: What's the Gateway API and why is it replacing Ingress in many clusters?
+    verify: true
+    tags: [kubernetes, basics]
+  - id: devops-cicd-005
+    level: easy
+    type: compare
+    q: Readiness vs liveness vs startup probes — what does each control?
+    hint: |-
+      - **Readiness**: fail → pod bị **rút khỏi Service endpoints** (không nhận traffic), **không restart**. Dùng khi đang khởi động, quá tải, mất dependency bắt buộc.
+      - **Liveness**: fail → kubelet **restart container**. Chỉ dùng cho trạng thái không tự hồi phục (deadlock, event loop treo). Phải rẻ và **không phụ thuộc dependency ngoài**.
+      - **Startup**: cho app khởi động chậm; trong lúc startup probe chưa pass thì liveness/readiness bị tạm hoãn → tránh bị kill khi đang boot.
+      Không có probe nào → pod được coi là ready ngay khi container chạy.
+    followUp: Should the readiness probe check the database? What about when the DB is down for every pod?
+    tags: [kubernetes, probes]
+  - id: devops-cicd-006
+    level: easy
+    type: compare
+    q: Rolling, blue/green and canary deployments — how do they differ?
+    hint: |-
+      - **Rolling**: thay dần instance cũ bằng mới (`maxSurge`, `maxUnavailable`); rẻ, mặc định của K8s/ECS; bản cũ và mới **cùng phục vụ** trong lúc rollout.
+      - **Blue/green**: dựng môi trường mới đầy đủ (green), test, rồi chuyển toàn bộ traffic; rollback tức thì; tốn gấp đôi trong lúc deploy.
+      - **Canary**: chuyển % nhỏ traffic sang bản mới, **đo** (error rate, latency, business metric) rồi tăng dần; blast radius nhỏ nhất, cần observability theo version.
+      Cả ba đều đòi hỏi schema DB tương thích ngược.
+    followUp: What metrics would automatically promote or abort a canary?
+    tags: [deployment, strategies]
+  - id: devops-cicd-007
+    level: easy
+    type: concept
+    q: What is a feature flag, and how is "deploy" different from "release"?
+    hint: |-
+      Feature flag = điều kiện runtime quyết định code path nào chạy (theo user, tenant, %, môi trường).
+      **Deploy** = đưa code lên production (có thể đang tắt). **Release** = bật tính năng cho người dùng. Tách hai việc → merge sớm vào main (trunk-based), bật dần, tắt ngay khi lỗi mà không redeploy.
+      Loại flag: release (tạm thời), experiment (A/B), ops/kill switch (lâu dài), permission (theo gói/tenant).
+      Chi phí: phải dọn flag, test cả hai nhánh, flag service thành dependency (cần default an toàn khi không lấy được flag).
+    followUp: Your flag provider is down. What should the app do?
+    tags: [feature-flags, release]
+  - id: devops-cicd-008
+    level: easy
+    type: concept
+    q: What is Terraform state and why must it be stored remotely with locking?
+    hint: |-
+      State ánh xạ resource trong code ↔ ID resource thật + thuộc tính; Terraform dùng nó để tính `plan` (tạo/sửa/xoá gì).
+      Remote backend (S3, Terraform Cloud/HCP, GCS…) để cả team và CI dùng chung, có versioning để khôi phục.
+      **Locking** ngăn hai `apply` đồng thời ghi hỏng state (S3 backend: trước đây dùng DynamoDB table; bản Terraform mới hỗ trợ lock file native trên S3 với `use_lockfile`).
+      State chứa **secret dạng plaintext** (password DB, key) → mã hoá bucket, giới hạn quyền đọc, không commit vào git.
+    followUp: Someone deleted a resource manually in the console. What happens on the next `terraform plan`?
+    verify: true
+    tags: [terraform, iac, state]
+  - id: devops-cicd-009
+    level: easy
+    type: concept
+    q: Name the 12-factor principles you think matter most for a containerized Node service, and why.
+    hint: |-
+      Những cái hay được hỏi:
+      - **Config trong environment** — cùng image cho mọi môi trường.
+      - **Stateless processes** — session/upload không nằm trên disk local → scale ngang được.
+      - **Logs là event stream** — ghi stdout, platform thu gom.
+      - **Disposability** — start nhanh, shutdown êm khi SIGTERM.
+      - **Build, release, run tách biệt** — build một lần, release = build + config.
+      - **Dev/prod parity**, **backing services** là resource gắn qua URL.
+      Hạn chế: 12-factor ra đời trước K8s/serverless; một số phần (config chỉ qua env) cần bổ sung secret manager.
+    followUp: Why is "config in env vars" not enough for secrets in practice?
+    tags: [12-factor, architecture]
+  - id: devops-cicd-010
+    level: medium
+    type: debug
+    q: Review this Dockerfile for a production Node API. List every problem you see.
+    example: |-
+      ```dockerfile
+      FROM node:latest
+      WORKDIR /app
+      COPY . .
+      ARG NPM_TOKEN
+      RUN echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" > .npmrc && npm install
+      ENV DATABASE_URL=postgres://admin:secret@db:5432/app
+      EXPOSE 3000
+      CMD npm run start
+      ```
+    hint: |-
+      - `node:latest`: không tái lập, image to → pin phiên bản (`node:22-slim` hoặc digest).
+      - `COPY . .` trước install → phá layer cache; thiếu `.dockerignore` (copy cả `node_modules`, `.git`, `.env`).
+      - `NPM_TOKEN` qua `ARG` + ghi `.npmrc` → token nằm trong layer/history. Dùng `RUN --mount=type=secret,id=npmrc`.
+      - `npm install` thay vì `npm ci`; cài cả devDependencies; không multi-stage.
+      - Secret hardcode trong `ENV` → nằm trong image, lộ cho mọi người pull được.
+      - Chạy root (không `USER node`).
+      - `CMD npm run start` (shell form + npm) → Node không nhận SIGTERM trực tiếp → shutdown không êm.
+      - Không `NODE_ENV=production`.
+    followUp: How would you prove the token isn't in the final image?
+    redFlags:
+      - Only spots the latest tag
+    tags: [docker, security, debugging]
+  - id: devops-cicd-011
+    level: medium
+    type: gotcha
+    q: Why does `docker stop` take exactly 10 seconds for your Node container, and why are in-flight requests dropped?
+    hint: |-
+      - Process PID 1 trong container: kernel **không áp dụng default signal action** cho nó → nếu Node không đăng ký handler `SIGTERM` thì signal bị bỏ qua.
+      - Nếu dùng shell form `CMD npm start`: PID 1 là `/bin/sh` hoặc `npm`, signal không được forward tới `node` đáng tin cậy.
+      - Sau grace period (mặc định 10s với `docker stop`, 30s trên K8s) → **SIGKILL** → request đang chạy bị cắt.
+      Fix: exec form `CMD ["node","server.js"]`, xử lý SIGTERM (`server.close()`, đóng DB pool, flush log), dùng `--init`/`tini` nếu app spawn child process (reap zombie).
+    example: |-
+      ```ts
+      const server = app.listen(port);
+      const shutdown = () => {
+        server.close(async () => { await db.end(); process.exit(0); });
+        setTimeout(() => process.exit(1), 25_000).unref(); // safety net
+      };
+      process.on("SIGTERM", shutdown);
+      process.on("SIGINT", shutdown);
+      ```
+    followUp: "`server.close()` never calls back because of keep-alive connections. What do you do?"
+    tags: [docker, signals, nodejs, graceful-shutdown]
+  - id: devops-cicd-012
+    level: medium
+    type: debug
+    q: Pods of this Deployment restart every few minutes under load and `kubectl describe` shows `OOMKilled` (exit code 137). What's going on?
+    example: |-
+      ```yaml
+      containers:
+        - name: api
+          image: acme/api:1.4.2
+          env:
+            - name: NODE_OPTIONS
+              value: "--max-old-space-size=1024"
+          resources:
+            requests: { cpu: "250m", memory: "256Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
+      ```
+    hint: |-
+      - Heap V8 được phép tới 1024 MB nhưng container limit chỉ 512 Mi → V8 không GC gắt trước khi chạm limit → kernel **OOM kill** (137). Tổng memory còn gồm buffers, native module, stack, code — không chỉ heap.
+      - Fix: đặt `--max-old-space-size` khoảng **60–75% memory limit**, hoặc tăng limit; kiểm tra memory leak (heap snapshot, metric RSS theo thời gian).
+      - Request thấp hơn nhiều so với limit → node bị overcommit, pod dễ bị evict khi node thiếu memory; memory request nên gần limit.
+      - CPU limit 500m có thể gây **CFS throttling** → latency tăng, GC chậm.
+    followUp: How do you tell a memory leak from a limit that is simply too small?
+    verify: true
+    tags: [kubernetes, oomkilled, nodejs, memory]
+  - id: devops-cicd-013
+    level: medium
+    type: concept
+    q: How do CPU requests and limits work in Kubernetes, and why do some teams remove CPU limits?
+    hint: |-
+      - **Request**: scheduler dùng để chọn node; cũng là trọng số chia CPU khi tranh chấp. HPA tính % CPU **trên request**.
+      - **Limit**: trần qua CFS quota → vượt thì bị **throttle** (không bị kill). Với Node, throttling làm latency tăng vọt, GC và event loop chậm.
+      - Nhiều team đặt CPU request đúng + **không đặt CPU limit** (cho burst dùng CPU rảnh) nhưng **luôn đặt memory limit**. Trade-off: noisy neighbor nếu request đặt sai.
+      - QoS: Guaranteed (request = limit cho cả CPU và memory), Burstable, BestEffort — ảnh hưởng thứ tự bị evict.
+      - Node đơn luồng: nhiều hơn ~1 CPU thường không giúp một process (trừ libuv threadpool, GC); scale bằng replica.
+    followUp: Your p99 latency is bad but average CPU is only 40%. How could CPU throttling explain it and how would you confirm?
+    tags: [kubernetes, resources, cpu, performance]
+  - id: devops-cicd-014
+    level: medium
+    type: concept
+    q: How does the Horizontal Pod Autoscaler work, and what metric would you scale a Node API on?
+    hint: |-
+      HPA định kỳ đọc metric (metrics-server hoặc custom/external metrics) và tính `desiredReplicas = ceil(current × currentValue / targetValue)`, có stabilization window để tránh dao động (scale down chậm hơn scale up).
+      CPU % trên **request** → cần đặt request. Node API I/O-bound có thể CPU thấp mà vẫn quá tải → cân nhắc **RPS per pod**, concurrency, event loop lag, hoặc queue length (KEDA cho SQS/Kafka lag).
+      Giới hạn: scale out mất thời gian (pull image, startup, readiness) → cần headroom; `maxReplicas` phải tính tới giới hạn DB connection.
+    followUp: Scaling from 10 to 40 pods made things worse. What resource might you have exhausted?
+    tags: [kubernetes, hpa, autoscaling]
+  - id: devops-cicd-015
+    level: medium
+    type: compare
+    q: ConfigMap vs Secret in Kubernetes — and why is a Secret not actually secret by default?
+    hint: |-
+      - **ConfigMap**: config không nhạy cảm; **Secret**: dữ liệu nhạy cảm — nhưng chỉ **base64-encoded**, lưu trong etcd, mặc định có thể **không mã hoá at rest** (tuỳ cluster/managed provider).
+      - Bảo vệ: bật **encryption at rest** (KMS provider), RBAC chặt (ai `get secrets` là đọc được hết), không commit manifest chứa secret vào git.
+      - Thực tế: **External Secrets Operator** / Secrets Store CSI Driver kéo từ AWS Secrets Manager/Vault; hoặc Sealed Secrets/SOPS cho GitOps.
+      - Mount qua volume (cập nhật được khi đổi) vs env var (chỉ đọc lúc start, dễ lộ qua dump env/log crash).
+    followUp: In a GitOps repo, how do you store secrets so Argo CD can apply them?
+    tags: [kubernetes, secrets, configmap]
+  - id: devops-cicd-016
+    level: medium
+    type: design
+    q: Design a CI pipeline for a Node/TypeScript monorepo (API + Next.js) that stays under 10 minutes.
+    hint: |-
+      - **Fail fast**: lint + typecheck + unit song song trước; integration/e2e sau.
+      - **Cache**: npm cache theo hash lockfile, build cache (Turborepo/Nx remote cache), Docker layer cache.
+      - **Chỉ chạy cái bị ảnh hưởng**: affected graph của monorepo (turbo `--filter`, nx affected), path filter.
+      - **Song song hoá**: shard test (Jest/Vitest `--shard`, Playwright shards), matrix job.
+      - Integration test với **testcontainers** hoặc service container (Postgres, Redis).
+      - Build image **một lần**, tag bằng SHA, push; scan + SBOM.
+      - Theo dõi thời gian pipeline & flaky rate như một metric.
+    followUp: Tests got 3x slower over six months. How do you find and fix the cause?
+    tags: [ci, pipeline, monorepo, design]
+  - id: devops-cicd-017
+    level: medium
+    type: concept
+    q: What does "build once, deploy many" mean and why does it matter?
+    hint: |-
+      Build **một artifact bất biến** (image với digest, tag = git SHA) và **promote** chính artifact đó qua dev → staging → prod; khác nhau chỉ là **config** inject lúc runtime.
+      Lợi ích: thứ đã test ở staging chính là thứ chạy ở prod (không build lại → không lệch dependency), rollback = deploy lại digest cũ, audit rõ ràng.
+      Hệ quả: không bake config/URL môi trường vào bundle. **Next.js `NEXT_PUBLIC_*`** được inline lúc build → phá nguyên tắc này; cần runtime config (fetch từ server, hoặc render env ở server component).
+    followUp: How do you handle `NEXT_PUBLIC_API_URL` differing between staging and prod with a single image?
+    tags: [ci-cd, artifacts, nextjs]
+  - id: devops-cicd-018
+    level: medium
+    type: debug
+    q: What's risky about this GitHub Actions deploy workflow?
+    example: |-
+      ```yaml
+      on:
+        pull_request_target:
+          types: [opened, synchronize]
+      jobs:
+        deploy-preview:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}
+            - uses: some-org/deploy-action@main
+            - run: npm ci && npm run build && ./deploy.sh
+              env:
+                AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+                AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      ```
+    hint: |-
+      - `pull_request_target` chạy với **secret và quyền của repo gốc**, nhưng lại checkout **code của PR** (có thể từ fork) và chạy `npm ci` / build → kẻ tấn công sửa `package.json` script hoặc `deploy.sh` để **đánh cắp secret**.
+      - Action bên thứ ba ghim `@main` → supply-chain risk; nên pin theo **commit SHA**.
+      - Access key dài hạn → dùng **OIDC** (`id-token: write`) + role giới hạn theo repo/branch/environment.
+      - Không khai báo `permissions:` tối thiểu cho `GITHUB_TOKEN`.
+      - Fix: `pull_request` (không có secret) cho build/test; deploy preview chỉ sau khi maintainer approve (environment protection) hoặc qua `workflow_run` tách biệt.
+    followUp: How would you let external contributors get preview deployments safely?
+    tags: [ci-cd, github-actions, security, debugging]
+  - id: devops-cicd-019
+    level: medium
+    type: concept
+    q: Explain the expand/contract (parallel change) pattern for database migrations in a continuous deployment pipeline.
+    hint: |-
+      Trong rolling/canary, **code cũ và mới chạy cùng lúc** trên cùng DB → mọi migration phải tương thích với cả hai.
+      Rename `name` → `full_name`:
+      1. **Expand**: thêm cột `full_name` (nullable), deploy code ghi **cả hai** cột, đọc cột cũ.
+      2. **Backfill** dữ liệu theo batch (không lock bảng lớn).
+      3. Đổi đọc sang cột mới (có thể qua feature flag).
+      4. **Contract** (release sau, khi không còn code cũ): ngừng ghi cột cũ, drop cột.
+      Mỗi bước rollback được bằng cách deploy lại code trước đó.
+    followUp: How would you add a NOT NULL column with a default to a 200M-row table in Postgres without downtime?
+    tags: [migrations, database, deployment]
+  - id: devops-cicd-020
+    level: medium
+    type: compare
+    q: Terraform vs AWS CDK vs CloudFormation — which would you pick for a TypeScript team deploying mostly to AWS?
+    hint: |-
+      - **CDK**: viết IaC bằng TypeScript (loop, type, test, construct tái sử dụng), synth ra CloudFormation → state do AWS quản, rollback stack tự động; nhưng bị giới hạn/độ chậm của CloudFormation, chủ yếu cho AWS.
+      - **Terraform/OpenTofu**: provider cho mọi cloud + SaaS (Cloudflare, Datadog, GitHub), `plan` rõ ràng, cộng đồng lớn; phải tự quản state/lock; HCL ít biểu đạt hơn.
+      - **CloudFormation thuần**: ít trừu tượng, dài dòng.
+      - Team TS thuần AWS → CDK hợp lý; tổ chức nhiều cloud/SaaS hoặc đã có module Terraform → Terraform. Quan trọng hơn công cụ: review `plan`/`diff` trong PR, apply từ CI, không click-ops.
+    followUp: What's the equivalent of `terraform plan` in CDK and how do you review it in a PR?
+    verify: true
+    tags: [terraform, cdk, cloudformation, iac]
+  - id: devops-cicd-021
+    level: medium
+    type: concept
+    q: What is GitOps and how does it differ from a push-based CI/CD deploy?
+    hint: |-
+      GitOps (OpenGitOps): trạng thái mong muốn **khai báo** trong Git, **versioned & immutable**, được agent **pull** tự động và **liên tục reconcile** (sửa drift).
+      - Push-based: CI có credential vào cluster/cloud và `kubectl apply`/`helm upgrade`.
+      - Pull-based (Argo CD, Flux): agent trong cluster theo dõi repo config; CI chỉ build image và cập nhật tag trong repo config (PR). Cluster không cần mở credential ra ngoài.
+      Lợi ích: audit qua git log, rollback = revert, drift detection. Chi phí: thêm repo/tooling, secret cần xử lý riêng, "Git là source of truth" đòi hỏi kỷ luật (không `kubectl edit` tay).
+    followUp: Someone hot-fixed a Deployment with `kubectl edit` during an incident. What does Argo CD do next and what should the process be?
+    tags: [gitops, argocd, flux]
+  - id: devops-cicd-022
+    level: medium
+    type: scenario
+    q: "A deploy went out and error rates spiked. Walk me through your rollback options on Kubernetes and on ECS."
+    hint: |-
+      - Quyết định trước: **rollback trước, điều tra sau** nếu tác động người dùng.
+      - Feature flag: tắt flag nếu lỗi nằm sau flag (nhanh nhất).
+      - K8s: `kubectl rollout undo deployment/api` (về ReplicaSet trước), hoặc GitOps: revert commit đổi image tag. Canary (Argo Rollouts/Flagger): abort → traffic về stable.
+      - ECS: deployment circuit breaker với rollback tự động; hoặc update service về task definition revision trước; CodeDeploy blue/green: đổi lại listener.
+      - Điều kiện để rollback an toàn: migration đã chạy phải tương thích với code cũ; message/event format mới không làm consumer cũ chết.
+      - Sau đó: postmortem, thêm test/alert/canary metric bắt được lỗi.
+    followUp: The new version already wrote data in a new format to the database. Can you still roll back?
+    tags: [rollback, kubernetes, ecs, incident]
+  - id: devops-cicd-023
+    level: medium
+    type: compare
+    q: Docker Compose, ECS and Kubernetes — where does each fit for a small team?
+    hint: |-
+      - **Compose**: local dev/test, môi trường một máy; không có self-healing đa node, không autoscale.
+      - **ECS (Fargate)**: orchestration managed đơn giản trên AWS: service, task, autoscaling, tích hợp ALB/IAM; ít khái niệm.
+      - **Kubernetes (EKS/GKE/AKS)**: chuẩn portable, ecosystem (Helm, operators, Argo), linh hoạt tối đa; tốn công vận hành và học.
+      Team nhỏ trên AWS: Compose cho dev + ECS cho prod là lựa chọn thực dụng. K8s khi có platform team, nhiều service, hoặc yêu cầu đa cloud/on-prem.
+    followUp: What do you lose moving from Compose in dev to ECS in prod, and how do you keep dev/prod parity?
+    tags: [docker-compose, ecs, kubernetes]
+  - id: devops-cicd-024
+    level: medium
+    type: gotcha
+    q: "`npm install` vs `npm ci` in Docker and CI — what's the difference and why does it matter?"
+    hint: |-
+      - `npm ci`: cài **đúng** theo `package-lock.json`, fail nếu lockfile lệch `package.json`, xoá `node_modules` cũ trước khi cài → tái lập được, nhanh hơn trong CI.
+      - `npm install`: có thể **cập nhật lockfile**, resolve lại version trong range → build hôm nay khác hôm qua.
+      - Production image: `npm ci --omit=dev` (hoặc `npm prune --omit=dev` sau build).
+      - Tương tự: `pnpm install --frozen-lockfile`, `yarn install --immutable`.
+      - Kèm theo: lockfile phải commit; audit/scan dependency; cẩn thận `postinstall` script (supply-chain).
+    followUp: How do you protect the pipeline from a malicious `postinstall` script in a transitive dependency?
+    tags: [npm, ci, reproducibility]
+  - id: devops-cicd-025
+    level: medium
+    type: concept
+    q: How do you scan and secure container images in the pipeline?
+    hint: |-
+      - Base image nhỏ (slim/distroless), cập nhật thường xuyên, pin theo digest.
+      - Scan CVE (Trivy, Grype, ECR scanning, Docker Scout) — fail build theo **severity + fix available**, không fail mọi CVE (tránh "alert fatigue" rồi bị tắt).
+      - Secret scanning (gitleaks) trong source và image layer.
+      - **SBOM** (Syft, `docker buildx --sbom`), **ký image** (cosign/Sigstore) và verify ở admission (Kyverno, policy) → chỉ image đã ký mới chạy.
+      - Runtime: non-root, read-only FS, drop capabilities, network policy.
+    followUp: A critical CVE is reported in the base image with no fix available yet. What do you do?
+    verify: true
+    tags: [security, supply-chain, docker, ci]
+  - id: devops-cicd-026
+    level: hard
+    type: scenario
+    q: "During every rolling deploy on Kubernetes, clients see a burst of 502/503 errors for a few seconds. Why, and how do you fix it?"
+    hint: |-
+      - Khi pod Terminating, việc **rút khỏi endpoints/LB** và việc gửi **SIGTERM** diễn ra **song song/bất đồng bộ** → pod có thể tắt trước khi ingress/kube-proxy/LB ngừng gửi traffic.
+      - Fix: `preStop` hook sleep vài giây (hoặc sleep action native trên K8s mới) để endpoints kịp cập nhật; app xử lý SIGTERM: ngừng accept, hoàn thành request, đóng keep-alive; `terminationGracePeriodSeconds` > preStop + thời gian drain.
+      - Pod mới: readiness probe chuẩn (chỉ ready khi thật sự phục vụ được), `maxUnavailable: 0`, `maxSurge` > 0.
+      - Keep-alive: LB idle timeout vs Node `keepAliveTimeout` (Node phải giữ lâu hơn LB).
+      - PodDisruptionBudget cho drain node.
+    example: |-
+      ```yaml
+      lifecycle:
+        preStop:
+          exec: { command: ["sh", "-c", "sleep 10"] }
+      terminationGracePeriodSeconds: 45
+      ```
+    followUp: Your distroless image has no `sh` for the preStop sleep. What are your options?
+    verify: true
+    tags: [kubernetes, rolling-update, graceful-shutdown]
+  - id: devops-cicd-027
+    level: hard
+    type: debug
+    q: This liveness probe caused a full outage when the database had a 30-second hiccup. Explain the failure and fix the config.
+    example: |-
+      ```yaml
+      livenessProbe:
+        httpGet: { path: /health, port: 3000 }   # /health runs SELECT 1 and pings Redis
+        periodSeconds: 5
+        timeoutSeconds: 1
+        failureThreshold: 2
+      readinessProbe:
+        httpGet: { path: /health, port: 3000 }
+      ```
+    hint: |-
+      - Liveness phụ thuộc DB/Redis → DB chậm → **mọi pod** fail liveness sau ~10s → kubelet restart **tất cả** → cold start đồng loạt, connection storm vào DB đang yếu → sự cố kéo dài hơn nhiều (cascading failure).
+      - `timeoutSeconds: 1` quá chặt với event loop bận/GC pause.
+      - Fix: tách endpoint — `/livez` chỉ kiểm tra process còn phục vụ được (không gọi dependency); `/readyz` kiểm tra dependency **cần thiết** (cân nhắc: nếu DB chết cho mọi pod thì rút hết khỏi LB cũng không giúp gì — có thể trả degrade thay vì unready). Thêm `startupProbe`, timeout/threshold hợp lý.
+    followUp: When is it actually correct for readiness to fail on a dependency?
+    tags: [kubernetes, probes, resilience, debugging]
+  - id: devops-cicd-028
+    level: hard
+    type: scenario
+    q: "Your canary shows the same error rate as stable, you promote to 100%, and then checkout conversion drops 15%. What went wrong with the canary process?"
+    hint: |-
+      - Canary chỉ đo **metric kỹ thuật** (5xx, latency) mà không đo **business metric** (conversion, add-to-cart, payment success) → lỗi logic trả 200 vẫn lọt.
+      - Traffic canary quá ít/không đại diện (chỉ 1% trong giờ thấp điểm, không có tenant lớn, sticky theo user khiến sample lệch) → không đủ ý nghĩa thống kê.
+      - Thời gian bake quá ngắn; lỗi chỉ xuất hiện theo luồng dài (checkout nhiều bước, job async).
+      - Cải thiện: automated canary analysis so sánh canary vs baseline (Argo Rollouts/Flagger/Kayenta), business KPI + SLO, segment theo tenant, thời gian bake tối thiểu, feature flag để tắt ngay.
+    followUp: How do you make canary analysis statistically meaningful for a low-traffic B2B tenant?
+    tags: [canary, deployment, metrics]
+  - id: devops-cicd-029
+    level: hard
+    type: scenario
+    q: "Terraform plan in CI wants to destroy and recreate your production RDS instance. What do you do?"
+    hint: |-
+      - **Dừng**, không apply. Đọc plan: dòng `# forces replacement` chỉ ra thuộc tính gây replace (đổi `identifier`, engine, subnet group, encryption, AZ, v.v.).
+      - Nguyên nhân hay gặp: ai đó đổi tên resource trong code (address đổi) → dùng `moved {}` block / `terraform state mv`; drift do sửa tay trên console; nâng provider version đổi default; thuộc tính không đổi được tại chỗ.
+      - Phòng thủ: `lifecycle { prevent_destroy = true }`, `deletion_protection = true` ở RDS, policy check trên plan (OPA/Sentinel/conftest) chặn destroy resource stateful, required review.
+      - Nếu thật sự phải thay: snapshot, kế hoạch migrate, maintenance window.
+    example: |-
+      ```hcl
+      moved {
+        from = aws_db_instance.main
+        to   = module.database.aws_db_instance.this
+      }
+      resource "aws_db_instance" "this" {
+        deletion_protection = true
+        lifecycle { prevent_destroy = true }
+      }
+      ```
+    followUp: How do you detect drift continuously instead of discovering it during a deploy?
+    tags: [terraform, iac, rds, safety]
+  - id: devops-cicd-030
+    level: hard
+    type: gotcha
+    q: What problems appear when running a Node app with multiple processes (cluster, PM2) inside a Kubernetes pod?
+    hint: |-
+      - K8s đã là process supervisor + load balancer → PM2/cluster bên trong thêm một tầng: che giấu crash (PM2 restart bên trong, K8s không biết), metric/probe chỉ thấy một phần, memory limit bị chia cho nhiều worker → OOM khó dự đoán.
+      - Signal: PID 1 là PM2 → phải cấu hình forward SIGTERM và graceful reload đúng.
+      - Thường tốt hơn: **một process mỗi container**, scale bằng replica, request CPU ~1 core hoặc ít hơn.
+      - Ngoại lệ hợp lý: tận dụng nhiều core trên node lớn để giảm overhead memory/pod — đo trước khi làm.
+    followUp: How would you use more than one CPU core per pod for a CPU-heavy endpoint without PM2?
+    tags: [nodejs, kubernetes, pm2, cluster]
+  - id: devops-cicd-031
+    level: hard
+    type: design
+    q: Design a blue/green deployment for a Node API with a SQL database and background workers. What makes it hard?
+    hint: |-
+      - Router: ALB target group swap / CodeDeploy / K8s Service selector đổi label / Argo Rollouts blue-green với preview service.
+      - Phần khó là **state**: DB dùng chung cho blue và green → schema phải tương thích cả hai (expand/contract); không có "DB blue" và "DB green" riêng trừ khi chấp nhận replication phức tạp.
+      - **Worker/consumer**: nếu cả blue và green cùng consume queue/Kafka thì bản mới xử lý message trước khi switch; hoặc ngược lại — cần quyết định ai consume và khi nào (pause consumer, feature flag, message versioning).
+      - Session/cache: session trong Redis dùng chung, cache key có version nếu format đổi.
+      - Cron/scheduler chạy hai lần nếu cả hai môi trường bật.
+      - Rollback: switch lại router — nhanh chỉ khi dữ liệu mới ghi vẫn đọc được bởi blue.
+    followUp: How do you smoke-test green with production traffic before the switch without affecting users?
+    tags: [blue-green, deployment, design]
+  - id: devops-cicd-032
+    level: hard
+    type: scenario
+    q: "A migration that adds an index locked the orders table and took checkout down for 8 minutes. How do you prevent this class of incident?"
+    hint: |-
+      - Postgres: `CREATE INDEX CONCURRENTLY` (không chạy được trong transaction — nhiều migration tool bọc transaction mặc định); SQL Server: `ONLINE = ON` (tuỳ edition).
+      - Đặt `lock_timeout` + `statement_timeout` cho session migration → fail nhanh thay vì xếp hàng lock và chặn mọi query sau nó.
+      - Tách migration nguy hiểm khỏi deploy code; chạy ngoài giờ cao điểm; backfill theo batch.
+      - Lint migration trong CI (squawk cho Postgres, strong_migrations kiểu tương tự) để bắt thao tác khoá bảng.
+      - Test migration trên bản sao dữ liệu cỡ production, đo thời gian.
+    followUp: Why can even a "fast" `ALTER TABLE` block all traffic if a long-running transaction is open?
+    tags: [migrations, postgres, sql-server, incident]
+  - id: devops-cicd-033
+    level: hard
+    type: concept
+    q: How do you manage Terraform across dev, staging and prod — workspaces, directories, or separate state per environment?
+    hint: |-
+      - **Workspaces** (CLI): cùng code, nhiều state; dễ nhầm workspace khi `apply`, khó cho môi trường khác nhau nhiều.
+      - **Thư mục/stack riêng theo môi trường** gọi chung **module có version**: state tách biệt, quyền tách biệt (role prod riêng), blast radius nhỏ; phổ biến nhất trong thực tế (Terragrunt/Terramate giảm lặp lại).
+      - Chia state theo **layer** (network, data, app) để `plan` nhanh và thay đổi app không đụng VPC.
+      - Promotion: đổi version module ở dev → staging → prod qua PR.
+      - CI: `plan` ở PR (comment kết quả), `apply` sau merge với approval cho prod; OIDC role theo môi trường.
+    followUp: How do you pass outputs (VPC id, subnet ids) from the network state to the app state safely?
+    tags: [terraform, iac, environments]
+  - id: devops-cicd-034
+    level: hard
+    type: gotcha
+    q: Why can Kubernetes Deployment `rollout undo` fail to fix an incident, even though the previous image was fine?
+    hint: |-
+      - Thay đổi gây lỗi không nằm trong Deployment: ConfigMap/Secret đã sửa (pod cũ đọc config mới), migration DB, thay đổi hạ tầng (Ingress, NetworkPolicy), dependency ngoài.
+      - ConfigMap không có version → rollback image nhưng config vẫn mới. Cách phòng: ConfigMap có hash trong tên (Kustomize `configMapGenerator`, Helm checksum annotation) để config đi cùng revision.
+      - Dữ liệu đã ghi bằng format mới mà code cũ không đọc được.
+      - GitOps: `kubectl rollout undo` bị Argo CD/Flux **ghi đè lại** theo Git → phải revert trong Git.
+      - `revisionHistoryLimit` thấp → không còn ReplicaSet cũ.
+    followUp: How would you make config changes go through the same canary as code changes?
+    tags: [kubernetes, rollback, gitops, config]
+  - id: devops-cicd-035
+    level: hard
+    type: design
+    q: Design a feature-flag system for a multi-tenant SaaS. How do you evaluate flags fast and safely?
+    hint: |-
+      - Rule targeting theo tenant, plan, user, %, môi trường; bucketing ổn định (hash `flagKey + tenantId`) để user không nhảy qua lại.
+      - Evaluate **local trong process** từ bản rule cache (SDK stream/poll từ flag service) → không gọi mạng mỗi request; **default an toàn** khi mất kết nối.
+      - Frontend: evaluate phía server rồi truyền kết quả (tránh flicker, không lộ rule nhạy cảm).
+      - Governance: owner + ngày hết hạn cho flag release, audit log thay đổi, quyền bật flag ở prod, kill switch cho tính năng rủi ro.
+      - Test: chạy test với cả hai trạng thái của flag quan trọng; dọn flag bằng lint/alert "flag 100% bật > 30 ngày".
+      - Build vs buy (LaunchDarkly, Unleash, Flagsmith, OpenFeature làm lớp trừu tượng).
+    followUp: Flag changes are instant — how do you prevent someone from turning on an unfinished feature for all tenants by mistake?
+    tags: [feature-flags, multi-tenancy, design]
+  - id: devops-cicd-036
+    level: hard
+    type: scenario
+    q: "A release needs a Kafka event schema change (a field renamed). How do you deploy producers and consumers without breaking anything?"
+    hint: |-
+      - Áp dụng expand/contract cho **message**: producer thêm field mới **và giữ field cũ** → deploy mọi consumer đọc được cả hai (ưu tiên field mới) → producer ngừng gửi field cũ ở release sau.
+      - Thứ tự: **consumer trước, producer sau** khi thêm yêu cầu mới; không bao giờ bắt consumer cũ đọc format chỉ có field mới.
+      - Schema Registry (Avro/Protobuf/JSON Schema) với compatibility mode (BACKWARD/FORWARD/FULL) kiểm tra trong CI.
+      - Message cũ vẫn còn trong topic (retention) → consumer mới phải đọc được format cũ khi replay.
+      - Contract test giữa producer và consumer (Pact message pact).
+    followUp: Which compatibility mode do you choose if consumers are always deployed before producers?
+    tags: [kafka, schema-evolution, deployment]
+  - id: devops-cicd-037
+    level: senior
+    type: design
+    q: Design the end-to-end delivery pipeline for 15 Node microservices owned by 4 teams. What is standardized and what is left to teams?
+    hint: |-
+      - Chuẩn hoá (**golden path**): template repo/Dockerfile, reusable workflow CI (lint/test/build/scan/sign), versioning image theo SHA, chuẩn health endpoint, logging/tracing, Helm chart/CDK construct chung, deploy strategy mặc định (canary + auto rollback), policy (no root, resource limits).
+      - Để team tự quyết: test chi tiết, lịch release, feature flags, SLO cụ thể.
+      - Độc lập deploy: mỗi service deploy riêng, contract test giữa service thay vì e2e toàn hệ thống cho mỗi PR.
+      - Môi trường: preview env theo PR cho service nặng UI; staging dùng chung với dữ liệu giả.
+      - Đo **DORA metrics** (deployment frequency, lead time, change failure rate, time to restore) để cải thiện, không để phạt.
+      - Trade-off: chuẩn hoá quá mức làm chậm team; quá lỏng → mỗi service một kiểu, ops không hỗ trợ nổi.
+    followUp: One team wants to deploy 20 times a day, another once a week. Does your design support both?
+    tags: [ci-cd, platform, design, dora]
+  - id: devops-cicd-038
+    level: senior
+    type: open
+    q: Would you move a team from ECS to Kubernetes? What would convince you either way?
+    hint: |-
+      Lý do nên chuyển: cần portability đa cloud/on-prem, cần ecosystem (operators, service mesh, Argo), nhiều team đã quen K8s, workload đặc thù (GPU scheduling, daemonset, CRD). Chuyển có kế hoạch, service ít rủi ro trước.
+      Lý do không: ECS đang đáp ứng; chi phí K8s là **con người** (upgrade version định kỳ, add-on, networking, security patch, on-call); "vì CV" không phải lý do kinh doanh.
+      Cách senior trả lời: xác định vấn đề cụ thể (deploy chậm? thiếu tính năng?), đo chi phí sở hữu, xem có giải pháp nhỏ hơn không (ECS + Service Connect, Copilot), quyết định có tiêu chí thoát.
+    followUp: What would your first 3 months of an ECS-to-EKS migration look like?
+    tags: [kubernetes, ecs, open, decision-making]
+  - id: devops-cicd-039
+    level: senior
+    type: design
+    q: How do you run database migrations safely for a multi-tenant platform with schema-per-tenant (hundreds of schemas)?
+    hint: |-
+      - Migration runner chạy như job riêng, **idempotent**, ghi trạng thái theo từng tenant (bảng version trong mỗi schema); chạy theo **batch có giới hạn concurrency** để không quá tải DB.
+      - Canary theo tenant: chạy trước cho tenant nội bộ/nhỏ, theo dõi, rồi mở rộng.
+      - Code phải chạy được với **cả version cũ và mới** trong suốt thời gian migrate (có thể kéo dài hàng giờ) → expand/contract bắt buộc.
+      - Xử lý tenant fail: dừng/đánh dấu, retry, không để một tenant chặn tất cả; alert + dashboard tiến độ.
+      - Tenant mới được tạo trong lúc migrate phải nhận schema mới nhất.
+      - Cân nhắc lại mô hình: shared schema + `tenant_id` + RLS giảm đáng kể độ phức tạp này.
+    followUp: Tenant #137 fails halfway because of dirty data. What's the recovery procedure?
+    tags: [migrations, multi-tenancy, design]
+  - id: devops-cicd-040
+    level: senior
+    type: open
+    q: What does a good deployment look like to you, and how do you measure whether your delivery process is healthy?
+    hint: |-
+      Deploy tốt: nhàm chán — tự động, nhỏ, thường xuyên, có thể deploy giờ hành chính mà không lo, rollback trong vài phút, user không nhận ra.
+      Đo bằng **DORA**: deployment frequency, lead time for changes, change failure rate, time to restore (thêm reliability/SLO). Kèm: thời gian pipeline, flaky rate, tỉ lệ deploy phải rollback, số hotfix.
+      Dấu hiệu không khoẻ: "đóng băng deploy" dài, release tập trung cuối sprint, deploy cần một người "biết cách", rollback chưa từng được thử.
+      Cải thiện: batch nhỏ hơn, trunk-based + feature flags, test nhanh hơn, canary tự động, runbook rollback đã diễn tập.
+    followUp: Change failure rate is 30%. Where do you start?
+    tags: [dora, delivery, open]
+  - id: devops-cicd-041
+    level: senior
+    type: design
+    q: Design ephemeral preview environments per pull request for a Next.js + Node API + Postgres stack.
+    hint: |-
+      - Mỗi PR: namespace K8s / ECS service riêng (hoặc Vercel-style preview cho Next.js), URL `pr-123.preview.example.com`, TTL tự xoá khi đóng PR hoặc idle.
+      - DB: tạo từ **snapshot/template nhỏ** có seed dữ liệu giả (không dùng PII prod), hoặc DB branching (Neon, Aurora clone), chạy migration của PR.
+      - Dependency nặng (Kafka, Elasticsearch): dùng chung bản staging với namespace/prefix riêng, hoặc mock.
+      - Secret: secret riêng cho preview, quyền thấp; không có secret prod.
+      - Chi phí: giới hạn số preview đồng thời, scale-to-zero, dọn tài nguyên mồ côi.
+      - Bảo mật: preview URL có auth (SSO) — preview thường bị crawl hoặc lộ.
+    followUp: Preview environments cost more than staging now. How do you bring the cost down?
+    tags: [preview-environments, ci-cd, design]
+  - id: devops-cicd-042
+    level: senior
+    type: open
+    q: Where do you draw the line between what developers own and what a platform/DevOps team owns?
+    hint: |-
+      Mô hình "you build it, you run it": team sản phẩm sở hữu service của mình end-to-end (code, deploy, alert, on-call, SLO); platform team cung cấp **self-service golden path** (pipeline template, cluster, observability stack, IaC module) và guardrail.
+      Ranh giới tốt: platform lo thứ **chung và khó** (network, cluster upgrade, security baseline, cost visibility); team lo thứ **đặc thù domain** (scaling policy, dashboard, runbook).
+      Anti-pattern: DevOps team thành "ticket queue" deploy hộ; hoặc ngược lại, mỗi team tự dựng hạ tầng khác nhau.
+      Đo: thời gian từ repo mới tới production, số ticket platform, mức độ adoption golden path.
+    followUp: A team keeps bypassing the golden path with custom scripts. How do you handle it?
+    tags: [platform-engineering, ownership, open]
+  - id: devops-cicd-043
+    level: cv
+    type: behavioral
+    q: You owned features end to end including deployment and production support. Describe your deployment process on that platform and one thing you would change now.
+    hint: |-
+      Câu trả lời mạnh nêu **cụ thể**: công cụ CI/CD đã dùng, các bước pipeline, môi trường (dev/staging/prod), cách deploy (rolling? thủ công?), cách rollback, cách chạy migration SQL Server, ai approve.
+      Sau đó: một điểm yếu có thật (ví dụ migration chạy tay, deploy giờ thấp điểm, không có canary) → bạn sẽ đổi thế nào (expand/contract, feature flags, auto rollback) và trade-off.
+      STAR ngắn gọn; (điền tên công cụ, tần suất deploy và số liệu thật của bạn — không bịa).
+    followUp: What was the last deploy that went wrong, and how long did it take to recover?
+    redFlags:
+      - Describes the process only in vague terms ("we used CI/CD")
+    tags: [cv, deployment, behavioral]
+  - id: devops-cicd-044
+    level: cv
+    type: scenario
+    q: During the monolith-to-microservices migration with Kafka, how did you deploy new services alongside the monolith without breaking stability?
+    hint: |-
+      Nội dung nên có: cách route traffic dần (proxy/gateway, feature flag theo tenant/endpoint), deploy độc lập mỗi service, **versioning event** trên Kafka (thêm field, không xoá), consumer group mới đọc song song để so sánh (shadow), cách rollback (đổi route/flag), monitoring so sánh cũ vs mới.
+      Nhấn mạnh quyết định khó: service nào tách trước và vì sao; khi nào dừng lại.
+      (điền cách làm thật, số service, thời gian và sự cố thật của bạn — không bịa số liệu)
+    followUp: What would you do differently if you had to repeat the migration with Kubernetes and GitOps?
+    tags: [cv, microservices, kafka, migration]
+  - id: devops-cicd-045
+    level: cv
+    type: design
+    q: If you containerized the multi-tenant platform you worked on (Node/Express API, Next.js storefront), what would the Dockerfiles and Kubernetes manifests look like?
+    hint: |-
+      Nói theo từng phần, gắn với đặc điểm thật của hệ thống:
+      - Next.js: `output: "standalone"`, multi-stage, runtime config cho từng tenant/domain (tránh `NEXT_PUBLIC_*` bake theo môi trường), cache ISR dùng chung (Redis/S3) khi nhiều replica.
+      - API: multi-stage, `USER node`, exec form, SIGTERM → đóng pool SQL Server/Redis.
+      - K8s: Deployment + probes (`/livez`, `/readyz`), requests/limits theo số đo thật, HPA theo RPS/CPU, ConfigMap/External Secrets, Ingress theo host tenant, PDB.
+      - Chỗ dễ vỡ: session/sticky, file upload local disk, cron chạy trên mọi replica.
+      (điền con số memory/CPU thật mà bạn quan sát — không bịa)
+    followUp: Which part of the current system is least container-friendly, and why?
+    tags: [cv, docker, kubernetes, nextjs]

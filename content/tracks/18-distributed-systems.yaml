@@ -1,0 +1,650 @@
+id: 18-distributed-systems
+slug: distributed-systems
+title: Distributed Systems Concepts
+tier: 5
+status: drafted
+summary: CAP/PACELC, consistency models, consensus (Raft), idempotency, retries/backoff/jitter, timeouts, circuit breaker, bulkhead, 2PC vs saga, distributed locks & fencing, clocks, consistent hashing.
+cvLinked: false
+overview: |-
+  ## TL;DR
+
+  - Hệ phân tán = nhiều máy giao tiếp qua **mạng không tin cậy**, **không có đồng hồ chung**, và **có thể pause bất kỳ lúc nào**. Mọi pattern trong track này là cách sống chung với 3 sự thật đó.
+  - **CAP** chỉ nói về lúc có network partition: chọn Consistency (từ chối) hay Availability (trả lời có thể sai). **PACELC** bổ sung: khi không partition, vẫn phải đổi **Latency** lấy **Consistency**.
+  - Resilience cơ bản: **timeout** ở mọi network call, **retry có backoff + jitter** chỉ cho thao tác **idempotent**, **circuit breaker**, **bulkhead**, **load shedding**.
+  - Transaction xuyên service: tránh **2PC** (blocking, coupling) → **saga** với compensating actions + outbox.
+  - Lock phân tán cần **lease + fencing token**; consensus (Raft) cho leader election và metadata; consistent hashing để chia dữ liệu mà ít phải di chuyển khi đổi số node.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Network partition | Một nhóm node không nói chuyện được với nhóm khác | AZ-a mất kết nối AZ-b |
+  | Linearizability | Mọi thao tác như xảy ra tức thời tại một điểm, theo thời gian thực | Đọc sau khi write được ack luôn thấy giá trị mới |
+  | Eventual consistency | Không có write mới thì cuối cùng mọi replica hội tụ | DNS, read replica |
+  | Read-your-writes | Một client luôn thấy write của chính mình | Sửa profile xong reload thấy ngay |
+  | Quorum | R + W > N ⇒ tập đọc và tập ghi giao nhau | N=3, W=2, R=2 |
+  | Idempotency | Thực hiện nhiều lần = một lần | `PUT /users/1`, `Idempotency-Key` cho POST |
+  | Circuit breaker | Ngừng gọi dependency đang hỏng một thời gian | Closed → Open → Half-open |
+  | Bulkhead | Chia tài nguyên riêng cho từng dependency | Pool 20 connection cho payment, 10 cho search |
+  | Saga | Chuỗi local transaction + compensation | Reserve stock → charge → (fail) → release stock |
+  | Fencing token | Số tăng đơn điệu kèm lock; storage từ chối token cũ | Lock #34 bị từ chối sau khi #35 đã ghi |
+  | Lamport clock | Counter logic cho thứ tự happens-before | `max(local, received) + 1` |
+  | Consistent hashing | Hash node và key lên vòng; thêm node chỉ chuyển ~1/N key | Vnodes cân bằng tải |
+
+  ## Cơ chế hoạt động
+
+  ### Retry an toàn
+
+  ```mermaid
+  flowchart TD
+    A["Call dependency<br/>(with timeout / deadline)"] --> B{"Success?"}
+    B -- yes --> Z["Return"]
+    B -- no --> C{"Retryable?<br/>(timeout, 503, 429, conn reset)"}
+    C -- no --> F["Fail fast / DLQ"]
+    C -- yes --> D{"Operation idempotent<br/>or has idempotency key?"}
+    D -- no --> F
+    D -- yes --> E{"Attempts < max AND<br/>deadline remaining AND<br/>retry budget OK AND<br/>breaker closed?"}
+    E -- no --> F
+    E -- yes --> G["Sleep random(0, base * 2^n)<br/>(full jitter)"] --> A
+  ```
+
+  ### Saga orchestration (happy path + compensation)
+
+  ```mermaid
+  sequenceDiagram
+    participant O as Orchestrator
+    participant I as Inventory
+    participant P as Payment
+    participant S as Shipping
+    O->>I: ReserveStock(order 42)
+    I-->>O: Reserved
+    O->>P: Charge(order 42, idemKey)
+    P-->>O: Charged
+    O->>S: CreateShipment
+    S-->>O: Failed (no carrier)
+    O->>P: Refund(order 42)
+    O->>I: ReleaseStock(order 42)
+    Note over O: order 42 = CANCELLED (saga state persisted at every step)
+  ```
+
+  ### Raft (tóm tắt)
+
+  - Mỗi node là follower/candidate/leader; thời gian chia thành **term**. Follower hết **election timeout (ngẫu nhiên)** mà không nghe heartbeat → thành candidate, tăng term, xin vote; đạt **đa số** → leader.
+  - Leader nhận lệnh, append vào log, replicate; entry được **commit** khi đa số đã ghi. Chỉ node có log đủ mới nhất mới được bầu (election restriction).
+  - Cluster 2f+1 node chịu được f node lỗi (3 → 1, 5 → 2).
+
+  ## Trade-offs
+
+  | Lựa chọn | Được | Mất | Khi nào |
+  |---|---|---|---|
+  | CP (từ chối khi partition) | Không bao giờ trả dữ liệu sai | Availability khi partition | Tiền, tồn kho, lock, metadata |
+  | AP (trả lời khi partition) | Luôn phản hồi | Có thể stale/xung đột → cần merge | Giỏ hàng, feed, counter |
+  | 2PC | Atomic xuyên resource | Blocking khi coordinator chết, latency, coupling | Trong một hệ DB/XA có kiểm soát |
+  | Saga choreography | Loose coupling, không điểm trung tâm | Khó theo dõi flow, dễ vòng event | Ít bước, ít team |
+  | Saga orchestration | Flow tường minh, dễ timeout/retry/observe | Orchestrator là thành phần thêm | Nhiều bước, long-running |
+  | Retry | Vượt lỗi tạm thời | Khuếch đại tải (retry storm), trùng | Chỉ với idempotent + backoff + budget |
+
+  ## Pitfalls
+
+  - Retry ở **mọi tầng** (client, gateway, service, SDK) → một request thành 3×3×3 = 27 request khi downstream chậm.
+  - Timeout của caller **ngắn hơn** tổng timeout+retry của callee → callee vẫn làm việc cho request đã bị bỏ.
+  - Retry POST không có idempotency key → trừ tiền hai lần.
+  - Dùng wall clock (`Date.now()`) để sắp thứ tự sự kiện giữa các máy hoặc đo khoảng thời gian (dùng monotonic clock: `performance.now()`, `process.hrtime.bigint()`).
+  - Tin rằng lock có TTL đảm bảo mutual exclusion khi process có thể bị GC pause.
+  - Circuit breaker dùng chung cho mọi endpoint của một dependency → một endpoint hỏng làm "tắt" cả dependency.
+  - Nói "chúng tôi chọn CA" — không có lựa chọn bỏ P trong hệ phân tán thật.
+
+  ## Cheat sheet
+
+  - CAP: khi partition, chọn C hoặc A. PACELC: Else → Latency vs Consistency.
+  - Quorum: R + W > N; N=3, W=2, R=2 phổ biến; quorum ≠ linearizable tuyệt đối (sloppy quorum, clock).
+  - Retry: max 2–3 lần, exponential backoff + **full jitter**, retry budget (vd ≤ 10% traffic), chỉ lỗi transient, tôn trọng `Retry-After`.
+  - Timeout: đặt theo p99.9 của dependency, **deadline propagation** qua các hop.
+  - Circuit breaker: failure-rate threshold trên sliding window + minimum calls, open → half-open probe.
+  - Idempotency key: client sinh UUID; server lưu (key → response) với unique constraint; so sánh payload hash.
+  - Lock đúng: lease (TTL) + fencing token kiểm tra ở storage; consensus store (etcd/ZooKeeper) cho correctness.
+  - Clocks: wall clock có thể nhảy lùi; monotonic cho duration; Lamport/vector clock cho thứ tự nhân quả; LWW theo timestamp = mất write.
+notionRefs:
+  - title: Principles and Theorems
+    url: https://app.notion.com/p/380ef77f8ab2808a8d0bc77b94779dda
+references:
+  - title: AWS Builders' Library — Timeouts, retries, and backoff with jitter
+    url: https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/
+  - title: AWS Builders' Library — Making retries safe with idempotent APIs
+    url: https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/
+  - title: AWS Builders' Library — Leader election in distributed systems
+    url: https://aws.amazon.com/builders-library/leader-election-in-distributed-systems/
+  - title: AWS Builders' Library — Using load shedding to avoid overload
+    url: https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/
+  - title: AWS Architecture Blog — Exponential backoff and jitter
+    url: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+  - title: The Raft consensus algorithm
+    url: https://raft.github.io/
+  - title: Jepsen — Consistency models
+    url: https://jepsen.io/consistency
+  - title: Martin Fowler — Circuit Breaker
+    url: https://martinfowler.com/bliki/CircuitBreaker.html
+  - title: microservices.io — Saga pattern
+    url: https://microservices.io/patterns/data/saga.html
+  - title: Martin Kleppmann — How to do distributed locking
+    url: https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html
+  - title: Daniel Abadi — Consistency Tradeoffs in Modern Distributed Database System Design (PACELC)
+    url: https://www.cs.umd.edu/~abadi/papers/abadi-pacelc.pdf
+  - title: Leslie Lamport — Time, Clocks, and the Ordering of Events in a Distributed System
+    url: https://lamport.azurewebsites.net/pubs/time-clocks.pdf
+questions:
+  - id: distributed-systems-001
+    level: easy
+    type: concept
+    q: State the CAP theorem precisely. What is wrong with saying "pick any two of three"?
+    hint: |-
+      CAP (Brewer, chứng minh bởi Gilbert & Lynch 2002): khi có **network partition**, hệ thống phải chọn **Consistency** (linearizable — từ chối/treo request không đảm bảo được) hoặc **Availability** (mọi node còn sống đều trả lời, có thể dữ liệu cũ).
+      "Chọn 2 trong 3" sai vì P không phải tuỳ chọn — mạng sẽ partition; "CA" chỉ có nghĩa là hệ không phân tán. Ngoài lúc partition, không có đánh đổi C/A theo nghĩa CAP.
+      C trong CAP = linearizability, **khác** C trong ACID.
+    followUp: Is a single-leader Postgres with async replicas CP or AP?
+    redFlags:
+      - "We chose CA"
+      - "Confuses CAP consistency with ACID consistency"
+    tags: [cap]
+  - id: distributed-systems-002
+    level: easy
+    type: concept
+    q: What does PACELC add to CAP? Give an example system on each side.
+    hint: |-
+      PACELC (Abadi): **if Partition** → chọn **A** hoặc **C**; **Else** (bình thường) → chọn **L**atency hoặc **C**onsistency.
+      Ý chính: kể cả khi mạng khoẻ, đồng bộ replica để có consistency mạnh tốn latency.
+      Ví dụ: DynamoDB/Cassandra mặc định PA/EL (ưu tiên availability + latency, tuỳ chỉnh consistency theo request); Spanner, etcd, ZooKeeper là PC/EC.
+    followUp: DynamoDB offers strongly consistent reads. Where does that put it in PACELC?
+    verify: true
+    tags: [pacelc]
+  - id: distributed-systems-003
+    level: easy
+    type: compare
+    q: Strong consistency vs eventual consistency — explain with a user-facing example.
+    hint: |-
+      Strong (linearizable): sau khi write được xác nhận, **mọi** read tiếp theo ở bất kỳ đâu thấy giá trị mới.
+      Eventual: nếu không có write mới, replica **cuối cùng** hội tụ; trong lúc đó read có thể thấy giá trị cũ.
+      Ví dụ: đổi mật khẩu cần strong (không cho mật khẩu cũ đăng nhập ở region khác); số like, feed, search index chấp nhận eventual.
+      Ở giữa có nhiều mức: read-your-writes, monotonic reads, causal.
+    followUp: Which consistency guarantee fixes "I updated my profile and it reverted on refresh"?
+    tags: [consistency]
+  - id: distributed-systems-004
+    level: easy
+    type: concept
+    q: What does idempotent mean for an API, and which HTTP methods are idempotent by definition?
+    hint: |-
+      Idempotent: gọi N lần có **cùng tác động lên trạng thái server** như gọi 1 lần (response có thể khác, vd 201 rồi 200/409).
+      Theo HTTP semantics: GET, HEAD, OPTIONS, PUT, DELETE là idempotent; **POST, PATCH không** (PATCH có thể idempotent tuỳ cách thiết kế).
+      Vì mạng có thể mất response, client không phân biệt được "server chưa làm" và "làm rồi nhưng mất trả lời" → idempotency là điều kiện để retry an toàn.
+    followUp: How do you make a POST /payments endpoint safe to retry?
+    tags: [idempotency]
+  - id: distributed-systems-005
+    level: easy
+    type: concept
+    q: Why must every network call have a timeout, and how do you pick its value?
+    hint: |-
+      Không có timeout → request treo vô hạn, giữ connection/memory/thread → cạn tài nguyên → cascading failure. Không phân biệt được "chậm" và "chết".
+      Chọn theo **latency thực đo** của dependency (vd p99.9 + biên), trừ vào **deadline tổng** của request người dùng; timeout connect ngắn hơn timeout đọc.
+      Quá ngắn → false timeout + retry tăng tải; quá dài → không bảo vệ gì.
+    followUp: What is deadline propagation and why is it better than fixed per-hop timeouts?
+    tags: [timeouts]
+  - id: distributed-systems-006
+    level: easy
+    type: concept
+    q: Describe the three states of a circuit breaker.
+    hint: |-
+      - **Closed**: request đi qua bình thường; đếm lỗi trên cửa sổ trượt.
+      - **Open**: tỉ lệ lỗi/chậm vượt ngưỡng → **fail fast** (hoặc fallback) không gọi dependency trong một khoảng.
+      - **Half-open**: hết thời gian chờ → cho một số request thử; thành công → Closed, thất bại → Open lại.
+      Mục đích: bảo vệ **caller** (không chờ timeout vô ích) và cho dependency thời gian hồi phục.
+    followUp: What fallback would you return from a product-recommendation call when the breaker is open?
+    tags: [circuit-breaker]
+  - id: distributed-systems-007
+    level: easy
+    type: concept
+    q: Why use exponential backoff and jitter when retrying?
+    hint: |-
+      Retry ngay lập tức khi dependency quá tải → càng quá tải. **Exponential backoff** giãn khoảng chờ (100ms, 200ms, 400ms...) → giảm tải dần.
+      Không có **jitter** → mọi client lỗi cùng lúc sẽ retry cùng lúc (đồng bộ hoá) → các "đợt sóng". Jitter (ngẫu nhiên hoá delay, vd full jitter `random(0, base*2^n)`) làm tải trải đều.
+      Luôn có số lần tối đa và trần delay.
+    example: |-
+      ```ts
+      const delay = (attempt: number, base = 100, cap = 5_000) =>
+        Math.random() * Math.min(cap, base * 2 ** attempt); // full jitter
+      ```
+    followUp: Why can retries still overload a system even with backoff and jitter?
+    tags: [retries, jitter]
+  - id: distributed-systems-008
+    level: easy
+    type: concept
+    q: What is leader election used for, and what goes wrong without it?
+    hint: |-
+      Dùng khi chỉ **một** node nên làm việc gì đó: chạy cron/scheduler, ghi vào log/partition, điều phối (Kafka controller, DB primary).
+      Không có (hoặc làm sai) → **split brain**: hai node cùng nghĩ mình là leader → ghi trùng, xung đột, gửi email hai lần.
+      Cách làm: consensus (Raft trong etcd/Consul, ZooKeeper), lease trong DB/Redis (kèm giới hạn), hoặc managed (K8s Lease object).
+    followUp: How does a leader know it is still the leader after a long GC pause?
+    tags: [leader-election]
+  - id: distributed-systems-009
+    level: easy
+    type: concept
+    q: What are the fallacies of distributed computing, and which one bites web developers most often?
+    hint: |-
+      8 fallacies (Deutsch và cộng sự): mạng tin cậy; latency bằng 0; bandwidth vô hạn; mạng an toàn; topology không đổi; có một admin; chi phí vận chuyển bằng 0; mạng đồng nhất.
+      Hay gặp nhất với web dev: **"mạng tin cậy"** (không timeout/retry/idempotency) và **"latency bằng 0"** (chatty call N+1 giữa service, tách service làm p99 tăng).
+    followUp: Give an example where a local function call turned into a network call caused an incident.
+    tags: [fundamentals]
+  - id: distributed-systems-010
+    level: medium
+    type: compare
+    q: Compare linearizability, sequential consistency, causal consistency and read-your-writes.
+    hint: |-
+      - **Linearizable**: mỗi thao tác xảy ra tức thời giữa lúc gọi và lúc trả, tôn trọng **thời gian thực** — mạnh nhất cho một object.
+      - **Sequential**: mọi node thấy **cùng một thứ tự** toàn cục, tôn trọng thứ tự từng client, nhưng không cần khớp thời gian thực.
+      - **Causal**: chỉ các thao tác có quan hệ nhân quả (happens-before) phải được thấy theo thứ tự; thao tác đồng thời có thể thấy khác nhau. Có thể đạt được mà vẫn available khi partition.
+      - **Read-your-writes** (session guarantee): client luôn thấy write của chính mình.
+    followUp: Why is causal consistency attractive for globally distributed apps?
+    tags: [consistency]
+  - id: distributed-systems-011
+    level: medium
+    type: concept
+    q: Explain quorum reads and writes (N, R, W). Does R + W > N guarantee linearizability?
+    hint: |-
+      N replica; write thành công khi W replica ack; read hỏi R replica và lấy bản mới nhất (theo version). R + W > N → tập đọc và ghi **giao nhau** → read thấy ít nhất một bản có write mới nhất đã hoàn tất.
+      Không tự động linearizable: write đồng thời, write thất bại một phần (đã ghi ở < W node), sloppy quorum/hinted handoff, và so sánh version bằng clock lệch đều có thể trả kết quả lạ. Cần read repair + thêm cơ chế (vd đọc xong ghi lại trước khi trả).
+    followUp: With N=3, what do W=1/R=3 and W=3/R=1 optimize for?
+    tags: [quorum, consistency]
+  - id: distributed-systems-012
+    level: medium
+    type: concept
+    q: Explain how Raft elects a leader and commits a log entry.
+    hint: |-
+      - Term tăng dần; follower không nhận heartbeat trong **election timeout ngẫu nhiên** (vd 150–300ms) → thành candidate, tăng term, vote cho mình, gửi RequestVote.
+      - Mỗi node vote tối đa một lần mỗi term và chỉ cho candidate có log **ít nhất mới bằng** mình → đa số vote → leader.
+      - Leader nhận lệnh, append, gửi AppendEntries; khi **đa số** đã lưu, entry committed, áp dụng vào state machine, trả client.
+      - Timeout ngẫu nhiên giảm split vote; term cao hơn làm leader cũ tự xuống follower.
+    followUp: What happens to uncommitted entries on an old leader that was partitioned away?
+    tags: [raft, consensus]
+  - id: distributed-systems-013
+    level: medium
+    type: concept
+    q: How does two-phase commit work, and why is it called a blocking protocol?
+    hint: |-
+      Phase 1 (prepare): coordinator hỏi mọi participant "sẵn sàng commit?"; participant ghi durable, khoá tài nguyên, trả yes/no.
+      Phase 2 (commit/abort): tất cả yes → commit; bất kỳ no → abort.
+      Blocking: participant đã vote yes **không được tự quyết**; nếu coordinator chết sau prepare, participant giữ lock chờ vô hạn tới khi coordinator hồi phục. Thêm: latency nhiều round-trip, availability = tích availability của mọi bên, hầu hết broker/API hiện đại không hỗ trợ XA.
+    followUp: Why do microservice architectures prefer sagas over 2PC?
+    tags: [2pc, transactions]
+  - id: distributed-systems-014
+    level: medium
+    type: compare
+    q: Saga choreography vs orchestration — trade-offs and when to use each?
+    hint: |-
+      - **Choreography**: mỗi service nghe event và phát event tiếp theo; không có điểm trung tâm. Ưu: loose coupling, đơn giản khi ít bước. Nhược: flow nằm rải rác, khó biết đơn đang ở đâu, dễ vòng lặp event, thêm bước là sửa nhiều service.
+      - **Orchestration**: một orchestrator (state machine lưu bền; Temporal, Step Functions, hoặc tự viết) gửi command và nhận reply. Ưu: flow tường minh, timeout/retry/compensation một chỗ, dễ quan sát. Nhược: thêm thành phần, rủi ro orchestrator ôm business logic.
+      Heuristic: 2–3 bước, ít team → choreography; nhiều bước, long-running, cần timeout → orchestration.
+    followUp: How do you observe the state of a choreographed saga in production?
+    tags: [saga]
+  - id: distributed-systems-015
+    level: medium
+    type: design
+    q: How do you design compensating transactions for a saga? What makes them hard?
+    hint: |-
+      Mỗi bước có hành động bù **nghiệp vụ** (không phải rollback kỹ thuật): reserve → release, charge → refund, send email → gửi email đính chính.
+      Khó: có bước **không bù được** (email đã gửi, hàng đã ship) → đặt chúng cuối saga (pivot transaction); compensation cũng có thể lỗi → phải idempotent và retry được; thiếu isolation → người khác thấy trạng thái trung gian (dùng **semantic lock**: trạng thái `PENDING`, hoặc commutative updates).
+      Lưu trạng thái saga bền ở mỗi bước.
+    followUp: What is a pivot transaction and how does it shape the step order?
+    tags: [saga, compensation]
+  - id: distributed-systems-016
+    level: medium
+    type: concept
+    q: What is the bulkhead pattern? Give a Node.js example.
+    hint: |-
+      Chia tài nguyên (connection pool, concurrency, thread, queue) **riêng** cho từng dependency hoặc loại việc để một phần hỏng không làm chìm cả hệ thống.
+      Node: không có thread pool per dependency như Java, nhưng có thể giới hạn **concurrency** per dependency (p-limit/semaphore), HTTP agent `maxSockets` riêng, DB pool riêng cho job nền vs API, hoặc tách process/deployment.
+      Khi hết slot → fail fast/queue ngắn thay vì chờ.
+    example: |-
+      ```ts
+      import pLimit from "p-limit";
+      const reportsLimit = pLimit(5);   // slow reporting API
+      const paymentsLimit = pLimit(50); // critical path
+      const getReport = (id: string) => reportsLimit(() => reportsClient.get(id));
+      ```
+    followUp: How does a bulkhead interact with a circuit breaker on the same dependency?
+    tags: [bulkhead, nodejs]
+  - id: distributed-systems-017
+    level: medium
+    type: design
+    q: Implement an idempotency-key mechanism for a POST endpoint. What are the edge cases?
+    hint: |-
+      Client gửi `Idempotency-Key` (UUID). Server: insert `(key, request_hash, status=IN_PROGRESS)` với **unique constraint** → nếu insert được thì xử lý và lưu response; nếu key đã tồn tại: DONE → trả lại response cũ; IN_PROGRESS → 409/425 (hoặc chờ).
+      Edge cases: cùng key nhưng **payload khác** → 422; crash giữa chừng (IN_PROGRESS kẹt → timeout/recovery); scope key theo user/tenant; TTL giữ key (vd 24h); side effect ra ngoài phải truyền tiếp idempotency key xuống provider.
+      Dùng DB (cùng transaction với business write) tốt hơn chỉ Redis.
+    followUp: Two identical requests arrive within 5ms on different pods. Walk through what happens.
+    tags: [idempotency, api]
+  - id: distributed-systems-018
+    level: medium
+    type: concept
+    q: How does consistent hashing work, and why are virtual nodes used?
+    hint: |-
+      Hash cả node và key lên một vòng (0..2^32); key thuộc node đầu tiên theo chiều kim đồng hồ. Thêm/bớt node chỉ di chuyển key ở **đoạn lân cận** (~1/N) thay vì gần như toàn bộ như `hash % N`.
+      **Virtual nodes**: mỗi node vật lý có nhiều điểm trên vòng → phân bố đều hơn, node mạnh có nhiều vnode hơn, khi node chết tải chia cho nhiều node thay vì dồn vào một.
+      Dùng trong: Cassandra/Dynamo, client-side sharding cache, load balancer (Maglev, ring hash). Redis Cluster dùng **hash slot cố định** (16384) — một biến thể khác.
+    followUp: Why does `hash(key) % N` cause a cache avalanche when you add one node?
+    tags: [consistent-hashing, sharding]
+  - id: distributed-systems-019
+    level: medium
+    type: gotcha
+    q: Why is it dangerous to use wall-clock timestamps to order events across machines or to measure durations?
+    hint: |-
+      Wall clock của mỗi máy lệch nhau (NTP chỉ giữ trong vài ms tới hàng trăm ms), có thể **nhảy lùi** (NTP step, leap second, VM migrate). Sắp thứ tự theo timestamp → sự kiện sau có thể "trước".
+      Đo duration bằng `Date.now()` có thể ra số âm → dùng **monotonic clock** (`performance.now()`, `process.hrtime.bigint()`).
+      Thứ tự nhân quả → Lamport/vector clock hoặc sequence từ một nguồn (DB sequence, Kafka offset trong partition). Spanner dùng TrueTime (khoảng sai số có giới hạn) + commit wait.
+    followUp: What is last-write-wins and when does it silently lose data?
+    tags: [clocks]
+  - id: distributed-systems-020
+    level: medium
+    type: compare
+    q: Lamport clocks vs vector clocks — what can each tell you?
+    hint: |-
+      **Lamport**: mỗi node một counter; tăng khi có sự kiện, gửi kèm message, nhận thì `max(local, recv) + 1`. Đảm bảo: a → b ⇒ L(a) < L(b). **Không** suy ngược được: L(a) < L(b) không có nghĩa a xảy ra trước b (có thể đồng thời).
+      **Vector clock**: mỗi node giữ vector counter của mọi node → so sánh được a trước b, b trước a, hay **đồng thời** (conflict) → dùng phát hiện xung đột (Dynamo gốc, Riak).
+      Nhược vector clock: kích thước tăng theo số node/client.
+    followUp: How would you use vector clocks to detect conflicting cart updates?
+    tags: [clocks, causality]
+  - id: distributed-systems-021
+    level: medium
+    type: concept
+    q: Why do people say exactly-once delivery is impossible, yet systems claim exactly-once processing?
+    hint: |-
+      Qua mạng không tin cậy, sender không phân biệt "message mất" với "ack mất" (Two Generals) → hoặc gửi lại (có thể trùng: at-least-once) hoặc không (có thể mất: at-most-once). **Delivery** đúng một lần là không thể đảm bảo.
+      "Exactly-once processing" = at-least-once delivery + **dedupe/idempotency** hoặc gói ghi kết quả và ghi tiến độ vào **cùng một transaction** (Kafka transactions, offset lưu cùng DB). Tác động ra thế giới ngoài vẫn cần idempotency của phía đó.
+    followUp: Where exactly does Kafka's exactly-once guarantee stop?
+    tags: [delivery-semantics, idempotency]
+  - id: distributed-systems-022
+    level: medium
+    type: design
+    q: What is deadline propagation, and how would you implement it across Node.js services?
+    hint: |-
+      Request người dùng có ngân sách thời gian (vd 2s). Mỗi hop truyền **thời điểm hết hạn** (hoặc thời gian còn lại) xuống dưới; service con dùng `min(own timeout, remaining)`, và **không bắt đầu/không retry** nếu thời gian còn lại quá ít.
+      Node: header `x-request-deadline` (gRPC có deadline sẵn), `AbortSignal.timeout(remaining)` cho `fetch`, truyền `AbortSignal` xuống DB/HTTP client; lưu trong AsyncLocalStorage.
+      Lợi ích: không làm việc vô ích cho request mà caller đã bỏ.
+    example: |-
+      ```ts
+      const remaining = Number(req.header("x-deadline")) - Date.now(); // ms, epoch-based header
+      if (remaining < 50) return res.status(504).end();
+      const r = await fetch(url, { signal: AbortSignal.timeout(remaining - 20),
+        headers: { "x-deadline": req.header("x-deadline")! } });
+      ```
+    followUp: Why does an epoch-based deadline header depend on clock sync, and what is the alternative?
+    tags: [timeouts, deadlines, nodejs]
+  - id: distributed-systems-023
+    level: medium
+    type: concept
+    q: What is split brain, and why do clusters use an odd number of nodes?
+    hint: |-
+      Split brain: partition làm hai nhóm node, mỗi nhóm nghĩ mình là primary → cả hai nhận write → dữ liệu phân kỳ.
+      Chống bằng **quorum**: chỉ nhóm có **đa số** (> N/2) được làm leader/nhận write; nhóm thiểu số tự dừng.
+      Số lẻ: 3 node chịu 1 lỗi, 4 node **cũng chỉ** chịu 1 lỗi (cần 3/4) → thêm node chẵn không tăng khả năng chịu lỗi mà còn tăng chi phí đồng thuận. Với 2 AZ, cần một "tie-breaker" ở nơi thứ ba.
+    followUp: You have a 3-node cluster across 2 data centers (2+1). Which DC failure takes you down?
+    tags: [split-brain, quorum]
+  - id: distributed-systems-024
+    level: medium
+    type: concept
+    q: What is a fencing token and how does it make a lock safe?
+    hint: |-
+      Lock service cấp kèm lock một **số tăng đơn điệu** (token). Client gửi token cùng mọi write tới storage; storage nhớ token lớn nhất đã thấy và **từ chối** write có token nhỏ hơn.
+      Nhờ đó client bị pause (GC) tỉnh dậy với lock đã hết hạn (token 33) sẽ bị từ chối vì client mới (token 34) đã ghi.
+      Yêu cầu: storage phải hỗ trợ kiểm tra (conditional write, column version). Nguồn token: ZooKeeper zxid/ znode version, etcd revision, DB sequence.
+    example: |-
+      ```sql
+      UPDATE jobs SET result = $1, fence = $2
+      WHERE id = $3 AND fence < $2;  -- 0 rows => stale lock holder
+      ```
+    followUp: Can a Redis SET NX lock give you a fencing token? What would you use instead?
+    tags: [locks, fencing]
+  - id: distributed-systems-025
+    level: medium
+    type: concept
+    q: What are backpressure and load shedding, and how do they differ?
+    hint: |-
+      **Backpressure**: consumer báo producer chậm lại (Node stream `highWaterMark`/`pause`, TCP window, Kafka pull, queue có giới hạn) → tải được điều tiết từ nguồn.
+      **Load shedding**: server quá tải chủ động **từ chối** bớt request (503/429 nhanh) để phần còn lại vẫn đạt SLO — ưu tiên request quan trọng, bỏ request đã quá deadline.
+      Không có cả hai → queue tăng vô hạn, latency tăng cho **mọi** request, rồi sập.
+    followUp: Which requests would you shed first on an e-commerce API during overload?
+    tags: [backpressure, load-shedding]
+  - id: distributed-systems-026
+    level: medium
+    type: compare
+    q: How do you provide read-your-writes consistency when reads go to asynchronous replicas?
+    hint: |-
+      Lựa chọn: (1) đọc từ **primary** trong một khoảng sau khi user ghi (cookie/session ghi "last write at"), (2) lưu **LSN/position** của write, chỉ đọc replica đã replay tới LSN đó (Postgres `pg_last_wal_replay_lsn()`), (3) sticky routing user tới replica cố định + chờ, (4) trả dữ liệu vừa ghi từ response của write cho UI (optimistic UI).
+      Chỉ áp dụng cho **chính user đó** — người khác vẫn eventual.
+    followUp: How does this interact with caching in front of the replica?
+    tags: [consistency, replication]
+  - id: distributed-systems-027
+    level: medium
+    type: concept
+    q: What are CRDTs and when would you choose one?
+    hint: |-
+      Conflict-free Replicated Data Types: cấu trúc dữ liệu mà merge **giao hoán, kết hợp, idempotent** → các replica cập nhật độc lập (kể cả khi partition) rồi luôn hội tụ về cùng kết quả, không cần coordination.
+      Ví dụ: G-Counter/PN-Counter (đếm like), OR-Set (giỏ hàng thêm/xoá), LWW-Register, sequence CRDT cho collaborative editing (Yjs, Automerge).
+      Chọn khi cần **AP** + offline/multi-region write; không hợp với invariant toàn cục (số dư ≥ 0, tồn kho không âm).
+    followUp: Why can't a CRDT enforce "stock must never go below zero"?
+    tags: [crdt, availability]
+  - id: distributed-systems-028
+    level: hard
+    type: debug
+    q: This retry helper is used for every outbound call. What problems will it cause in production?
+    example: |-
+      ```ts
+      async function withRetry<T>(fn: () => Promise<T>, retries = 5): Promise<T> {
+        try {
+          return await fn();
+        } catch (e) {
+          if (retries === 0) throw e;
+          await sleep(1000);
+          return withRetry(fn, retries - 1);
+        }
+      }
+      // usage
+      await withRetry(() => http.post("/payments", body));
+      await withRetry(() => http.get(`/inventory/${sku}`));
+      ```
+    hint: |-
+      - Retry **mọi** lỗi, kể cả 400/401/409/422 (không bao giờ thành công) → lãng phí, che lỗi thật.
+      - Retry **POST /payments** không có idempotency key → có thể trừ tiền nhiều lần (request đầu có thể đã thành công nhưng timeout).
+      - Delay cố định 1s, không exponential, **không jitter** → các client đồng bộ retry thành đợt sóng.
+      - 5 lần × 1s + không có timeout per attempt → request người dùng có thể treo rất lâu, vượt deadline caller.
+      - Không có retry budget/circuit breaker → khuếch đại tải khi downstream đang quá tải; lồng nhiều tầng retry → nhân lên.
+      Fix: chỉ retry lỗi transient, idempotency key, full jitter, max 2–3, deadline, breaker.
+    followUp: How do you implement a retry budget across all calls from one service?
+    tags: [debug, retries, idempotency]
+  - id: distributed-systems-029
+    level: hard
+    type: debug
+    q: Service A calls B, which calls C. Users see many 504s from A while C is still doing work. Look at the timeouts.
+    example: |-
+      ```text
+      Gateway -> A : timeout 3s
+      A -> B       : timeout 5s, retries 2
+      B -> C       : timeout 10s, retries 3
+      C -> DB      : statement_timeout none
+      ```
+    hint: |-
+      Timeout **tăng dần vào trong** thay vì giảm: gateway bỏ request sau 3s nhưng A vẫn chờ B tới 5s × 3 lần; B chờ C 10s × 4 lần; C chạy query không giới hạn → làm việc vô ích cho request đã chết, giữ connection/pool → cạn tài nguyên, lỗi lan rộng.
+      Retry lồng: 3 × 4 = 12 lần gọi C cho một request.
+      Fix: timeout **giảm dần** theo độ sâu (mỗi tầng < tầng trên), deadline propagation, retry ở **một** tầng (thường gần client nhất có idempotency), `statement_timeout` ở DB, hủy công việc khi caller hủy (AbortSignal).
+    followUp: Which single layer would you keep retries at, and why?
+    tags: [debug, timeouts, cascading-failure]
+  - id: distributed-systems-030
+    level: hard
+    type: debug
+    q: This leader-style job uses a Redis lease. Occasionally two instances process the same batch. Why, and how do you fix it?
+    example: |-
+      ```ts
+      async function tick() {
+        const ok = await redis.set("lease:batch", podId, "PX", 10_000, "NX");
+        if (!ok) return;
+        const batch = await db.claimNextBatch();       // ~100ms
+        for (const item of batch) await processItem(item); // usually 2s, sometimes 20s (GC, slow API)
+        await redis.del("lease:batch");
+      }
+      setInterval(tick, 1000);
+      ```
+    hint: |-
+      - Lease 10s nhưng xử lý có lúc 20s (GC pause, API chậm) → lease **hết hạn giữa chừng**, pod khác lấy lease và claim batch → hai pod cùng làm.
+      - `DEL` không kiểm tra owner → xoá lease của pod khác.
+      - `setInterval` gọi `tick` chồng nhau trên cùng pod khi tick trước chưa xong.
+      Fix: đưa correctness vào **DB**: `claimNextBatch` dùng `UPDATE ... SET owner=?, lease_until=? WHERE ... FOR UPDATE SKIP LOCKED` hoặc fencing token kiểm tra khi ghi kết quả; release bằng compare-and-delete; gia hạn lease (heartbeat) và dừng nếu gia hạn thất bại; xử lý item idempotent.
+    followUp: Why does renewing the lease still not fully solve the problem without a fencing token?
+    tags: [debug, locks, leader-election]
+  - id: distributed-systems-031
+    level: hard
+    type: scenario
+    q: A payments dependency recovers after a 10-minute outage, and immediately falls over again. Your graphs show request volume at five times normal. What happened, and how do you prevent it?
+    hint: |-
+      **Retry storm**: trong lúc outage, client ở mọi tầng retry + request mới xếp hàng; khi dependency vừa lên, toàn bộ backlog + retry đồng loạt đổ vào (thundering herd) → sập lại.
+      Phòng: backoff + full jitter; **retry budget** (vd retry ≤ 10% request); circuit breaker (half-open chỉ cho vài probe); load shedding ở dependency (trả 503 nhanh khi vượt capacity); queue có giới hạn + bỏ request quá deadline; ramp-up traffic từ từ (LB slow start).
+    followUp: How does a circuit breaker in half-open state help, and how should it be configured?
+    tags: [retries, incident, thundering-herd]
+  - id: distributed-systems-032
+    level: hard
+    type: scenario
+    q: A slow downstream service causes your whole API to become unresponsive, including endpoints that don't use that service. Explain the mechanism and fixes.
+    hint: |-
+      **Cascading failure** qua tài nguyên chung: request tới dependency chậm giữ connection/socket/DB connection/memory lâu → pool chung cạn (HTTP agent sockets, DB pool, event loop bị nghẽn do backlog) → mọi endpoint phải chờ tài nguyên đó.
+      Fix: timeout ngắn, **bulkhead** (giới hạn concurrency riêng cho dependency đó), circuit breaker + fallback, load shedding, tách pool; theo dõi saturation (pool wait time, event loop lag).
+    followUp: What metrics would have shown this before users noticed?
+    tags: [cascading-failure, bulkhead]
+  - id: distributed-systems-033
+    level: hard
+    type: scenario
+    q: In an order saga, the refund compensation step itself keeps failing. What do you do?
+    hint: |-
+      Compensation phải **retry được và idempotent** (refund với idempotency key); retry với backoff lâu dài (không giới hạn thời gian ngắn), lưu trạng thái saga (`COMPENSATING`).
+      Nếu vẫn lỗi (provider từ chối vĩnh viễn) → chuyển sang trạng thái cần **con người xử lý** (DLQ/ticket, dashboard), thông báo khách, reconciliation job đối chiếu với provider.
+      Thiết kế: không bao giờ để saga "biến mất" ở trạng thái trung gian; có alert theo tuổi saga kẹt.
+    followUp: How would you detect sagas stuck in an intermediate state?
+    tags: [saga, compensation, incident]
+  - id: distributed-systems-034
+    level: hard
+    type: scenario
+    q: Customers occasionally get charged twice. Logs show the client timed out and retried. Walk through the root cause and the full fix.
+    hint: |-
+      Request 1 tới payment provider **thành công**, nhưng response bị chậm/mất → client timeout → retry → request 2 tạo charge mới. Server không có cách nhận ra đó là cùng một ý định.
+      Fix: client sinh **idempotency key** cho mỗi ý định thanh toán (lưu cùng order), server lưu key với unique constraint và trả lại kết quả cũ; truyền cùng key sang provider (Stripe hỗ trợ `Idempotency-Key`); timeout client phải lớn hơn p99 của server; reconciliation job đối chiếu charges với orders để phát hiện và hoàn tiền.
+    followUp: The idempotency record is written, but the process crashes before calling the provider. What happens on retry?
+    tags: [idempotency, payments, incident]
+  - id: distributed-systems-035
+    level: hard
+    type: concept
+    q: What does the FLP impossibility result say, and why do Raft and Paxos still work in practice?
+    hint: |-
+      FLP (Fischer–Lynch–Paterson 1985): trong mô hình **hoàn toàn bất đồng bộ** (không giới hạn thời gian message), không có thuật toán consensus **deterministic** nào đảm bảo luôn kết thúc nếu có dù chỉ một process có thể crash.
+      Thực tế: Raft/Paxos luôn **an toàn** (không bao giờ quyết định sai), còn **liveness** dựa vào giả định partial synchrony — dùng timeout và randomization (election timeout ngẫu nhiên). Trong giai đoạn mạng tệ, có thể không bầu được leader, nhưng không bao giờ có hai leader cùng term commit.
+    followUp: Which of safety or liveness does Raft give up during a bad network period?
+    tags: [flp, consensus]
+  - id: distributed-systems-036
+    level: hard
+    type: concept
+    q: What are hedged requests, and what risks do they carry?
+    hint: |-
+      Gửi request tới một replica; nếu chưa có trả lời sau ~p95 latency thì gửi **bản thứ hai** tới replica khác, dùng kết quả đến trước, hủy cái còn lại. Cắt **tail latency** (The Tail at Scale, Dean & Barroso).
+      Rủi ro: tăng tải (giới hạn tỉ lệ hedge, vd ≤ 5%), chỉ an toàn cho thao tác **idempotent/đọc**, khi hệ thống quá tải thì hedge làm tệ hơn → tắt khi thấy quá tải.
+    followUp: Why do hedged requests help p99 but barely change p50?
+    tags: [tail-latency]
+  - id: distributed-systems-037
+    level: hard
+    type: scenario
+    q: Two regions accept writes and resolve conflicts with last-write-wins by timestamp. Users report edits disappearing. Explain.
+    hint: |-
+      LWW giữ bản có timestamp lớn nhất và **bỏ âm thầm** bản kia. Hai edit đồng thời (không có quan hệ nhân quả) → một cái mất. Clock skew làm tệ hơn: region có đồng hồ chạy nhanh "thắng" kể cả khi edit của nó cũ hơn thực tế.
+      Lựa chọn: tránh multi-writer cho dữ liệu đó (single home region per entity), phát hiện xung đột bằng version vector và cho user/merge logic giải quyết, dùng CRDT cho kiểu dữ liệu merge được, hoặc merge ở mức field.
+    followUp: How would you pick a "home region" per entity and route writes to it?
+    tags: [clocks, conflicts, multi-region]
+  - id: distributed-systems-038
+    level: hard
+    type: scenario
+    q: During a network partition between AZs, your Redis Sentinel setup promotes a new master while the old master keeps accepting writes from clients in its AZ. What happens, and how do you limit it?
+    hint: |-
+      Split brain tạm thời: client ở phía thiểu số ghi vào master cũ; khi partition hết, master cũ bị hạ xuống replica và **resync từ master mới → write đó mất**.
+      Giới hạn: `min-replicas-to-write` + `min-replicas-max-lag` để master cũ ngừng nhận write khi mất liên lạc replica; Sentinel quorum đặt ở ≥3 vị trí; chấp nhận Redis là AP-ish, không dùng cho dữ liệu không được phép mất.
+    followUp: Which data in your system is acceptable to lose this way, and which is not?
+    verify: true
+    tags: [split-brain, redis, partition]
+  - id: distributed-systems-039
+    level: hard
+    type: concept
+    q: How do failure detectors based on heartbeats go wrong, and what trade-off do you tune?
+    hint: |-
+      Heartbeat timeout không phân biệt được node **chết**, **chậm** (GC pause, CPU throttle) và **mạng chậm** → chỉ đoán.
+      Timeout ngắn: phát hiện nhanh nhưng **false positive** → failover không cần thiết, rebalance, có thể hai leader. Timeout dài: an toàn hơn nhưng downtime dài khi chết thật.
+      Cải tiến: phi accrual detector (Cassandra/Akka) tính mức nghi ngờ theo phân phối heartbeat; nhiều nguồn xác nhận; kết hợp lease + fencing để false positive không gây hỏng dữ liệu.
+    followUp: Give an example where an aggressive Kubernetes liveness probe causes an outage.
+    tags: [failure-detection]
+  - id: distributed-systems-040
+    level: hard
+    type: gotcha
+    q: A circuit breaker opens for your whole payments client whenever one rarely used endpoint fails. What is wrong with the configuration?
+    hint: |-
+      Breaker đặt ở **granularity sai**: một breaker cho cả dependency → endpoint phụ lỗi làm tắt cả endpoint chính. Nên tách breaker theo endpoint/operation (hoặc theo host/region).
+      Kiểm tra thêm: ngưỡng tính theo **tỉ lệ** lỗi với `minimumNumberOfCalls` (không phải vài lỗi liên tiếp khi traffic thấp), loại lỗi nào tính (4xx của client không nên tính), thời gian open, số probe half-open.
+    followUp: Should HTTP 429 from the dependency count as a failure for the breaker?
+    tags: [circuit-breaker, gotcha]
+  - id: distributed-systems-041
+    level: senior
+    type: design
+    q: Design an idempotent, reliable payment API that sits between your checkout and an external payment provider.
+    hint: |-
+      - API nhận `Idempotency-Key` + payload hash; bảng `payment_attempts` với unique key, state machine (`CREATED → PENDING → SUCCEEDED/FAILED/UNKNOWN`).
+      - Gọi provider với **cùng idempotency key**; timeout → trạng thái `UNKNOWN`, không coi là thất bại → job **reconcile** hỏi provider.
+      - Webhook của provider verify chữ ký, idempotent theo event id, cập nhật state; outbox phát `PaymentSucceeded`.
+      - Retry có jitter, circuit breaker; audit log mọi chuyển trạng thái; đối soát hằng ngày.
+    followUp: The provider times out and never sends a webhook. How does the order get resolved?
+    tags: [design, payments, idempotency]
+  - id: distributed-systems-042
+    level: senior
+    type: open
+    q: For an e-commerce platform, which features need strong consistency and which can be eventually consistent? Defend the boundary.
+    hint: |-
+      Strong (hoặc ít nhất serializable ở một chỗ): trừ tồn kho khi đặt hàng/giữ chỗ, thanh toán và số dư, mã giảm giá dùng một lần, unique username/email, quyền truy cập.
+      Eventual: catalog/search index, recommendation, review, số lượt xem, hiển thị "còn hàng" ở listing, analytics, email.
+      Nêu lý do bằng **chi phí sai** (tiền, pháp lý, trải nghiệm) và chi phí strong (latency, availability). Nói cách UI xử lý eventual (trạng thái pending, refetch).
+    followUp: How do you prevent overselling while keeping checkout fast during a spike?
+    tags: [consistency, design]
+  - id: distributed-systems-043
+    level: senior
+    type: design
+    q: Design a distributed rate limiter for a public API running on many instances. How does it behave when its store fails?
+    hint: |-
+      Thuật toán: token bucket hoặc sliding window counter; state trong Redis, cập nhật **atomic bằng Lua**; key theo api-key/tenant/IP; hash tag để các key của một client cùng slot.
+      Giảm latency: local token cache (xin trước một lô token), hoặc chấp nhận xấp xỉ.
+      Store lỗi: **fail-open** (tránh tự gây outage, có local limit bảo thủ per instance) vs **fail-closed** (API đắt/chống abuse). Header `429` + `Retry-After`, `RateLimit-*`.
+      Nhiều region: limit per region hoặc đồng bộ gần đúng.
+    followUp: How would you give a large tenant a higher limit without code changes?
+    tags: [design, rate-limiting]
+  - id: distributed-systems-044
+    level: senior
+    type: open
+    q: How do you test that a distributed system behaves correctly under failures?
+    hint: |-
+      Tầng: unit test cho retry/idempotency logic với fake clock; integration test với **fault injection** (Toxiproxy: latency, drop, reset), container kill; contract test; chaos experiment ở staging rồi production với blast radius nhỏ (kill pod, AZ failover, dependency chậm); game day có runbook.
+      Kiểm tra tính đúng: invariant checker (tổng tiền không đổi, không double charge), Jepsen-style history checking cho store tự viết.
+      Đo: SLO có giữ được không, alert có bắn đúng không.
+    followUp: What is the first chaos experiment you would run on a new service, and why?
+    tags: [testing, chaos]
+  - id: distributed-systems-045
+    level: senior
+    type: design
+    q: A scheduled job must run exactly once per minute across 10 replicas of a Node service. Design it.
+    hint: |-
+      Lựa chọn: (1) tách job ra **một** scheduler riêng (K8s CronJob với `concurrencyPolicy: Forbid`, EventBridge Scheduler) — đơn giản nhất; (2) leader election (K8s Lease, etcd) và chỉ leader chạy; (3) claim theo **slot thời gian** trong DB: `INSERT INTO job_runs(job, minute) ... ON CONFLICT DO NOTHING` → chỉ một replica thắng mỗi phút.
+      "Exactly once" thực tế = at-least-once + job idempotent (theo slot) + phát hiện slot bị bỏ lỡ (catch-up).
+    example: |-
+      ```sql
+      INSERT INTO job_runs (job_name, slot) VALUES ('sync-prices', date_trunc('minute', now()))
+      ON CONFLICT (job_name, slot) DO NOTHING
+      RETURNING slot; -- a row back => this replica runs the job
+      ```
+    followUp: The replica that won the slot crashes halfway. How does the minute get completed?
+    tags: [design, scheduling, leader-election]

@@ -1,0 +1,952 @@
+id: 16-caching
+slug: caching
+title: Caching
+tier: 4
+status: drafted
+summary: Cache patterns, invalidation, stampede/penetration/hot key, Redis internals, Redis vs Memcached, HTTP/CDN cache, multi-tenant cache keys.
+cvLinked: true
+overview: |-
+  ## TL;DR
+
+  - Cache là **bản sao có thể sai** của dữ liệu gốc. Mọi quyết định cache thực chất là trả lời 3 câu: *được phép stale bao lâu?*, *invalidate thế nào?*, *khi cache chết thì hệ thống sống ra sao?*
+  - Pattern phổ biến nhất ở backend Node/TS là **cache-aside** + TTL + **delete-on-write**. Các pattern khác (read-through, write-through, write-behind, refresh-ahead) là biến thể đổi latency/consistency/complexity.
+  - Senior interview xoáy vào **failure modes**: stampede (thundering herd), penetration, avalanche, hot key, big key, race giữa writer và reader, Redis down → DB sập theo.
+  - Redis không chỉ là key-value: data structures, persistence (RDB/AOF), eviction policy, Cluster 16384 slots, Lua atomic, pub/sub, lock (và **giới hạn** của Redlock).
+  - Multi-tenant: **tenant id phải nằm trong cache key** (và trong CDN cache key / `Vary`), nếu không là data leak chứ không chỉ là bug.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Cache-aside (lazy loading) | App tự đọc cache → miss thì đọc DB rồi set cache | `get(k) ?? set(k, await db.find(), ttl)` |
+  | Read-through | Cache layer/library tự load từ DB khi miss | DataLoader/cache library có `loader` function |
+  | Write-through | Ghi DB **và** cache đồng bộ trong cùng request | Update profile → `db.update` rồi `cache.set` |
+  | Write-behind (write-back) | Ghi cache trước, flush DB bất đồng bộ | Counter view count gom batch mỗi 5s |
+  | Refresh-ahead | Làm mới key **trước** khi hết hạn | Còn 10% TTL thì background refresh |
+  | TTL + jitter | Hạn sống + ngẫu nhiên hoá để key không hết hạn cùng lúc | `ttl = 300 + rand(0..60)` |
+  | Stampede / thundering herd | Hot key hết hạn → N request cùng miss và cùng đánh DB | Trang chủ hết hạn lúc 12:00:00 |
+  | Penetration | Query key **không tồn tại** → luôn miss → luôn đánh DB | `GET /product/-1` bị bot spam |
+  | Avalanche | **Nhiều** key hết hạn cùng lúc hoặc cache cluster chết | Warm cache lúc deploy với cùng TTL |
+  | Hot key / big key | 1 key nhận quá nhiều traffic / 1 key quá lớn | `config:global` 200k rps; hash 2GB |
+  | Negative caching | Cache cả kết quả "không có" với TTL ngắn | `set("p:-1", NULL_SENTINEL, 30)` |
+  | Eviction vs expiration | Eviction = bị đuổi vì hết memory; expiration = hết TTL | `maxmemory-policy allkeys-lru` |
+
+  ## Cơ chế hoạt động
+
+  ### Cache-aside read + delete-on-write
+
+  ```mermaid
+  sequenceDiagram
+    participant C as Client
+    participant A as API (Node)
+    participant R as Redis
+    participant D as DB
+    C->>A: GET /products/42
+    A->>R: GET t:acme:product:42:v3
+    alt hit
+      R-->>A: JSON
+    else miss
+      R-->>A: nil
+      A->>D: SELECT ... WHERE id=42 AND tenant_id='acme'
+      D-->>A: row
+      A->>R: SET key JSON EX 300+jitter
+    end
+    A-->>C: 200
+    Note over A,D: Write path
+    C->>A: PUT /products/42
+    A->>D: UPDATE (commit)
+    A->>R: DEL t:acme:product:42:v3
+  ```
+
+  ### Chống stampede (quyết định khi miss)
+
+  ```mermaid
+  flowchart TD
+    M["Cache miss / near expiry"] --> L{"In-process singleflight<br/>đã có promise cho key?"}
+    L -- yes --> W["await promise hiện có"]
+    L -- no --> S{"Còn bản stale<br/>(stale-while-revalidate)?"}
+    S -- yes --> RS["Trả stale ngay +<br/>refresh nền (1 lần)"]
+    S -- no --> K{"SET lock NX PX<br/>thành công?"}
+    K -- yes --> DB["Query DB → SET cache<br/>→ release lock"]
+    K -- no --> BO["Chờ ngắn + đọc lại cache<br/>(hoặc trả fallback)"]
+  ```
+
+  ### Redis Cluster routing
+
+  - `slot = CRC16(key) mod 16384`; mỗi master giữ một dải slot. Client cluster-aware cache bảng slot và xử lý `MOVED`/`ASK`.
+  - Multi-key command (MGET, Lua, MULTI) chỉ chạy khi các key **cùng slot** → dùng **hash tag** `{tenant:acme}:cart` (chỉ phần trong `{}` được hash). Lạm dụng hash tag = dồn hết vào một node (hot shard).
+
+  ## Trade-offs
+
+  | Pattern | Read latency | Write latency | Consistency | Rủi ro chính | Hợp khi |
+  |---|---|---|---|---|---|
+  | Cache-aside | Miss chậm (2 round-trip) | Không đổi | Eventual, cửa sổ stale = TTL hoặc tới lúc DEL | Race reader/writer, stampede | Read-heavy, default choice |
+  | Read-through | Như cache-aside | Không đổi | Eventual | Phụ thuộc library/provider | Muốn gom logic load vào 1 chỗ |
+  | Write-through | Hit rate cao sau write | Tăng (2 lần ghi) | Tốt hơn nhưng **không atomic** giữa DB và cache | Cache chứa data không ai đọc; lỗi nửa chừng | Data vừa ghi được đọc ngay |
+  | Write-behind | Nhanh | Rất nhanh | Yếu; DB trễ | **Mất dữ liệu** nếu cache chết trước flush | Counter, metrics, chấp nhận mất |
+  | Refresh-ahead | Luôn hit với hot key | Không đổi | Vẫn stale trong khoảng refresh | Refresh cả key không còn ai dùng | Hot key dự đoán được |
+
+  | | Redis | Memcached |
+  |---|---|---|
+  | Data model | String, Hash, List, Set, ZSet, Stream, Bitmap, HyperLogLog, Geo, JSON (module/8.x) | Chỉ string/blob |
+  | Threading | Command execution đơn luồng (I/O threads từ 6.0) | Multi-threaded |
+  | Persistence / replication | RDB, AOF, replica, Sentinel, Cluster | Không (thuần cache) |
+  | Eviction | Nhiều policy cấu hình được | LRU theo slab class |
+  | Hợp | Cần data structure, atomic op, lock, pub/sub, rate limit | Cache blob đơn giản, scale theo core, ít vận hành |
+
+  ## Pitfalls
+
+  - **Update cache thay vì delete** khi write → hai writer đồng thời có thể để lại giá trị cũ trong cache vĩnh viễn (đến hết TTL).
+  - Không có TTL "vì sẽ invalidate khi write" → bất kỳ đường ghi nào quên DEL (script, migration, service khác) = stale mãi mãi.
+  - Cache **lỗi / `undefined` / response rỗng do timeout** như dữ liệu thật.
+  - Key thiếu `tenantId`, `locale`, `currency`, `role` → user A thấy dữ liệu user B.
+  - Dùng `KEYS *` hoặc `DEL` một big key trên production → block event loop của Redis.
+  - Coi Redis là "luôn sống": không timeout, không circuit breaker → Redis chậm kéo toàn bộ API chậm theo; Redis chết → 100% traffic đổ vào DB.
+  - Distributed lock bằng `SET NX` rồi `DEL` không kiểm tra owner → xoá lock của người khác.
+  - HTTP: `Cache-Control: public` cho response có cookie/Authorization → CDN cache dữ liệu cá nhân.
+
+  ## Cheat sheet
+
+  - Default: cache-aside + TTL có jitter + **DEL sau khi commit DB** + singleflight trong process.
+  - Stampede: singleflight · lock `SET k v NX PX` · stale-while-revalidate · refresh-ahead · probabilistic early expiration (XFetch).
+  - Penetration: validate input · cache null TTL ngắn · Bloom filter. Avalanche: jitter TTL · multi-level cache · HA cluster · rate limit tới DB.
+  - Hot key: L1 in-process cache vài giây · nhân bản key `k#1..k#N` · client-side caching (RESP3 tracking).
+  - Big key: `redis-cli --bigkeys` / `--memkeys`, `MEMORY USAGE`, chia nhỏ, `UNLINK` thay `DEL`.
+  - Eviction: default `noeviction`; cache thuần → `allkeys-lru` hoặc `allkeys-lfu`; `volatile-*` chỉ đuổi key có TTL.
+  - Persistence: RDB = snapshot (fork + copy-on-write), AOF = log ghi (`appendfsync everysec` mặc định). Cache thuần có thể tắt cả hai.
+  - Lock: `SET lock:k <uuid> NX PX 10000`; release bằng Lua compare-and-delete; việc quan trọng cần **fencing token**.
+  - HTTP: `no-cache` = được lưu nhưng phải revalidate; `no-store` = không lưu; `s-maxage` cho shared cache; `ETag` → `304`; `Vary` nằm trong cache key.
+notionRefs:
+  - title: Caching
+    url: https://app.notion.com/p/8a77df87b2d04f6380e9fc541642edc0
+  - title: Comprehensive Caching Guide for Senior Engineers
+    url: https://app.notion.com/p/378ef77f8ab280e3814afa4e5eab47dc
+references:
+  - title: Redis docs — Key eviction
+    url: https://redis.io/docs/latest/develop/reference/eviction/
+  - title: Redis docs — Persistence (RDB / AOF)
+    url: https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/
+  - title: Redis docs — Distributed locks with Redis
+    url: https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/
+  - title: Redis docs — Cluster specification
+    url: https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/
+  - title: Redis docs — Client-side caching
+    url: https://redis.io/docs/latest/develop/reference/client-side-caching/
+  - title: Martin Kleppmann — How to do distributed locking
+    url: https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html
+  - title: AWS Builders' Library — Caching challenges and strategies
+    url: https://aws.amazon.com/builders-library/caching-challenges-and-strategies/
+  - title: RFC 9111 — HTTP Caching
+    url: https://www.rfc-editor.org/rfc/rfc9111
+  - title: RFC 5861 — stale-while-revalidate / stale-if-error
+    url: https://www.rfc-editor.org/rfc/rfc5861
+  - title: MDN — Cache-Control
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cache-Control
+  - title: Memcached wiki
+    url: https://github.com/memcached/memcached/wiki
+  - title: Vattani et al. — Optimal Probabilistic Cache Stampede Prevention (VLDB 2015)
+    url: https://www.vldb.org/pvldb/vol8/p886-vattani.pdf
+questions:
+  - id: caching-001
+    level: easy
+    type: concept
+    q: What is the cache-aside pattern? Walk me through the read path and the write path.
+    hint: |-
+      Read: app đọc cache → **hit** thì trả; **miss** thì query DB, `SET` vào cache kèm TTL, rồi trả.
+      Write: ghi DB (commit) → **xoá** key trong cache (không set lại) để lần đọc sau tự load bản mới.
+      Cache không biết gì về DB — app chịu trách nhiệm hết. Ưu: đơn giản, cache chết thì vẫn đọc DB được. Nhược: miss tốn 2 round-trip, có cửa sổ stale, dễ stampede.
+    example: |-
+      ```ts
+      async function getProduct(tenantId: string, id: string): Promise<Product | null> {
+        const key = `t:${tenantId}:product:${id}`;
+        const cached = await redis.get(key);
+        if (cached) return JSON.parse(cached);
+        const row = await db.product.findFirst({ where: { tenantId, id } });
+        if (row) await redis.set(key, JSON.stringify(row), "EX", 300 + Math.floor(Math.random() * 60));
+        return row;
+      }
+      ```
+    followUp: Why delete the key on write instead of writing the new value into the cache?
+    redFlags:
+      - "Describes only the read path and forgets invalidation"
+      - "Says cache-aside gives strong consistency"
+    tags: [patterns, cache-aside]
+  - id: caching-002
+    level: easy
+    type: concept
+    q: What does a TTL buy you, and how do you choose a TTL for a given piece of data?
+    hint: |-
+      TTL là **lưới an toàn**: kể cả khi quên invalidate, dữ liệu sai chỉ tồn tại tối đa TTL. Nó cũng giới hạn memory cho key không còn ai đọc.
+      Chọn theo: (1) business chấp nhận stale bao lâu (giá: vài giây–phút; danh mục: giờ), (2) tần suất thay đổi, (3) chi phí miss (query nặng → TTL dài + refresh), (4) hit ratio mục tiêu.
+      Luôn thêm **jitter** để tránh nhiều key hết hạn cùng lúc (avalanche).
+    followUp: If you invalidate on every write, do you still need a TTL? Why?
+    redFlags:
+      - "Picks one TTL for everything without talking about staleness tolerance"
+    tags: [ttl]
+  - id: caching-003
+    level: easy
+    type: concept
+    q: What is cache hit ratio, how do you measure it in Redis, and what else would you monitor on a cache?
+    hint: |-
+      Hit ratio = hits / (hits + misses). Redis: `INFO stats` → `keyspace_hits`, `keyspace_misses` (toàn instance, không theo key pattern) → nên đo thêm ở app layer theo từng loại key.
+      Theo dõi thêm: latency p99 của lệnh cache, `evicted_keys`, `expired_keys`, `used_memory` vs `maxmemory`, `mem_fragmentation_ratio`, `connected_clients`, `instantaneous_ops_per_sec`, `latency` spikes, và **DB QPS** (mục tiêu thật của cache).
+      Hit ratio cao nhưng DB vẫn nặng → có thể đang cache nhầm chỗ.
+    followUp: Hit ratio is 95% but DB load barely dropped. What could explain that?
+    tags: [observability, redis]
+  - id: caching-004
+    level: easy
+    type: compare
+    q: What is the difference between cache-aside and read-through caching?
+    hint: |-
+      Cache-aside: **app code** tự check cache, tự gọi DB, tự set.
+      Read-through: cache layer (library/provider) nhận `loader` và tự gọi DB khi miss; app chỉ gọi `cache.get(key)`.
+      Hành vi dữ liệu gần như giống nhau; khác ở **chỗ đặt logic**. Read-through dễ gom singleflight/TTL/metrics vào một chỗ, nhưng gắn với library.
+    followUp: Where would you put request coalescing — in the app or in the read-through layer?
+    tags: [patterns]
+  - id: caching-005
+    level: easy
+    type: compare
+    q: Explain write-through and write-behind. Which one can lose data?
+    hint: |-
+      Write-through: mỗi write ghi DB **và** cache đồng bộ; request chỉ xong khi cả hai xong → write chậm hơn, đọc ngay sau write sẽ hit.
+      Write-behind (write-back): ghi cache trước, **flush DB sau** (batch/queue) → write rất nhanh nhưng **mất dữ liệu** nếu cache chết trước khi flush, và DB luôn trễ.
+      Write-through cũng không atomic: ghi DB xong mà set cache fail → vẫn lệch, nên vẫn cần TTL.
+    followUp: Give a real use case where write-behind is the right call.
+    redFlags:
+      - "Says write-through gives strong consistency with no caveat"
+    tags: [patterns]
+  - id: caching-006
+    level: easy
+    type: compare
+    q: Define cache penetration, cache stampede and cache avalanche. How are they different?
+    hint: |-
+      - **Penetration**: request key **không tồn tại** trong cả cache lẫn DB → luôn miss → luôn đánh DB (thường do bot/ID rác).
+      - **Stampede / thundering herd**: **một** hot key hết hạn → hàng nghìn request cùng miss và cùng query DB.
+      - **Avalanche**: **rất nhiều** key hết hạn cùng lúc (cùng TTL) hoặc cả cache cluster chết → DB nhận toàn bộ traffic.
+      Fix tương ứng: null caching/Bloom filter · lock/singleflight/SWR · TTL jitter + HA + multi-level cache.
+    followUp: Which of the three is hardest to protect against if Redis itself goes down?
+    tags: [stampede, penetration, avalanche]
+  - id: caching-007
+    level: easy
+    type: compare
+    q: Redis vs Memcached — how do you choose?
+    hint: |-
+      Memcached: chỉ string/blob, **multi-threaded**, không persistence, slab allocator + LRU, ops đơn giản — hợp cache blob thuần.
+      Redis: nhiều data structure, atomic op, Lua, TTL từng key (và từng field trong Hash từ 7.4), replication/Sentinel/Cluster, persistence, pub/sub, streams — hợp khi cần hơn "get/set".
+      Câu trả lời tốt nêu cả chi phí: Redis cần tuning eviction/persistence; license Redis đổi nhiều lần (7.4 source-available, 8.0 thêm AGPLv3) → nhiều team chọn Valkey/managed service.
+    followUp: Your team already runs Memcached. What feature would force you to add Redis?
+    verify: true
+    tags: [redis, memcached]
+  - id: caching-008
+    level: easy
+    type: concept
+    q: Name five Redis data structures and a production use case for each.
+    hint: |-
+      - String: cache JSON, counter (`INCR`), lock (`SET NX PX`).
+      - Hash: object nhiều field (`HSET user:1 name ...`), cập nhật từng field.
+      - Sorted Set: leaderboard, sliding-window rate limiter (score = timestamp), delay queue.
+      - Set: tag, unique visitor nhỏ, membership.
+      - List: queue đơn giản (`LPUSH`/`BRPOP`). Stream: event log có consumer group, ack.
+      - Bonus: HyperLogLog (đếm unique xấp xỉ ~0.81% sai số), Bitmap (feature flag theo user), Geo.
+    followUp: Implement a sliding-window rate limiter with a sorted set — which commands, and why must it be atomic?
+    tags: [redis, data-structures]
+  - id: caching-009
+    level: easy
+    type: compare
+    q: What is the difference between eviction and expiration in Redis?
+    hint: |-
+      **Expiration**: key có TTL và hết hạn → bị xoá (lazy khi truy cập + active sampling định kỳ). Có thể có key đã hết hạn nhưng chưa bị xoá khỏi memory ngay.
+      **Eviction**: memory chạm `maxmemory` → Redis đuổi key theo `maxmemory-policy` (kể cả key chưa hết hạn nếu policy là `allkeys-*`).
+      Default policy là `noeviction` → write trả lỗi OOM khi đầy. Theo dõi `expired_keys` vs `evicted_keys`: eviction tăng = cache thiếu memory hoặc có leak key.
+    followUp: Which eviction policy do you set for a pure cache, and which for a Redis that also stores locks and sessions?
+    tags: [redis, eviction]
+  - id: caching-010
+    level: easy
+    type: compare
+    q: "HTTP caching: what is the difference between `Cache-Control: no-cache`, `no-store`, `private` and `max-age=0`?"
+    hint: |-
+      - `no-store`: không được lưu ở bất kỳ cache nào.
+      - `no-cache`: **được lưu**, nhưng phải **revalidate** với origin (ETag/Last-Modified) trước mỗi lần dùng.
+      - `private`: chỉ browser cache được lưu, shared cache (CDN, proxy) không được.
+      - `max-age=0`: stale ngay lập tức → thường dẫn tới revalidate (gần giống `no-cache`, nhưng `must-revalidate`/`no-cache` mới là cách nói rõ ràng).
+      Dữ liệu nhạy cảm (token, trang tài khoản): `no-store`.
+    followUp: How do `ETag` and `If-None-Match` save bandwidth but not a round-trip?
+    redFlags:
+      - "Thinks `no-cache` means do not cache"
+    tags: [http, cdn]
+  - id: caching-011
+    level: easy
+    type: concept
+    q: What kinds of data should you not cache, or cache only with great care?
+    hint: |-
+      - Dữ liệu cần **strong consistency** cho quyết định tiền/tồn kho (số dư, stock khi checkout) — cache để hiển thị được, không dùng để quyết định.
+      - Dữ liệu **cá nhân/nhạy cảm** nếu key không scope đúng user/tenant; secret, token dài hạn.
+      - Dữ liệu cardinality cực cao, mỗi key đọc 1 lần (hit ratio ~0) → tốn memory vô ích.
+      - Dữ liệu rẻ để tính hơn chi phí serialize + network.
+      Nguyên tắc: cache thứ **đọc nhiều, đổi ít, chịu được stale**.
+    followUp: Product stock is shown on the listing page and checked at checkout. How do you cache one but not the other?
+    tags: [design]
+  - id: caching-012
+    level: easy
+    type: compare
+    q: In-process (in-memory) cache vs distributed cache like Redis — trade-offs in a Node.js service with multiple replicas?
+    hint: |-
+      In-process (Map/LRU): nhanh nhất (không network), nhưng **mỗi replica một bản** → không nhất quán giữa pod, mất khi restart, chiếm heap (GC pressure), invalidate khó.
+      Redis: dùng chung, sống qua deploy, invalidate một chỗ; tốn 1 network hop (~sub-ms trong cùng AZ) và là dependency có thể chết.
+      Thực tế: **L1 in-process TTL ngắn (vài giây) + L2 Redis** cho hot key; invalidate L1 bằng pub/sub hoặc chấp nhận TTL ngắn.
+    followUp: How would you invalidate L1 caches across 20 pods when a product changes?
+    tags: [multi-level, nodejs]
+  - id: caching-013
+    level: medium
+    type: compare
+    q: On a write, should you update the cache or delete the key? Defend your choice.
+    hint: |-
+      **Delete** là default an toàn:
+      - Update: hai writer A, B cùng sửa; DB commit A→B nhưng cache set B→A (thứ tự mạng khác) → cache giữ **giá trị cũ** tới hết TTL.
+      - Update còn tốn công tính giá trị có thể không ai đọc, và giá trị cache thường là **view tổng hợp** (join nhiều bảng) → writer không đủ dữ liệu để dựng lại.
+      - Delete idempotent, thứ tự không quan trọng; nhược: request tiếp theo miss (có thể stampede với hot key → kết hợp singleflight).
+      Update hợp lý khi có versioning (chỉ set nếu version mới hơn) hoặc write-through có kiểm soát.
+    followUp: Even with delete-on-write, cache-aside can still end up stale. Describe the interleaving.
+    redFlags:
+      - "Update is better because it avoids a miss — no mention of races"
+    tags: [invalidation, consistency]
+  - id: caching-014
+    level: medium
+    type: scenario
+    q: Even with delete-after-commit, a reader can put stale data back into the cache. Show the interleaving and how you would reduce it.
+    hint: |-
+      Interleaving: (1) Reader miss, đọc DB được **v1** → bị chậm (GC/network). (2) Writer UPDATE v2, commit, DEL key. (3) Reader lúc này mới `SET key v1` → cache giữ v1 tới hết TTL.
+      Giảm thiểu: TTL ngắn làm giới hạn; **delayed double delete** (DEL lần 2 sau ~vài trăm ms, lớn hơn thời gian đọc+set tối đa); set có **version/updatedAt** và chỉ ghi đè khi mới hơn (Lua compare); hoặc invalidate qua **CDC** (Debezium/binlog) cho mọi đường ghi.
+      Không có cách nào hoàn hảo nếu không có versioning — cần nói rõ "bounded staleness".
+    example: |-
+      ```text
+      t0 Reader: GET k -> miss
+      t1 Reader: SELECT -> v1
+      t2 Writer: UPDATE -> v2, COMMIT
+      t3 Writer: DEL k
+      t4 Reader: SET k v1 EX 300   <-- stale for up to 300s
+      ```
+    followUp: How would a version-checked SET look in Lua?
+    tags: [invalidation, race]
+  - id: caching-015
+    level: medium
+    type: compare
+    q: Should the cache delete happen before or after the database commit? What about inside the transaction?
+    hint: |-
+      - **DEL trước rồi mới ghi DB**: giữa hai bước, reader miss → đọc DB cũ → set lại bản cũ → stale tới hết TTL. Tệ hơn.
+      - **DEL trong transaction (trước commit)**: reader vẫn thấy dữ liệu chưa commit là cũ → cùng vấn đề; và nếu rollback thì DEL vô ích (vô hại).
+      - **DEL sau commit**: cửa sổ nhỏ nhất; nếu DEL fail → cần retry (queue/outbox) hoặc dựa vào TTL.
+      Mạnh nhất: DEL sau commit + TTL + (tuỳ chọn) invalidate qua CDC/outbox để không phụ thuộc mọi code path nhớ DEL.
+    followUp: The DEL call to Redis times out after the commit. What do you do?
+    tags: [invalidation]
+  - id: caching-016
+    level: medium
+    type: concept
+    q: List the main techniques to prevent a cache stampede and when each fits.
+    hint: |-
+      - **Singleflight / request coalescing** trong process: chỉ 1 promise load DB cho mỗi key/pod — rẻ, luôn nên có.
+      - **Distributed lock** (`SET lock:k NX PX`): chỉ 1 pod rebuild; pod khác chờ/đọc stale — khi rebuild rất đắt.
+      - **Stale-while-revalidate**: lưu giá trị kèm "soft TTL", hết soft TTL vẫn trả stale và refresh nền.
+      - **Refresh-ahead / probabilistic early expiration**: refresh trước khi hết hạn.
+      - **TTL jitter**: chống nhiều key cùng hết hạn.
+      Với N pod, singleflight vẫn cho N query DB → hot key đắt cần thêm lock hoặc SWR.
+    followUp: With 50 pods and singleflight only, how many DB queries hit on a hot key expiry?
+    tags: [stampede]
+  - id: caching-017
+    level: medium
+    type: design
+    q: Implement request coalescing (singleflight) for cache misses in a Node.js service. What are the gotchas?
+    hint: |-
+      Dùng `Map<key, Promise>`: nếu đã có promise đang chạy thì `await` chung, xong thì **xoá khỏi map trong `finally`** (kể cả khi lỗi) để lỗi không bị cache vĩnh viễn.
+      Gotchas: chỉ dedupe **trong một process**; một request chậm làm tất cả chờ → cần timeout; lỗi lan ra mọi caller cùng lúc; key phải chứa đủ dimension (tenant) nếu không sẽ trả nhầm dữ liệu.
+    example: |-
+      ```ts
+      const inflight = new Map<string, Promise<unknown>>();
+      export function singleflight<T>(key: string, fn: () => Promise<T>): Promise<T> {
+        const existing = inflight.get(key);
+        if (existing) return existing as Promise<T>;
+        const p = fn().finally(() => inflight.delete(key));
+        inflight.set(key, p);
+        return p;
+      }
+      // usage: await singleflight(key, () => loadFromDbAndSet(key))
+      ```
+    followUp: How would you extend this across pods without a hard lock?
+    tags: [stampede, nodejs]
+  - id: caching-018
+    level: medium
+    type: scenario
+    q: You warm the cache on deploy with a 1-hour TTL for all keys. An hour later DB CPU spikes. Why, and how do you fix it?
+    hint: |-
+      Đây là **cache avalanche**: mọi key được set cùng thời điểm với cùng TTL → cùng hết hạn → DB nhận toàn bộ traffic.
+      Fix: **jitter** TTL (`base + random(0..20%)`), warm dần (rate limit warmer), stale-while-revalidate, refresh-ahead cho hot key, và giới hạn concurrency tới DB (bulkhead) để DB không sập khi miss hàng loạt.
+    example: |-
+      ```ts
+      const ttl = (base: number) => base + Math.floor(Math.random() * base * 0.2);
+      await redis.set(key, value, "EX", ttl(3600));
+      ```
+    followUp: Jitter spreads expiry, but what if Redis restarts and loses everything?
+    tags: [avalanche, ttl]
+  - id: caching-019
+    level: medium
+    type: design
+    q: Implement stale-while-revalidate at the application level on top of Redis. What do you store?
+    hint: |-
+      Lưu `{ value, softExpiresAt }` với **hard TTL** dài hơn (vd soft 60s, hard 600s).
+      Đọc: chưa quá soft → trả; quá soft nhưng còn hard → **trả stale ngay** + kích hoạt refresh nền (chỉ 1 lần: lock `SET NX` hoặc singleflight); hết hard → miss thật.
+      Ưu: latency ổn định, chống stampede. Nhược: người dùng thấy dữ liệu cũ tới soft+refresh time → không dùng cho giá/tồn kho khi checkout.
+    example: |-
+      ```ts
+      type Entry<T> = { v: T; softExp: number };
+      async function swr<T>(key: string, load: () => Promise<T>, softSec = 60, hardSec = 600) {
+        const raw = await redis.get(key);
+        if (raw) {
+          const e: Entry<T> = JSON.parse(raw);
+          if (Date.now() > e.softExp && (await redis.set(`${key}:lock`, "1", "PX", 10_000, "NX"))) {
+            void refresh(key, load, softSec, hardSec).catch(log.warn); // background, never awaited by user
+          }
+          return e.v;
+        }
+        return refresh(key, load, softSec, hardSec);
+      }
+      ```
+    followUp: How is this different from the HTTP `stale-while-revalidate` directive?
+    tags: [stampede, swr]
+  - id: caching-020
+    level: medium
+    type: compare
+    q: How do null caching and Bloom filters protect against cache penetration? What are their downsides?
+    hint: |-
+      - **Null caching**: miss ở DB thì cache một sentinel (`"__NULL__"`) với **TTL ngắn** (30–60s). Nhược: attacker dùng ID ngẫu nhiên → vẫn tốn memory mỗi ID; khi entity được tạo thì phải xoá sentinel.
+      - **Bloom filter**: tập các ID tồn tại; "không có" là chắc chắn không có, "có" có thể false positive. Chặn ID rác trước khi chạm cache/DB. Nhược: không xoá được phần tử (trừ counting/cuckoo filter), phải rebuild/đồng bộ khi thêm entity.
+      Luôn kèm: validate input (định dạng ID), rate limit theo IP/tenant.
+    followUp: A product is created right after its ID was null-cached. What does the user see, and how do you avoid it?
+    tags: [penetration, bloom-filter]
+  - id: caching-021
+    level: medium
+    type: compare
+    q: Compare Redis eviction policies. LRU vs LFU, `allkeys-*` vs `volatile-*` — which do you pick and why?
+    hint: |-
+      Policies: `noeviction` (default), `allkeys-lru`, `allkeys-lfu`, `allkeys-random`, `volatile-lru`, `volatile-lfu`, `volatile-random`, `volatile-ttl`.
+      - `allkeys-*`: đuổi bất kỳ key nào → hợp **cache thuần**.
+      - `volatile-*`: chỉ đuổi key có TTL → key không TTL (lock, config) an toàn; nhưng nếu không còn key có TTL thì hành xử như noeviction (lỗi OOM).
+      - LRU xấp xỉ (sampling `maxmemory-samples`); LFU (từ 4.0) giữ key phổ biến lâu dài tốt hơn khi có scan một lần làm "bẩn" LRU.
+      Tốt nhất: tách instance cho cache và cho dữ liệu cần giữ (session/lock/queue).
+    followUp: Your Redis holds both cache entries and BullMQ jobs. What goes wrong with `allkeys-lru`?
+    verify: true
+    tags: [redis, eviction]
+  - id: caching-022
+    level: medium
+    type: compare
+    q: RDB vs AOF persistence in Redis — how do they work and what do you choose for a cache vs a primary store?
+    hint: |-
+      - **RDB**: snapshot định kỳ bằng `fork()` + copy-on-write → file gọn, restart nhanh; mất dữ liệu từ lần snapshot cuối; fork trên dataset lớn gây latency spike và cần memory dư cho COW.
+      - **AOF**: log mọi write; `appendfsync always | everysec (default) | no`; everysec → mất tối đa ~1s; file lớn hơn, cần rewrite (từ 7.0 là multi-part AOF).
+      - Cache thuần: có thể tắt persistence (restart = cache lạnh → phải chịu được) hoặc chỉ RDB để warm nhanh.
+      - Dữ liệu cần giữ: AOF everysec + RDB, và vẫn nhớ replication là async → failover có thể mất write.
+    followUp: Why can a Redis replica failover lose acknowledged writes even with AOF on?
+    verify: true
+    tags: [redis, persistence]
+  - id: caching-023
+    level: medium
+    type: concept
+    q: How does Redis Cluster decide which node owns a key, and why do multi-key commands sometimes fail with CROSSSLOT?
+    hint: |-
+      16384 hash slot; `slot = CRC16(key) mod 16384`; mỗi master giữ một dải slot. Client nhận `MOVED` (slot đã chuyển hẳn) hoặc `ASK` (đang migrate) và cập nhật bảng slot.
+      Lệnh multi-key (MGET, MSET, Lua với nhiều key, MULTI) yêu cầu mọi key **cùng slot** → lỗi `CROSSSLOT`.
+      Giải pháp: **hash tag** — chỉ phần trong `{...}` được hash: `{cart:42}:items`, `{cart:42}:total`. Cẩn thận: hash tag theo tenant lớn dồn hết tenant đó vào 1 shard (hot shard).
+      Cluster chỉ dùng DB 0; pub/sub thường broadcast toàn cluster (sharded pub/sub từ 7.0).
+    followUp: Your Lua rate limiter touches two keys and breaks after moving to Cluster. Fix it.
+    tags: [redis, cluster]
+  - id: caching-024
+    level: medium
+    type: compare
+    q: Redis Pub/Sub vs Redis Streams — which would you use to broadcast cache invalidations, and which for a job queue?
+    hint: |-
+      - **Pub/Sub**: fire-and-forget, **at-most-once**; subscriber offline/đứt kết nối là **mất message**, không có lịch sử. Hợp broadcast invalidation L1 (mất một message → L1 TTL ngắn vẫn cứu).
+      - **Streams**: log bền (`XADD`), consumer group, `XACK`, pending list (`XPENDING`/`XCLAIM`/`XAUTOCLAIM`) → at-least-once, replay được. Hợp queue/event nhẹ.
+      Cả hai đều không thay Kafka khi cần retention dài, throughput cao, partition ordering, nhiều team.
+    followUp: A pod reconnects to Redis after a network blip. What invalidations did it miss, and how do you recover?
+    tags: [redis, pubsub, streams]
+  - id: caching-025
+    level: medium
+    type: concept
+    q: Why are Lua scripts (or Redis Functions) atomic, and when would you use them instead of MULTI/EXEC?
+    hint: |-
+      Redis thực thi command trên **một luồng** → script chạy từ đầu tới cuối không bị command khác chen vào.
+      `MULTI/EXEC` chỉ queue lệnh, **không thể đọc giá trị giữa chừng để rẽ nhánh** (phải kết hợp `WATCH` + retry optimistic). Lua cho phép read-modify-write có điều kiện trong một bước: rate limiter, compare-and-delete lock, set-if-newer-version.
+      Giá: script chạy lâu **block cả instance**; phải khai báo mọi key qua `KEYS[]` (để Cluster route đúng slot).
+    example: |-
+      ```ts
+      // set only if incoming version is newer (prevents stale overwrite)
+      const SET_IF_NEWER = `
+        local cur = redis.call('HGET', KEYS[1], 'ver')
+        if (not cur) or tonumber(ARGV[1]) > tonumber(cur) then
+          redis.call('HSET', KEYS[1], 'ver', ARGV[1], 'data', ARGV[2])
+          redis.call('EXPIRE', KEYS[1], ARGV[3])
+          return 1
+        end
+        return 0`;
+      await redis.eval(SET_IF_NEWER, 1, key, String(row.version), JSON.stringify(row), "300");
+      ```
+    followUp: What happens to other clients while a slow Lua script runs?
+    tags: [redis, lua, atomicity]
+  - id: caching-026
+    level: medium
+    type: concept
+    q: How do you implement a simple distributed lock with a single Redis instance correctly?
+    hint: |-
+      Acquire: `SET lock:<res> <random-token> NX PX <ttl>` — một lệnh atomic (không dùng `SETNX` + `EXPIRE` rời).
+      Release: Lua **compare-and-delete**: chỉ `DEL` nếu value = token của mình (tránh xoá lock người khác sau khi lock mình đã hết hạn).
+      TTL > thời gian xử lý tối đa; việc dài → gia hạn (watchdog). Hiểu rõ giới hạn: Redis failover (replication async) có thể làm 2 client cùng giữ lock → với tác vụ cần **correctness** phải có fencing token ở tài nguyên đích.
+    example: |-
+      ```ts
+      const token = crypto.randomUUID();
+      const ok = await redis.set("lock:rebuild:home", token, "PX", 10_000, "NX");
+      if (ok) {
+        try { await rebuild(); } finally {
+          await redis.eval(
+            "if redis.call('get',KEYS[1])==ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end",
+            1, "lock:rebuild:home", token);
+        }
+      }
+      ```
+    followUp: Is this lock safe to protect a payment from being executed twice?
+    tags: [redis, lock]
+  - id: caching-027
+    level: medium
+    type: concept
+    q: Explain HTTP validation caching with ETag and Last-Modified, and what `s-maxage` and `Vary` do.
+    hint: |-
+      - Server trả `ETag: "abc"` (hoặc `Last-Modified`); lần sau client gửi `If-None-Match: "abc"` → không đổi thì `304 Not Modified` không body → tiết kiệm bandwidth, **vẫn tốn round-trip**.
+      - `max-age` áp dụng cho mọi cache; `s-maxage` chỉ cho **shared cache** (CDN/proxy) và ưu tiên hơn `max-age` ở đó.
+      - `Vary: Accept-Encoding, Accept-Language` → các header này trở thành một phần của **cache key**. `Vary: Cookie`/`Authorization` thường làm hit ratio ~0 → tốt hơn là không cache ở CDN.
+      - `stale-while-revalidate`, `stale-if-error` (RFC 5861) cho phép trả bản cũ khi revalidate/khi origin lỗi.
+    followUp: How would you cache a product API at the CDN that returns different prices per tenant?
+    tags: [http, cdn]
+  - id: caching-028
+    level: medium
+    type: design
+    q: What goes into a good cache key? Show a naming scheme and explain versioning.
+    hint: |-
+      Key phải chứa **mọi dimension làm output khác nhau**: tenant, entity, id, locale, currency, role/segment, query params đã normalize (sort, lowercase).
+      Dạng: `<app>:<tenant>:<entity>:<id>:v<schemaVer>`. **Schema version** trong key cho phép deploy đổi shape JSON mà không đọc nhầm bản cũ (key cũ tự hết hạn).
+      Key dài vừa phải; hash (sha1) phần query phức tạp. Giữ prefix để quét/đo theo loại key (dùng `SCAN MATCH`, không `KEYS`).
+    example: |-
+      ```ts
+      const key = (t: string, id: string, locale: string) => `shop:${t}:product:${id}:${locale}:v3`;
+      // list with filters -> normalize then hash
+      const listKey = (t: string, q: Record<string, string>) =>
+        `shop:${t}:plp:${sha1(JSON.stringify(Object.entries(q).sort()))}:v3`;
+      ```
+    followUp: How do you invalidate all list/search keys that contain product 42?
+    tags: [keys, multi-tenant]
+  - id: caching-029
+    level: medium
+    type: design
+    q: Design a two-level cache (in-process L1 + Redis L2). How do you keep L1 from serving stale data for too long?
+    hint: |-
+      Đọc: L1 (LRU, TTL vài giây, giới hạn số entry) → L2 Redis → DB; set ngược lên.
+      Invalidation L1: (1) TTL rất ngắn (chấp nhận stale ≤ TTL), (2) broadcast qua Redis Pub/Sub khi write → mỗi pod xoá L1 (at-most-once nên vẫn cần TTL), (3) Redis **client-side caching** (RESP3 `CLIENT TRACKING`) để server push invalidation.
+      Chú ý memory heap Node (giới hạn size), serialize/clone để caller không mutate object dùng chung.
+    followUp: A caller mutates the object returned from L1. What bug appears?
+    tags: [multi-level, nodejs]
+  - id: caching-030
+    level: medium
+    type: concept
+    q: What is refresh-ahead, and when does it waste resources?
+    hint: |-
+      Refresh-ahead: khi key đã dùng quá một ngưỡng TTL (vd 80%) và có request đọc → refresh nền để key không bao giờ hết hạn với hot key.
+      Tốt cho hot key có pattern đọc đều và loader đắt. Lãng phí khi: dự đoán sai (refresh key không ai đọc nữa), số key lớn (refresh theo lịch = gánh DB liên tục), dữ liệu đổi hiếm (TTL dài + invalidate là đủ).
+      Lưu ý: refresh-ahead **không** làm dữ liệu "strong consistent" — vẫn stale giữa các lần refresh.
+    followUp: How is probabilistic early expiration better than a fixed 80% threshold?
+    redFlags:
+      - "Claims refresh-ahead gives strong consistency"
+    tags: [patterns, refresh-ahead]
+  - id: caching-031
+    level: medium
+    type: gotcha
+    q: Why is Redis fast despite executing commands on a single thread, and what does that imply for how you use it?
+    hint: |-
+      Data trong RAM, cấu trúc dữ liệu tối ưu, I/O multiplexing (epoll), không lock; từ 6.0 có I/O threads cho đọc/ghi socket nhưng **thực thi command vẫn tuần tự**.
+      Hệ quả: một command O(N) lớn (`KEYS *`, `HGETALL` hash triệu field, `DEL` big key, `SMEMBERS`, Lua dài) **block mọi client**. Dùng `SCAN`/`HSCAN`, `UNLINK` (xoá nền), giới hạn size value, pipeline để giảm RTT.
+      Scale CPU bằng nhiều shard (Cluster) chứ không bằng core.
+    followUp: How do you find which commands are causing latency spikes? (SLOWLOG, LATENCY DOCTOR)
+    tags: [redis, performance]
+  - id: caching-032
+    level: medium
+    type: design
+    q: How should a Node.js service behave when Redis is slow or unavailable?
+    hint: |-
+      - **Timeout ngắn** cho lệnh cache (vd 50–100ms), tách khỏi timeout tổng; không để `ioredis` queue lệnh vô hạn (`maxRetriesPerRequest`, `enableOfflineQueue` tuỳ trường hợp).
+      - **Fail-open** cho cache đọc: lỗi cache → đọc DB; nhưng DB phải được bảo vệ (bulkhead/concurrency limit, rate limit) vì 100% traffic sẽ đổ vào.
+      - **Circuit breaker** quanh Redis để không tốn thời gian chờ khi nó chết.
+      - Với dữ liệu mà Redis là source (lock, rate limit, session) → quyết định fail-open hay fail-closed theo rủi ro business.
+    followUp: Rate limiter is backed by Redis and Redis is down. Fail open or closed? Justify.
+    tags: [resilience, nodejs, redis]
+  - id: caching-033
+    level: hard
+    type: scenario
+    q: "In production, a hot key (the home page payload) expires and DB CPU jumps to 100% within seconds. Walk me through mitigation now and a permanent fix."
+    hint: |-
+      Ngay lúc đó: set lại key thủ công/tăng TTL, bật rate limit hoặc load shedding cho endpoint, scale read replica nếu có.
+      Gốc rễ: stampede — N pod × M request cùng miss cùng query.
+      Fix lâu dài: singleflight trong process + lock phân tán hoặc **stale-while-revalidate** (không bao giờ để hot key "trống"), refresh-ahead/XFetch, L1 cache vài giây, TTL jitter, giới hạn concurrency query nặng ở DB layer. Thêm alert theo miss rate của key nhóm hot.
+    followUp: The rebuild query takes 8 seconds. How does that change your lock TTL and waiting strategy?
+    redFlags:
+      - "Just increase TTL"
+      - "Add more DB replicas as the only fix"
+    tags: [stampede, hot-key, incident]
+  - id: caching-034
+    level: hard
+    type: scenario
+    q: A single Redis key receives around 150k reads per second and saturates one shard's CPU and network. How do you handle a hot key?
+    hint: |-
+      - **L1 in-process cache** (TTL 1–5s) → phần lớn đọc không tới Redis.
+      - **Nhân bản key**: `k#0..k#N-1`, đọc ngẫu nhiên một bản, ghi/invalidate tất cả (các bản rơi vào slot khác nhau).
+      - **Client-side caching** (RESP3 tracking) cho key ít đổi.
+      - Thêm **read replicas** và đọc từ replica (chấp nhận lag).
+      - Giảm payload (nén, chỉ field cần), hoặc đẩy lên CDN nếu là public content.
+      Phát hiện: `redis-cli --hotkeys` (cần policy LFU), metrics theo prefix ở client, `MONITOR` chỉ ngắn hạn (rất tốn).
+    followUp: How do you invalidate N replicated copies consistently?
+    verify: true
+    tags: [hot-key, redis]
+  - id: caching-035
+    level: hard
+    type: scenario
+    q: "Latency spikes appear every few minutes across all Redis clients. You find a 1.5 GB hash key. Why does a big key hurt, and how do you fix it safely?"
+    hint: |-
+      Big key gây: lệnh O(N) (`HGETALL`, `DEL`) block single thread; network transfer lớn; migrate slot trong Cluster chậm/timeout; expire/evict big key cũng block (nếu không lazyfree); memory lệch giữa shard.
+      Phát hiện: `redis-cli --bigkeys`/`--memkeys`, `MEMORY USAGE key`, slowlog.
+      Fix: chia nhỏ (bucket theo hash id: `k:{0..255}`), `HSCAN` thay `HGETALL`, xoá bằng `UNLINK` hoặc xoá dần bằng HSCAN + HDEL; bật `lazyfree-lazy-eviction`, `lazyfree-lazy-expire`.
+    followUp: Why can expiring that big key cause a spike even if no client touches it?
+    verify: true
+    tags: [big-key, redis, incident]
+  - id: caching-036
+    level: hard
+    type: scenario
+    q: Your Redis cluster goes down completely during peak traffic. What happens to your system, and what should have been in place?
+    hint: |-
+      Nếu fail-open: 100% đọc đổ vào DB → DB quá tải → **cascading failure** (API timeout → client retry → càng tệ). Nếu không timeout: mọi request treo chờ Redis.
+      Cần có: timeout + circuit breaker quanh Redis; bulkhead/concurrency limit và load shedding trước DB; L1 cache giữ hot data; degrade tính năng (ẩn recommendation, trả trang tĩnh); HA (replica + Sentinel/Cluster/managed Multi-AZ); cache warm có kiểm soát khi Redis quay lại (tránh stampede thứ hai).
+      Capacity planning: DB phải chịu được ít nhất traffic "cache lạnh" trong một khoảng ngắn, hoặc phải có chiến lược shedding rõ.
+    followUp: How would you load-test this failure mode before it happens?
+    tags: [resilience, incident]
+  - id: caching-037
+    level: hard
+    type: debug
+    q: This cache-aside helper causes intermittent empty product pages that persist for five minutes. Find the bugs.
+    example: |-
+      ```ts
+      async function getProducts(tenantId: string, category: string) {
+        const key = `products:${category}`;
+        const hit = await redis.get(key);
+        if (hit !== null) return JSON.parse(hit);
+        let rows: Product[] = [];
+        try {
+          rows = await withTimeout(db.products.find({ tenantId, category }), 500);
+        } catch (e) {
+          log.warn("db slow", e);
+        }
+        await redis.set(key, JSON.stringify(rows), "EX", 300);
+        return rows;
+      }
+      ```
+    hint: |-
+      1. Timeout/lỗi DB → `rows = []` vẫn được **cache 5 phút** → trang rỗng kéo dài. Không cache kết quả lỗi; nếu muốn negative cache thì TTL rất ngắn và chỉ khi DB trả rỗng thật.
+      2. Key **thiếu `tenantId`** → tenant A thấy sản phẩm của tenant B (data leak).
+      3. Không TTL jitter, không singleflight → stampede khi hết hạn.
+      4. Không version trong key → đổi shape `Product` khi deploy sẽ đọc JSON cũ.
+    followUp: How would you write a test that catches the cross-tenant bug?
+    tags: [debug, multi-tenant, cache-aside]
+  - id: caching-038
+    level: hard
+    type: debug
+    q: Two workers sometimes run the same nightly job at the same time despite this lock. Why?
+    example: |-
+      ```ts
+      async function runExclusive(job: () => Promise<void>) {
+        const acquired = await redis.setnx("lock:nightly", "1");
+        if (!acquired) return;
+        await redis.expire("lock:nightly", 60);
+        try {
+          await job(); // sometimes takes 3 minutes
+        } finally {
+          await redis.del("lock:nightly");
+        }
+      }
+      ```
+    hint: |-
+      - `SETNX` rồi `EXPIRE` là **2 lệnh** → crash giữa hai lệnh để lại lock không TTL (deadlock vĩnh viễn). Dùng `SET key token NX PX ttl`.
+      - TTL 60s < job 3 phút → lock hết hạn, worker B lấy lock, chạy song song.
+      - `DEL` không kiểm tra owner → A xoá luôn lock **của B**, worker C lại vào.
+      Fix: token ngẫu nhiên + compare-and-delete bằng Lua, TTL > thời gian tối đa hoặc watchdog gia hạn, và job idempotent/fencing token nếu trùng là nguy hiểm.
+    followUp: The job writes to a database. How does a fencing token make double execution safe?
+    tags: [debug, lock, redis]
+  - id: caching-039
+    level: hard
+    type: gotcha
+    q: What is Redlock, and why do Martin Kleppmann and others argue it is unsafe for correctness-critical locking?
+    hint: |-
+      Redlock: lấy lock trên N (vd 5) Redis master độc lập; thành công nếu đạt **đa số** trong thời gian < TTL.
+      Phê bình (Kleppmann 2016): (1) process pause (GC, swap), network delay có thể làm client tưởng còn giữ lock khi lock đã hết hạn; (2) phụ thuộc giả định về thời gian/clock (Redis dùng wall clock cho TTL — clock jump làm lock hết hạn sớm); (3) không cung cấp **fencing token** tăng đơn điệu.
+      Kết luận thực dụng: lock Redis ổn cho **efficiency** (tránh làm trùng việc); cho **correctness** dùng hệ có consensus (etcd/ZooKeeper) + fencing token, hoặc ràng buộc ở DB (unique constraint, optimistic version).
+    followUp: How does a fencing token actually get checked by the storage layer?
+    verify: true
+    tags: [lock, redlock, distributed]
+  - id: caching-040
+    level: hard
+    type: concept
+    q: Explain probabilistic early expiration (XFetch). Why does it prevent stampedes without locks?
+    hint: |-
+      Mỗi request tự quyết định **refresh sớm** với xác suất tăng dần khi gần hết hạn: refresh nếu `now - delta * beta * ln(rand()) >= expiry` (delta = thời gian tính lại lần trước, beta ≥ 1, `ln(rand())` âm).
+      Kết quả: gần hết hạn chỉ vài request "trúng" và refresh, không có thời điểm cả đàn cùng miss. Loader đắt (delta lớn) sẽ refresh sớm hơn.
+      Không cần lock → không có single point; đổi lại có thể vài refresh trùng.
+    example: |-
+      ```ts
+      function shouldRefresh(expiresAtMs: number, deltaMs: number, beta = 1) {
+        return Date.now() - deltaMs * beta * Math.log(Math.random()) >= expiresAtMs;
+      }
+      ```
+    followUp: What do you need to store alongside the value for this to work?
+    tags: [stampede, xfetch]
+  - id: caching-041
+    level: hard
+    type: design
+    q: Several services and batch scripts write to the same tables. Application-level cache invalidation keeps missing writes. What is a more robust approach?
+    hint: |-
+      Invalidate dựa trên **change data capture**: đọc transaction log (Postgres WAL logical decoding, MySQL binlog, SQL Server CDC/Change Tracking) qua Debezium → Kafka → invalidation consumer `DEL`/update key.
+      Ưu: bắt **mọi** đường ghi (script, migration, service khác), đúng thứ tự commit. Nhược: thêm pipeline cần vận hành, có độ trễ (thường giây), phải map row → các cache key (kể cả list/aggregate).
+      Kết hợp TTL làm lưới an toàn, và metric "invalidation lag".
+    followUp: A single row change should invalidate 30 list keys. How do you map it without scanning keys?
+    tags: [invalidation, cdc]
+  - id: caching-042
+    level: hard
+    type: scenario
+    q: After adding a read replica, users occasionally see old data for minutes even though you delete cache keys on write. What is going on?
+    hint: |-
+      Write vào primary → DEL cache → request tiếp theo miss → đọc **replica đang lag** → set lại bản cũ vào cache với TTL đầy đủ → stale kéo dài bằng TTL, không chỉ bằng replication lag.
+      Fix: khi repopulate cache ngay sau write, đọc từ **primary**; hoặc delayed double delete lớn hơn lag; hoặc set cache từ writer (dữ liệu vừa commit) với version check; theo dõi replica lag và ngừng đọc replica khi lag vượt ngưỡng.
+    followUp: How does read-your-writes consistency relate to this bug?
+    tags: [consistency, replication]
+  - id: caching-043
+    level: hard
+    type: scenario
+    q: "Your Node service starts throwing `OOM command not allowed when used memory > 'maxmemory'` from Redis. Diagnose."
+    hint: |-
+      Policy đang là `noeviction` (default) và memory đầy → mọi write bị từ chối (đọc vẫn chạy).
+      Kiểm tra: `INFO memory` (`used_memory`, `maxmemory`, fragmentation), `INFO keyspace` (key không TTL?), `--bigkeys`, prefix nào tăng. Nguyên nhân thường: key không TTL, key cardinality bùng nổ (cache theo query tự do), queue/stream không trim.
+      Fix ngắn: tăng memory/xoá prefix bằng SCAN + UNLINK. Dài: TTL bắt buộc, policy phù hợp (`allkeys-lru` cho cache), tách instance cho dữ liệu không được evict, alert ở 75–80% memory.
+    followUp: Why is `used_memory_rss` much larger than `used_memory`, and what can you do?
+    tags: [redis, incident, eviction]
+  - id: caching-044
+    level: hard
+    type: scenario
+    q: You implemented write-behind for view counters. After a Redis failover, a day of counts partly disappears. Explain and redesign.
+    hint: |-
+      Write-behind giữ dữ liệu chỉ trong Redis tới khi flush; Redis replication **async** → failover promote replica thiếu các write gần nhất; nếu instance chết trước flush thì mất phần chưa flush.
+      Redesign: chấp nhận xấp xỉ và nói rõ SLA; hoặc ghi event bền (Kafka/Stream với ack) rồi aggregate; flush thường xuyên với `GETDEL`/`INCRBY` âm atomic; idempotent flush (ghi theo cửa sổ thời gian + key cửa sổ) để retry không đếm đôi. `WAIT` chỉ tăng xác suất, không đảm bảo.
+    followUp: How do you make the flush idempotent so a retry does not double-count?
+    tags: [write-behind, durability]
+  - id: caching-045
+    level: hard
+    type: scenario
+    q: After each deployment, response times are terrible for 10 minutes. You suspect a cold cache. How do you confirm and fix it?
+    hint: |-
+      Xác nhận: miss rate tăng vọt sau deploy, DB QPS tăng, L1 in-process trống (pod mới), hoặc key đổi version (`:v3` → `:v4`) làm mọi key mới đều miss.
+      Fix: rolling deploy chậm (pod mới vào dần), warm hot key trước khi nhận traffic (readiness chờ warm top-N), không bump schema version trừ khi cần (hoặc đọc fallback key cũ rồi migrate), SWR, giới hạn concurrency tới DB.
+    followUp: How do you pick which keys to warm?
+    tags: [warmup, deploy]
+  - id: caching-046
+    level: hard
+    type: scenario
+    q: Users see an old JavaScript bundle and a broken page right after a frontend deploy behind a CDN. What went wrong, and what is the right caching strategy for static assets vs HTML?
+    hint: |-
+      HTML bị cache lâu ở CDN/browser trỏ tới bundle cũ, hoặc bundle tên cố định (`main.js`) bị cache → HTML mới + JS cũ lệch nhau.
+      Chuẩn: asset có **content hash** trong tên (`main.3f9a1c.js`) + `Cache-Control: public, max-age=31536000, immutable`; HTML `no-cache` (hoặc max-age ngắn + revalidate); giữ asset cũ vài bản để client đang mở trang không 404; purge CDN cho HTML khi deploy.
+    followUp: Why keep old hashed assets available after the deploy?
+    tags: [http, cdn, deploy]
+  - id: caching-047
+    level: hard
+    type: debug
+    q: A product API is placed behind a CDN. Shortly after, some users see another tenant's prices. Find the problem.
+    example: |-
+      ```ts
+      app.get("/api/products/:id", auth, async (req, res) => {
+        const p = await getProductWithPrice(req.tenantId, req.params.id);
+        res.set("Cache-Control", "public, max-age=300");
+        res.json(p);
+      });
+      // tenant resolved from Authorization header / subdomain cookie
+      ```
+    hint: |-
+      `public, max-age=300` cho phép CDN cache; cache key của CDN mặc định là URL (+ host) — **không có tenant** (tenant nằm trong header/cookie) → response của tenant đầu tiên được trả cho mọi người.
+      Fix: response có Authorization/giá theo tenant → `private` hoặc `no-store`; nếu muốn cache ở edge thì tenant phải nằm trong URL/host hoặc được đưa vào cache key (cache policy của CDN) và **tách phần giá** khỏi phần catalog công khai. Kiểm tra CDN có mặc định bỏ qua cache khi có `Authorization` hay không (tuỳ provider).
+    followUp: How would you split a product response into a cacheable part and a per-tenant part?
+    verify: true
+    tags: [debug, cdn, multi-tenant, security]
+  - id: caching-048
+    level: hard
+    type: debug
+    q: This cleanup endpoint made Redis unresponsive for several seconds in production. What is wrong?
+    example: |-
+      ```ts
+      app.post("/admin/cache/flush-tenant/:t", async (req, res) => {
+        const keys = await redis.keys(`shop:${req.params.t}:*`);
+        if (keys.length) await redis.del(...keys);
+        res.sendStatus(204);
+      });
+      ```
+    hint: |-
+      - `KEYS` là O(N) trên **toàn bộ keyspace** và block single thread → mọi client khác bị treo.
+      - `DEL` hàng trăm nghìn key trong một lệnh (và có thể có big key) cũng block; spread args lớn có thể vượt giới hạn call stack của Node.
+      - Trong Cluster, `KEYS` chỉ chạy trên node đang kết nối và DEL multi-key khác slot sẽ lỗi CROSSSLOT.
+      Fix: `SCAN` với `MATCH` + `COUNT` theo batch, `UNLINK` theo batch nhỏ, chạy trên từng master; tốt hơn: **namespace version** (`shop:acme:v17:*` → tăng version là "xoá" logic, key cũ tự hết TTL).
+    followUp: Explain the namespace-version trick and its memory cost.
+    tags: [debug, redis]
+  - id: caching-049
+    level: senior
+    type: design
+    q: Design caching for a multi-tenant product catalog where each tenant has its own prices, promotions and visibility rules.
+    hint: |-
+      Tách theo **mức chia sẻ**: dữ liệu sản phẩm chung (mô tả, ảnh) cache theo product id (có thể CDN); **giá/khuyến mãi/visibility** cache theo `tenant` (và segment/currency) với TTL ngắn hơn; ghép ở API/BFF.
+      Key luôn có tenant; test tự động chống leak. Invalidation theo event (price-changed, promo-started) + TTL; promotion có giờ bắt đầu → pre-compute trước, TTL căn theo thời điểm hiệu lực.
+      Giới hạn memory theo tenant (tenant lớn không đẩy tenant nhỏ ra ngoài — noisy neighbor), đo hit ratio theo tenant.
+      Checkout luôn tính giá từ source of truth.
+    followUp: One large tenant causes most evictions. How do you isolate it?
+    tags: [design, multi-tenant]
+  - id: caching-050
+    level: senior
+    type: open
+    q: How do you decide how stale each kind of data is allowed to be? Who is involved in that decision?
+    hint: |-
+      Phân loại dữ liệu theo tác động khi sai: tiền/tồn kho/quyền (không cache để quyết định), hiển thị giá (giây–phút), nội dung (phút–giờ), cấu hình (giờ + invalidate chủ động).
+      Hỏi product/business: "user thấy giá cũ 60s có sao không?" — biến thành **staleness budget** có tài liệu, không phải số dev tự chọn.
+      Mỗi loại có: TTL, cơ chế invalidation, hành vi khi cache chết, metric theo dõi. Review lại khi incident.
+    followUp: Give an example where you pushed back on a caching request from product.
+    tags: [design, consistency]
+  - id: caching-051
+    level: senior
+    type: design
+    q: A flash sale will send 50x normal traffic to a few product pages and their stock count. Design the caching and inventory protection.
+    hint: |-
+      - Trang sản phẩm: CDN + SWR, L1 cache, pre-warm trước giờ G, không để key hết hạn trong sự kiện.
+      - Stock **hiển thị**: cache xấp xỉ vài giây ("còn ít hàng").
+      - Stock **thật**: giảm atomic ở một nơi — Redis `DECR`/Lua kiểm tra ≥ 0 làm cổng đặt chỗ (reservation) rồi ghi DB bất đồng bộ/đối soát, hoặc DB với `UPDATE ... WHERE stock > 0`. Phải có reconciliation vì Redis có thể mất write khi failover.
+      - Hàng đợi/waiting room, rate limit theo user, idempotency key cho order.
+    followUp: Redis says 0 left but the DB still has 3 units after reconciliation. What happened and how do you release them?
+    tags: [design, flash-sale]
+  - id: caching-052
+    level: senior
+    type: open
+    q: How do you prove a cache is worth its cost, and when would you remove one?
+    hint: |-
+      Đo trước/sau: DB QPS/CPU, p95/p99 latency, hit ratio theo loại key, chi phí instance, số incident do stale data, độ phức tạp (số đường invalidation).
+      Gỡ cache khi: hit ratio thấp, DB đã đủ nhanh (index/materialized view tốt hơn), stale data gây bug nhiều hơn lợi ích, hoặc cache che giấu query tệ.
+      Senior answer: "cache là tối ưu cuối cùng — trước đó xem query plan, index, N+1, payload".
+    followUp: What would you try before introducing a cache for a slow endpoint?
+    tags: [open, observability]
+  - id: caching-053
+    level: senior
+    type: compare
+    q: Redis Sentinel vs Redis Cluster vs a managed service (ElastiCache/MemoryDB/Valkey). How do you choose for a mid-sized team?
+    hint: |-
+      - **Sentinel**: 1 master + replicas + failover tự động; dữ liệu không shard (giới hạn bởi 1 máy); client phải hỗ trợ Sentinel.
+      - **Cluster**: shard theo slot + failover mỗi shard; scale memory/CPU ngang; đổi lại hạn chế multi-key (CROSSSLOT), client phức tạp hơn.
+      - **Managed**: đỡ vận hành (patch, failover, backup, Multi-AZ); cân nhắc giá, giới hạn command/config, lock-in. Valkey (fork BSD của Redis 7.2 do Linux Foundation quản lý) là lựa chọn phổ biến trên managed cloud sau thay đổi license.
+      Team nhỏ-vừa: managed + chế độ cluster khi dữ liệu vượt 1 node.
+    followUp: What client-side changes are needed when moving from a single instance to Cluster mode?
+    verify: true
+    tags: [redis, operations]
+  - id: caching-054
+    level: senior
+    type: open
+    q: Someone proposes using Redis as the primary database for user carts and sessions. What questions do you ask?
+    hint: |-
+      - Chấp nhận mất bao nhiêu dữ liệu? (AOF everysec ~1s, replication async → failover mất write).
+      - Dữ liệu có vừa RAM (và giá RAM) không? Tăng trưởng thế nào?
+      - Truy vấn cần gì: chỉ theo key hay cần query/secondary index/report?
+      - Backup/restore, TTL cho giỏ bỏ quên, eviction phải là `noeviction`/instance riêng.
+      Session/cart là use case hợp lý nếu mất vài giây là chấp nhận được; đơn hàng/thanh toán thì không.
+    followUp: What eviction policy must a Redis holding sessions use, and why?
+    tags: [redis, design]
+  - id: caching-055
+    level: senior
+    type: design
+    q: Design cache invalidation for search listing pages (filters, sorting, pagination) where any product change can affect many pages.
+    hint: |-
+      Không cố invalidate chính xác từng page: số tổ hợp filter gần như vô hạn.
+      Lựa chọn: TTL ngắn + SWR cho listing; **namespace version** theo tenant/category (`plp:acme:cat12:v{n}` → product đổi category 12 thì tăng n); tag-based invalidation (Set lưu key thuộc tag, cẩn thận big key); hoặc để listing đọc thẳng Elasticsearch (đã là "cache" có index) và chỉ cache trang đầu phổ biến.
+      Nêu rõ trade-off: độ tươi vs hit ratio vs độ phức tạp.
+    followUp: What are the memory and cleanup costs of tag-based invalidation in Redis?
+    tags: [invalidation, design, search]
+  - id: caching-056
+    level: cv
+    type: behavioral
+    q: On a multi-tenant e-commerce platform you introduced Redis caching for frequently accessed APIs to reduce database load. How did you choose which endpoints to cache, and how did you measure the result?
+    hint: |-
+      Câu trả lời mạnh có: (1) dữ liệu đo trước — endpoint nào top QPS/latency/DB time (APM, slow query log, SQL Server Query Store), (2) tiêu chí chọn: đọc nhiều, đổi ít, chịu được stale, (3) pattern + TTL + invalidation cho từng loại, (4) kết quả: DB CPU/QPS, p95 latency, hit ratio **(điền số liệu thật của bạn)**, (5) điều đã học (vd một endpoint bị stale gây bug, đã sửa thế nào).
+      Nếu không có số đo trước/sau, nói thật và nêu cách lẽ ra nên đo.
+    followUp: Which endpoint did you decide NOT to cache, and why?
+    redFlags:
+      - "We cached everything that was slow"
+      - "Invents precise numbers they cannot explain"
+    tags: [cv, redis]
+  - id: caching-057
+    level: cv
+    type: design
+    q: Your platform served many tenants from shared infrastructure. How did you make the Redis cache tenant-aware, and how did you guarantee one tenant could never read another tenant's cached data?
+    hint: |-
+      Nội dung mong đợi: tenant id lấy từ context đã xác thực (không từ query param), **helper tạo key tập trung** (không nối chuỗi tay khắp nơi), prefix `t:{tenantId}:...`, test/lint chống key không có tenant, review các endpoint dùng dữ liệu chung vs theo tenant.
+      Nâng cao: giới hạn memory/rate theo tenant (noisy neighbor), xoá toàn bộ cache một tenant (namespace version), log/metrics theo tenant. **(điền cách làm thật của bạn)**
+    followUp: A shared product is visible to some tenants only. Which part goes in the key?
+    tags: [cv, multi-tenant]
+  - id: caching-058
+    level: cv
+    type: scenario
+    q: Product data in your platform was updated by a Data Enrichment Service syncing from external providers, not only by user edits. How did cached product data stay fresh after a sync?
+    hint: |-
+      Nêu rõ luồng thật: sync ghi DB → phát event/hook → invalidate (DEL/namespace version) các key liên quan + indexer cập nhật Elasticsearch; hoặc dựa vào TTL nếu chấp nhận được.
+      Vấn đề cần nói: sync hàng loạt (hàng nghìn sản phẩm) → invalidate theo batch, tránh stampede khi tất cả miss cùng lúc (warm dần, SWR); thứ tự update (dùng version/updatedAt); retry khi invalidate lỗi. **(điền kiến trúc và số lượng thật của bạn)**
+    followUp: A sync updates 100k products at once. What happens to your cache and DB, and how would you smooth it?
+    tags: [cv, invalidation]
+  - id: caching-059
+    level: cv
+    type: behavioral
+    q: In the back-office migration you used Memcached with TTL plus refresh, which significantly reduced DB load. How did the refresh work, and why Memcached rather than Redis there?
+    hint: |-
+      Giải thích cụ thể cơ chế refresh: refresh-ahead theo ngưỡng TTL, job định kỳ, hay refresh khi miss với lock (Memcached có `add` atomic dùng làm lock đơn giản).
+      Lý do chọn Memcached: đã có sẵn trong hạ tầng, chỉ cần cache blob, multi-thread, ops đơn giản — hoặc lý do thật khác. Nói giới hạn: không persistence, không data structure, item size giới hạn (mặc định 1MB).
+      Kết quả **(điền số liệu thật của bạn)** và cách đo.
+    followUp: How did you avoid a stampede when a popular Memcached item expired?
+    verify: true
+    tags: [cv, memcached]
+  - id: caching-060
+    level: cv
+    type: scenario
+    q: During the monolith-to-microservices migration, both the legacy system and new services could change the same data. How did you keep caches consistent across both sides?
+    hint: |-
+      Điểm mạnh cần có: xác định **ai là owner** của mỗi dữ liệu trong từng giai đoạn; mọi write (cũ lẫn mới) phát event hoặc được CDC bắt → invalidate chung; TTL ngắn hơn trong giai đoạn chuyển tiếp; key/format cache có version để hai phía không đọc nhầm shape của nhau.
+      Nói thật về trade-off đã chấp nhận (stale bao lâu) và sự cố nếu có. **(điền chi tiết thật của bạn)**
+    followUp: What would you do differently if you ran that migration again?
+    tags: [cv, migration, invalidation]
+  - id: caching-061
+    level: cv
+    type: compare
+    q: You had both Redis and Elasticsearch in front of SQL Server. Which queries went to which, and how did you handle stale search results after product updates?
+    hint: |-
+      Redis: lookup theo key (chi tiết sản phẩm, config tenant, session). Elasticsearch: full-text, filter/facet, sort — là **read model** được indexer cập nhật bất đồng bộ (near real-time, refresh interval mặc định 1s khi index có traffic tìm kiếm).
+      Stale: nêu độ trễ indexer, xử lý update đến sai thứ tự (external version / updatedAt), reindex khi mapping đổi (alias swap), và nơi nào phải đọc từ DB (checkout). **(điền số liệu/độ trễ thật của bạn)**
+    followUp: A product update event arrives before the create event at the indexer. What happens?
+    verify: true
+    tags: [cv, elasticsearch]
+  - id: caching-062
+    level: cv
+    type: behavioral
+    q: Tell me about a production bug caused by caching that you investigated. How did you find the root cause and what did you change?
+    hint: |-
+      STAR: Situation (triệu chứng user thấy), Task, Action (cách khoanh vùng: so sánh cache vs DB, log key, TTL còn lại `TTL key`, tái hiện race), Result (fix + test + metric/alert mới).
+      Loại bug hay gặp để gợi nhớ: cache lỗi/rỗng, key thiếu dimension, stale sau write qua đường khác, stampede khi deploy, serialize Date thành string.
+      Reflection: thay đổi quy trình (helper key chung, checklist invalidation). **(điền câu chuyện thật của bạn)**
+    followUp: What monitoring would have caught it before users did?
+    tags: [cv, behavioral, incident]

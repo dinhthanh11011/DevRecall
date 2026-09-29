@@ -1,0 +1,876 @@
+id: 17-messaging-kafka
+slug: messaging-kafka
+title: Messaging & Kafka
+tier: 5
+status: drafted
+summary: Partitions, consumer groups, ordering, delivery semantics, idempotency, outbox/CDC, DLQ, consumer lag, schema evolution, Kafka vs RabbitMQ/SQS, Node consumer pitfalls, Socket.IO scaling.
+cvLinked: true
+overview: |-
+  ## TL;DR
+
+  - Kafka là **distributed, partitioned, replicated commit log**: message không bị xoá khi đọc; consumer tự quản **offset**. Khác hẳn queue truyền thống (RabbitMQ/SQS) nơi broker xoá message sau khi ack.
+  - Thứ tự chỉ được đảm bảo **trong một partition**; key quyết định partition → chọn key = chọn đơn vị ordering và đơn vị song song.
+  - Delivery thực tế là **at-least-once** + **idempotent consumer**. "Exactly-once" của Kafka (idempotent producer + transactions) chỉ áp dụng trong phạm vi *Kafka → Kafka*; side effect ra ngoài (DB, email, HTTP) cần idempotency riêng.
+  - Bài toán senior hay hỏi: **dual write** (DB + publish) → **transactional outbox**/CDC; poison pill → retry topic + DLQ; consumer lag; rebalance storm; schema evolution.
+  - Kafka **4.0 (2025) bỏ hẳn ZooKeeper** — cluster chạy **KRaft**; consumer rebalance protocol mới (KIP-848) GA ở 4.0; **share groups** (queue semantics, KIP-932) production-ready ở 4.2 — kiểm tra lại theo version bạn chạy.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Topic / partition | Topic chia thành partition; mỗi partition là log append-only có thứ tự | `orders` có 12 partition |
+  | Offset | Vị trí record trong partition; consumer group commit offset đã xử lý | Group `billing` ở offset 1042 của p3 |
+  | Key → partition | Default partitioner: `murmur2(key) % numPartitions`; key null → sticky partitioner | key = `orderId` giữ thứ tự của 1 đơn |
+  | Consumer group | Mỗi partition gán cho **đúng 1** consumer trong group | 12 partition, 4 consumer → mỗi con 3 |
+  | Replication / ISR | Mỗi partition có leader + follower; ISR = replica bắt kịp leader | RF=3, ISR={1,2,3} |
+  | `acks` | Producer chờ bao nhiêu replica xác nhận: `0`, `1`, `all` | `acks=all` + `min.insync.replicas=2` |
+  | Idempotent producer | Broker dedupe retry bằng producer id + sequence number | Mặc định bật từ Kafka 3.0 |
+  | Transactions | Ghi nhiều partition + commit offset **atomic** | read-process-write exactly-once |
+  | Consumer lag | Log-end offset − committed offset | Lag 2M trên p7 → consumer chậm/kẹt |
+  | Log compaction | Giữ bản ghi **mới nhất theo key**; value null = tombstone | Topic `customer-state` |
+  | Outbox | Ghi event vào bảng outbox **cùng transaction** với business data | `orders` + `outbox` trong 1 tx |
+  | DLQ | Nơi đậu message xử lý thất bại sau N lần | `orders.dlq` |
+
+  ## Cơ chế hoạt động
+
+  ### Produce → replicate → consume
+
+  ```mermaid
+  sequenceDiagram
+    participant P as Producer
+    participant L as Leader (p3)
+    participant F as Followers (ISR)
+    participant C as Consumer (group billing)
+    P->>L: ProduceRequest(key=order-42, acks=all, pid, seq)
+    L->>F: followers fetch
+    F-->>L: caught up (high watermark advances)
+    L-->>P: ack (offset 1043)
+    C->>L: Fetch from committed offset
+    L-->>C: records up to high watermark
+    C->>C: process (idempotent)
+    C->>L: commit offset 1044 (next to read)
+  ```
+
+  ### Transactional outbox + CDC
+
+  ```mermaid
+  flowchart LR
+    API["Order service"] -->|"BEGIN; INSERT order; INSERT outbox; COMMIT"| DB[("DB")]
+    DB -->|"WAL / binlog / CDC"| DBZ["Debezium or polling relay"]
+    DBZ --> K["Kafka topic orders"]
+    K --> S1["Billing consumer<br/>(dedupe by event_id)"]
+    K --> S2["Indexer consumer"]
+    S1 -->|"fail N times"| DLQ["orders.dlq"]
+  ```
+
+  ### Rebalance (classic protocol)
+
+  - **Eager**: mọi consumer revoke hết partition → stop-the-world → assign lại.
+  - **Cooperative (incremental)**: chỉ revoke partition cần chuyển; consumer khác tiếp tục xử lý.
+  - **KIP-848 (`group.protocol=consumer`)**: broker (group coordinator) tính assignment, rebalance incremental, không còn barrier đồng bộ toàn group.
+
+  ## Trade-offs
+
+  | | Kafka | RabbitMQ | SQS (+SNS) |
+  |---|---|---|---|
+  | Mô hình | Log bền, consumer kéo (pull) theo offset | Broker định tuyến (exchange → queue), push + ack | Queue managed, pull, visibility timeout |
+  | Replay | Có (theo retention/compaction) | Không với classic queue (Streams thì có) | Không (trừ tính năng redrive DLQ) |
+  | Ordering | Theo partition | Theo queue (1 consumer) | Standard: best-effort; FIFO: theo `MessageGroupId` |
+  | Throughput | Rất cao, scale theo partition | Cao vừa | Gần như không giới hạn (standard) |
+  | Routing | Đơn giản (topic/key) | Rất linh hoạt (topic/headers/fanout exchange) | SNS filter policy + fanout |
+  | Vận hành | Nặng (hoặc managed: MSK/Confluent) | Vừa | Không có server |
+  | Hợp | Event streaming, nhiều consumer độc lập, replay, CDC | Task queue, routing phức tạp, RPC-ish | Task queue đơn giản trên AWS, fanout với SNS |
+
+  | Delivery | Cách đạt | Rủi ro |
+  |---|---|---|
+  | At-most-once | Commit offset **trước** khi xử lý | Mất message khi crash |
+  | At-least-once | Commit **sau** khi xử lý | Trùng lặp → cần idempotent consumer |
+  | Exactly-once (Kafka→Kafka) | Idempotent producer + transactions + `read_committed` | Không bao phủ side effect ngoài Kafka |
+
+  ## Pitfalls
+
+  - Thêm partition cho topic có key → mapping key→partition đổi → **mất thứ tự** giữa bản cũ và mới của cùng key.
+  - Xử lý lâu hơn `max.poll.interval.ms` → consumer bị đá khỏi group → rebalance → xử lý lại → vòng lặp.
+  - Handler async fire-and-forget (KafkaJS) → offset commit trước khi xử lý xong → mất message khi crash.
+  - Retry vô hạn trên poison pill → partition kẹt, lag tăng mãi.
+  - Gửi message sang DLQ/retry topic cho một key nhưng vẫn xử lý message sau của cùng key → vỡ ordering.
+  - `acks=all` nhưng `min.insync.replicas=1` → vẫn có thể mất dữ liệu khi chỉ leader xác nhận.
+  - Dual write (commit DB rồi `producer.send`) không atomic → mất hoặc thừa event.
+  - Coi Redis Pub/Sub hay Socket.IO adapter là "message bus bền" — chúng at-most-once.
+
+  ## Cheat sheet
+
+  - Producer bền: `acks=all`, `enable.idempotence=true` (default từ 3.0), topic RF=3, `min.insync.replicas=2`, `unclean.leader.election.enable=false` (default).
+  - Consumer: commit sau xử lý; handler idempotent (unique `event_id`, upsert, version check); `max.poll.records` nhỏ khi xử lý chậm.
+  - Ordering: 1 key = 1 partition; idempotent producer giữ thứ tự với `max.in.flight.requests.per.connection ≤ 5`.
+  - Rebalance: cooperative-sticky hoặc KIP-848; static membership `group.instance.id` cho rolling deploy.
+  - Error: phân loại lỗi transient (retry với backoff) vs permanent (DLQ ngay); DLQ có header lý do + offset gốc; có quy trình replay.
+  - Schema Registry: `BACKWARD` (default) → nâng cấp **consumer trước**; `FORWARD` → producer trước; `FULL` → thứ tự nào cũng được.
+  - Lag: đo theo partition (Burrow/kafka-consumer-groups/exporter), alert theo **thời gian trễ** chứ không chỉ số message.
+  - Socket.IO nhiều node: sticky session (khi có HTTP long-polling) + adapter (Redis/Redis Streams) để broadcast giữa node.
+notionRefs:
+  - title: Kafka
+    url: https://app.notion.com/p/6b4f40b711a141cdb38661d0463308b0
+  - title: Queues
+    url: https://app.notion.com/p/e0b60fd1777a4d0cb3d8967549f1f5fd
+references:
+  - title: Apache Kafka documentation — Design
+    url: https://kafka.apache.org/documentation/#design
+  - title: Apache Kafka — Producer configs
+    url: https://kafka.apache.org/documentation/#producerconfigs
+  - title: Apache Kafka — Consumer configs
+    url: https://kafka.apache.org/documentation/#consumerconfigs
+  - title: Apache Kafka 4.2.0 release announcement (share groups production-ready)
+    url: https://kafka.apache.org/blog/2026/02/17/apache-kafka-4.2.0-release-announcement/
+  - title: KIP-848 — The Next Generation of the Consumer Rebalance Protocol
+    url: https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol
+  - title: KIP-932 — Queues for Kafka
+    url: https://cwiki.apache.org/confluence/display/KAFKA/KIP-932%3A+Queues+for+Kafka
+  - title: Confluent — Schema evolution and compatibility
+    url: https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html
+  - title: Confluent — Exactly-once semantics in Kafka
+    url: https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/
+  - title: microservices.io — Transactional outbox
+    url: https://microservices.io/patterns/data/transactional-outbox.html
+  - title: Debezium — Outbox event router
+    url: https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html
+  - title: Confluent JavaScript client (migration from KafkaJS)
+    url: https://docs.confluent.io/kafka-clients/javascript/current/migration.html
+  - title: Socket.IO — Using multiple nodes
+    url: https://socket.io/docs/v4/using-multiple-nodes/
+  - title: Socket.IO — Redis adapter
+    url: https://socket.io/docs/v4/redis-adapter/
+  - title: AWS — Amazon SQS FIFO queues
+    url: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-fifo-queues.html
+  - title: RabbitMQ — Consumer acknowledgements and publisher confirms
+    url: https://www.rabbitmq.com/docs/confirms
+questions:
+  - id: messaging-kafka-001
+    level: easy
+    type: concept
+    q: Explain topics, partitions and offsets in Kafka. Why are topics split into partitions?
+    hint: |-
+      Topic = luồng dữ liệu có tên; chia thành **partition** — mỗi partition là log append-only có thứ tự, lưu trên một leader broker và được replicate.
+      Offset = số thứ tự tăng dần của record trong partition; consumer group lưu offset đã xử lý (topic nội bộ `__consumer_offsets`).
+      Partition cho phép **song song** (mỗi partition một consumer trong group), **scale** lưu trữ/throughput qua nhiều broker, và là **đơn vị ordering**.
+    followUp: What limits how many consumers in one group can work in parallel?
+    tags: [basics, partitions]
+  - id: messaging-kafka-002
+    level: easy
+    type: concept
+    q: How does a consumer group divide work? What happens if you have more consumers than partitions?
+    hint: |-
+      Mỗi partition được gán cho **đúng một** consumer trong group; một consumer có thể giữ nhiều partition. Các group khác nhau đọc độc lập (mỗi group có offset riêng) → fan-out tự nhiên.
+      Consumer nhiều hơn partition → phần thừa **idle** (dự phòng khi con khác chết). Muốn song song hơn: tăng partition (cẩn thận với key ordering) hoặc xử lý song song bên trong consumer theo key.
+      Ngoại lệ: share groups (KIP-932, Kafka 4.x) cho phép nhiều consumer cùng đọc một partition với ack từng record.
+    followUp: How would you get more parallelism than the partition count without adding partitions?
+    verify: true
+    tags: [consumer-group]
+  - id: messaging-kafka-003
+    level: easy
+    type: concept
+    q: What ordering guarantees does Kafka provide, and how do message keys affect them?
+    hint: |-
+      Kafka chỉ đảm bảo thứ tự **trong một partition**, không đảm bảo giữa các partition của topic.
+      Default partitioner hash key (murmur2) → cùng key luôn vào cùng partition (khi số partition không đổi) → thứ tự theo key được giữ. Key null → sticky partitioner (gom batch vào một partition rồi đổi).
+      Chọn key = chọn đơn vị ordering: `orderId` (thứ tự các event của 1 đơn), `customerId` (mọi event của 1 khách).
+    followUp: What happens to per-key ordering if you add partitions to the topic?
+    tags: [ordering, keys]
+  - id: messaging-kafka-004
+    level: easy
+    type: concept
+    q: When are messages deleted from a Kafka topic? Explain retention and log compaction.
+    hint: |-
+      Đọc **không** xoá message. Xoá theo `cleanup.policy`:
+      - `delete`: xoá segment cũ theo `retention.ms` (mặc định 7 ngày) hoặc `retention.bytes`.
+      - `compact`: giữ **ít nhất bản mới nhất cho mỗi key**; value null (tombstone) → key bị xoá sau `delete.retention.ms`.
+      - Có thể kết hợp `compact,delete`.
+      Hệ quả: có thể replay, nhiều group đọc cùng dữ liệu; consumer offline lâu hơn retention sẽ mất dữ liệu (reset theo `auto.offset.reset`).
+    followUp: When would you use a compacted topic instead of a database table?
+    tags: [retention, compaction]
+  - id: messaging-kafka-005
+    level: easy
+    type: concept
+    q: Define at-most-once, at-least-once and exactly-once delivery. Which is the realistic default?
+    hint: |-
+      - At-most-once: commit offset trước rồi xử lý → crash thì **mất**.
+      - At-least-once: xử lý rồi mới commit → crash trước commit thì **xử lý lại** (trùng).
+      - Exactly-once: mỗi message có hiệu ứng đúng một lần.
+      Mặc định thực tế: **at-least-once + idempotent consumer** ("effectively once"). EOS của Kafka chỉ trong phạm vi đọc-xử lý-ghi lại Kafka.
+    followUp: Why can't Kafka transactions make sending an email exactly-once?
+    tags: [delivery-semantics]
+  - id: messaging-kafka-006
+    level: easy
+    type: concept
+    q: What are replication factor, leader, followers and ISR?
+    hint: |-
+      Mỗi partition có `replication.factor` bản (thường 3) trên broker khác nhau. **Leader** nhận read/write (mặc định; consumer có thể fetch từ follower gần nhất với rack-awareness), **followers** fetch từ leader.
+      **ISR** (in-sync replicas) = replica bắt kịp leader trong `replica.lag.time.max.ms`. Leader chết → controller chọn leader mới từ ISR.
+      High watermark = offset mà mọi ISR đã có → consumer chỉ đọc được tới đó.
+    followUp: What is unclean leader election and why is it off by default?
+    tags: [replication]
+  - id: messaging-kafka-007
+    level: easy
+    type: concept
+    q: What is consumer lag and why is it the most important Kafka consumer metric?
+    hint: |-
+      Lag = log-end offset (hoặc high watermark) − committed offset của group, **tính theo partition**.
+      Lag tăng đều = consumer không theo kịp (xử lý chậm, downstream chậm, kẹt ở poison pill); lag răng cưa = bình thường theo batch.
+      Nên alert theo **thời gian trễ** (record cũ nhất chưa xử lý bao nhiêu giây) vì số message không nói lên tác động business. Tool: `kafka-consumer-groups.sh --describe`, Burrow, exporter cho Prometheus.
+    followUp: Lag is high on one partition only. What does that suggest?
+    tags: [lag, observability]
+  - id: messaging-kafka-008
+    level: easy
+    type: concept
+    q: What is a dead-letter queue (DLQ) and what should a DLQ message contain?
+    hint: |-
+      DLQ = topic/queue chứa message không xử lý được sau số lần retry (hoặc lỗi permanent như schema sai) để partition chính không bị kẹt.
+      Nên có: payload gốc nguyên vẹn, header topic/partition/offset gốc, lý do lỗi + stack, số lần thử, timestamp, consumer/service version.
+      Bắt buộc có: alert khi DLQ có message, người sở hữu, **quy trình replay** sau khi fix. DLQ không ai xem = thùng rác mất dữ liệu.
+    followUp: How do you replay DLQ messages safely after fixing the bug?
+    tags: [dlq, error-handling]
+  - id: messaging-kafka-009
+    level: easy
+    type: compare
+    q: How is Kafka's log model different from a traditional message queue?
+    hint: |-
+      Queue (RabbitMQ classic, SQS): broker giữ trạng thái từng message, xoá sau ack, mỗi message thường tới một consumer; không replay.
+      Kafka: log bền, broker không theo dõi từng message — consumer giữ **offset**; nhiều group đọc độc lập; replay được; ordering theo partition; song song theo partition (không theo message).
+      Hệ quả: Kafka hợp event streaming/nhiều subscriber/CDC; queue hợp task phân phối với ack từng việc và retry riêng lẻ.
+    followUp: What does Kafka lose by not tracking per-message acks, and how do share groups change that?
+    tags: [compare, queue]
+  - id: messaging-kafka-010
+    level: easy
+    type: concept
+    q: What is KRaft, and what changed with ZooKeeper in recent Kafka versions?
+    hint: |-
+      KRaft = Kafka Raft metadata mode: một nhóm **controller** dùng Raft quản lý metadata (topic, partition, ISR, config) trong log nội bộ `__cluster_metadata`, thay cho ZooKeeper.
+      Kafka **4.0** (2025) **bỏ hẳn** chế độ ZooKeeper; muốn lên 4.x phải migrate sang KRaft trước (qua bản 3.x bridge release).
+      Lợi ích: một hệ thống để vận hành, failover controller nhanh hơn, hỗ trợ số partition lớn hơn.
+    followUp: Why must the controller quorum have an odd number of nodes?
+    verify: true
+    tags: [kraft, operations]
+  - id: messaging-kafka-011
+    level: easy
+    type: concept
+    q: "What do producer `acks=0`, `acks=1` and `acks=all` mean?"
+    hint: |-
+      - `0`: không chờ ack → nhanh nhất, có thể mất mà không biết.
+      - `1`: leader ghi xong là ack → mất nếu leader chết trước khi follower copy.
+      - `all` (`-1`): chờ **tất cả ISR** → kết hợp `min.insync.replicas` để có độ bền thật. Mặc định `all` từ Kafka 3.0.
+      Latency tăng dần theo mức; throughput bù lại bằng batching (`linger.ms`, `batch.size`).
+    followUp: With `acks=all`, if the ISR shrinks to only the leader, is the write still durable?
+    verify: true
+    tags: [producer, durability]
+  - id: messaging-kafka-012
+    level: easy
+    type: design
+    q: How do you choose a message key for order events?
+    hint: |-
+      Key = đơn vị cần giữ thứ tự: `orderId` nếu chỉ cần thứ tự trong 1 đơn; `customerId` nếu logic phụ thuộc thứ tự mọi đơn của khách.
+      Cân nhắc **phân bố**: key có cardinality thấp hoặc lệch (1 tenant lớn) → hot partition. Không dùng key null nếu cần ordering.
+      Key cũng là key compaction và key để consumer dedupe/partition cache nội bộ.
+    followUp: One tenant produces 60% of events. What happens if tenantId is the key?
+    tags: [keys, ordering]
+  - id: messaging-kafka-013
+    level: medium
+    type: concept
+    q: "Explain how `acks=all` and `min.insync.replicas` interact. With RF=3, what setting survives one broker failure without data loss or write downtime?"
+    hint: |-
+      `acks=all` chờ mọi replica trong **ISR hiện tại**; nếu ISR co lại còn 1 (chỉ leader) thì `acks=all` ≈ `acks=1`. `min.insync.replicas` (mặc định 1) đặt số ISR tối thiểu; ít hơn → producer nhận `NotEnoughReplicas` (từ chối ghi thay vì ghi không bền).
+      RF=3 + `min.insync.replicas=2`: mất 1 broker vẫn ghi được và mỗi write có ≥2 bản. Mất 2 broker → ngừng ghi (chọn consistency hơn availability).
+      Thêm `unclean.leader.election.enable=false` để replica lạc hậu không được làm leader.
+    followUp: Why is RF=2 with min.insync.replicas=2 a poor choice?
+    tags: [durability, replication]
+  - id: messaging-kafka-014
+    level: medium
+    type: concept
+    q: How does the idempotent producer work, and what does it not protect against?
+    hint: |-
+      Broker gán **producer id (PID)**; producer đánh **sequence number** theo từng partition. Retry mang cùng seq → broker bỏ bản trùng, giữ đúng thứ tự (với `max.in.flight.requests.per.connection ≤ 5`). Mặc định bật từ Kafka 3.0.
+      Không bảo vệ: app gọi `send()` hai lần cho cùng dữ liệu (ví dụ retry ở tầng app, restart process → PID mới), trùng ở phía consumer, hay trùng do dual write. Phạm vi chỉ là một producer session trên từng partition.
+    followUp: How do transactions extend idempotence across restarts?
+    verify: true
+    tags: [producer, idempotence]
+  - id: messaging-kafka-015
+    level: medium
+    type: compare
+    q: Compare eager and cooperative rebalancing, and describe what KIP-848 changes.
+    hint: |-
+      - **Eager**: mọi consumer revoke toàn bộ partition → dừng hết → join/sync → assign lại. Downtime cả group.
+      - **Cooperative (incremental, CooperativeStickyAssignor)**: chỉ revoke partition phải chuyển, qua nhiều vòng; phần còn lại vẫn chạy.
+      - **KIP-848** (`group.protocol=consumer`, GA ở Kafka 4.0): assignment do **broker** tính, consumer gửi heartbeat và nhận partition dần, không còn barrier đồng bộ toàn group; một số config session chuyển sang broker.
+      Client ecosystem khác nhau: kiểm tra client Node của bạn hỗ trợ protocol nào.
+    followUp: Does KafkaJS support cooperative rebalancing?
+    verify: true
+    tags: [rebalance]
+  - id: messaging-kafka-016
+    level: medium
+    type: compare
+    q: "What is the difference between `session.timeout.ms`, `heartbeat.interval.ms` and `max.poll.interval.ms`? Which one kicks in when processing is slow?"
+    hint: |-
+      - `session.timeout.ms` (default 45s từ 3.0): không nhận heartbeat trong khoảng này → consumer coi là chết (process crash, network).
+      - `heartbeat.interval.ms` (default 3s): tần suất heartbeat (thread nền ở Java client), nên ≤ 1/3 session timeout.
+      - `max.poll.interval.ms` (default 5 phút): khoảng tối đa giữa hai lần `poll()` → xử lý batch quá lâu thì consumer tự rời group dù heartbeat vẫn chạy.
+      Xử lý chậm → `max.poll.interval.ms`; fix: giảm `max.poll.records`, xử lý nhanh hơn, hoặc tách xử lý dài ra (pause partition).
+    followUp: How does this map to KafkaJS, where heartbeats are not on a background thread?
+    verify: true
+    tags: [consumer, rebalance, config]
+  - id: messaging-kafka-017
+    level: medium
+    type: compare
+    q: Auto-commit vs manual offset commit — what are the failure modes of each?
+    hint: |-
+      Auto-commit (Java: commit định kỳ trong `poll()` các offset đã trả về): nếu xử lý bất đồng bộ ngoài vòng poll → offset commit **trước** khi xử lý xong → mất khi crash; crash giữa hai lần commit → xử lý lại.
+      Manual commit **sau** xử lý: at-least-once rõ ràng; commit từng message thì chậm → commit theo batch/interval; commit sync vs async (async có thể commit sai thứ tự nếu retry).
+      Nhớ: offset commit là "offset của record **kế tiếp** cần đọc" (last processed + 1).
+    followUp: You process messages in parallel within a partition. How do you commit safely?
+    tags: [consumer, offsets]
+  - id: messaging-kafka-018
+    level: medium
+    type: design
+    q: How do you make a Kafka consumer idempotent when it writes to a relational database?
+    hint: |-
+      - Event có `event_id` duy nhất (từ producer/outbox). Consumer insert `processed_events(event_id)` **cùng transaction** với thay đổi business; unique violation → bỏ qua.
+      - Hoặc thao tác vốn idempotent: upsert theo business key, `UPDATE ... WHERE version < :v`.
+      - Hoặc lưu offset trong DB cùng transaction (tự quản offset) → xử lý + offset atomic.
+      Tránh dedupe chỉ bằng cache TTL (Redis) cho nghiệp vụ tiền — hết TTL hoặc Redis mất dữ liệu là trùng.
+    example: |-
+      ```ts
+      await db.$transaction(async (tx) => {
+        const inserted = await tx.$executeRaw`
+          INSERT INTO processed_events (event_id) VALUES (${evt.id})
+          ON CONFLICT DO NOTHING`;
+        if (inserted === 0) return; // duplicate delivery
+        await tx.invoice.create({ data: toInvoice(evt) });
+      });
+      ```
+    followUp: How long do you keep rows in processed_events, and what breaks if you delete too early?
+    tags: [idempotency, consumer]
+  - id: messaging-kafka-019
+    level: medium
+    type: compare
+    q: Blocking retries in the consumer vs non-blocking retry topics — what are the trade-offs?
+    hint: |-
+      - **Blocking retry** (retry tại chỗ với backoff): giữ ordering tuyệt đối trên partition, nhưng một message lỗi **chặn cả partition** → lag.
+      - **Retry topics** (`orders.retry.1m`, `orders.retry.10m`, rồi `orders.dlq`): partition chính tiếp tục chạy; đổi lại **mất ordering** cho key đó (message sau của cùng key có thể xử lý trước).
+      Chọn theo nghiệp vụ: event độc lập → retry topic; event có thứ tự theo key (state machine) → blocking retry ngắn, rồi "park" cả key (lưu các message sau của key vào DLQ/bảng chờ).
+    followUp: How would you park all later messages for a key once one of its messages goes to the DLQ?
+    tags: [retries, ordering, dlq]
+  - id: messaging-kafka-020
+    level: medium
+    type: concept
+    q: What is a poison pill, and how should a consumer handle one?
+    hint: |-
+      Poison pill = message **luôn** làm consumer lỗi (không deserialize được, schema sai, dữ liệu vi phạm invariant). Retry vô hạn → partition kẹt, lag tăng, có thể crash-loop.
+      Xử lý: phân loại lỗi — deserialization/validation = **permanent** → DLQ ngay kèm metadata; lỗi transient (timeout DB) → retry có giới hạn + backoff. Không để exception làm crash process lặp lại trên cùng offset.
+    followUp: How does a schema registry reduce poison pills?
+    tags: [error-handling, dlq]
+  - id: messaging-kafka-021
+    level: medium
+    type: concept
+    q: "What is the dual-write problem, and how does the transactional outbox pattern solve it?"
+    hint: |-
+      Dual write: `COMMIT` DB rồi `producer.send()` — crash hoặc Kafka lỗi giữa hai bước → DB có đơn nhưng không có event (hoặc ngược lại nếu send trước). Không có transaction chung giữa DB và Kafka.
+      Outbox: trong **cùng transaction** DB, insert business row + row `outbox(id, aggregate_id, type, payload)`. Một relay (polling hoặc CDC) đọc outbox và publish, đánh dấu đã gửi/xoá.
+      Kết quả: at-least-once publish (relay có thể gửi trùng) → consumer phải idempotent theo `event_id`. Ordering theo aggregate: publish với key = aggregate_id và relay xử lý theo thứ tự.
+    example: |-
+      ```ts
+      await db.$transaction([
+        db.order.create({ data: order }),
+        db.outbox.create({
+          data: { id: randomUUID(), aggregateId: order.id, type: "OrderPlaced", payload: order },
+        }),
+      ]);
+      ```
+    followUp: Compare a polling relay with CDC (Debezium) for reading the outbox.
+    tags: [outbox, consistency]
+  - id: messaging-kafka-022
+    level: medium
+    type: compare
+    q: Polling publisher vs log-based CDC (for example Debezium) for the outbox — what do you gain and lose?
+    hint: |-
+      - **Polling** (`SELECT ... WHERE sent_at IS NULL ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED`): đơn giản, không cần hạ tầng mới; tốn tải DB, độ trễ = chu kỳ poll, cẩn thận ordering khi nhiều relay song song, cần dọn bảng.
+      - **CDC** đọc WAL/binlog: độ trễ thấp, không query DB, đúng thứ tự commit; cần Kafka Connect + Debezium, quyền replication, quản lý replication slot (slot bị bỏ quên làm **WAL phình** trên Postgres).
+      Debezium có Outbox Event Router SMT chuyển row outbox thành event đúng topic/key.
+    followUp: What happens to Postgres if the Debezium connector is down for a day?
+    tags: [cdc, outbox]
+  - id: messaging-kafka-023
+    level: medium
+    type: concept
+    q: Explain Schema Registry compatibility modes. With BACKWARD compatibility, who upgrades first — producers or consumers?
+    hint: |-
+      - **BACKWARD** (default Confluent): schema mới đọc được dữ liệu ghi bằng schema cũ → được xoá field, thêm field **có default** → nâng cấp **consumer trước**.
+      - **FORWARD**: schema cũ đọc được dữ liệu schema mới → được thêm field, xoá field có default → nâng cấp **producer trước**.
+      - **FULL**: cả hai → thứ tự nào cũng được. Biến thể `_TRANSITIVE` kiểm tra với **mọi** version cũ, không chỉ bản liền trước.
+      Đổi kiểu/đổi tên field = breaking → topic mới hoặc version mới + migration.
+    followUp: Why does BACKWARD (non-transitive) still allow a consumer to break when replaying old data?
+    verify: true
+    tags: [schema, evolution]
+  - id: messaging-kafka-024
+    level: medium
+    type: design
+    q: How do you choose the number of partitions for a topic, and why is increasing it later risky?
+    hint: |-
+      Ước lượng: throughput mục tiêu / throughput một consumer xử lý được (thường consumer là bottleneck) + headroom tăng trưởng; song song tối đa trong group = số partition.
+      Quá nhiều partition: tốn file handle/memory, rebalance lâu, nhiều request nhỏ. Quá ít: không scale consumer.
+      Tăng partition sau này: **không giảm được**; key được hash lại sang partition khác → ordering theo key bị phá trong giai đoạn chuyển; consumer có state theo partition bị ảnh hưởng. Nên over-provision vừa phải từ đầu.
+    followUp: You must increase partitions on a keyed topic. How do you migrate without breaking per-key ordering?
+    tags: [partitions, capacity]
+  - id: messaging-kafka-025
+    level: medium
+    type: compare
+    q: Kafka vs RabbitMQ — when would you pick each?
+    hint: |-
+      RabbitMQ: smart broker — exchange (direct/topic/fanout/headers) định tuyến linh hoạt, ack từng message, priority, TTL, DLX, nhiều consumer cạnh tranh trên queue; tốt cho **task queue**, routing phức tạp, throughput vừa. Có Streams và quorum queues cho độ bền.
+      Kafka: log bền, replay, nhiều consumer group độc lập, throughput rất cao, ordering theo partition; tốt cho **event streaming**, CDC, analytics, event sourcing nhẹ.
+      Câu trả lời tốt nói về đội ngũ vận hành, managed service sẵn có, và nhu cầu replay.
+    followUp: You need per-message delayed retries with different delays. Which is easier and why?
+    tags: [compare, rabbitmq]
+  - id: messaging-kafka-026
+    level: medium
+    type: compare
+    q: Kafka vs SQS/SNS on AWS — how do you decide?
+    hint: |-
+      SQS: queue serverless, không cần vận hành, visibility timeout + redrive DLQ, scale gần như vô hạn; Standard = at-least-once, thứ tự best-effort; FIFO = thứ tự theo `MessageGroupId`, dedupe trong 5 phút, throughput giới hạn hơn. Không replay, mỗi message cho 1 consumer.
+      SNS + SQS: fanout tới nhiều queue (mỗi subscriber một queue), filter policy.
+      Kafka/MSK: replay, retention dài, nhiều consumer đọc cùng stream, ordering theo partition, throughput lớn; tốn vận hành/chi phí cố định.
+      Thường: SQS cho job/task nội bộ; Kafka cho event backbone giữa nhiều team.
+    followUp: How do SQS visibility timeout and Kafka offset commit compare as mechanisms for redelivery?
+    verify: true
+    tags: [compare, aws, sqs]
+  - id: messaging-kafka-027
+    level: medium
+    type: gotcha
+    q: What is the SQS visibility timeout, and what bug appears if it is shorter than your processing time?
+    hint: |-
+      Nhận message → message **ẩn** khỏi consumer khác trong visibility timeout (mặc định 30s, tối đa 12h). Xử lý xong phải `DeleteMessage`; không xoá kịp → message hiện lại và consumer khác xử lý → **trùng**.
+      Xử lý dài hơn timeout → trùng lặp song song. Fix: timeout > p99 xử lý, gia hạn bằng `ChangeMessageVisibility` (heartbeat), idempotent consumer, `maxReceiveCount` + DLQ cho poison pill.
+    followUp: How is this similar to Kafka's max.poll.interval.ms problem?
+    verify: true
+    tags: [sqs, gotcha]
+  - id: messaging-kafka-028
+    level: medium
+    type: concept
+    q: How do Kafka transactions give exactly-once semantics for a read-process-write pipeline?
+    hint: |-
+      Producer có `transactional.id` (ổn định qua restart → **fencing** producer "zombie" cũ bằng epoch). Trong một transaction: ghi output tới nhiều partition + `sendOffsetsToTransaction` (offset input) → commit/abort **atomic**.
+      Consumer downstream dùng `isolation.level=read_committed` để không thấy dữ liệu của transaction bị abort.
+      Phạm vi: chỉ Kafka→Kafka (Kafka Streams dùng `processing.guarantee=exactly_once_v2`). Ghi ra DB/HTTP không nằm trong transaction.
+    followUp: What is a zombie producer and how does the epoch fence it?
+    tags: [transactions, eos]
+  - id: messaging-kafka-029
+    level: medium
+    type: gotcha
+    q: "What does the consumer setting `isolation.level` do, and what is the default?"
+    hint: |-
+      `read_uncommitted` (**default**): đọc mọi record kể cả thuộc transaction chưa commit/đã abort.
+      `read_committed`: chỉ đọc tới **LSO** (last stable offset) — record của transaction đã commit; record bị abort bị lọc. Transaction treo lâu → LSO đứng yên → consumer "đứng" dù có dữ liệu mới (bị giới hạn bởi `transaction.timeout.ms`).
+      Dùng transaction ở producer mà consumer để default → exactly-once không có ý nghĩa.
+    followUp: Why can a long-running transaction increase lag for read_committed consumers?
+    tags: [transactions, consumer]
+  - id: messaging-kafka-030
+    level: medium
+    type: design
+    q: When would you use a compacted topic, and what are tombstones?
+    hint: |-
+      Compacted topic = "bảng" dạng log: giữ bản mới nhất cho mỗi key → service mới có thể đọc từ đầu để **dựng lại state** (customer profile, product catalog, config), dùng cho KTable/ event-carried state transfer.
+      Tombstone = record key K với value `null` → báo xoá; sau `delete.retention.ms` compaction bỏ luôn key.
+      Lưu ý: compaction chạy nền, không tức thì (segment active không bị compact) → consumer vẫn có thể thấy nhiều bản của một key.
+    followUp: A consumer starts from offset 0 on a compacted topic and sees two values for the same key. Why?
+    tags: [compaction]
+  - id: messaging-kafka-031
+    level: medium
+    type: compare
+    q: "In KafkaJS, what is the difference between `eachMessage` and `eachBatch`, and when do you need to call `heartbeat()` yourself?"
+    hint: |-
+      `eachMessage`: KafkaJS gọi handler từng message (tuần tự trong partition; `partitionsConsumedConcurrently` cho song song giữa partition), tự resolve offset và auto-commit theo `autoCommitInterval`/`autoCommitThreshold`.
+      `eachBatch`: nhận cả batch → tự `resolveOffset()`, `commitOffsetsIfNecessary()`, và **gọi `heartbeat()`** trong vòng lặp dài vì heartbeat của KafkaJS chạy cùng event loop — xử lý batch lâu hơn `sessionTimeout` (mặc định 30s) mà không heartbeat → bị đá khỏi group.
+      Lưu ý: KafkaJS không còn được maintain tích cực (release cuối 2023) — cân nhắc client được hỗ trợ.
+    followUp: What happens to offsets if your eachBatch handler throws halfway through?
+    verify: true
+    tags: [kafkajs, nodejs]
+  - id: messaging-kafka-032
+    level: medium
+    type: design
+    q: You run Socket.IO on several Node instances behind a load balancer. What do you need for it to work, and why?
+    hint: |-
+      1. **Sticky sessions** nếu bật HTTP long-polling (mặc định bắt đầu bằng polling rồi upgrade): các request của một session phải tới cùng node, nếu không lỗi "Session ID unknown" (400). Chỉ dùng transport `websocket` thì không cần sticky nhưng mất fallback.
+      2. **Adapter** (`@socket.io/redis-adapter`, Redis Streams adapter, hoặc cluster adapter): `io.to(room).emit()` trên node A phải tới client đang kết nối node B → adapter broadcast qua Redis Pub/Sub.
+      Redis Pub/Sub là at-most-once → event trong lúc mất kết nối có thể mất; cần connection state recovery hoặc client refetch trạng thái khi reconnect.
+    followUp: For financial price updates, how do you guarantee a client does not miss updates after a reconnect?
+    verify: true
+    tags: [socketio, scaling, realtime]
+  - id: messaging-kafka-033
+    level: medium
+    type: compare
+    q: "Events vs commands, and thin events vs event-carried state transfer — how do you design message payloads?"
+    hint: |-
+      - **Command** (`ChargePayment`): yêu cầu một service cụ thể làm gì, có thể bị từ chối → coupling tới người nhận.
+      - **Event** (`OrderPlaced`): sự thật đã xảy ra, publisher không biết ai nghe.
+      - **Thin event** (`{orderId}`): consumer phải gọi ngược API lấy dữ liệu → coupling runtime + đọc trạng thái mới hơn event.
+      - **Event-carried state transfer** (payload đầy đủ): consumer tự đủ dữ liệu, dựng read model riêng; đổi lại payload lớn, schema phải quản lý cẩn thận, lộ dữ liệu cho mọi consumer.
+    followUp: A thin event consumer calls back the producer API and gets a newer state than the event. Is that a problem?
+    tags: [event-design]
+  - id: messaging-kafka-034
+    level: medium
+    type: concept
+    q: How do you propagate tracing and correlation IDs through Kafka messages?
+    hint: |-
+      Dùng **record headers**: `traceparent` (W3C Trace Context), `correlation-id`, `causation-id`, `event-id`, `schema-version`, `tenant-id`.
+      Producer inject context hiện tại; consumer extract và tạo span mới (link hoặc child) cho xử lý. OpenTelemetry có instrumentation cho nhiều client Kafka.
+      Headers không phải payload → không ảnh hưởng schema, nhưng các bước chuyển tiếp (retry topic, DLQ, outbox relay) phải **copy headers** nếu không trace đứt.
+    followUp: Should a consumer span be a child of the producer span or linked to it? Why?
+    tags: [observability, tracing]
+  - id: messaging-kafka-035
+    level: hard
+    type: debug
+    q: This KafkaJS consumer occasionally loses orders when pods restart. Find the bug.
+    example: |-
+      ```ts
+      await consumer.run({
+        eachMessage: async ({ message }) => {
+          const order = JSON.parse(message.value!.toString());
+          processOrder(order).catch((err) => logger.error(err)); // don't block the consumer
+        },
+      });
+      ```
+    hint: |-
+      Handler trả về **ngay** (không `await processOrder`) → KafkaJS coi message xử lý xong và commit offset; pod restart khi `processOrder` còn chạy → message **mất** (offset đã commit). Lỗi cũng bị nuốt, không retry.
+      Còn nữa: `JSON.parse` lỗi → throw → retry mãi (poison pill); không xử lý song song có kiểm soát.
+      Fix: `await processOrder(order)`; muốn song song thì `partitionsConsumedConcurrently` hoặc `eachBatch` với concurrency có giới hạn và chỉ resolve offset liên tục đã xong; parse lỗi → DLQ.
+    followUp: How do you process messages of one partition concurrently while still committing offsets correctly?
+    redFlags:
+      - "Adds a try/catch and calls it fixed"
+    tags: [debug, kafkajs, nodejs]
+  - id: messaging-kafka-036
+    level: hard
+    type: debug
+    q: Events for the same account sometimes arrive out of order at the consumer. Here is the producer config. What is wrong?
+    example: |-
+      ```properties
+      acks=1
+      enable.idempotence=false
+      retries=2147483647
+      max.in.flight.requests.per.connection=5
+      # key = null, account id is only in the payload
+      ```
+    hint: |-
+      - **Key null** → record của cùng account rải ra nhiều partition → không có ordering nào. Key phải = `accountId`.
+      - Không idempotence + `max.in.flight > 1` + retry → batch 1 lỗi, batch 2 thành công, batch 1 retry thành công → **đảo thứ tự** (và có thể trùng).
+      - `acks=1` → mất dữ liệu khi leader chết.
+      Fix: key = accountId, `enable.idempotence=true` (giữ thứ tự với in-flight ≤ 5), `acks=all`. (Idempotence mặc định bật từ 3.0 nhưng config tường minh `false` sẽ tắt nó.)
+    followUp: Does the consumer side need anything to keep this ordering?
+    verify: true
+    tags: [debug, ordering, producer]
+  - id: messaging-kafka-037
+    level: hard
+    type: debug
+    q: A consumer group keeps rebalancing every few minutes and lag keeps growing. Each message calls an external API that sometimes takes 10 seconds. Diagnose from this config.
+    example: |-
+      ```properties
+      max.poll.records=500
+      max.poll.interval.ms=300000
+      session.timeout.ms=45000
+      enable.auto.commit=true
+      ```
+    hint: |-
+      500 record × tới 10s = tới ~83 phút giữa hai lần `poll()` ≫ `max.poll.interval.ms` 5 phút → consumer bị coi là chết, rời group → **rebalance** → batch chưa commit bị giao cho consumer khác → xử lý lại → lặp vòng.
+      Fix: giảm `max.poll.records` (vd 10–50), timeout cho API ngoài, song song có giới hạn trong batch, hoặc `pause()` partition và xử lý nền rồi `resume()`; chuyển tác vụ chậm sang queue riêng; cân nhắc tăng `max.poll.interval.ms` như biện pháp phụ. Thêm static membership để rolling deploy không gây rebalance.
+    followUp: How does cooperative rebalancing reduce the damage but not fix the root cause?
+    tags: [debug, rebalance, consumer]
+  - id: messaging-kafka-038
+    level: hard
+    type: scenario
+    q: "In production, consumer lag on the `payments` topic grows steadily for hours. Walk me through your investigation."
+    hint: |-
+      1. Lag **tất cả** partition hay **một vài**? Một partition → hot key hoặc poison pill kẹt; tất cả → consumer chậm/thiếu/downstream chậm.
+      2. Consumer còn sống, có đang rebalance liên tục không? (log, metric rebalance).
+      3. Thời gian xử lý mỗi message, downstream (DB, API) latency/error, retry nội bộ.
+      4. Producer rate có tăng đột biến (campaign, backfill)?
+      Hành động: scale consumer (≤ số partition), tối ưu xử lý/batch, skip + DLQ poison pill, tăng partition (nếu không ràng buộc ordering), throttle backfill.
+    followUp: Lag is only on partition 7. What are the top two hypotheses and how do you tell them apart?
+    tags: [lag, incident]
+  - id: messaging-kafka-039
+    level: hard
+    type: scenario
+    q: After a deployment, customers receive duplicate confirmation emails. The consumer commits offsets after sending. Explain and fix.
+    hint: |-
+      Deploy → consumer bị dừng/rebalance → message đã gửi email nhưng **offset chưa commit** (commit theo interval/batch) → consumer khác xử lý lại → email trùng. Đây là at-least-once đúng như thiết kế.
+      Fix: side effect idempotent — lưu `sent_notifications(event_id)` hoặc dùng idempotency key của provider email; graceful shutdown (dừng nhận, xử lý nốt, commit rồi mới thoát); cooperative rebalance/static membership giảm số lần xảy ra — nhưng **không** thay thế idempotency.
+    followUp: The email provider has no idempotency key. How do you minimize duplicates?
+    tags: [duplicates, idempotency, incident]
+  - id: messaging-kafka-040
+    level: hard
+    type: scenario
+    q: One partition receives far more traffic than others because a large tenant is used as the key. How do you fix the hot partition?
+    hint: |-
+      Lựa chọn tuỳ ràng buộc ordering:
+      - Nếu chỉ cần thứ tự **theo entity** (order/account) chứ không theo tenant → đổi key thành entity id (hoặc `tenantId:entityId`).
+      - Nếu phải giữ thứ tự theo tenant → không chia được mà giữ ordering; có thể topic riêng cho tenant lớn, hoặc tối ưu consumer cho partition đó.
+      - Key salting (`tenant#0..N`) chia tải nhưng **mất ordering** giữa các salt.
+      - Custom partitioner cho tenant lớn.
+      Nhớ: đổi key/partitioner giữa chừng tạo giai đoạn thứ tự lẫn lộn.
+    followUp: How would you migrate the key without processing events for one order out of order?
+    tags: [hot-partition, keys, multi-tenant]
+  - id: messaging-kafka-041
+    level: hard
+    type: scenario
+    q: A broker failed and some messages that producers received acks for are gone. What configuration allowed this?
+    hint: |-
+      Các khả năng: `acks=1` (leader ack rồi chết trước khi follower copy); `acks=all` nhưng `min.insync.replicas=1` và ISR đã co còn leader; `unclean.leader.election.enable=true` → replica lạc hậu lên leader và **truncate** dữ liệu; RF=1.
+      Ngoài ra: Kafka dựa vào replication chứ không fsync mỗi message → nhiều broker chết cùng lúc (cùng rack/AZ, mất điện) có thể mất dữ liệu trong page cache → rack awareness trải replica qua AZ.
+      Fix chuẩn: RF=3, `min.insync.replicas=2`, `acks=all`, unclean election off, replica trên nhiều AZ.
+    followUp: Why doesn't Kafka fsync every write by default, and why is that usually acceptable?
+    tags: [durability, incident]
+  - id: messaging-kafka-042
+    level: hard
+    type: gotcha
+    q: A teammate says enabling Kafka transactions means the consumer that updates Postgres now processes each message exactly once. Is that right?
+    hint: |-
+      Không. Transaction Kafka gom **ghi Kafka + commit offset** atomic. Ghi Postgres nằm ngoài: commit Postgres xong rồi crash trước khi commit Kafka transaction → message xử lý lại → Postgres ghi lần hai.
+      Cách đạt effectively-once với DB: lưu offset (hoặc `event_id`) **trong Postgres cùng transaction** với dữ liệu business, và khi khởi động seek tới offset lưu trong DB; hoặc dedupe table/upsert idempotent.
+    followUp: Sketch the startup logic when offsets are stored in Postgres instead of Kafka.
+    redFlags:
+      - "Yes, EOS covers any sink"
+    tags: [eos, gotcha]
+  - id: messaging-kafka-043
+    level: hard
+    type: scenario
+    q: An order-state consumer sends a failing `OrderPaid` event to the DLQ and then processes `OrderShipped` for the same order. What breaks, and how do you design around it?
+    hint: |-
+      State machine nhận `Shipped` khi chưa có `Paid` → trạng thái sai, hoặc lỗi dây chuyền đưa tiếp vào DLQ; khi replay `Paid` sau thì thứ tự đã đảo.
+      Thiết kế: khi một message của key K vào DLQ → **park key K** (lưu K vào bảng "blocked keys"; message sau của K cũng đưa vào hàng chờ theo thứ tự) tới khi xử lý xong; hoặc consumer kiểm tra version/sequence của aggregate và từ chối event nhảy cóc; hoặc blocking retry cho lỗi transient.
+      Replay phải theo đúng thứ tự offset gốc.
+    followUp: How do you prevent the blocked-keys table from growing forever?
+    tags: [ordering, dlq, design]
+  - id: messaging-kafka-044
+    level: hard
+    type: scenario
+    q: Your outbox relay sometimes publishes the same event twice and occasionally out of order. Why, and what do you change?
+    hint: |-
+      Trùng: relay publish thành công nhưng crash trước khi đánh dấu `sent` → lần sau publish lại (vốn at-least-once). Nhiều relay instance đọc cùng row nếu không khoá.
+      Sai thứ tự: nhiều relay song song, hoặc sắp theo `created_at` (không đơn điệu giữa các transaction; transaction commit muộn có id nhỏ hơn đã bị bỏ qua), retry batch một phần.
+      Fix: consumer dedupe theo `event_id`; relay một instance per shard (leader election) hoặc `FOR UPDATE SKIP LOCKED` + key = aggregate_id; hoặc chuyển sang CDC theo thứ tự commit; idempotent producer cho retry ở tầng Kafka.
+    followUp: Why can ordering by an auto-increment id still skip rows in a polling relay?
+    tags: [outbox, ordering]
+  - id: messaging-kafka-045
+    level: hard
+    type: scenario
+    q: A producer deployed a schema change that renamed a field. Consumers crash-loop. How do you recover now and prevent it next time?
+    hint: |-
+      Ngay: rollback producer; message đã ghi bằng schema mới vẫn nằm trong topic → consumer phải xử lý được (bản vá đọc cả hai) hoặc skip sang DLQ và replay sau khi có bản vá. Không xoá topic.
+      Phòng: Schema Registry với compatibility (BACKWARD/FULL) chặn đăng ký schema breaking; kiểm tra compatibility trong CI; đổi tên = thêm field mới + deprecate field cũ (expand/contract); consumer tolerant reader (bỏ qua field lạ).
+    followUp: What is a tolerant reader and how do you implement it in TypeScript with zod?
+    tags: [schema, incident]
+  - id: messaging-kafka-046
+    level: hard
+    type: debug
+    q: After scaling a Socket.IO server to three instances, some clients get `400 Session ID unknown` and room broadcasts only reach some users. Find the issues.
+    example: |-
+      ```ts
+      const io = new Server(httpServer, { cors: { origin: APP_URL } });
+      io.on("connection", (socket) => {
+        socket.join(`account:${socket.data.accountId}`);
+      });
+      // elsewhere, on instance that received the Kafka event:
+      io.to(`account:${evt.accountId}`).emit("balance", evt.balance);
+      // LB: round-robin, no session affinity
+      ```
+    hint: |-
+      - Transport mặc định bắt đầu bằng **HTTP long-polling** → các request polling của một session bị round-robin sang node khác → `Session ID unknown`. Cần **sticky session** ở LB (cookie/IP hash) hoặc chỉ dùng `transports: ["websocket"]`.
+      - Không có **adapter** → `io.to(room).emit` chỉ tới client kết nối **cùng instance** với consumer nhận event. Thêm `@socket.io/redis-adapter` (hoặc Streams adapter).
+      - Nên kiểm tra thêm: auth ở middleware trước khi join room theo accountId (tránh join room của người khác).
+    followUp: Each instance consumes the Kafka topic in the same consumer group. Is that a problem with the adapter approach?
+    verify: true
+    tags: [debug, socketio, scaling]
+  - id: messaging-kafka-047
+    level: hard
+    type: scenario
+    q: Every rolling deployment on Kubernetes causes several rebalances and a lag spike. How do you reduce this?
+    hint: |-
+      Mỗi pod dừng rồi pod mới join → mỗi lần là một rebalance (eager = cả group dừng).
+      Giảm: **static membership** (`group.instance.id` ổn định theo pod ordinal, StatefulSet) → consumer quay lại trong `session.timeout.ms` không gây rebalance; **cooperative-sticky** hoặc KIP-848 để rebalance incremental; graceful shutdown (commit trước khi rời); `maxSurge`/`maxUnavailable` hợp lý.
+      Kiểm tra client Node của bạn hỗ trợ những tính năng nào.
+    followUp: What is the downside of a long session timeout with static membership?
+    verify: true
+    tags: [rebalance, kubernetes, operations]
+  - id: messaging-kafka-048
+    level: hard
+    type: debug
+    q: This graceful-shutdown code still causes duplicate processing on every deploy. Why?
+    example: |-
+      ```ts
+      consumer.on("SIGTERM", async () => {
+        await consumer.disconnect();
+      });
+      await consumer.run({ eachMessage: handle });
+      ```
+    hint: |-
+      - `SIGTERM` là **tín hiệu của process**, phải là `process.on("SIGTERM", ...)`; `consumer.on` không nhận signal (KafkaJS `on` dùng cho instrumentation events) → handler không bao giờ chạy → pod bị kill sau grace period, offset chưa commit.
+      - Nên: dừng nhận message, chờ handler đang chạy xong, commit, `disconnect()` (KafkaJS commit offset đã resolve khi disconnect/stop), rồi `process.exit`. Đặt `terminationGracePeriodSeconds` > thời gian xử lý tối đa.
+      - Vẫn cần consumer idempotent: shutdown sạch giảm trùng, không loại bỏ.
+    followUp: How long should terminationGracePeriodSeconds be, and what bounds it?
+    tags: [debug, shutdown, kafkajs]
+  - id: messaging-kafka-049
+    level: hard
+    type: design
+    q: Your consumer writes to a downstream API that rate-limits you. How do you apply back-pressure in a Kafka consumer?
+    hint: |-
+      Kafka là pull → back-pressure tự nhiên: **đừng poll/nhận thêm** khi chưa xử lý kịp. Công cụ: `consumer.pause([{ topic, partitions }])` / `resume()`, giới hạn concurrency, token bucket trước khi gọi API.
+      Khi bị 429: backoff theo `Retry-After`, không commit offset message chưa gửi được. Lag tăng là **chấp nhận được** (Kafka giữ dữ liệu) miễn nằm trong retention và có alert.
+      Tránh: buffer vô hạn trong memory, hoặc đẩy lỗi 429 sang DLQ (đó là lỗi transient).
+    followUp: What happens to rebalancing if you pause for longer than max.poll.interval.ms?
+    tags: [backpressure, consumer]
+  - id: messaging-kafka-050
+    level: hard
+    type: scenario
+    q: A bug corrupted a read model for the last three days. How do you reprocess events from Kafka safely?
+    hint: |-
+      Điều kiện: dữ liệu còn trong retention (hoặc có compacted/archival). Cách: tạo **consumer group mới** (hoặc `kafka-consumer-groups --reset-offsets --to-datetime` khi group đã dừng) → replay vào read model mới (blue/green) rồi chuyển đọc; hoặc replay vào read model hiện tại nếu consumer idempotent/upsert theo version.
+      Cẩn thận: side effect (email, payment) phải tắt trong chế độ replay; throttle để không đè DB; ordering theo partition được giữ.
+    followUp: Why is replaying into a fresh read model usually safer than in-place?
+    tags: [replay, operations]
+  - id: messaging-kafka-051
+    level: senior
+    type: design
+    q: Design an event-driven order pipeline (order, payment, inventory, notification) on Kafka. Cover consistency, retries and failure handling.
+    hint: |-
+      - Order service ghi order + outbox trong 1 transaction → `orders` (key = orderId).
+      - Payment/Inventory consume, idempotent theo event_id, phát event kết quả (qua outbox của chúng) → saga (choreography hoặc orchestrator) với compensating action (release stock, refund).
+      - Retry: transient → backoff/retry topic; permanent → DLQ + alert + replay. Ordering theo orderId.
+      - Schema Registry, headers tracing, lag alert, runbook.
+      - Nói rõ chỗ nào **eventual**: UI hiển thị "đang xử lý"; đọc trạng thái từ read model.
+    followUp: Payment succeeded but inventory reservation failed permanently. Walk through the compensation.
+    tags: [design, saga, outbox]
+  - id: messaging-kafka-052
+    level: senior
+    type: open
+    q: A team of six asks you whether to adopt Kafka, RabbitMQ or SQS for their new service. How do you decide?
+    hint: |-
+      Hỏi trước: có cần **replay** / nhiều consumer độc lập / event backbone chia sẻ giữa team? Throughput và retention? Đang ở cloud nào, có managed service? Đội có ai vận hành Kafka được?
+      Heuristic: task queue đơn giản trên AWS → SQS (+SNS fanout); routing phức tạp, priority, RPC-ish → RabbitMQ; event streaming, CDC, analytics, nhiều team → Kafka (managed).
+      Senior: chọn theo tổng chi phí sở hữu và rủi ro vận hành, không theo trend; để đường lui (abstraction mỏng, outbox dùng được với cả hai).
+    followUp: What would make you move from SQS to Kafka later, and how painful is that?
+    tags: [open, architecture]
+  - id: messaging-kafka-053
+    level: senior
+    type: design
+    q: In a multi-tenant platform, would you use a topic per tenant or shared topics with tenant in the key or header? Discuss.
+    hint: |-
+      Topic per tenant: cô lập tốt (retention, ACL, xoá tenant dễ), nhưng số topic/partition bùng nổ → metadata, rebalance, consumer phải subscribe regex; khó vận hành với hàng nghìn tenant.
+      Shared topic + `tenantId` trong header/payload (key = entity id): đơn giản, scale tốt; cần enforce authorization ở consumer, xử lý noisy neighbor (quota theo client-id, ưu tiên), xoá dữ liệu tenant khó (compaction tombstone, retention).
+      Hybrid: shared cho đa số, topic riêng cho tenant lớn/đặc biệt (compliance).
+    followUp: A tenant requests deletion of all their data under GDPR. What does that mean for Kafka topics?
+    tags: [multi-tenant, design]
+  - id: messaging-kafka-054
+    level: senior
+    type: open
+    q: How do you govern event schemas and topic ownership across many teams?
+    hint: |-
+      Mỗi topic có **owner** (team producer), mô tả, SLA, retention, schema trong registry với compatibility bắt buộc; review thay đổi schema như review API; event catalog (AsyncAPI).
+      Quy ước tên (`<domain>.<entity>.<event>.v1`), không cho consumer ghi vào topic của domain khác, ACL theo service.
+      Breaking change: topic version mới + chạy song song + deprecate có hạn. Tránh "god topic" chứa mọi thứ.
+    followUp: How do you detect consumers that still read a deprecated topic?
+    tags: [governance, schema]
+  - id: messaging-kafka-055
+    level: senior
+    type: compare
+    q: Kafka now has share groups (Queues for Kafka). When would you use them instead of a classic consumer group or a separate queue system?
+    hint: |-
+      Share group (KIP-932): nhiều consumer cùng đọc **một partition**, broker khoá từng record (acquisition lock), ack/release/reject từng record, đếm số lần giao → giống work queue; không giữ ordering.
+      Dùng khi: task độc lập, cần scale consumer vượt số partition, thời gian xử lý không đều, muốn retry theo từng record mà không thêm RabbitMQ/SQS.
+      Không dùng khi: cần ordering theo key, hoặc client của bạn (Node) chưa hỗ trợ. Kafka 4.2 đánh dấu production-ready — kiểm tra phiên bản broker/client.
+    followUp: What delivery guarantee do share groups give, and how are poison messages handled?
+    verify: true
+    tags: [share-groups, kafka-4]
+  - id: messaging-kafka-056
+    level: senior
+    type: open
+    q: Your Node services use KafkaJS. What is your position on keeping it, and how would you plan a migration?
+    hint: |-
+      Thực tế: KafkaJS không có release mới từ khoảng 2023 và không được maintain tích cực → rủi ro bảo mật, không có tính năng mới (KIP-848, share groups).
+      Lựa chọn: `@confluentinc/kafka-javascript` (dựa librdkafka, có lớp API tương thích KafkaJS), hoặc client JS thuần khác đang được maintain.
+      Kế hoạch: bọc client sau một interface nội bộ, migrate từng service (bắt đầu từ consumer ít quan trọng), so sánh metrics (lag, throughput, error), lưu ý khác biệt config/semantic (librdkafka là native addon → build image, Alpine/musl).
+    followUp: What behavioral differences would you test for before switching a consumer in production?
+    verify: true
+    tags: [kafkajs, nodejs, migration]
+  - id: messaging-kafka-057
+    level: senior
+    type: design
+    q: What SLOs and alerts would you define for a business-critical streaming pipeline?
+    hint: |-
+      SLI: **end-to-end latency** (event time → xử lý xong), consumer lag theo thời gian, error rate/DLQ rate, throughput so với producer.
+      SLO ví dụ: 99% event xử lý trong < 30s. Alert theo burn rate, DLQ > 0 cho topic quan trọng, rebalance rate, under-replicated partitions, ISR shrink, disk broker.
+      Kèm runbook: skip/park message, scale consumer, replay.
+    followUp: How do you measure end-to-end latency when producer and consumer clocks differ?
+    tags: [observability, slo]
+  - id: messaging-kafka-058
+    level: cv
+    type: design
+    q: In a monolith-to-microservices migration you used Kafka for asynchronous communication. How did you keep the database write and the event publish consistent?
+    hint: |-
+      Câu trả lời mạnh: nêu rõ đã dùng gì — outbox (bảng + relay/CDC), hay publish sau commit + reconciliation job — và **vì sao**; thừa nhận rủi ro dual write nếu chưa làm outbox, và cách sẽ sửa.
+      Kèm: event_id để consumer dedupe, key để giữ thứ tự, cách xử lý khi Kafka tạm down (outbox tích lại rồi đẩy), monitoring (outbox backlog). **(điền kiến trúc thật của bạn)**
+    followUp: What happens in your design if Kafka is unavailable for 15 minutes?
+    redFlags:
+      - "We just call producer.send after saving — it never fails"
+    tags: [cv, outbox, migration]
+  - id: messaging-kafka-059
+    level: cv
+    type: behavioral
+    q: During that migration, how did you decide which interactions became asynchronous Kafka events and which stayed synchronous calls?
+    hint: |-
+      Tiêu chí nên nêu: caller có cần kết quả ngay để trả user không (sync), có chấp nhận eventual consistency không, fan-out nhiều consumer (async), cần tách availability giữa service (async), luồng lâu/batch (async).
+      Ví dụ cụ thể từ dự án (vd: đồng bộ dữ liệu, thông báo, cập nhật read model → async; validate/tra cứu → sync) **(điền ví dụ thật của bạn)**. Nêu một quyết định mà sau này bạn thấy nên làm khác.
+    followUp: Which async flow caused the most debugging pain, and why?
+    tags: [cv, architecture]
+  - id: messaging-kafka-060
+    level: cv
+    type: scenario
+    q: How did your Kafka consumers in that system handle duplicate and out-of-order messages?
+    hint: |-
+      Nội dung mong đợi: nguồn trùng (rebalance, retry, relay), cơ chế dedupe (unique event_id, upsert, version/updatedAt), key để ordering, cách xử lý message lỗi (retry, DLQ), và cách test (kill consumer giữa chừng, replay topic).
+      Nếu hệ thống từng bị trùng trong production, kể ngắn gọn và cách sửa. **(điền chi tiết thật của bạn)**
+    followUp: How did you test that the consumer was really idempotent?
+    tags: [cv, idempotency]
+  - id: messaging-kafka-061
+    level: cv
+    type: design
+    q: You built a Data Enrichment Service that syncs product data from external providers. How was the pipeline structured, and how did you handle provider failures and backfills?
+    hint: |-
+      Nêu: lịch/trigger sync (poll, webhook), chuẩn hoá dữ liệu (data transformation), cách ghi (upsert idempotent theo provider id + version), phát event cho indexer/cache.
+      Lỗi provider: timeout, retry backoff + jitter, circuit breaker, rate limit theo provider, dữ liệu xấu → quarantine thay vì làm hỏng catalog.
+      Backfill: chạy riêng, throttle, không ảnh hưởng realtime (topic/priority riêng). **(điền số lượng sản phẩm/tần suất thật của bạn)**
+    followUp: A provider sends a partial payload that would wipe fields. How do you protect the catalog?
+    tags: [cv, pipeline, data-sync]
+  - id: messaging-kafka-062
+    level: cv
+    type: scenario
+    q: Your Indexer Service kept Elasticsearch in sync with product data. How did you deal with updates arriving out of order or being replayed?
+    hint: |-
+      Kỹ thuật chuẩn: ghi document với **external versioning** (`version_type=external`, version = updatedAt/sequence) để bản cũ không đè bản mới; key event theo productId để giữ thứ tự trong partition; bulk indexing có retry cho item lỗi; full reindex vào index mới + alias swap khi đổi mapping.
+      Nêu cách bạn thực sự làm và độ trễ index điển hình **(điền số liệu thật của bạn)**.
+    followUp: How do you rebuild the whole index without downtime?
+    verify: true
+    tags: [cv, elasticsearch, ordering]
+  - id: messaging-kafka-063
+    level: cv
+    type: design
+    q: On a financial platform you built real-time features with Socket.IO. How did you scale it across instances and make sure users did not see wrong or missing data after reconnects?
+    hint: |-
+      Nêu: sticky session/transport, adapter giữa instance (Redis), auth khi handshake và kiểm soát room, nguồn sự kiện (Kafka/DB) → emit.
+      Độ tin cậy: Socket.IO/Redis adapter là at-most-once → khi reconnect client **refetch snapshot** hoặc gửi last-seen sequence để server gửi bù; message có sequence/timestamp để client bỏ bản cũ; throttle/coalesce update giá.
+      **(điền số connection/instance thật của bạn)**
+    followUp: How did you load-test the WebSocket layer?
+    verify: true
+    tags: [cv, socketio, realtime]
+  - id: messaging-kafka-064
+    level: cv
+    type: behavioral
+    q: Tell me about a production incident involving your messaging system. What happened, and what did you change afterwards?
+    hint: |-
+      STAR: triệu chứng (lag, trùng, mất event, DLQ đầy), cách phát hiện (alert hay user báo), cách khoanh vùng (offset, log, trace), hành động khắc phục ngay, root cause, thay đổi lâu dài (config, idempotency, alert mới, runbook).
+      Reflection: điều gì nên có từ đầu. **(điền câu chuyện thật của bạn — không bịa số liệu)**
+    followUp: What alert would have caught it earlier?
+    tags: [cv, behavioral, incident]

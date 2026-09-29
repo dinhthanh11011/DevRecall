@@ -1,0 +1,747 @@
+id: 26-observability
+slug: observability
+title: Observability, Reliability & Incident Response
+tier: 7
+status: drafted
+summary: Logs/metrics/traces, structured logging & correlation ID, OpenTelemetry, RED/USE, SLI/SLO/error budget, alert theo triệu chứng, load testing (k6), capacity planning, debug production BE/DB/FE, incident & postmortem.
+cvLinked: true
+prerequisites: []
+overview: |-
+  ## TL;DR
+
+  - **Monitoring** trả lời "có hỏng không?" (câu hỏi biết trước); **observability** trả lời "tại sao hỏng?" cho cả câu hỏi **chưa biết trước** — nhờ telemetry giàu ngữ cảnh (high-cardinality, liên kết được với nhau).
+  - Ba tín hiệu: **metrics** (rẻ, tổng hợp, để alert), **logs** (chi tiết từng sự kiện), **traces** (đường đi của một request qua nhiều service). Chìa khoá là **nối** chúng bằng `trace_id` / correlation ID.
+  - **OpenTelemetry** là chuẩn vendor-neutral để instrument (API + SDK + Collector + OTLP) — instrument một lần, gửi tới backend nào cũng được.
+  - Reliability đo bằng **SLI → SLO → error budget**; alert theo **triệu chứng người dùng thấy** (burn rate), không theo mọi nguyên nhân (CPU 80%).
+  - Senior interview hay hỏi: "Kể sự cố khó nhất bạn debug" → cần **phương pháp** (khoanh vùng, giả thuyết, bằng chứng), không phải may mắn. Kết thúc bằng **postmortem blameless** có action item.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Structured logging | Log là JSON có field cố định, query được | `{"level":"error","trace_id":"4bf9…","tenant_id":"t_42","msg":"payment failed"}` |
+  | Correlation ID | ID đi theo request qua mọi service/log | Header `traceparent` / `x-request-id` → `AsyncLocalStorage` → mọi log line |
+  | Span / trace | Span = một đơn vị công việc có start/end + attributes; trace = cây span của một request | `GET /checkout` → span `SELECT orders` 120 ms → span `POST stripe` 800 ms |
+  | Cardinality | Số giá trị khác nhau của một label | Label `user_id` trên metric → hàng triệu time series → backend nổ |
+  | RED | Rate, Errors, Duration — cho **service** (request-driven) | API: 1.2k rps, 0.3% 5xx, p99 450 ms |
+  | USE | Utilization, Saturation, Errors — cho **resource** | DB CPU 85%, 40 connection chờ, 0 disk error |
+  | Golden signals | Latency, Traffic, Errors, Saturation (Google SRE) | Dashboard đầu tiên của mọi service |
+  | SLI | Tỉ lệ sự kiện tốt / tổng sự kiện | `requests < 300ms và không 5xx / total requests` |
+  | SLO | Mục tiêu cho SLI trong cửa sổ thời gian | 99.9% trong 30 ngày |
+  | Error budget | `1 − SLO` — lượng "được phép hỏng" | 99.9%/30 ngày ≈ 43 phút downtime tương đương |
+  | Burn rate | Tốc độ tiêu budget so với mức "vừa đủ hết đúng hạn" | Burn rate 14.4 trong 1h = tiêu 2% budget tháng trong 1 giờ |
+  | Percentile | p50/p95/p99 — không bao giờ lấy trung bình của percentile | p99 = 1% request chậm hơn giá trị này |
+
+  ## Cơ chế hoạt động
+
+  **Telemetry pipeline với OpenTelemetry:**
+
+  ```mermaid
+  flowchart LR
+    subgraph App["Node service"]
+      SDK["OTel SDK<br/>auto-instrumentation<br/>(http, express, pg, redis, kafkajs)"]
+      LOG["pino logger<br/>+ trace_id"]
+    end
+    FE["Browser RUM<br/>(Web Vitals, errors)"] -- "traceparent" --> App
+    SDK -- "OTLP" --> COL["OTel Collector<br/>batch · sampling · redact"]
+    LOG -- "stdout" --> COL
+    COL --> TR[("Traces backend<br/>Jaeger/Tempo/X-Ray")]
+    COL --> MET[("Metrics<br/>Prometheus/CloudWatch")]
+    COL --> LG[("Logs<br/>Loki/Elasticsearch/CloudWatch")]
+    MET --> AL["Alerting (SLO burn rate)"] --> ONC["On-call"]
+  ```
+
+  **Phương pháp debug sự cố production (BE / DB / FE):**
+
+  ```mermaid
+  flowchart TD
+    A["Alert / user report"] --> B["Xác nhận tác động: ai, bao nhiêu, từ khi nào?<br/>(SLO dashboard)"]
+    B --> C{"Có thay đổi gần đây?<br/>deploy, config, flag, traffic, dependency"}
+    C -- "có" --> M["Mitigate trước: rollback / tắt flag / scale"]
+    C -- "không rõ" --> D["Khoanh vùng theo tầng"]
+    D --> FE["FE: RUM, JS error, network tab,<br/>chỉ một browser/region?"]
+    D --> BE["BE: RED theo endpoint, trace chậm nhất,<br/>log lỗi theo trace_id"]
+    D --> DB["DB: slow query, lock/blocking, connection pool,<br/>CPU/IO, plan thay đổi"]
+    FE --> H["Giả thuyết → kiểm chứng bằng dữ liệu"]
+    BE --> H
+    DB --> H
+    H --> M
+    M --> P["Postmortem blameless + action items"]
+  ```
+
+  ## Trade-offs
+
+  | Tín hiệu | Mạnh | Yếu | Chi phí |
+  |---|---|---|---|
+  | Metrics | Rẻ, lưu lâu, alert, xu hướng | Mất chi tiết; high-cardinality đắt | Theo số time series |
+  | Logs | Chi tiết đầy đủ, ngữ cảnh | Đắt khi volume lớn, khó tổng hợp nếu không structured | Theo GB ingest + retention |
+  | Traces | Thấy latency qua nhiều service, critical path | Cần propagation đúng; phải sampling | Theo span; sampling quyết định |
+  | Head sampling | Đơn giản, rẻ, quyết định ở đầu request | Có thể bỏ mất trace lỗi/chậm hiếm | Thấp |
+  | Tail sampling | Giữ trace lỗi/chậm, bỏ trace bình thường | Collector phải buffer toàn bộ trace, phức tạp | Cao hơn |
+
+  | Load test type | Mục đích | Hình dạng tải |
+  |---|---|---|
+  | Smoke | Script chạy đúng, baseline | Rất ít VU, ngắn |
+  | Average-load | Hành vi ở tải bình thường | Ramp tới mức trung bình, giữ |
+  | Stress | Hành vi trên mức bình thường | Tải cao hơn peak |
+  | Spike | Tăng đột ngột (flash sale) | Nhảy vọt trong vài giây |
+  | Soak / endurance | Leak, degrade theo thời gian | Tải vừa trong nhiều giờ |
+  | Breakpoint | Tìm giới hạn | Tăng dần tới khi vỡ |
+
+  ## Pitfalls
+
+  - Log text tự do, không có `trace_id`/`tenant_id` → không nối được log giữa các service.
+  - Log PII/secret (token, password, số thẻ) → sự cố bảo mật + compliance.
+  - Label metric high-cardinality (`user_id`, URL có ID) → chi phí và backend quá tải.
+  - Dùng **average latency** hoặc lấy trung bình của p99 giữa các instance.
+  - Alert theo nguyên nhân (CPU, memory) thay vì triệu chứng → alert fatigue, on-call bỏ qua alert thật.
+  - SLO 100% hoặc SLO không ai dùng để ra quyết định.
+  - Load test từ laptop, closed model (VU chờ response) → **coordinated omission**, số đẹp giả tạo.
+  - Postmortem tìm "người có lỗi" → mọi người giấu thông tin lần sau.
+  - OTel SDK khởi tạo **sau** khi đã import `express`/`pg` → auto-instrumentation không patch được.
+
+  ## Cheat sheet
+
+  - Log: JSON, level đúng, `trace_id`, `span_id`, `request_id`, `tenant_id`, `service`, `version`; không PII; ra stdout.
+  - Node: `AsyncLocalStorage` giữ context request; pino (nhanh) + OTel log correlation.
+  - W3C Trace Context: `traceparent: 00-<trace-id 32 hex>-<span-id 16 hex>-<flags>`.
+  - RED cho service, USE cho resource; bốn golden signals cho dashboard mặc định.
+  - 99.9% / 30 ngày ≈ 43.2 phút · 99.95% ≈ 21.6 phút · 99.99% ≈ 4.3 phút.
+  - Alert: multi-window multi-burn-rate (ví dụ page khi 2% budget cháy trong 1h, ticket khi 10% cháy trong 3 ngày).
+  - Load test: open model (arrival-rate) khi mô phỏng user thật; đo p95/p99, error rate, throughput, và **saturation** của DB/pool.
+  - Little's Law: `concurrency = throughput × latency`.
+  - Incident: phân vai (incident commander, comms, ops), **mitigate trước, root cause sau**, timeline, postmortem blameless trong vài ngày.
+notionRefs:
+  - title: Logging & Monitoring
+    url: https://app.notion.com/p/c3e7bf3f3db64041b1eb1447248b6c4b
+references:
+  - title: OpenTelemetry — Concepts (signals, context propagation)
+    url: https://opentelemetry.io/docs/concepts/
+  - title: OpenTelemetry — Node.js getting started
+    url: https://opentelemetry.io/docs/languages/js/getting-started/nodejs/
+  - title: OpenTelemetry — Sampling
+    url: https://opentelemetry.io/docs/concepts/sampling/
+  - title: W3C Trace Context
+    url: https://www.w3.org/TR/trace-context/
+  - title: Google SRE Book — Monitoring distributed systems (golden signals)
+    url: https://sre.google/sre-book/monitoring-distributed-systems/
+  - title: Google SRE Book — Service level objectives
+    url: https://sre.google/sre-book/service-level-objectives/
+  - title: Google SRE Workbook — Alerting on SLOs
+    url: https://sre.google/workbook/alerting-on-slos/
+  - title: Google SRE Book — Postmortem culture
+    url: https://sre.google/sre-book/postmortem-culture/
+  - title: Brendan Gregg — The USE Method
+    url: https://www.brendangregg.com/usemethod.html
+  - title: Grafana k6 — Load test types
+    url: https://grafana.com/docs/k6/latest/testing-guides/test-types/
+  - title: Grafana k6 — Open and closed models
+    url: https://grafana.com/docs/k6/latest/using-k6/scenarios/concepts/open-vs-closed/
+  - title: Prometheus — Metric and label naming / cardinality
+    url: https://prometheus.io/docs/practices/naming/
+  - title: Node.js — AsyncLocalStorage
+    url: https://nodejs.org/api/async_context.html
+questions:
+  - id: observability-001
+    level: easy
+    type: compare
+    q: Logs, metrics and traces — what is each good for, and give one example question each answers best?
+    hint: |-
+      - **Metrics**: số tổng hợp theo thời gian, rẻ → alert và xu hướng. "Error rate của `/checkout` 10 phút qua là bao nhiêu?"
+      - **Logs**: sự kiện rời rạc có chi tiết → "Vì sao order `o_123` fail lúc 10:02?"
+      - **Traces**: đường đi của một request qua nhiều service, thời gian từng bước → "Trong 2s của request chậm này, bao nhiêu nằm ở DB và bao nhiêu ở payment provider?"
+      Giá trị thật đến từ **liên kết**: alert (metric) → trace mẫu (exemplar) → log cùng `trace_id`.
+    followUp: How do you jump from a latency spike on a dashboard to the exact slow request's logs?
+    tags: [logs, metrics, traces]
+  - id: observability-002
+    level: easy
+    type: concept
+    q: What is structured logging and why does it matter in a Node microservices system?
+    hint: |-
+      Log dưới dạng **JSON có field cố định** (`level`, `time`, `msg`, `service`, `trace_id`, `tenant_id`, `err.stack`…) thay vì chuỗi tự do.
+      Lợi ích: query/filter/aggregate được (`level=error AND tenant_id=t_42`), parse không cần regex, nối log giữa các service qua ID.
+      Node: **pino** (nhanh, JSON mặc định, ghi stdout) hoặc winston; log ra **stdout** để platform thu gom (12-factor).
+      Chú ý: log level đúng (không log error cho 404 bình thường), không log PII/secret (pino `redact`).
+    example: |-
+      ```ts
+      import pino from "pino";
+      export const logger = pino({
+        redact: ["req.headers.authorization", "*.password", "*.cardNumber"],
+        base: { service: "order-api", version: process.env.GIT_SHA },
+      });
+      logger.info({ orderId, tenantId, durationMs }, "order created");
+      ```
+    followUp: Your logging bill doubled. What do you cut first without losing debuggability?
+    tags: [logging, structured-logging, pino]
+  - id: observability-003
+    level: easy
+    type: concept
+    q: What is a correlation ID and how do you propagate it across services?
+    hint: |-
+      ID duy nhất gắn với một request/luồng nghiệp vụ, xuất hiện trong **mọi log** và được **truyền tiếp** sang service khác → ghép toàn bộ câu chuyện.
+      Truyền: HTTP header (chuẩn **W3C `traceparent`**; hoặc `x-request-id`), Kafka/SQS **message header**, job payload.
+      Trong Node: middleware đọc header (hoặc tạo mới) → lưu vào **`AsyncLocalStorage`** → logger tự đính kèm; OTel làm việc này tự động cho trace context.
+      Trả ID cho client (response header) để support tra cứu khi user báo lỗi.
+    followUp: How do you keep the correlation ID when a request triggers an async Kafka consumer 5 minutes later?
+    tags: [correlation-id, tracing, context-propagation]
+  - id: observability-004
+    level: easy
+    type: compare
+    q: RED vs USE vs the four golden signals — when do you use each?
+    hint: |-
+      - **RED** (Rate, Errors, Duration) — cho **service** xử lý request (API, consumer). Dashboard mặc định cho mỗi service.
+      - **USE** (Utilization, Saturation, Errors — Brendan Gregg) — cho **resource** (CPU, memory, disk, connection pool, thread pool, DB).
+      - **Golden signals** (Latency, Traffic, Errors, Saturation — Google SRE) — gần như RED + saturation.
+      Debug: RED cho biết **service nào** bị ảnh hưởng; USE cho biết **resource nào** là nút thắt.
+      Ví dụ: API p99 tăng (RED) → connection pool DB saturation 100% với 50 request chờ (USE).
+    followUp: What does "saturation" look like for a Node.js process specifically?
+    tags: [red, use, golden-signals, metrics]
+  - id: observability-005
+    level: easy
+    type: compare
+    q: SLI, SLO and SLA — define each with an example for a checkout API.
+    hint: |-
+      - **SLI**: chỉ số đo từ góc người dùng, thường là tỉ lệ: `số request checkout thành công và < 1s / tổng request checkout`.
+      - **SLO**: mục tiêu nội bộ cho SLI trong cửa sổ: 99.5% trong 28/30 ngày.
+      - **SLA**: cam kết **hợp đồng** với khách hàng, có hậu quả (credit/refund): 99.0% monthly. SLA nên **lỏng hơn** SLO để có vùng đệm.
+      Error budget = `1 − SLO` → dùng để quyết định: còn budget thì ship nhanh; cháy budget thì ưu tiên reliability.
+    followUp: Who should agree on an SLO, and what happens when the error budget is exhausted?
+    tags: [sli, slo, sla, error-budget]
+  - id: observability-006
+    level: easy
+    type: concept
+    q: Why are averages misleading for latency, and what are percentiles?
+    hint: |-
+      Latency phân phối lệch (long tail): trung bình 120 ms có thể che giấu 2% request mất 5s. pN = N% request nhanh hơn giá trị này.
+      Dùng p50 (trải nghiệm điển hình), p95/p99 (tail — thường là khách hàng quan trọng nhất, request nặng nhất).
+      Không được **lấy trung bình các p99** của nhiều instance — phải tính percentile từ **histogram** gộp.
+      Một page gọi 20 API → xác suất ít nhất một call chạm p99 ≈ 1 − 0.99²⁰ ≈ 18%.
+    followUp: Why do Prometheus histograms aggregate across instances correctly while summaries don't?
+    tags: [latency, percentiles, metrics]
+  - id: observability-007
+    level: easy
+    type: concept
+    q: What is OpenTelemetry, and what are its main components?
+    hint: |-
+      OpenTelemetry (OTel, CNCF) = chuẩn **vendor-neutral** để tạo và thu thập telemetry (traces, metrics, logs).
+      - **API**: interface để instrument code.
+      - **SDK**: implementation (sampler, processor, exporter).
+      - **Instrumentation libraries / auto-instrumentation**: patch sẵn http, express, pg, mysql, redis, kafkajs…
+      - **OTLP**: giao thức truyền dữ liệu.
+      - **Collector**: nhận, xử lý (batch, sampling, redact, enrich), export tới nhiều backend.
+      - **Semantic conventions**: tên attribute chuẩn (`http.response.status_code`, `db.system`…).
+      Lợi ích: instrument một lần, đổi backend (Jaeger, Tempo, Datadog, X-Ray) không phải sửa code.
+    followUp: Why deploy an OTel Collector instead of exporting directly from each service to the vendor?
+    verify: true
+    tags: [opentelemetry, tracing]
+  - id: observability-008
+    level: easy
+    type: compare
+    q: Load test, stress test, spike test, soak test — what's the difference and when do you run each?
+    hint: |-
+      - **Average-load**: tải bình thường mong đợi → xác nhận đạt SLO.
+      - **Stress**: vượt peak → hệ thống degrade thế nào, có hồi phục không.
+      - **Spike**: tăng đột ngột (flash sale, push notification) → autoscaling kịp không, queue/cache có chịu nổi không.
+      - **Soak** (nhiều giờ): memory leak, connection leak, disk đầy, degrade theo thời gian.
+      - **Breakpoint**: tăng tới khi vỡ → biết giới hạn thật cho capacity planning.
+      - **Smoke**: tải tối thiểu để kiểm tra script trước khi chạy test lớn.
+      Chạy trên môi trường giống production (dữ liệu cỡ thật), có monitoring đầy đủ.
+    followUp: Which test would have caught a slow memory leak in a Socket.IO server, and what would you measure?
+    tags: [load-testing, k6, performance]
+  - id: observability-009
+    level: medium
+    type: debug
+    q: The logs from this Express service can't be tied to a request. Fix it so every log line carries the request's trace/correlation ID without passing it through every function.
+    example: |-
+      ```ts
+      app.use((req, _res, next) => {
+        (global as any).requestId = req.headers["x-request-id"] ?? crypto.randomUUID();
+        next();
+      });
+
+      export function log(msg: string) {
+        console.log(`${new Date().toISOString()} [${(global as any).requestId}] ${msg}`);
+      }
+      ```
+    hint: |-
+      - Biến **global** bị ghi đè bởi request đồng thời (Node xử lý nhiều request xen kẽ trên một thread) → log gắn **nhầm ID** — còn tệ hơn không có.
+      - Log text, không structured.
+      Fix: **`AsyncLocalStorage`** giữ context theo chuỗi async của từng request; logger (pino child) đọc từ store. Ưu tiên dùng trace context của OTel (`trace_id` từ active span) và chuẩn `traceparent`; trả ID trong response header.
+    followUp: Where does AsyncLocalStorage context get lost, and how do you detect it?
+    tags: [asynclocalstorage, logging, nodejs, debugging]
+  - id: observability-010
+    level: medium
+    type: concept
+    q: How do you instrument a Node/Express service with OpenTelemetry, and what's the most common setup mistake?
+    hint: |-
+      - Cài `@opentelemetry/sdk-node` + `@opentelemetry/auto-instrumentations-node` + exporter OTLP; khởi tạo SDK với `resource` (`service.name`, `service.version`, `deployment.environment`).
+      - **Lỗi phổ biến**: SDK phải được load **trước** mọi module được instrument (http, express, pg) — dùng `node --require ./tracing.js` (CJS) hoặc `--import` (ESM, cần loader hook) thay vì import trong `app.ts` sau khi đã import express.
+      - Khác: không set `service.name` (mọi thứ thành `unknown_service`), không shutdown SDK khi SIGTERM (mất span cuối), export đồng bộ không batch, không propagate context qua Kafka message.
+      - Thêm manual span cho logic nghiệp vụ quan trọng, attribute `tenant.id`.
+    example: |-
+      ```ts
+      // tracing.ts — load with: node --import ./dist/tracing.js dist/server.js
+      import { NodeSDK } from "@opentelemetry/sdk-node";
+      import { getNodeAutoInstrumentations } from "@opentelemetry/auto-instrumentations-node";
+      import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
+
+      const sdk = new NodeSDK({
+        serviceName: "order-api",
+        traceExporter: new OTLPTraceExporter(),
+        instrumentations: [getNodeAutoInstrumentations()],
+      });
+      sdk.start();
+      process.on("SIGTERM", () => sdk.shutdown());
+      ```
+    followUp: How do you propagate trace context through a Kafka producer and consumer?
+    verify: true
+    tags: [opentelemetry, nodejs, instrumentation]
+  - id: observability-011
+    level: medium
+    type: compare
+    q: Head-based vs tail-based sampling for traces — how do you choose?
+    hint: |-
+      - **Head sampling**: quyết định giữ/bỏ ở **đầu** trace (ví dụ 10%, `ParentBased(TraceIdRatio)`), truyền quyết định theo `traceparent` flags → rẻ, đơn giản, nhưng có thể bỏ mất trace lỗi/chậm hiếm.
+      - **Tail sampling**: Collector buffer toàn bộ span của trace rồi quyết định **sau khi xong** (giữ mọi trace lỗi, latency > 1s, tenant quan trọng; lấy mẫu ít trace bình thường) → giá trị debug cao, nhưng tốn memory Collector và cần mọi span của một trace tới **cùng** Collector instance (load-balancing exporter theo trace ID).
+      - Thực tế: head sampling vừa phải + tail sampling ở Collector; metric RED tính từ **toàn bộ** request (không từ trace đã sample).
+    followUp: If you sample traces at 5%, can you still compute accurate error rates from traces? Why not?
+    tags: [tracing, sampling, opentelemetry]
+  - id: observability-012
+    level: medium
+    type: gotcha
+    q: A developer adds `userId` and full `url` as labels on a Prometheus request-count metric. What happens?
+    hint: |-
+      Mỗi tổ hợp label là **một time series** riêng → `userId` (hàng triệu) × URL có ID (`/orders/123`) → **cardinality explosion**: memory Prometheus tăng vọt, query chậm, chi phí vendor tính theo series tăng mạnh, có thể sập backend monitoring.
+      Fix: label chỉ dùng giá trị **giới hạn** (`method`, `route` template như `/orders/:id`, `status_code` hoặc class `5xx`, `tenant_tier`); chi tiết theo user đưa vào **logs/traces** (chịu được high-cardinality) hoặc exemplars.
+      Guardrail: giới hạn series per metric, review metric trong PR.
+    followUp: You need per-tenant latency for 5,000 tenants. How do you do it without exploding cardinality?
+    tags: [metrics, cardinality, prometheus]
+  - id: observability-013
+    level: medium
+    type: concept
+    q: Compute the error budget for a 99.9% monthly availability SLO and explain how the team should use it.
+    hint: |-
+      30 ngày = 43,200 phút → 0.1% ≈ **43.2 phút** "tương đương downtime" mỗi tháng (hoặc 0.1% request được phép lỗi nếu SLO theo request).
+      99.95% ≈ 21.6 phút; 99.99% ≈ 4.3 phút — mỗi số 9 thêm đắt gấp nhiều lần.
+      Dùng budget: còn nhiều → deploy thường xuyên, thử nghiệm; cháy gần hết → **freeze tính năng rủi ro**, ưu tiên reliability, postmortem. Đây là công cụ **đàm phán** giữa product và engineering, không phải KPI phạt.
+      SLO theo request (good/total) thường công bằng hơn theo thời gian cho API.
+    followUp: A dependency (payment provider) causes most of your budget burn. Does it count against your SLO?
+    tags: [slo, error-budget, sre]
+  - id: observability-014
+    level: medium
+    type: concept
+    q: What does "alert on symptoms, not causes" mean, and what is a burn-rate alert?
+    hint: |-
+      - Alert **page** con người chỉ khi **người dùng đang/ sắp bị ảnh hưởng** (error rate, latency SLO, checkout fail) — không page vì CPU 85% (có thể vô hại). Cause-based metric để trên dashboard/ticket để điều tra.
+      - **Burn rate** = tốc độ tiêu error budget / tốc độ "vừa đủ". Burn rate 1 = hết budget đúng cuối cửa sổ.
+      - SRE Workbook: **multi-window, multi-burn-rate** — ví dụ page khi burn rate ~14.4 trong 1h (2% budget/giờ) **và** cửa sổ ngắn 5 phút vẫn cao (để alert tự tắt nhanh khi hết); ticket khi burn chậm kéo dài (10% trong 3 ngày).
+      - Mỗi alert phải **actionable**, có runbook link.
+    followUp: Your on-call gets 40 pages a week and ignores most. How do you fix the alerting?
+    verify: true
+    tags: [alerting, slo, burn-rate]
+  - id: observability-015
+    level: medium
+    type: debug
+    q: This k6 script is supposed to prove the API handles 500 requests per second. Why can't it prove that, and how do you fix it?
+    example: |-
+      ```js
+      import http from "k6/http";
+      import { sleep } from "k6";
+
+      export const options = { vus: 500, duration: "5m" };
+
+      export default function () {
+        http.get("https://staging.example.com/api/products");
+        sleep(1);
+      }
+      ```
+    hint: |-
+      - Đây là **closed model**: mỗi VU chờ response rồi sleep 1s → throughput = `500 / (latency + 1s)`. Nếu API chậm đi, tải **tự giảm** → hệ thống không bao giờ nhận 500 rps khi đang yếu (coordinated omission) → kết quả đẹp giả.
+      - Không có `thresholds` → test không bao giờ "fail".
+      - Một endpoint, cùng một response (cache hit 100%) → không đại diện traffic thật.
+      Fix: executor **`constant-arrival-rate`** (open model) `rate: 500, timeUnit: "1s"`, `preAllocatedVUs` đủ lớn; thresholds `http_req_failed: ["rate<0.01"]`, `http_req_duration: ["p(95)<300","p(99)<800"]`; kịch bản trộn nhiều endpoint + dữ liệu đa dạng; chạy từ máy load generator đủ mạnh, gần hạ tầng.
+    followUp: During the test, the load generator's CPU hits 100%. What does that do to your results?
+    verify: true
+    tags: [k6, load-testing, coordinated-omission, debugging]
+  - id: observability-016
+    level: medium
+    type: concept
+    q: What would you measure during a load test besides response time?
+    hint: |-
+      - Phía client: throughput thực tế (rps), error rate theo loại, p50/p95/p99, số request bị drop/timeout.
+      - Phía server (RED + USE): CPU, memory/RSS, **event loop lag** (Node), GC pause, connection pool (in-use, waiting), thread pool libuv.
+      - DB: CPU, active connections, lock waits, slow queries, cache hit ratio, replication lag.
+      - Cache/queue: Redis latency/evictions, queue depth, consumer lag.
+      - Autoscaling: thời gian scale out, số replica.
+      Mục tiêu: tìm **nút thắt đầu tiên** và "knee" của đồ thị latency theo throughput, không chỉ báo "đạt X rps".
+    followUp: Latency stays flat until 800 rps then explodes. What is happening at the "knee"?
+    tags: [load-testing, performance, metrics]
+  - id: observability-017
+    level: medium
+    type: concept
+    q: How do you detect and measure event loop blocking in a Node.js service in production?
+    hint: |-
+      - Metric **event loop delay/lag**: `perf_hooks.monitorEventLoopDelay()` (histogram p99), hoặc `eventLoopUtilization()`; OTel/prom-client runtime metrics có sẵn.
+      - Triệu chứng: latency tăng cho **mọi** endpoint cùng lúc dù CPU trung bình không cao; health check timeout.
+      - Tìm thủ phạm: CPU profile (`--cpu-prof`, clinic flame, `0x`), trace thấy khoảng trống không có span con; log request dài.
+      - Nguyên nhân hay gặp: `JSON.parse/stringify` payload lớn, regex catastrophic backtracking, sync crypto/zlib/fs, vòng lặp lớn trên dữ liệu trong memory.
+      - Fix: stream, chia nhỏ công việc, worker threads, đưa sang job queue.
+    followUp: Why does one slow endpoint make all other endpoints slow in Node but not in a thread-per-request server?
+    tags: [nodejs, event-loop, performance]
+  - id: observability-018
+    level: medium
+    type: concept
+    q: What frontend observability do you need for a Next.js app, and how does it connect to the backend?
+    hint: |-
+      - **RUM**: Core Web Vitals (LCP, INP, CLS) theo route/device/region (`useReportWebVitals` hoặc thư viện web-vitals), TTFB.
+      - **Error tracking**: JS exception + source map (Sentry…), unhandled rejection, error boundary; hydration error.
+      - **Network**: API call fail/chậm từ phía client (CORS, timeout, mạng mobile).
+      - Nối với backend: gửi `traceparent` từ browser (OTel web) hoặc request ID → trace đi từ click tới DB.
+      - Next.js server: instrumentation (`instrumentation.ts` + OTel) cho SSR/route handlers.
+      - Privacy: không gửi PII, sample session replay.
+    followUp: Backend p99 is fine, but users complain the product page is slow. Where do you look?
+    verify: true
+    tags: [frontend, rum, nextjs, web-vitals]
+  - id: observability-019
+    level: medium
+    type: concept
+    q: What is capacity planning, and how do you use Little's Law in it?
+    hint: |-
+      Capacity planning = dự đoán tài nguyên cần cho tải tương lai (tăng trưởng + peak như flash sale) với headroom, dựa trên **số đo thật** (load test, production metric).
+      **Little's Law**: `L = λ × W` — số request đồng thời = throughput × thời gian xử lý. Ví dụ 2,000 rps × 50 ms = 100 request đồng thời → cần pool DB, concurrency Lambda, worker tương ứng.
+      Quy trình: đo throughput tối đa mỗi instance ở SLO (không phải tới lúc vỡ) → dự báo peak × hệ số an toàn → tính số instance/connection → kiểm tra giới hạn **dùng chung** (DB, third-party rate limit) vì scale app không scale DB.
+    followUp: Your app scales horizontally but the database doesn't. How do you plan for Black Friday?
+    tags: [capacity-planning, littles-law, performance]
+  - id: observability-020
+    level: medium
+    type: concept
+    q: What happens in a well-run incident response? Describe the roles and the first 15 minutes.
+    hint: |-
+      - Vai trò: **Incident Commander** (điều phối, ra quyết định, không tự debug), **Ops/SME** (điều tra, thực thi), **Communications** (cập nhật stakeholder/status page), scribe (timeline).
+      - 15 phút đầu: xác nhận & phân loại mức độ (SEV), mở kênh incident, đánh giá tác động (ai/bao nhiêu), kiểm tra **thay đổi gần đây**, **mitigate trước** (rollback, tắt flag, failover, scale, chặn traffic xấu) rồi mới root cause.
+      - Cập nhật định kỳ (ví dụ 30 phút) kể cả khi chưa có tin mới.
+      - Kết thúc: xác nhận hồi phục bằng metric, rồi postmortem.
+    followUp: Two senior engineers disagree about whether to roll back during the incident. What should happen?
+    tags: [incident-response, on-call]
+  - id: observability-021
+    level: medium
+    type: concept
+    q: What makes a postmortem "blameless", and what should it contain?
+    hint: |-
+      Blameless: giả định mọi người hành động hợp lý với thông tin họ có → tập trung vào **hệ thống và quy trình** cho phép lỗi xảy ra, không phải "ai sai". Nếu phạt người, lần sau thông tin bị giấu.
+      Nội dung: tóm tắt, tác động (user, thời gian, tiền), **timeline** (phát hiện, mitigate, hồi phục), root cause + contributing factors (thường nhiều yếu tố), cái gì đi tốt, cái gì may mắn, **action items** có owner + deadline (phòng ngừa, phát hiện sớm hơn, giảm tác động).
+      Tránh action item kiểu "cẩn thận hơn" — phải là thay đổi hệ thống (test, alert, guardrail).
+    followUp: How do you make sure postmortem action items actually get done?
+    tags: [postmortem, blameless, incident-response]
+  - id: observability-022
+    level: medium
+    type: debug
+    q: What's wrong with this alerting rule set?
+    example: |-
+      ```yaml
+      - alert: HighCPU
+        expr: avg(rate(process_cpu_seconds_total[1m])) > 0.8
+        for: 0m
+        labels: { severity: page }
+      - alert: AnyError
+        expr: increase(http_requests_total{status=~"5.."}[1m]) > 0
+        labels: { severity: page }
+      - alert: SlowRequests
+        expr: avg(http_request_duration_seconds_sum / http_request_duration_seconds_count) > 0.5
+        labels: { severity: page }
+      ```
+    hint: |-
+      - **HighCPU** page: nguyên nhân, không phải triệu chứng; `for: 0m` → dao động là page; trung bình toàn fleet che instance nóng.
+      - **AnyError > 0**: một lỗi 5xx đơn lẻ cũng page lúc 3 giờ sáng → alert fatigue. Nên theo **tỉ lệ** lỗi so với tổng, tốt nhất là SLO burn rate.
+      - **SlowRequests** dùng **average** latency (sum/count) → che tail; và lấy `avg` của tỉ số giữa các series. Nên dùng `histogram_quantile(0.99, sum by (le) (rate(..._bucket[5m])))` hoặc SLI "tỉ lệ request < 500ms".
+      - Không có `for`, không có runbook/annotation, không có severity ticket vs page.
+    followUp: Rewrite the error alert as a multi-window burn-rate alert for a 99.9% SLO.
+    tags: [alerting, prometheus, debugging]
+  - id: observability-023
+    level: hard
+    type: scenario
+    q: "p99 latency of the product listing API jumped from 300 ms to 4 s at 14:00 but p50 is unchanged. No deploy happened. How do you investigate?"
+    hint: |-
+      p50 không đổi, p99 tăng → **một phần** request bị ảnh hưởng. Khoanh vùng theo chiều:
+      - Theo **endpoint/params/tenant**: tenant lớn nào đó (query danh mục khổng lồ), page size lớn, filter mới?
+      - Theo **instance/AZ**: một pod/instance lỗi (GC, noisy neighbor, CPU throttling)?
+      - Theo **dependency**: trace chậm nhất → span nào chiếm thời gian (DB, Elasticsearch, Redis miss).
+      - Thay đổi không phải deploy: config/flag, job batch lúc 14:00 (report, reindex) chiếm DB/ES, cache TTL hết đồng loạt (stampede), traffic từ crawler/bot, plan query đổi do statistics.
+      Mitigate khi đã khoanh vùng (rate limit bot, dời batch, cache), rồi fix gốc.
+    followUp: The slow traces all hit Elasticsearch with deep pagination. What do you do?
+    tags: [latency, debugging, scenario]
+  - id: observability-024
+    level: hard
+    type: scenario
+    q: "Customers report intermittent 500 errors at checkout, about 1 in 200 requests, with no clear pattern. Walk me through finding the root cause."
+    hint: |-
+      1. Định lượng: error rate theo thời gian, endpoint, tenant, instance, version, region → có tập trung không?
+      2. Lấy **trace/log mẫu** của request lỗi (lọc theo status + `trace_id`) → exception thật, span nào fail.
+      3. Giả thuyết thường gặp với lỗi "ngẫu nhiên" tỉ lệ thấp: một instance hỏng trong pool (chỉ một pod lỗi), connection bị đóng bởi LB/DB idle timeout (keep-alive mismatch → `ECONNRESET`), pool exhausted khi burst, race condition/deadlock DB, timeout với dependency ngoài, dữ liệu đặc biệt (null, unicode) của một số order.
+      4. Kiểm chứng bằng dữ liệu (tương quan với pod/tenant/payload), tái hiện ở staging.
+      5. Fix + thêm alert/test để bắt được lần sau.
+    followUp: The errors are all `ECONNRESET` on calls to an internal service. What's your top hypothesis?
+    tags: [debugging, errors, scenario]
+  - id: observability-025
+    level: hard
+    type: scenario
+    q: "A SQL query that has run in 20 ms for months suddenly takes 8 s and the database CPU is at 100%. Nothing was deployed. What do you check?"
+    hint: |-
+      - **Query plan thay đổi**: statistics cập nhật/lỗi thời, parameter sniffing (SQL Server — plan cache tạo từ giá trị tham số bất thường; Postgres generic vs custom plan), data volume vượt ngưỡng khiến optimizer chọn scan.
+      - **Blocking/lock**: transaction dài, migration, job batch giữ lock (SQL Server `sys.dm_exec_requests`/`blocking_session_id`; Postgres `pg_stat_activity`, `pg_locks`).
+      - Index bị drop/disabled, fragmentation, autovacuum bloat (Postgres).
+      - Tải thay đổi: một tenant mới lớn, cache miss hàng loạt đổ về DB.
+      Công cụ: Query Store (SQL Server), `pg_stat_statements`, `EXPLAIN (ANALYZE, BUFFERS)`, so sánh plan cũ/mới.
+      Mitigate: force plan cũ (Query Store) / update statistics / kill query chặn / tạm rate-limit rồi fix gốc.
+    followUp: How does parameter sniffing work in SQL Server, and what are the fixes and their trade-offs?
+    verify: true
+    tags: [database, sql-server, postgres, debugging]
+  - id: observability-026
+    level: hard
+    type: gotcha
+    q: Why can a trace look "complete" in your tracing UI but hide where the time actually went?
+    hint: |-
+      - **Missing instrumentation**: thư viện không được auto-instrument (driver SQL Server không hỗ trợ, HTTP client tuỳ chỉnh), hoặc SDK load sau module → khoảng trống không có span con.
+      - **Context bị mất** qua callback/queue/thread pool → span tách thành trace riêng (orphan).
+      - **Thời gian chờ** không phải span: event loop bị block, chờ connection pool, chờ lock, GC pause — xuất hiện như span cha dài mà con ngắn.
+      - **Clock skew** giữa host → span con nằm ngoài span cha.
+      - **Sampling** khác nhau giữa service → trace thiếu một nửa.
+      Cách xử lý: thêm manual span/attribute cho pool wait, bật runtime metrics (event loop lag), đối chiếu log theo `trace_id`.
+    followUp: How would you instrument "time waiting for a DB connection from the pool"?
+    tags: [tracing, gotcha, opentelemetry]
+  - id: observability-027
+    level: hard
+    type: scenario
+    q: "A Kafka consumer group's lag grows steadily for hours during business peak, then recovers overnight. How do you analyse and fix it?"
+    hint: |-
+      - Đo: lag theo **partition** (đều hay dồn một partition → **hot key**), throughput consume vs produce, thời gian xử lý mỗi message, rebalance frequency, error/retry.
+      - Nguyên nhân: consumer xử lý chậm (gọi DB/API tuần tự mỗi message), số consumer ≤ số partition là trần song song, hot partition, rebalance liên tục (`max.poll.interval.ms` vượt khi xử lý chậm), retry nội tuyến chặn partition.
+      - Fix: batch xử lý / song song trong partition có kiểm soát ordering theo key, tăng partition (có kế hoạch — ảnh hưởng ordering), scale consumer, tách retry topic/DLQ, tối ưu downstream.
+      - Alert theo **lag tính bằng thời gian** (độ trễ dữ liệu người dùng cảm nhận), không chỉ số message.
+    followUp: Adding more consumers didn't help at all. Why might that be?
+    tags: [kafka, consumer-lag, scenario]
+  - id: observability-028
+    level: hard
+    type: gotcha
+    q: What are the common ways load test results mislead you?
+    hint: |-
+      - **Coordinated omission** (closed model): generator chậm lại khi hệ thống chậm → percentile đẹp giả.
+      - Load generator bị nghẽn (CPU, network, ephemeral ports) → đo chính generator.
+      - Dữ liệu không thực tế: cùng một user/product → cache hit 100%; DB nhỏ hơn production → query nhanh giả.
+      - Môi trường khác production (instance size, số replica, không có WAF/CDN, autoscaling tắt).
+      - Test quá ngắn → không thấy leak, GC, connection churn, cache expiry.
+      - Không có think time/kịch bản giống người dùng thật, bỏ qua bước nặng (checkout, search).
+      - Chỉ nhìn trung bình, bỏ qua error rate (request lỗi nhanh làm latency "đẹp").
+      - Rate limit/third-party sandbox khác production.
+    followUp: How do you load test a flow that calls a third-party payment provider?
+    tags: [load-testing, gotcha, performance]
+  - id: observability-029
+    level: hard
+    type: design
+    q: Design logging for a multi-tenant platform so support can debug a tenant's issue quickly without leaking data between tenants or storing PII.
+    hint: |-
+      - Mọi log/span có `tenant_id` (attribute chuẩn), `request_id`/`trace_id`, `user_id` dạng **pseudonymous** (hash/ID nội bộ), không email/tên/địa chỉ.
+      - **Redaction** ở hai lớp: logger (pino `redact`) + Collector (processor xoá/hash field nhạy cảm) — phòng dev quên.
+      - Quyền truy cập log theo vai trò; nếu tenant có quyền xem log của họ → lọc cứng theo `tenant_id` ở tầng query, không cho tự do.
+      - Log level động theo tenant (bật debug cho một tenant trong 30 phút qua flag) thay vì bật debug toàn hệ thống.
+      - Retention theo loại dữ liệu và quy định (GDPR: quyền xoá — log chứa PII thì khó xoá → càng không nên log PII).
+      - Sampling log info volume cao; không sample error/audit log.
+    followUp: A tenant asks for all logs related to their account for an audit. How do you respond?
+    tags: [logging, multi-tenancy, privacy, design]
+  - id: observability-030
+    level: hard
+    type: scenario
+    q: "Memory of your Node API pods grows steadily and they get OOMKilled every ~6 hours. How do you find the leak?"
+    hint: |-
+      1. Xác nhận là leak: RSS/heap tăng đơn điệu theo thời gian/số request, không trở về sau GC; so sánh `heapUsed` vs RSS (RSS tăng mà heap không → native memory/buffer).
+      2. Tái hiện: soak test ở staging với traffic tương tự.
+      3. **Heap snapshot** (`--heapsnapshot-signal=SIGUSR2`, `v8.writeHeapSnapshot()`, Chrome DevTools) chụp 2–3 lần cách nhau → so sánh "Comparison" xem object nào tăng, retainer path.
+      4. Nghi phạm thường gặp: cache in-memory không giới hạn (Map global), listener không gỡ (`EventEmitter` warning), closure giữ request lớn, timer/interval không clear, thư viện metric với label cardinality cao, Socket.IO room không dọn.
+      5. Fix + guardrail: LRU có giới hạn, alert memory trend, test soak trong CI định kỳ.
+    followUp: Heap usage is flat but RSS keeps growing. What could that be?
+    tags: [nodejs, memory-leak, debugging]
+  - id: observability-031
+    level: hard
+    type: design
+    q: Define SLIs and SLOs for a B2B2C e-commerce platform. Which user journeys, and how do you measure them?
+    hint: |-
+      - Chọn **user journey quan trọng**: xem sản phẩm/catalog, search, add-to-cart, checkout/payment, đăng nhập, admin của merchant (B2B).
+      - SLI dạng tỉ lệ: availability (`non-5xx / total` tại LB hoặc gateway), latency (`% request < ngưỡng` — ví dụ search < 500ms), correctness/freshness (tồn kho cập nhật trong 1 phút; order event xử lý trong 5 phút).
+      - Đo ở nơi gần người dùng nhất khả thi (LB/CDN log, synthetic check, RUM cho FE), loại trừ traffic bot/health check.
+      - SLO khác nhau theo journey (checkout chặt hơn admin report); cửa sổ 28/30 ngày; error budget policy thống nhất với product.
+      - Multi-tenant: SLO tổng + theo dõi tenant lớn (một tenant 100% lỗi có thể không làm vỡ SLO tổng).
+    followUp: A top tenant is having a terrible day but the global SLO is green. How do you catch that?
+    tags: [slo, sli, design, multi-tenancy]
+  - id: observability-032
+    level: hard
+    type: scenario
+    q: "Users of one region report the site is 'broken' but all your dashboards are green. What do you do?"
+    hint: |-
+      Dashboard xanh + user kêu → **khoảng mù** của monitoring. Hướng điều tra:
+      - Tầng trước backend: DNS, CDN edge/PoP của region đó, WAF rule chặn nhầm (geo, bot), chứng chỉ TLS, ISP routing — request có tới server không? (CDN log, WAF log).
+      - Frontend: JS error chỉ trên một browser/phiên bản, bundle/chunk 404 sau deploy do cache CDN, third-party script (payment widget) lỗi ở region đó.
+      - Backend chỉ đo request **thành công tới nó** → lỗi trước LB không xuất hiện.
+      - Hành động: tái hiện từ region đó (synthetic check đa vùng, VPN), thu HAR/console log của user, kiểm tra RUM theo country.
+      - Bài học: thêm **synthetic monitoring** đa vùng + RUM error rate vào SLO.
+    followUp: Which parts of your monitoring measure what users actually experience, and which only measure your servers?
+    tags: [debugging, frontend, cdn, scenario]
+  - id: observability-033
+    level: hard
+    type: compare
+    q: Self-hosted observability stack (Prometheus/Grafana/Loki/Tempo) vs a SaaS vendor (Datadog, New Relic) vs cloud-native (CloudWatch/X-Ray). How do you decide?
+    hint: |-
+      - **Self-hosted** (OSS): không phí license, linh hoạt, dữ liệu tự quản; nhưng tốn công vận hành (scale Prometheus, retention, HA), cần người chuyên.
+      - **SaaS**: nhanh, UX mạnh, correlation sẵn, APM/RUM đầy đủ; **chi phí tăng theo volume** (host, custom metric, log GB, span) — dễ vượt ngân sách, lock-in (giảm bằng OTel).
+      - **Cloud-native**: tích hợp sẵn (IAM, service metric), không phải vận hành; query/UX hạn chế hơn, multi-cloud kém.
+      - Quyết định theo: quy mô dữ liệu, ngân sách, năng lực team, yêu cầu data residency. Dùng **OTel + Collector** để giữ quyền chuyển đổi.
+    followUp: Your Datadog bill is growing 3x faster than traffic. What levers do you have?
+    tags: [observability-stack, cost, compare]
+  - id: observability-034
+    level: senior
+    type: design
+    q: You join a team with no observability — just `console.log` and a few CPU alerts. What's your 90-day plan?
+    hint: |-
+      - Tuần 1–3: **structured logging** + request/trace ID; RED dashboard cho các service chính; alert cơ bản theo triệu chứng (error rate, latency, uptime synthetic) có runbook; dọn alert vô nghĩa.
+      - Tuần 4–8: **OTel** auto-instrumentation + Collector, trace cho luồng quan trọng (checkout), runtime metrics (event loop, heap, pool); FE error tracking + Web Vitals.
+      - Tuần 8–12: định nghĩa **SLO** với product cho 2–3 journey, burn-rate alert, quy trình incident + postmortem template, on-call rotation.
+      - Nguyên tắc: bắt đầu từ sự cố gần nhất ("lần trước mất bao lâu để tìm root cause?"), đo MTTD/MTTR trước và sau, làm cho dev **muốn** dùng (golden path, library chung).
+    followUp: How do you convince product management to spend engineering time on this instead of features?
+    tags: [observability, strategy, senior]
+  - id: observability-035
+    level: senior
+    type: open
+    q: How do you balance observability cost against debuggability as traffic grows 10x?
+    hint: |-
+      - Metric cho alert/xu hướng (rẻ), traces **tail-sampled** (giữ lỗi/chậm), logs: info sample hoặc chuyển thành metric, error/audit giữ đủ.
+      - Retention phân tầng: hot vài ngày, cold (S3) lâu hơn và query khi cần.
+      - Kiểm soát cardinality và log volume per service (budget/quotas, dashboard chi phí theo team).
+      - Loại bỏ log "noise" (health check, log mỗi vòng lặp), dùng dynamic log level.
+      - Đo giá trị: loại telemetry nào đã thật sự dùng trong incident? Cái không ai dùng là ứng viên cắt.
+      Trade-off: cắt quá tay → sự cố tiếp theo kéo dài; cần xem MTTR như chi phí thật.
+    followUp: Which telemetry would you never sample, and why?
+    tags: [observability, cost, open]
+  - id: observability-036
+    level: senior
+    type: design
+    q: Design a load-testing strategy for a flash-sale event expected to bring 20x normal traffic to the storefront and checkout.
+    hint: |-
+      - Mô hình hoá traffic: tỉ lệ journey (browse/search/cart/checkout), spike hình dạng (người dùng vào đúng giờ mở bán), số user đồng thời, bot.
+      - Test **spike + stress + soak** trên môi trường cỡ production (hoặc production ngoài giờ với traffic được đánh dấu) bằng open-model (k6 arrival-rate, chạy phân tán).
+      - Tìm nút thắt theo thứ tự: CDN/cache hit ratio, autoscaling tốc độ, DB write path (tồn kho — hot row!), connection pool, third-party (payment rate limit), queue.
+      - Chuẩn bị: pre-scale (không chờ autoscale), cache warming, queue/waiting room, rate limit per user, feature degrade (tắt recommendation), kill switch.
+      - Kế hoạch ngày D: war room, dashboard, runbook, ngưỡng quyết định bật waiting room.
+    followUp: Inventory decrement for a hot product becomes the bottleneck. How do you redesign it?
+    tags: [load-testing, capacity-planning, design, flash-sale]
+  - id: observability-037
+    level: senior
+    type: open
+    q: What does a mature on-call culture look like, and how do you prevent burnout?
+    hint: |-
+      - Alert ít và chất: mọi page phải actionable, có runbook; theo dõi số page/tuần, page ngoài giờ, tỉ lệ false positive.
+      - Rotation công bằng, có secondary, handover có ghi chú, bù giờ/tiền cho on-call.
+      - Người viết code tham gia on-call cho service của mình ("you build it, you run it") → động lực fix gốc.
+      - Sau mỗi incident: postmortem blameless, action item được ưu tiên thật (error budget policy).
+      - Toil được đo và tự động hoá dần; diễn tập (game day) để người mới tự tin.
+    followUp: How do you handle an alert that fires every night and resolves itself?
+    tags: [on-call, sre, culture, open]
+  - id: observability-038
+    level: senior
+    type: design
+    q: Design distributed tracing across a Node monolith being split into Kafka-based microservices, so you can compare old and new paths.
+    hint: |-
+      - Chuẩn **W3C Trace Context** ở mọi nơi; OTel SDK cho monolith và service mới với cùng semantic conventions + `service.version`.
+      - Kafka: inject `traceparent` vào **message headers** ở producer, extract ở consumer; dùng **span links** (không phải parent-child) cho batch consume hoặc xử lý muộn.
+      - Attribute `code.path=legacy|new` hoặc `migration.route` để so sánh latency/error giữa đường cũ và mới cho cùng endpoint.
+      - Gateway/strangler proxy tạo root span, ghi route quyết định.
+      - Dashboard RED so sánh cũ vs mới; tail sampling giữ trace lỗi của cả hai.
+      - Log correlation qua `trace_id` cho consumer chạy bất đồng bộ.
+    followUp: Why use span links instead of parent-child for a consumer that processes a batch of 100 messages?
+    verify: true
+    tags: [tracing, kafka, microservices, design]
+  - id: observability-039
+    level: cv
+    type: behavioral
+    q: You investigated and resolved production issues across backend, database and frontend. Walk me through the hardest one — how did you find the root cause?
+    hint: |-
+      Câu trả lời mạnh có **phương pháp**, không chỉ kết quả:
+      - Situation: triệu chứng người dùng thấy, tác động (bao nhiêu tenant/user, bao lâu) — (điền số liệu thật của bạn).
+      - Bạn khoanh vùng thế nào: tầng nào loại trừ trước và **bằng dữ liệu gì** (log, metric, query plan, network tab).
+      - Giả thuyết sai đã loại bỏ (cho thấy tư duy thật).
+      - Root cause + fix ngắn hạn (mitigate) và dài hạn.
+      - Phòng ngừa: alert/test/runbook đã thêm; bài học.
+      Kể **tên công cụ cụ thể** đã dùng — interviewer sẽ hỏi tiếp.
+    followUp: How long did it take to detect the issue, and what would have made detection faster?
+    redFlags:
+      - Says only "we looked at the logs and found the bug", with no method
+      - Cannot name the tools used
+    tags: [cv, debugging, behavioral]
+  - id: observability-040
+    level: cv
+    type: scenario
+    q: Which logging, monitoring and tracing tools did you use on the multi-tenant platform, and how did you find a single tenant's failing request among all the traffic?
+    hint: |-
+      Nêu cụ thể: log đi đâu (ELK/Elasticsearch? CloudWatch? Datadog?), log format (structured chưa?), có correlation ID/tenant ID không, dashboard/alert gì.
+      Mô tả luồng tìm một request: user báo lỗi → lấy request ID/thời gian/tenant → query log → trace/DB.
+      Thành thật về khoảng trống (ví dụ chưa có distributed tracing) và bạn sẽ cải thiện thế nào (OTel, `AsyncLocalStorage`, `tenant_id` trên mọi log).
+      (điền tên công cụ và quy trình thật của bạn)
+    followUp: If you had to add OpenTelemetry to that platform tomorrow, where would you start?
+    redFlags:
+      - Says only "we checked the server logs", with no correlation strategy
+    tags: [cv, logging, multi-tenancy]
+  - id: observability-041
+    level: cv
+    type: behavioral
+    q: On the financial platform you did performance and load testing to validate behaviour under high traffic. What tool did you use, how did you design the test, and what did you find?
+    hint: |-
+      Nội dung cần có:
+      - Công cụ (k6, JMeter, Artillery, Gatling, Locust…) và **vì sao** chọn.
+      - Mục tiêu có số: target throughput, SLO latency, thời gian test — (điền số liệu thật của bạn).
+      - Kịch bản: journey nào, dữ liệu test, open vs closed model, môi trường test giống prod đến đâu.
+      - Kết quả: nút thắt đầu tiên tìm thấy (DB? pool? Socket.IO? event loop?) và bạn đã fix gì, số đo trước/sau.
+      - Hạn chế của test và rủi ro còn lại.
+    followUp: How did you make sure the load generator itself wasn't the bottleneck?
+    redFlags:
+      - Cannot state the target numbers or the bottleneck found
+    tags: [cv, load-testing, performance]
+  - id: observability-042
+    level: cv
+    type: scenario
+    q: You built real-time features with Socket.IO on the financial platform. How did you monitor it and what metrics told you it was healthy?
+    hint: |-
+      Metric nên nhắc: số connection hiện tại (theo instance), connect/disconnect rate, **reconnect storm**, message rate in/out, latency emit→ack, event loop lag, memory per connection, lỗi auth handshake, room size; Redis adapter latency nếu scale nhiều node.
+      Sự cố điển hình: memory tăng theo connection, reconnect đồng loạt sau deploy, sticky session sai với polling transport.
+      Kể cách bạn load test WebSocket (Artillery/k6 ws) nếu có.
+      (điền metric, công cụ và sự cố thật của bạn — không bịa số liệu)
+    followUp: After a deploy, all clients reconnect at once and the new pods fall over. What do you change?
+    tags: [cv, socketio, websocket, monitoring]
+  - id: observability-043
+    level: cv
+    type: behavioral
+    q: Tell me about a production incident you handled end to end. What did the postmortem conclude, and what changed afterwards?
+    hint: |-
+      STAR: bối cảnh + tác động (điền số liệu thật), vai trò của bạn (người điều tra? người điều phối?), timeline phát hiện → mitigate → fix, root cause **và contributing factors**.
+      Postmortem: có blameless không, action item nào, **đã thực sự làm chưa** và có hiệu quả không (sự cố tương tự có tái diễn?).
+      Reflection: nếu làm lại, bạn sẽ mitigate nhanh hơn ở bước nào.
+    followUp: Was there any action item that never got done? Why?
+    tags: [cv, incident-response, postmortem, behavioral]
+  - id: observability-044
+    level: cv
+    type: scenario
+    q: Your high-traffic APIs on the e-commerce platform — how did you know they were fast enough, and what was your latency target?
+    hint: |-
+      Interviewer kiểm tra bạn có **đo** hay chỉ cảm nhận: SLO/target cụ thể (p95/p99 bao nhiêu), đo ở đâu (APM, LB log, custom metric), theo dõi theo tenant/endpoint.
+      Kể một lần latency vượt target: phát hiện bằng gì, nguyên nhân (query, cache miss, Elasticsearch), fix và số đo trước/sau.
+      Nếu không có SLO chính thức: thành thật và nói bạn sẽ định nghĩa thế nào.
+      (điền con số thật của bạn — không bịa)
+    followUp: What was the p99 of your slowest important endpoint and why was it slow?
+    tags: [cv, performance, slo]
+  - id: observability-045
+    level: cv
+    type: scenario
+    q: During the monolith-to-microservices migration, how did you verify that the new services performed at least as well as the monolith before switching traffic?
+    hint: |-
+      Nội dung mạnh: baseline metric của monolith (latency, error, throughput) trước khi tách; so sánh bằng shadow traffic hoặc canary theo %; dashboard cũ vs mới; tiêu chí dừng/rollback rõ ràng; kiểm tra end-to-end latency khi thêm hop mạng + Kafka (độ trễ bất đồng bộ).
+      Nói về điều **bất ngờ** đã gặp (ví dụ latency tăng do nhiều hop, consumer lag) và cách xử lý.
+      (điền cách đo và số liệu thật của bạn)
+    followUp: What does "eventually consistent" mean for the user after the split, and how did you measure the delay?
+    tags: [cv, microservices, migration, performance]

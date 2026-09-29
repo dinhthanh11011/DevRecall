@@ -1,0 +1,967 @@
+id: 99-project-deep-dive
+slug: project-deep-dive
+title: Project Deep-Dive
+tier: 8
+status: drafted
+summary: "Interviewer đào sâu vào từng dự án trên CV: multi-tenant e-commerce, monolith → microservices, banking SPA, real-time finance — chuỗi prove-it cho từng claim, STAR template và số liệu cần thu thập."
+cvLinked: true
+overview: |-
+  ## TL;DR
+
+  - Phần deep-dive là nơi senior interview **thắng hoặc thua**: interviewer chọn một dòng trên CV và hỏi liên tục "**what exactly did you do → why that way → what broke → what would you change → numbers?**" tới khi chạm giới hạn hiểu biết của bạn.
+  - Mỗi claim trên CV phải có: **một kiến trúc vẽ được trên bảng**, **một câu chuyện STAR**, **2–3 con số thật**, và **một điều bạn sẽ làm khác**.
+  - Nguyên tắc vàng: **không bịa**. Nếu không có số chính xác, nói ước lượng và cách bạn biết. Nếu phần đó do người khác làm, nói rõ phần của bạn.
+  - Bốn dự án: **P1** e-commerce multi-tenant B2B2C (2024–2026, trọng tâm), **P2** monolith → microservices back-office (2023–2024), **P3** banking React SPA (2022–2023), **P4** financial web apps real-time (2022).
+  - Khoảng trống đã biết (NestJS, AWS chưa dùng production; CV chưa có số liệu) → chuẩn bị câu trả lời trung thực từ trước.
+
+  ## Khái niệm cốt lõi — chuỗi prove-it
+
+  | Bước | Interviewer hỏi | Bạn cần có |
+  |---|---|---|
+  | What | "What exactly did you build/change?" | Phạm vi cụ thể, phần **của bạn** |
+  | Why | "Why that approach and not X?" | Ít nhất 1 phương án đã loại + lý do |
+  | How | "Walk me through the flow / schema / code" | Diagram, tên bảng/endpoint/key |
+  | Broke | "What went wrong?" | Một sự cố/bug thật và cách xử lý |
+  | Numbers | "How much? How did you measure?" | Số trước/sau + công cụ đo |
+  | Change | "What would you do differently?" | Một cải thiện thực tế, không phải "không có gì" |
+
+  ```mermaid
+  flowchart LR
+    C["Claim trên CV"] --> W["What: phần bạn làm"]
+    W --> Y["Why: trade-off, phương án loại"]
+    Y --> H["How: diagram, schema, code"]
+    H --> B["What broke: sự cố thật"]
+    B --> N["Numbers: trước/sau, cách đo"]
+    N --> D["Change: làm khác gì"]
+    D -. "interviewer chọn claim khác" .-> C
+  ```
+
+  ## P1 — Multi-tenant B2B2C e-commerce platform (2024–2026)
+
+  Nền tảng phục vụ retailer và khách hàng ở hai quốc gia; team quốc tế (PO, QA, Designer, Tech Lead), giao tiếp tiếng Anh, phân tán. Stack: Node, TS, Express, React, Next.js, relational DB (SQL Server), Redis, Elasticsearch.
+
+  ```mermaid
+  flowchart LR
+    U["Customer / Retailer staff"] --> FE["Next.js / React apps"]
+    FE --> API["Node/TS API<br/>auth + tenant middleware"]
+    API --> AUTH["JWT / OAuth<br/>Google OAuth, RBAC"]
+    API --> R[("Redis cache<br/>hot APIs")]
+    API --> DB[("Relational DB<br/>tenant_id scoped")]
+    API --> ES[("Elasticsearch")]
+    EXT["External product providers"] --> DE["Data Enrichment Service<br/>sync + normalize"]
+    DE --> DB
+    DB --> IX["Indexer Service<br/>transform + index"]
+    IX --> ES
+  ```
+
+  **Claims sẽ bị đào**: (1) own feature end-to-end · (2) schema change, indexing, query optimization cho high-traffic API · (3) tenant-aware data access & authorization · (4) zero-downtime, zero-data-loss migration · (5) giới thiệu Redis caching cho hot API · (6) JWT/OAuth, Google OAuth, RBAC, permission check · (7) Checkout, Address Management, Shift Management · (8) Data Enrichment Service · (9) Indexer Service → Elasticsearch · (10) refactor legacy, xử lý prod issue BE/DB/FE · (11) AI-assisted workflow có human review.
+
+  **STAR template (dùng cho mỗi claim)**
+  - **S**: API/feature nào, traffic/tenant/dữ liệu cỡ nào, vấn đề gì.
+  - **T**: bạn được giao gì / tự nhận gì.
+  - **A**: các bước bạn làm, phương án đã loại, khó khăn giữa chừng.
+  - **R**: số trước/sau, tác động kinh doanh.
+  - **Reflection**: sẽ làm khác gì.
+
+  **Numbers to collect** (điền số liệu thật của bạn): số tenant/retailer · số user/đơn hàng/ngày · RPS của hot API · p95/p99 latency trước/sau cache và index · cache hit ratio, TTL · kích thước bảng khi migration · thời gian backfill · số lần migration zero-downtime · số sản phẩm được enrich/index, thời gian reindex · số provider · số role/permission · tỷ lệ lỗi checkout.
+
+  ## P2 — Enterprise back-office: monolith → Node/Express microservices (2023–2024)
+
+  ```mermaid
+  flowchart LR
+    C["Clients / UI"] --> GW["Routing layer<br/>(strangler facade)"]
+    GW -->|"chưa migrate"| MONO["Legacy monolith"]
+    GW -->|"đã migrate"| S1["Service A (Node/Express)"]
+    GW --> S2["Service B"]
+    S1 -- "events" --> K[["Kafka"]]
+    K --> S2
+    S1 --> MC[("Memcached<br/>TTL + refresh")]
+    S1 --> DB1[("DB")]
+    MONO --> DB0[("Legacy DB")]
+  ```
+
+  **Claims**: decomposition thành service · Kafka async communication · caching + data transformation · backward compatibility trong incremental migration · Memcached TTL + refresh giảm tải DB đáng kể.
+
+  **STAR template**: S = monolith gặp vấn đề gì (deploy, scale, coupling) → T = phần bạn phụ trách (service/luồng nào) → A = cách chọn boundary, routing, event, cache, đảm bảo tương thích → R = số service/luồng migrate, DB load giảm bao nhiêu → Reflection.
+
+  **Numbers to collect**: số service bạn tham gia extract · thời gian migration · throughput Kafka (msg/s), số topic/partition · DB load trước/sau Memcached (QPS, CPU) · hit ratio, TTL · số incident do migration.
+
+  ## P3 — Banking React SPA (2022–2023)
+
+  ```mermaid
+  flowchart TD
+    R["Route-level code splitting<br/>React.lazy + Suspense"] --> P["Pages"]
+    P --> H["Custom hooks<br/>business logic"]
+    H --> S["Redux Toolkit store<br/>slices"]
+    H --> API["REST API"]
+    P --> L["Core component library<br/>reusable, themed"]
+  ```
+
+  **Claims**: reusable component architecture · memoization, code splitting, lazy loading, dynamic imports · business logic trong custom hooks · core component library · Redux Toolkit.
+
+  **STAR template**: S = vấn đề performance/maintainability cụ thể → T = phần bạn own → A = profile (React DevTools Profiler, bundle analyzer), thay đổi cụ thể → R = bundle size/render time trước/sau → Reflection.
+
+  **Numbers to collect**: bundle size initial trước/sau · số route/chunk · thời gian render của màn hình nặng · số component trong library, số màn hình dùng · LCP/TTI nếu có.
+
+  ## P4 — Financial web apps, real-time (2022)
+
+  ```mermaid
+  sequenceDiagram
+    participant B as Browser (React)
+    participant S as Node/Express + Socket.IO
+    participant D as DB
+    B->>S: connect (auth)
+    S-->>B: joined room (account/tenant)
+    D-->>S: data change
+    S-->>B: emit update
+    B->>S: upload CSV
+    S->>S: stream parse + batch insert
+    S->>D: bulk write
+  ```
+
+  **Claims**: reliability · Socket.IO real-time · React class components · unit + load testing · fix CSV processing bottleneck.
+
+  **Numbers to collect**: số connection đồng thời · kích thước CSV, thời gian xử lý trước/sau · memory peak trước/sau · công cụ load test, target RPS/concurrent user, cái gì hỏng đầu tiên.
+
+  ## Trade-offs — cách kể về quyết định
+
+  | Tình huống | Câu trả lời yếu | Câu trả lời senior |
+  |---|---|---|
+  | Không nhớ số | Bịa số chính xác | "Khoảng X theo dashboard lúc đó; đây là cách tôi đo" |
+  | Phần do người khác làm | Nhận là của mình | "Phần đó do teammate; tôi làm Y và tích hợp với nó" |
+  | Quyết định bạn không đồng ý | Chê quyết định | "Team chọn A vì ràng buộc Z; tôi đề xuất B; nhìn lại…" |
+  | Không biết câu trả lời | Nói vòng vo | "Tôi không chắc; tôi sẽ kiểm tra bằng…" |
+  | Thứ chưa dùng production | Nói như đã dùng | "Chưa dùng production; tôi đã POC và hiểu trade-off…" |
+
+  ## Pitfalls
+
+  - Không vẽ được kiến trúc của chính dự án mình.
+  - Không phân biệt được phần mình làm với phần team làm.
+  - "Significantly", "much faster" không có số; hoặc số không bảo vệ được.
+  - Không nhớ tên bảng/endpoint/key/topic — dấu hiệu làm hời hợt.
+  - Không có câu chuyện "cái gì đã hỏng" — interviewer nghi ngờ độ sâu.
+  - Tiết lộ thông tin mật của client (tên, số liệu nội bộ nhạy cảm) — nói ở mức khái quát hoá.
+
+  ## Cheat sheet
+
+  - Mỗi claim: **1 diagram · 1 STAR · 2–3 số · 1 phương án đã loại · 1 điều hỏng · 1 điều làm khác**.
+  - Tenant: token → middleware → repository/query → cache key → search index — tenant ở **mọi** tầng.
+  - Migration: expand → dual-write/backfill theo batch → verify → switch read → contract; luôn có rollback.
+  - Cache: key có tenant, TTL + invalidation on write, stampede protection, fallback khi Redis down.
+  - Microservices: strangler fig, boundary theo domain, Kafka key theo entity, idempotent consumer, outbox, backward compat.
+  - Frontend: đo trước (Profiler, bundle analyzer), memo có lý do, split theo route.
+  - Real-time/CSV: Socket.IO scale bằng adapter + sticky session; CSV bằng stream + batch + backpressure.
+notionRefs: []
+references:
+  - title: Martin Fowler — Strangler Fig Application
+    url: https://martinfowler.com/bliki/StranglerFigApplication.html
+  - title: Martin Fowler — Parallel Change (expand/contract)
+    url: https://martinfowler.com/bliki/ParallelChange.html
+  - title: microservices.io — Transactional Outbox pattern
+    url: https://microservices.io/patterns/data/transactional-outbox.html
+  - title: AWS SaaS Lens — Tenant isolation
+    url: https://docs.aws.amazon.com/wellarchitected/latest/saas-lens/tenant-isolation.html
+  - title: Redis docs — Client-side caching and cache patterns
+    url: https://redis.io/docs/latest/develop/use/patterns/
+  - title: Elasticsearch — Aliases (zero-downtime reindex)
+    url: https://www.elastic.co/guide/en/elasticsearch/reference/current/aliases.html
+  - title: Socket.IO — Using multiple nodes
+    url: https://socket.io/docs/v4/using-multiple-nodes/
+  - title: react.dev — lazy
+    url: https://react.dev/reference/react/lazy
+  - title: Node.js — Backpressuring in Streams
+    url: https://nodejs.org/en/learn/modules/backpressuring-in-streams
+  - title: Stripe — Idempotent requests
+    url: https://docs.stripe.com/api/idempotent_requests
+questions:
+  - id: project-deep-dive-001
+    level: easy
+    type: open
+    q: Pick the project on your CV you know best and draw its architecture for me.
+    hint: |-
+      Chuẩn bị sẵn diagram P1 (xem overview): client apps → API (auth + tenant middleware) → DB/Redis/Elasticsearch; Data Enrichment từ provider ngoài; Indexer → ES.
+      Nói theo luồng một request cụ thể (vd. search sản phẩm hoặc checkout), đánh dấu phần **bạn** build.
+      Nêu quy mô bằng số thật: (điền số liệu thật của bạn) — tenant, user, RPS.
+      Kết thúc bằng một điểm yếu của kiến trúc và cách bạn sẽ cải thiện.
+    followUp: Which box on that diagram would fail first if traffic grew 10x?
+    redFlags:
+      - "Cannot draw the system or only draws their own component"
+    tags: [p1, architecture]
+  - id: project-deep-dive-002
+    level: easy
+    type: concept
+    q: In your e-commerce platform, what does "multi-tenant B2B2C" mean concretely? Who are the tenants and who are the users?
+    hint: |-
+      - **Tenant** = retailer (B2B: nền tảng bán cho doanh nghiệp); **end user** = khách mua của retailer (B2C) + nhân viên retailer.
+      - Mỗi request thuộc về một tenant; dữ liệu (sản phẩm, giá, đơn, ca làm) tách theo tenant.
+      - Mô hình isolation: pool (chung DB, cột `tenant_id`), bridge (schema riêng) hay silo (DB riêng) — nói đúng cái dự án dùng.
+      - Hai quốc gia → currency, timezone, locale, có thể yêu cầu dữ liệu khác nhau.
+    followUp: Can one person be a customer of two retailers? How is that modeled?
+    tags: [p1, multi-tenancy]
+  - id: project-deep-dive-003
+    level: easy
+    type: open
+    q: What was your role on the e-commerce platform team, and how was the team organized?
+    hint: |-
+      - Vai trò: full-stack, own feature end-to-end (analysis → breakdown → implement → test → demo → prod).
+      - Team: PO, QA, Designer, Tech Lead, dev ở nhiều nơi; nêu kích thước (điền số liệu thật của bạn).
+      - Nhịp làm việc: sprint, refinement, review, release; cách phối hợp timezone.
+      - Phần bạn quyết định vs phần lead quyết định.
+    followUp: What decisions were you allowed to make on your own, and which needed the tech lead?
+    tags: [p1, role]
+  - id: project-deep-dive-004
+    level: easy
+    type: open
+    q: In the monolith-to-microservices migration, what was wrong with the monolith that justified the migration?
+    hint: |-
+      Nêu **vấn đề kinh doanh/kỹ thuật cụ thể**, không phải "microservices là xu hướng": deploy chậm/rủi ro (một thay đổi deploy cả hệ thống), coupling, scale không đều giữa các phần, công nghệ cũ khó tuyển/bảo trì, DB bottleneck.
+      Nêu phần bạn tham gia và phần đã có quyết định từ trước.
+      Thừa nhận chi phí của microservices (network, consistency, vận hành).
+    followUp: Looking back, was microservices the right call, or would a modular monolith have been enough?
+    redFlags:
+      - "Microservices are just better / more scalable"
+    tags: [p2, microservices]
+  - id: project-deep-dive-005
+    level: easy
+    type: open
+    q: Describe the banking SPA you worked on. What were the main screens and the main technical challenges?
+    hint: |-
+      - Sản phẩm: loại màn hình (dashboard tài khoản, giao dịch, form nhiều bước…) — khái quát hoá, không lộ thông tin client.
+      - Stack: React, Redux Toolkit, REST; component library nội bộ.
+      - Thách thức: performance với màn hình dữ liệu lớn, tính nhất quán UI giữa nhiều team/màn hình, form phức tạp, bảo mật phía client.
+      - Phần bạn own.
+    followUp: What security concerns are specific to a banking frontend?
+    tags: [p3, react]
+  - id: project-deep-dive-006
+    level: easy
+    type: open
+    q: In your financial platform project, what did "real-time" mean and why was Socket.IO chosen?
+    hint: |-
+      - Dữ liệu nào cần đẩy real-time (trạng thái giao dịch, số dư, thông báo) và độ trễ chấp nhận được.
+      - Socket.IO: WebSocket + fallback, reconnect tự động, rooms/namespaces, ack — tiện cho Node/Express.
+      - Phương án khác: polling, SSE (một chiều, đơn giản hơn), WebSocket thuần.
+      - Nói rõ ai quyết định chọn và phần bạn implement.
+    followUp: Would SSE have been enough? Why or why not?
+    tags: [p4, realtime]
+  - id: project-deep-dive-007
+    level: easy
+    type: open
+    q: Which of your four projects taught you the most, and what specifically did you learn?
+    hint: |-
+      Chọn một, nêu **bài học cụ thể và thay đổi hành vi**: vd. P2 dạy về backward compatibility và incremental migration; P1 dạy về tenant isolation và zero-downtime migration; P4 dạy về streaming/backpressure.
+      Kèm một ví dụ bạn áp dụng bài học đó ở dự án sau.
+    followUp: What did you do in the next project because of that lesson?
+    tags: [cross, learning]
+  - id: project-deep-dive-008
+    level: medium
+    type: design
+    q: Walk me through how a request is scoped to a tenant, from the token to the SQL query. Where is the tenant ID enforced?
+    hint: |-
+      - Token (JWT) chứa `sub` + tenant (hoặc tenant lấy từ subdomain/header rồi **kiểm tra membership** của user với tenant đó — không tin header).
+      - Middleware xác thực → đặt `req.context = { userId, tenantId, roles }`.
+      - Data access layer (repository/query builder) **tự thêm** `WHERE tenant_id = @tenantId`; không cho truy vấn raw bỏ qua.
+      - Tầng khác cũng phải có tenant: cache key, ES index/filter, file storage path, background job payload.
+      - Nêu đúng cách dự án làm, và điểm bạn muốn cải thiện (vd. Row-Level Security).
+    example: |-
+      ```ts
+      // pseudo: repository tenant-aware
+      class OrderRepo {
+        constructor(private ctx: { tenantId: string }) {}
+        findById(id: string) {
+          return db.order.findFirst({ where: { id, tenantId: this.ctx.tenantId } });
+        }
+      }
+      ```
+    followUp: What happens if a developer forgets the filter in a new query? What catches it?
+    redFlags:
+      - "Trusts a tenant ID sent from the client without checking membership"
+    tags: [p1, multi-tenancy, security]
+  - id: project-deep-dive-009
+    level: medium
+    type: design
+    q: How did you model RBAC and permissions? Is a role per tenant or global?
+    hint: |-
+      - Mô hình phổ biến: `users`, `tenants`, `memberships(user_id, tenant_id, role_id)`, `roles`, `role_permissions` → một user có role khác nhau ở tenant khác nhau.
+      - Permission dạng `resource:action` (`order:refund`); check ở middleware/guard + kiểm **ownership** của resource.
+      - Role hệ thống (platform admin) tách riêng với role trong tenant.
+      - Permission trong JWT (nhanh, stale) vs tra DB/cache mỗi request (tươi, tốn) — nói dự án chọn gì và tại sao.
+    followUp: A user's role is downgraded while they have a valid access token. How long until it takes effect?
+    tags: [p1, rbac, auth]
+  - id: project-deep-dive-010
+    level: medium
+    type: design
+    q: Explain your JWT setup. Where is the token stored on the client, how long do access and refresh tokens live, and how do you revoke access?
+    hint: |-
+      - Access token ngắn (vài phút), refresh token dài hơn, **rotation** + phát hiện reuse.
+      - Lưu trữ: httpOnly Secure SameSite cookie (chống XSS đọc token) vs memory + refresh cookie; localStorage dễ bị XSS.
+      - Revoke: xoá refresh token/session ở server, denylist `jti` cho access token (Redis, TTL = thời gian sống còn lại), hoặc `token_version` trên user.
+      - Verify: pin algorithm, `iss`/`aud`/`exp`.
+      Nói đúng thông số dự án (điền số liệu thật của bạn).
+    followUp: How does this work with server-side rendering in Next.js?
+    tags: [p1, jwt, auth]
+  - id: project-deep-dive-011
+    level: medium
+    type: design
+    q: How did you implement Google OAuth login, and how did you link a Google identity to an existing email/password account?
+    hint: |-
+      - Flow: **Authorization Code** (+ PKCE nếu public client) → đổi code lấy token ở server → verify ID token (chữ ký, `aud`, `iss`, `exp`, `nonce`) → dùng `sub` làm định danh ổn định (không dùng email làm khoá chính).
+      - Account linking an toàn: chỉ auto-link khi `email_verified = true` **và** user xác nhận (đăng nhập bằng mật khẩu hiện có hoặc email xác nhận) — tránh account takeover.
+      - Bảng `identities(user_id, provider, provider_sub)`.
+      - `state` chống CSRF.
+    followUp: What attack becomes possible if you auto-link purely by matching email?
+    redFlags:
+      - "Uses the email from Google as the primary key without checking email_verified"
+    tags: [p1, oauth, auth]
+    verify: true
+  - id: project-deep-dive-012
+    level: medium
+    type: design
+    q: You introduced Redis caching for hot APIs. Which endpoints, what key design, what TTL, and how did you invalidate on writes?
+    hint: |-
+      - Chọn endpoint bằng dữ liệu: read nhiều/write ít, tốn DB (catalog, config tenant, danh mục).
+      - Key: `{env}:{tenantId}:{resource}:{id|queryHash}:{version}` — **luôn có tenant**, locale/currency nếu giá khác.
+      - Pattern: cache-aside; TTL + jitter; invalidate (delete) sau khi commit DB, hoặc version key.
+      - Chống stampede: lock/single-flight, stale-while-revalidate.
+      - Redis down → fallback DB có circuit breaker, không fail request.
+      Numbers: (điền số liệu thật của bạn) — hit ratio, p95 trước/sau, DB QPS giảm.
+    followUp: How did you prevent serving a stale price after a retailer updated it?
+    tags: [p1, caching, redis]
+  - id: project-deep-dive-013
+    level: medium
+    type: scenario
+    q: Give me one slow query you fixed on a high-traffic API. What did the execution plan show and what did you change?
+    hint: |-
+      Kể theo chuỗi: triệu chứng (p95 cao, timeout) → tìm query (APM, slow query log, Query Store trên SQL Server) → **execution plan** (scan vs seek, key lookup, sort, estimate sai) → thay đổi (composite index đúng thứ tự cột `tenant_id` trước, covering/INCLUDE, sửa query non-SARGable, pagination keyset) → đo lại.
+      Nêu cả chi phí index (write chậm hơn, dung lượng).
+      Numbers: (điền số liệu thật của bạn) — thời gian query, logical reads, p95 trước/sau, kích thước bảng.
+    followUp: How did you add that index to a large production table without blocking writes?
+    redFlags:
+      - "Just added an index on every column in the WHERE clause"
+    tags: [p1, sql, performance]
+    verify: true
+  - id: project-deep-dive-014
+    level: medium
+    type: design
+    q: Walk me through one zero-downtime, zero-data-loss migration you did, step by step.
+    hint: |-
+      **Expand/contract**:
+      1. Expand: thêm cột/bảng mới (nullable, không default nặng), deploy.
+      2. Code **dual-write** (ghi cả cũ và mới), đọc vẫn từ cũ.
+      3. **Backfill theo batch** nhỏ (theo khoá, có throttle), idempotent, resume được.
+      4. Verify: so sánh count/checksum, đọc song song (shadow read).
+      5. Switch read sang mới (flag), monitor.
+      6. Contract: ngừng ghi cũ, xoá cột cũ ở release sau.
+      Rollback ở mỗi bước. Nêu migration thật của bạn + số (điền số liệu thật của bạn): số dòng, thời gian backfill.
+    followUp: At which step is data loss most likely, and how did you guard against it?
+    tags: [p1, migration, database]
+  - id: project-deep-dive-015
+    level: medium
+    type: design
+    q: How did you design Checkout to avoid double charges and overselling?
+    hint: |-
+      - **Idempotency key** cho request tạo đơn/thanh toán (client sinh, server lưu kết quả theo key).
+      - Tồn kho: reserve bằng conditional update atomic (`UPDATE … WHERE qty >= n`) hoặc lock; reservation có hạn.
+      - Transaction boundary: DB transaction cho order + reservation; gọi payment **ngoài** transaction DB, trạng thái order dạng state machine (`pending → paid → confirmed`), webhook/reconcile cho kết quả không chắc chắn.
+      - Retry an toàn, không retry lỗi không idempotent.
+      Nói rõ phần nào dự án có thật (payment do ai tích hợp).
+    followUp: The payment gateway times out. Did the customer pay or not? What does your system do?
+    tags: [p1, checkout, idempotency]
+  - id: project-deep-dive-016
+    level: medium
+    type: design
+    q: For Shift Management, how did you model shifts, overlapping shifts, and time zones across two countries?
+    hint: |-
+      - Lưu thời gian dạng **UTC instant** + timezone IANA của store (vd. `America/New_York`, `Europe/London`); hiển thị theo timezone store, không theo trình duyệt.
+      - Shift qua nửa đêm và **DST** (giờ bị lặp/mất) — test riêng.
+      - Chống chồng ca cho một nhân viên: kiểm ở app + ràng buộc DB (constraint/unique hoặc check trong transaction với lock) để tránh race.
+      - Tenant + store scope, quyền (manager vs staff).
+    followUp: A shift is scheduled from 01:30 to 03:30 on the night DST starts. What happens in your system?
+    tags: [p1, timezone, data-modeling]
+    verify: true
+  - id: project-deep-dive-017
+    level: medium
+    type: design
+    q: Describe the Data Enrichment Service. How did you normalize inconsistent product data from external providers?
+    hint: |-
+      - Pipeline: fetch (API/file, theo lịch hoặc event) → validate schema → **normalize** (đơn vị, category mapping, tên/brand, encoding, giá/tiền tệ) → dedupe (key tự nhiên: GTIN/SKU provider) → merge theo độ ưu tiên nguồn → lưu.
+      - Mỗi provider một adapter; mapping cấu hình được.
+      - Idempotent, chạy lại được; lưu raw payload để replay/debug.
+      - Provider down/chậm: retry + backoff, circuit breaker, không làm hỏng dữ liệu đang có.
+      Numbers: (điền số liệu thật của bạn) — số provider, số sản phẩm/lần sync, thời gian.
+    followUp: Two providers send conflicting data for the same product. Which wins and why?
+    tags: [p1, data-pipeline]
+  - id: project-deep-dive-018
+    level: medium
+    type: design
+    q: How does data get from the database into Elasticsearch in your Indexer Service?
+    hint: |-
+      Nêu cách thật: polling theo `updated_at`/rowversion, event/queue khi dữ liệu đổi, hay CDC.
+      - Transform: denormalize (product + price + stock + category theo tenant), analyzer theo ngôn ngữ.
+      - Bulk API, batch size, retry lỗi từng document.
+      - Idempotent: document id = product id (+tenant) → index lại an toàn.
+      - Tenant: index chung với field `tenant_id` + filter bắt buộc, hoặc index/alias theo tenant.
+      - Reindex toàn bộ không downtime: index mới + **alias swap**.
+    followUp: How do you detect and fix drift between the DB and Elasticsearch?
+    tags: [p1, elasticsearch, indexing]
+  - id: project-deep-dive-019
+    level: medium
+    type: design
+    q: In the microservices migration, how were service boundaries decided, and what was extracted first?
+    hint: |-
+      - Boundary theo **business capability/bounded context** và ownership dữ liệu, không theo layer kỹ thuật.
+      - Chọn service đầu tiên: ít phụ thuộc, giá trị rõ, rủi ro thấp (hoặc điểm đau lớn nhất) — giải thích lựa chọn thật.
+      - Dữ liệu: service sở hữu dữ liệu riêng; giai đoạn chuyển tiếp có thể đọc chung DB.
+      - Nói rõ phần bạn tham gia vs quyết định kiến trúc có sẵn.
+    followUp: Which boundary turned out to be wrong, and how did you notice?
+    tags: [p2, microservices, ddd]
+  - id: project-deep-dive-020
+    level: medium
+    type: design
+    q: How was traffic routed between the monolith and the new services during the incremental migration?
+    hint: |-
+      - **Strangler fig**: facade/proxy/gateway định tuyến theo route; chuyển từng route sang service mới.
+      - Chuyển dần: flag/percent, tenant/client cụ thể; shadow traffic để so sánh kết quả.
+      - Rollback: đổi route lại monolith.
+      - Verify parity: so sánh response, contract test, số liệu nghiệp vụ.
+    followUp: How did you verify that the new service returned the same results as the monolith?
+    tags: [p2, migration, strangler-fig]
+  - id: project-deep-dive-021
+    level: medium
+    type: design
+    q: Explain the Memcached "TTL + refresh" strategy you used. Why Memcached rather than Redis?
+    hint: |-
+      - TTL: dữ liệu tự hết hạn giới hạn độ stale.
+      - Refresh: làm mới **trước khi** hết hạn (refresh-ahead / background refresh / stale-while-revalidate) để tránh miss đồng loạt và stampede lên DB.
+      - Chống stampede: một request làm mới (lock `add` trong Memcached), các request khác dùng giá trị cũ.
+      - Memcached: đơn giản, multi-thread, key-value thuần; hợp khi chỉ cần cache (không cần data structure, persistence, pub/sub). Có thể do hạ tầng có sẵn — nói thật.
+      Numbers: (điền số liệu thật của bạn) — DB QPS/CPU trước/sau, hit ratio.
+    followUp: What did "reduced DB load significantly" mean in numbers, and how did you measure it?
+    tags: [p2, caching, memcached]
+  - id: project-deep-dive-022
+    level: medium
+    type: design
+    q: In the banking SPA, what belonged in the Redux store versus local component state versus server state?
+    hint: |-
+      - **Redux (global client state)**: session/user info, feature flags, UI state dùng chung nhiều màn hình.
+      - **Local state**: form input, toggle, trạng thái chỉ một component cần.
+      - **Server state** (dữ liệu từ API): lý tưởng dùng cache chuyên dụng (RTK Query/React Query) với invalidation; nếu để trong slice thì phải tự xử lý loading/stale.
+      - Business logic trong custom hooks tách khỏi UI.
+      Nói dự án thực tế làm thế nào và bạn sẽ đổi gì.
+    followUp: Did you use RTK Query? If not, what problems did storing API data in slices cause?
+    tags: [p3, redux, state]
+  - id: project-deep-dive-023
+    level: medium
+    type: design
+    q: Describe the core component library you built. How did you design the component APIs?
+    hint: |-
+      - Nguyên tắc API: props nhất quán, composition (children/slots) thay vì prop khổng lồ, controlled/uncontrolled, forward ref, `...rest` props.
+      - Theming (tokens), accessibility (label, focus, ARIA, keyboard).
+      - Tài liệu/Storybook, test.
+      - Phân phối: package nội bộ/monorepo, versioning, breaking change.
+      Numbers: (điền số liệu thật của bạn) — số component, số màn hình/team sử dụng.
+    followUp: How did you handle a breaking change in a component used across many screens?
+    tags: [p3, component-library]
+  - id: project-deep-dive-024
+    level: medium
+    type: design
+    q: How did you scale Socket.IO across multiple Node instances, and how did clients recover missed messages after reconnecting?
+    hint: |-
+      - Nhiều instance → cần **adapter** (Redis adapter/streams) để broadcast giữa node; **sticky session** nếu dùng HTTP long-polling fallback.
+      - Auth khi connect (middleware), join room theo user/account.
+      - Reconnect: client tự reconnect; message bị lỡ → client gửi `lastEventId`/timestamp, server trả phần thiếu từ DB; hoặc tính năng connection state recovery của Socket.IO (version mới).
+      - Nói đúng cách dự án thật làm (có thể chỉ một instance — nói thật).
+    followUp: What happens to in-flight messages when you deploy a new version?
+    tags: [p4, socketio, realtime]
+    verify: true
+  - id: project-deep-dive-025
+    level: hard
+    type: scenario
+    q: A developer adds a new reporting endpoint with a raw SQL query and forgets the tenant filter. In your architecture, what catches it before production, and what catches it after?
+    hint: |-
+      **Trước prod** (nói cái thật có + cái nên có): data access layer không cho raw query không tenant (lint/grep rule), review checklist có mục tenant, **test cross-tenant negative** bắt buộc, integration test seed 2 tenant.
+      **Sau prod**: DB-level guard (Row-Level Security / security policy trên SQL Server, view theo tenant, user DB theo tenant), audit log truy cập, alert khi response chứa `tenant_id` khác context (sampling), bug bounty/pentest.
+      Nếu xảy ra leak: incident — chặn endpoint, xác định phạm vi dữ liệu lộ, thông báo theo nghĩa vụ pháp lý/hợp đồng.
+    followUp: Would you add Row-Level Security? What does it cost you in performance and in developer experience?
+    tags: [p1, multi-tenancy, security]
+    verify: true
+  - id: project-deep-dive-026
+    level: hard
+    type: scenario
+    q: One very large tenant starts running heavy operations and slows down every other tenant. How would you handle this noisy-neighbor problem on your platform?
+    hint: |-
+      - **Ngắn hạn**: xác định bằng metric theo tenant (latency, query, QPS), rate limit/quota theo tenant, đưa job nặng sang queue với concurrency limit theo tenant, tối ưu query cụ thể.
+      - **Trung hạn**: tách workload đọc nặng sang read replica/ES, cache theo tenant, fair scheduling cho background job.
+      - **Dài hạn**: tiering — tenant lớn sang silo (DB/cluster riêng), routing theo tenant.
+      Cần **observability có tenant dimension** trước tiên.
+    followUp: How would you migrate one tenant from the shared database to its own database with no downtime?
+    tags: [p1, multi-tenancy, scaling]
+  - id: project-deep-dive-027
+    level: hard
+    type: scenario
+    q: A popular product's cache entry expires during a flash sale and database CPU jumps to 100%. What happened and how would you prevent it in your Redis setup?
+    hint: |-
+      **Cache stampede**: nhiều request cùng miss → cùng query DB.
+      Phòng: single-flight/mutex (`SET key:lock NX PX`) để một request rebuild, còn lại đợi hoặc trả stale; **stale-while-revalidate** (lưu soft TTL trong value); refresh-ahead cho hot key; TTL jitter để không hết hạn đồng loạt; pre-warm trước sự kiện.
+      Kèm bảo vệ DB: connection pool limit, circuit breaker, load shedding.
+      Nói đã gặp thật chưa; nếu có — số liệu (điền số liệu thật của bạn).
+    followUp: Your lock holder crashes before writing the cache. What happens to the waiting requests?
+    tags: [p1, caching, redis]
+  - id: project-deep-dive-028
+    level: hard
+    type: gotcha
+    q: You delete the cache key after updating the database. Describe a race where the cache still ends up stale, and how you'd fix it.
+    hint: |-
+      Race: Request A (read) miss → đọc DB giá **cũ** → (bị chậm) … Request B update DB → delete cache → A mới ghi giá cũ vào cache → stale tới hết TTL.
+      Fix: TTL ngắn làm giới hạn; **delayed double delete** (xoá lại sau vài trăm ms); version key (`price:v{n}`) tăng khi ghi; ghi cache kèm version/timestamp và chỉ ghi nếu mới hơn (Lua/`SET` có điều kiện); hoặc invalidate qua event/CDC sau commit.
+      Nếu dữ liệu cần đúng tuyệt đối (giá lúc checkout) → **đọc từ DB** ở bước quan trọng.
+    followUp: Which data in your platform did you decide must never be served from cache, and why?
+    tags: [p1, caching, consistency]
+  - id: project-deep-dive-029
+    level: hard
+    type: scenario
+    q: Redis goes down in production. What happens to your hot APIs, and what should happen?
+    hint: |-
+      - Nếu client Redis không có timeout ngắn → request treo, cạn thread/connection → **cả API chết** dù DB khoẻ.
+      - Nên: timeout ngắn (vài chục ms), circuit breaker, **fallback DB** có giới hạn (DB có chịu được toàn bộ traffic không? nếu không → rate limit, trả stale từ in-process cache nhỏ, degrade tính năng).
+      - Nếu Redis dùng cho session/denylist/rate limit → quyết định fail-open hay fail-closed cho từng chức năng.
+      - Alert và runbook.
+    followUp: Would you fail open or fail closed for a JWT revocation denylist stored in Redis?
+    tags: [p1, caching, resilience]
+  - id: project-deep-dive-030
+    level: hard
+    type: scenario
+    q: You need to rename a column on a hot table with millions of rows, used by several services. Plan it.
+    hint: |-
+      Không `sp_rename`/`ALTER … RENAME` trực tiếp (vỡ code đang chạy).
+      1. Thêm cột mới; 2. deploy code dual-write (hoặc trigger/computed tạm thời); 3. backfill theo batch (theo PK range, `TOP (N)`/`LIMIT`, sleep, theo dõi lock/log growth/replica lag); 4. verify; 5. chuyển đọc sang cột mới (từng service); 6. ngừng ghi cột cũ; 7. drop cột cũ ở release sau khi mọi consumer đã chuyển.
+      Rủi ro: lock escalation, transaction log đầy, replica lag, service quên cập nhật. SQL Server vs PostgreSQL khác về lock/online DDL — nêu cái bạn biết.
+    followUp: Midway through the backfill, you notice replication lag climbing. What do you do?
+    tags: [p1, migration, database]
+    verify: true
+  - id: project-deep-dive-031
+    level: hard
+    type: scenario
+    q: A migration you deployed went wrong in production. Tell me how you rolled back, or how you would.
+    hint: |-
+      - Thiết kế để **rollback bằng code, không bằng schema**: expand trước nên code cũ vẫn chạy với schema mới; tắt flag/deploy version cũ.
+      - Dữ liệu đã ghi sai → script sửa có kiểm chứng, từ backup/point-in-time restore cho phần bị hỏng (không restore cả DB nếu có ghi mới).
+      - Dừng backfill, đánh giá phạm vi, giao tiếp.
+      Nếu chưa từng gặp: nói thật, và mô tả kế hoạch rollback bạn đã chuẩn bị cho migration cụ thể.
+    followUp: Why is a "down migration" script often useless in production?
+    tags: [p1, migration, incident]
+  - id: project-deep-dive-032
+    level: hard
+    type: scenario
+    q: Customers report they were charged but their orders show as failed. Walk me through how you would investigate and fix it in your checkout.
+    hint: |-
+      - Mitigate: xác định số đơn/khách bị ảnh hưởng, dừng/khoanh vùng nếu còn đang xảy ra.
+      - Điều tra: log theo order id/idempotency key, payment gateway dashboard/webhook log; thường do timeout sau khi gateway đã charge, webhook không xử lý (lỗi/không idempotent), transaction DB rollback sau khi charge.
+      - Fix dữ liệu: **reconcile** với gateway (job so sánh), cập nhật trạng thái hoặc refund.
+      - Phòng: state machine rõ, webhook idempotent + retry, job reconcile định kỳ, alert khi lệch.
+    followUp: How do you make the webhook handler safe if the gateway sends the same event three times, out of order?
+    tags: [p1, checkout, payments]
+  - id: project-deep-dive-033
+    level: hard
+    type: scenario
+    q: Search results in Elasticsearch show products that were deleted or have old prices. How do you find the cause and fix drift?
+    hint: |-
+      - Nguyên nhân: event xoá/cập nhật bị mất (indexer lỗi, không retry, message bị nuốt), polling bỏ sót (`updated_at` không cập nhật khi soft delete, clock skew, cửa sổ polling), bulk error từng document không được xử lý, thứ tự xử lý sai (update cũ ghi đè update mới).
+      - Fix: xử lý lỗi bulk per item + DLQ; dùng **external version** (`version_type=external`) để chặn ghi cũ đè mới; tombstone cho delete.
+      - Phát hiện drift: job so sánh count/checksum theo tenant, reindex định kỳ phần lệch; full reindex qua alias.
+    followUp: How long can search be stale in your system, and did the PO agree to that?
+    tags: [p1, elasticsearch, consistency]
+    verify: true
+  - id: project-deep-dive-034
+    level: hard
+    type: design
+    q: How do you reindex all products into a new Elasticsearch mapping without search downtime?
+    hint: |-
+      1. Tạo index mới `products_v2` với mapping mới.
+      2. Bulk load từ DB (hoặc `_reindex` nếu chỉ đổi mapping và source đủ).
+      3. Trong lúc đó, update mới phải được ghi vào **cả hai** index (dual-write) hoặc replay từ offset/timestamp bắt đầu.
+      4. Verify count/sample query.
+      5. **Atomic alias swap** `products` → `v2`.
+      6. Giữ v1 một thời gian để rollback, rồi xoá.
+      Tuning khi load: `refresh_interval`, replicas = 0 tạm thời.
+    followUp: What breaks if your application writes to the index name directly instead of the alias?
+    tags: [p1, elasticsearch]
+    verify: true
+  - id: project-deep-dive-035
+    level: hard
+    type: scenario
+    q: An external product provider changes its payload format without notice and your enrichment job starts writing garbage. How should the system behave?
+    hint: |-
+      - **Validate schema** ở biên (zod/JSON schema) → payload sai bị **quarantine**, không ghi đè dữ liệu tốt.
+      - Ngưỡng bất thường: nếu > X% record lỗi hoặc số sản phẩm giảm đột ngột → dừng batch, alert (circuit breaker cho dữ liệu).
+      - Lưu raw payload để replay sau khi sửa adapter.
+      - Có version của dữ liệu đã enrich để rollback.
+      - Contract với provider/monitoring phía họ.
+    followUp: How do you re-run enrichment for only the affected products after fixing the adapter?
+    tags: [p1, data-pipeline, resilience]
+  - id: project-deep-dive-036
+    level: hard
+    type: design
+    q: How did you guarantee that a database write and the corresponding Kafka event stay consistent in the microservices migration?
+    hint: |-
+      - Vấn đề **dual write**: commit DB xong mà publish fail (hoặc ngược lại) → hệ thống lệch.
+      - **Transactional outbox**: ghi event vào bảng `outbox` trong cùng transaction; relay (polling hoặc CDC) publish lên Kafka; at-least-once → consumer **idempotent** (dedupe theo event id).
+      - Thay thế: CDC trực tiếp từ bảng nghiệp vụ; hoặc chấp nhận + reconcile.
+      - Nói **thật** dự án đã làm gì (có thể chỉ publish sau commit + retry) và rủi ro còn lại.
+    followUp: Your outbox relay publishes the same event twice. What does each consumer need to do?
+    redFlags:
+      - "Claims exactly-once end-to-end without explaining how"
+    tags: [p2, kafka, outbox]
+  - id: project-deep-dive-037
+    level: hard
+    type: design
+    q: How did you choose Kafka topics, partition keys and consumer groups, and what ordering guarantees did you rely on?
+    hint: |-
+      - Topic theo domain event (`order.events`), không theo consumer.
+      - **Key = entity id** (orderId) → mọi event của một entity vào cùng partition → giữ thứ tự **trong partition** (không có thứ tự toàn cục).
+      - Số partition = giới hạn song song của consumer group; tăng partition làm đổi mapping key.
+      - Consumer group theo service; commit offset sau khi xử lý xong (at-least-once); retry topic + DLQ cho poison message.
+      Numbers: (điền số liệu thật của bạn) — topic, partition, throughput.
+    followUp: A consumer takes too long per message and keeps getting kicked out of the group. What's happening?
+    tags: [p2, kafka]
+    verify: true
+  - id: project-deep-dive-038
+    level: hard
+    type: scenario
+    q: During the migration, a consumer service receives a message in an old format from the monolith and crashes in a loop. How should it have been designed?
+    hint: |-
+      - **Schema evolution**: chỉ thêm field optional, không đổi nghĩa/xoá field; version field trong message; schema registry (Avro/JSON Schema/Protobuf) với compatibility check.
+      - Consumer **tolerant reader**: bỏ qua field lạ, default cho field thiếu.
+      - Poison message: không retry vô hạn trên cùng partition (block cả partition) → retry có giới hạn → DLQ + alert.
+      - Contract test giữa producer (monolith) và consumer.
+    followUp: How do you replay the messages from the DLQ after fixing the consumer?
+    tags: [p2, kafka, compatibility]
+  - id: project-deep-dive-039
+    level: hard
+    type: scenario
+    q: A large screen in your banking SPA re-renders on every keystroke and feels sluggish. Walk me through how you found and fixed it.
+    hint: |-
+      - Đo trước: React DevTools **Profiler** (component nào render, vì sao), "highlight updates".
+      - Nguyên nhân thường gặp: state đặt quá cao (form state trong Redux/global), selector trả object mới mỗi lần (`useSelector` không memo), prop callback/object tạo mới, context value đổi liên tục, list lớn không virtualize.
+      - Fix: đặt state gần nơi dùng, `createSelector`, `React.memo` + `useCallback`/`useMemo` **có chủ đích**, tách context, virtualization.
+      - Đo lại.
+      Numbers: (điền số liệu thật của bạn) — thời gian render trước/sau.
+    followUp: When does useMemo make performance worse?
+    redFlags:
+      - "Wrapped every component in React.memo without profiling"
+    tags: [p3, react, performance]
+  - id: project-deep-dive-040
+    level: hard
+    type: scenario
+    q: Your CSV import took far too long and sometimes crashed the Node process. What was the bottleneck and how did you fix it?
+    hint: |-
+      Nguyên nhân điển hình: đọc cả file vào memory (`readFile` + `split`), parse đồng bộ chặn event loop, insert từng dòng một (N round-trip), không có backpressure.
+      Fix: **stream** (`fs.createReadStream` → CSV parser stream) với `pipeline`, xử lý theo **batch** (vd. 500–1.000 dòng) bằng bulk insert/TVP, giới hạn concurrency, validate từng dòng và gom lỗi, chạy như job nền (queue) và báo tiến độ.
+      Nói đúng cái bạn đã làm + số: (điền số liệu thật của bạn) — kích thước file, thời gian, memory trước/sau.
+    example: |-
+      ```ts
+      import { pipeline } from 'node:stream/promises';
+      import { parse } from 'csv-parse';
+
+      await pipeline(
+        fs.createReadStream(path),
+        parse({ columns: true }),
+        async function* (rows) {
+          let batch = [];
+          for await (const row of rows) {
+            batch.push(validate(row));
+            if (batch.length === 1000) { await repo.bulkInsert(batch); batch = []; }
+          }
+          if (batch.length) await repo.bulkInsert(batch);
+        },
+      );
+      ```
+    followUp: Row 40,000 of 100,000 fails validation. What does the user see, and is the import partial or all-or-nothing?
+    tags: [p4, nodejs, streams]
+  - id: project-deep-dive-041
+    level: hard
+    type: scenario
+    q: You ran load tests on the financial platform. What tool, what scenario, what target, and what broke first?
+    hint: |-
+      - Tool thật đã dùng (k6/JMeter/Artillery…), scenario mô phỏng hành vi thật (login → xem dữ liệu → giao dịch), ramp-up, thời gian.
+      - Target: RPS/concurrent users/p95 mục tiêu, dựa trên đâu.
+      - Cái gì hỏng đầu tiên: DB connection pool, query chậm, CPU Node (JSON lớn), memory, số socket.
+      - Bạn fix gì và đo lại.
+      Numbers: (điền số liệu thật của bạn).
+    followUp: How did you make sure the load test environment was representative of production?
+    tags: [p4, load-testing]
+  - id: project-deep-dive-042
+    level: senior
+    type: open
+    q: If you were starting the multi-tenant e-commerce platform from scratch today, what would you design differently?
+    hint: |-
+      Câu hỏi đo judgment. Chọn 2–3 thay đổi có lý do, dựa trên đau thực tế:
+      - Tenant isolation ở tầng DB (RLS) + observability theo tenant ngay từ đầu.
+      - Event/outbox cho đồng bộ DB → ES thay vì polling (nếu polling gây drift).
+      - Idempotency và state machine cho checkout từ đầu.
+      - Migration tooling + expand/contract làm chuẩn.
+      Thừa nhận điều đã làm đúng; không chê hết quyết định cũ (có ràng buộc lúc đó).
+    followUp: Which of those would you actually fight for if the team had only one quarter?
+    tags: [p1, senior, design]
+  - id: project-deep-dive-043
+    level: senior
+    type: open
+    q: Would you choose microservices again for that back-office migration? Defend your answer.
+    hint: |-
+      Không có đáp án đúng — cần lập luận:
+      - Chi phí microservices: vận hành, distributed transaction, debugging, latency, team phải trưởng thành về DevOps.
+      - Lợi ích thật đã đạt được (deploy độc lập? scale riêng?) — có số liệu không.
+      - Phương án thay: **modular monolith** với boundary rõ trước, tách service chỉ phần cần scale/deploy riêng.
+      - Kết luận của bạn + điều kiện để kết luận khác đi.
+    followUp: What signals would tell you a service boundary should be merged back?
+    tags: [p2, senior, architecture]
+  - id: project-deep-dive-044
+    level: senior
+    type: design
+    q: Your platform must now support a third country with different currency, tax rules, and data-residency requirements. What changes?
+    hint: |-
+      - Tiền: lưu **minor units + currency code**, không float; giá theo tenant/market.
+      - Thuế: rule engine/config theo market, không hard-code; tách tính thuế khỏi checkout core.
+      - Locale/timezone/format địa chỉ (liên quan Address Management).
+      - **Data residency**: dữ liệu của tenant ở region yêu cầu → routing theo tenant, DB/region riêng (silo cho market đó), backup/log cũng phải tuân thủ.
+      - Rollout theo tenant với flag.
+    followUp: How does data residency affect your caching and search layers?
+    tags: [p1, senior, design]
+  - id: project-deep-dive-045
+    level: senior
+    type: open
+    q: Across all your projects, what is the most important technical lesson you've learned about running systems in production?
+    hint: |-
+      Chọn một bài học có câu chuyện chứng minh, ví dụ:
+      - "Mọi thay đổi phải đảo ngược được" (flag, expand/contract, alias swap).
+      - "Không đo thì không tối ưu" (baseline trước khi cache/index).
+      - "Tenant/authorization phải được enforce ở tầng chung, không dựa vào trí nhớ".
+      - "Idempotency ở mọi nơi có retry".
+      Kèm ví dụ cụ thể từ dự án + cách bạn áp dụng bây giờ.
+    followUp: How do you teach that lesson to a team so they don't have to learn it the hard way?
+    tags: [cross, senior]
+  - id: project-deep-dive-046
+    level: senior
+    type: design
+    q: The indexing pipeline must handle ten times more product updates per day. What would you change?
+    hint: |-
+      - Đo bottleneck trước: đọc DB, transform, bulk ES, network.
+      - Chuyển sang **event-driven/CDC** + queue (Kafka) để tách producer/consumer, scale consumer theo partition (key = product id để giữ thứ tự).
+      - Batch + bulk size tối ưu, coalesce nhiều update của cùng sản phẩm trong cửa sổ ngắn.
+      - ES: số shard, refresh interval, hardware, tách index theo tenant lớn.
+      - Backpressure và SLA độ trễ index (vd. "trong 1 phút") thống nhất với PO.
+    followUp: How would you prioritize price and stock changes over description changes?
+    tags: [p1, senior, scaling]
+  - id: project-deep-dive-047
+    level: senior
+    type: open
+    q: What would you need to learn or change to take full ownership of deploying and operating these systems on a cloud platform like AWS?
+    hint: |-
+      Trung thực về gap (AWS chưa dùng production) + kế hoạch cụ thể:
+      - Map kinh nghiệm có sẵn: Redis → ElastiCache, Kafka → MSK, ES → OpenSearch, DB → RDS, service → ECS/EKS/Lambda, cấu hình → Parameter Store/Secrets Manager.
+      - Kiến thức cần: IAM/least privilege, VPC/networking, IaC (Terraform/CDK), CI/CD, observability (CloudWatch/X-Ray), cost.
+      - Đang làm gì: POC/khóa học/cert (điền thông tin thật của bạn).
+    followUp: How would you deploy the Indexer Service on AWS, roughly?
+    tags: [cross, senior, gaps]
+  - id: project-deep-dive-048
+    level: cv
+    type: behavioral
+    q: "You wrote that you owned features end-to-end. Pick Checkout, Address Management or Shift Management: what exactly did you do, why that way, what broke, what would you change, and what are the numbers?"
+    hint: |-
+      Dùng đủ chuỗi prove-it:
+      - **What**: phạm vi bạn own (schema, API, UI, test, release).
+      - **Why**: 1 quyết định thiết kế + phương án đã loại.
+      - **Broke**: bug/incident sau release và cách xử lý.
+      - **Change**: một điều làm khác.
+      - **Numbers**: (điền số liệu thật của bạn) — thời gian giao, số đơn/ca/địa chỉ xử lý mỗi ngày, bug sau release.
+      Reflection: ownership kéo dài sau khi merge (monitor, fix, cải thiện).
+    followUp: Which part of that feature did someone else build, and how did you integrate with it?
+    redFlags:
+      - "Describes the feature as a user would, not as the engineer who built it"
+    tags: [p1, cv, ownership]
+  - id: project-deep-dive-049
+    level: cv
+    type: scenario
+    q: You claim tenant-aware data access and authorization. How did you test that cross-tenant access is impossible? Was there ever a leak or a near miss?
+    hint: |-
+      - Test: integration test seed ≥2 tenant, gọi mọi endpoint với token tenant B trên resource tenant A → phải 404/403; test cho cache key và search filter; có thể test tự động quét route.
+      - Review checklist, code owner cho data access.
+      - Near miss: kể thật nếu có (bug bắt ở review/QA) + thay đổi sau đó.
+      - Nếu chưa có test hệ thống như vậy: nói thật và đề xuất.
+      Numbers: (điền số liệu thật của bạn) — số endpoint có test cross-tenant.
+    followUp: What about background jobs and admin tools — are they tenant-scoped too?
+    tags: [p1, cv, multi-tenancy, testing]
+  - id: project-deep-dive-050
+    level: cv
+    type: scenario
+    q: You said you "introduced Redis caching for hot APIs". How did you decide which APIs were hot, and how did you prove caching helped?
+    hint: |-
+      - Chọn bằng dữ liệu: APM/log theo endpoint (RPS × latency × DB time), tỷ lệ đọc/ghi, dữ liệu có chấp nhận stale không.
+      - Baseline trước khi cache (p95, DB QPS/CPU), đo sau (hit ratio, p95, DB load), rollout sau flag.
+      - "Introduced" = bạn đề xuất + implement? Hay implement theo thiết kế của lead? Nói rõ.
+      Numbers: (điền số liệu thật của bạn) — endpoint, RPS, p95 trước/sau, hit ratio, TTL.
+    followUp: What did you decide NOT to cache, and why?
+    redFlags:
+      - "'It was much faster' with no baseline"
+    tags: [p1, cv, caching]
+  - id: project-deep-dive-051
+    level: cv
+    type: scenario
+    q: You wrote that you performed zero-downtime, zero-data-loss migrations. How do you know there was zero data loss?
+    hint: |-
+      "Zero data loss" phải có **bằng chứng**:
+      - Verify sau backfill: count theo tenant, checksum/hash theo batch, so sánh mẫu, shadow read so sánh kết quả cũ/mới.
+      - Dual-write có log mismatch; job reconcile.
+      - Backup/point-in-time trước bước rủi ro.
+      "Zero downtime" → error rate/latency trong lúc migration (dashboard), không có maintenance window.
+      Numbers: (điền số liệu thật của bạn) — số dòng, thời gian backfill, số mismatch phát hiện và sửa.
+    followUp: What would you have done if the checksum didn't match at 2 a.m.?
+    tags: [p1, cv, migration]
+  - id: project-deep-dive-052
+    level: cv
+    type: scenario
+    q: You mention indexing and query optimization for high-traffic APIs. How many indexes did you add, and did any of them hurt write performance or get dropped later?
+    hint: |-
+      - Số index thật và lý do từng cái (query nào dùng) — (điền số liệu thật của bạn).
+      - Đánh đổi: mỗi index tăng chi phí INSERT/UPDATE, lock, dung lượng; index trùng/không dùng → kiểm bằng DMV/usage stats (SQL Server `sys.dm_db_index_usage_stats`, Postgres `pg_stat_user_indexes`).
+      - Cách tạo trên bảng lớn: online index build (tuỳ edition SQL Server) / `CREATE INDEX CONCURRENTLY` (Postgres), giờ thấp điểm.
+      - Có index nào bạn gỡ bỏ không.
+    followUp: How did you verify the new index was actually used by the query in production?
+    tags: [p1, cv, sql]
+    verify: true
+  - id: project-deep-dive-053
+    level: cv
+    type: scenario
+    q: On the Data Enrichment Service, what exactly did you contribute, and what happened when a provider was down or slow?
+    hint: |-
+      - "Contributed" → phần cụ thể của bạn: adapter provider nào, normalize rule nào, retry/scheduling, test.
+      - Provider down: retry + backoff, timeout, không xoá/ghi đè dữ liệu cũ khi lấy dữ liệu rỗng, alert, chạy lại phần thiếu.
+      - Idempotency khi rerun.
+      Numbers: (điền số liệu thật của bạn) — số provider, số sản phẩm, thời gian sync, tỷ lệ lỗi.
+    followUp: How did you know the enriched data was correct? Who validated it?
+    tags: [p1, cv, data-pipeline]
+  - id: project-deep-dive-054
+    level: cv
+    type: scenario
+    q: On the Indexer Service, how long did a full reindex take, and what happened to search during it?
+    hint: |-
+      - Thời gian full reindex, số document, số tenant (điền số liệu thật của bạn).
+      - Search có bị ảnh hưởng không: dùng alias swap hay index trực tiếp (nếu trực tiếp → có thời gian dữ liệu thiếu).
+      - Cách xử lý update đến trong lúc reindex.
+      - Bạn đã cải thiện gì (bulk size, song song, refresh interval).
+    followUp: What would you change to make a full reindex safe to run during business hours?
+    tags: [p1, cv, elasticsearch]
+  - id: project-deep-dive-055
+    level: cv
+    type: scenario
+    q: You implemented JWT/OAuth including Google OAuth and RBAC. Where exactly are permission checks enforced, and how do you avoid forgetting one on a new endpoint?
+    hint: |-
+      - Nơi check: middleware/guard theo route (`requirePermission('order:refund')`), cộng check **ownership/tenant** của resource trong service.
+      - Tránh quên: **deny by default** (route không khai báo permission → bị chặn), decorator/metadata, test tự động liệt kê route không có permission, review checklist.
+      - Frontend chỉ ẩn UI — không phải bảo mật.
+      Nói đúng cách dự án làm; phần nào là đề xuất.
+    followUp: Show me how a permission change for a role propagates to users who are already logged in.
+    tags: [p1, cv, rbac, auth]
+  - id: project-deep-dive-056
+    level: cv
+    type: behavioral
+    q: You resolved production issues across backend, database and frontend on the e-commerce platform. Tell me about the hardest one, end to end.
+    hint: |-
+      - **S**: triệu chứng, tenant/user bị ảnh hưởng.
+      - **A**: timeline điều tra qua từng tầng, công cụ (log, APM, query plan, browser devtools), giả thuyết bị loại, root cause.
+      - **R**: fix + phòng ngừa (test, alert, runbook).
+      - Numbers: (điền số liệu thật của bạn) — thời gian phát hiện, MTTR, số đơn/user ảnh hưởng.
+      Reflection: điều bạn sẽ thêm vào hệ thống để phát hiện sớm hơn.
+    followUp: What tooling did you wish you had during that incident?
+    tags: [p1, cv, incident]
+  - id: project-deep-dive-057
+    level: cv
+    type: scenario
+    q: In the microservices migration, what exactly did you build yourself, and what was the hardest backward-compatibility problem you hit?
+    hint: |-
+      - Phần của bạn: service/endpoint/consumer cụ thể, transformation logic.
+      - Backward compat: client cũ vẫn gọi API cũ (adapter/facade), format dữ liệu khác giữa monolith và service (data transformation), message schema thay đổi, ID khác nhau.
+      - Cách kiểm: contract test, so sánh response, chạy song song.
+      Numbers: (điền số liệu thật của bạn) — số endpoint migrate, thời gian chạy song song.
+    followUp: How long did the old and new paths run in parallel, and who decided when to cut over?
+    tags: [p2, cv, compatibility]
+  - id: project-deep-dive-058
+    level: cv
+    type: scenario
+    q: "Your CV says Memcached with TTL and refresh 'reduced DB load significantly'. What were the before and after numbers, and what else changed at the same time?"
+    hint: |-
+      - Số thật: DB QPS/CPU/latency trước và sau (điền số liệu thật của bạn); nếu không có số chính xác → nói ước lượng + nguồn (dashboard nào).
+      - Loại trừ yếu tố gây nhiễu: traffic thay đổi, deploy khác, index mới cùng thời điểm.
+      - Staleness chấp nhận được là bao nhiêu, ai đồng ý.
+      Reflection: lần sau đặt baseline + metric trước khi thay đổi.
+    followUp: Did any user ever see stale data because of that cache? What happened?
+    redFlags:
+      - "Cannot quantify 'significantly' at all"
+    tags: [p2, cv, caching, metrics]
+  - id: project-deep-dive-059
+    level: cv
+    type: scenario
+    q: On the banking SPA you mention memoization, code splitting, lazy loading and dynamic imports. Give me one concrete before/after result.
+    hint: |-
+      - Một thay đổi cụ thể: route-based splitting với `React.lazy` + `Suspense`, dynamic import thư viện nặng (chart, PDF, date) khi cần, memo cho list/selector nặng.
+      - Cách đo: bundle analyzer (initial JS), Lighthouse/Web Vitals, Profiler.
+      - Numbers: (điền số liệu thật của bạn) — initial bundle KB trước/sau, thời gian tải/render.
+      - Chi phí: loading state, waterfall request nếu chia quá nhỏ.
+    followUp: How did you decide where to put the split points?
+    tags: [p3, cv, performance]
+  - id: project-deep-dive-060
+    level: cv
+    type: scenario
+    q: You separated business logic into custom hooks on the banking SPA. Show me what one of those hooks looked like and how you tested it.
+    hint: |-
+      - Ví dụ hook: `useTransferForm` (validation, gọi API, trạng thái submit), `useAccountSummary` (fetch + transform).
+      - Nguyên tắc: hook trả dữ liệu + action, không trả JSX; tách hàm thuần (tính toán) ra ngoài để unit test dễ.
+      - Test: `renderHook` (Testing Library) + mock API; hàm thuần test riêng.
+      - Cạm bẫy: dependency array sai → stale closure, effect chạy lặp.
+    example: |-
+      ```ts
+      function useTransferForm(accountId: string) {
+        const [amount, setAmount] = useState('');
+        const error = validateAmount(amount); // pure, unit-tested separately
+        const submit = useCallback(async () => {
+          if (error) return;
+          await api.transfer({ accountId, amount: toMinorUnits(amount) });
+        }, [accountId, amount, error]);
+        return { amount, setAmount, error, submit };
+      }
+      ```
+    followUp: How do you prevent a double submit of a transfer from this hook?
+    tags: [p3, cv, react, hooks]
+  - id: project-deep-dive-061
+    level: cv
+    type: scenario
+    q: On the financial platform you fixed a CSV processing bottleneck. What was the file size and processing time before and after, and how did you find the bottleneck?
+    hint: |-
+      - Tìm bottleneck: đo thời gian từng giai đoạn (đọc, parse, validate, ghi DB), `--cpu-prof`/clinic.js, memory usage, số query.
+      - Fix cụ thể bạn làm (stream, batch insert, bỏ query trong vòng lặp, index).
+      - Numbers: (điền số liệu thật của bạn) — kích thước file/số dòng, thời gian và memory trước/sau.
+      Reflection: nếu làm lại, có chuyển sang job nền + báo tiến độ không.
+    followUp: What happens if two users upload the same file at the same time?
+    tags: [p4, cv, performance]
+  - id: project-deep-dive-062
+    level: cv
+    type: scenario
+    q: You worked with React class components on the financial platform. If you had to migrate one to hooks today, how would you do it safely?
+    hint: |-
+      - Map lifecycle: `componentDidMount/DidUpdate/WillUnmount` → `useEffect` với dependency đúng + cleanup; `setState` merge → nhiều `useState`/`useReducer`; instance field → `useRef`.
+      - Cạm bẫy: `componentDidUpdate` so sánh prevProps → effect dependency; socket subscription phải cleanup (tránh duplicate listener khi re-render/StrictMode).
+      - An toàn: test hành vi trước (Testing Library), migrate từng component, error boundary vẫn cần class (hoặc lib).
+    followUp: Why do error boundaries still require a class component?
+    tags: [p4, cv, react]
+    verify: true
+  - id: project-deep-dive-063
+    level: cv
+    type: behavioral
+    q: If I called your former tech lead on the e-commerce platform, what would they say was your single most valuable contribution, and what would they say you should improve?
+    hint: |-
+      - Chọn đóng góp có bằng chứng (feature, fix, cải thiện quy trình) + tác động.
+      - Điểm cần cải thiện **thật** (vd. đo lường kết quả, lên tiếng sớm hơn về rủi ro, viết design doc) + bạn đã làm gì.
+      - Nhất quán với các câu trả lời trước.
+      Numbers: (điền số liệu thật của bạn).
+      Reflection: cho thấy bạn biết người khác nhìn mình thế nào.
+    followUp: When did you last receive that feedback directly, and what did you change?
+    tags: [p1, cv, self-awareness]

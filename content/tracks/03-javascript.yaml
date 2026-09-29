@@ -1,0 +1,991 @@
+id: 03-javascript
+slug: javascript
+title: JavaScript Core
+tier: 1
+status: drafted
+summary: Closures, this, prototypes, event loop, promises/async, modules, memory, number/date gotchas — kèm output-prediction puzzles và debug thực tế.
+cvLinked: true
+prerequisites: []
+overview: |-
+  ## TL;DR
+
+  - JavaScript là ngôn ngữ **single-threaded** chạy trên một **event loop**; mọi thứ bất đồng bộ (timer, I/O, promise) đều là callback được xếp hàng chờ call stack rỗng.
+  - Senior interview hiếm khi hỏi "closure là gì" — họ hỏi **tại sao đoạn code này in ra thế này**, **leak ở đâu**, **promise nào bị nuốt lỗi**.
+  - Nắm chắc 5 trục: **scope & closure**, **`this` binding**, **prototype chain**, **event loop (macro vs micro task)**, **promise error propagation**.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Closure | Function "nhớ" biến của scope nơi nó được tạo | `const inc = counter(); inc(); inc()` giữ `count` riêng |
+  | `this` | Được quyết định **lúc gọi**, không phải lúc khai báo (trừ arrow function) | `obj.fn()` → `this = obj`; `const f = obj.fn; f()` → `undefined` (strict) |
+  | Prototype | Object tra cứu property theo chuỗi `__proto__` | `class` chỉ là syntax sugar trên prototype |
+  | Microtask | Promise callbacks, `queueMicrotask` — chạy **hết** trước macrotask kế tiếp | `Promise.resolve().then(...)` chạy trước `setTimeout(..., 0)` |
+  | TDZ | `let`/`const` bị hoisted nhưng chưa khởi tạo | Truy cập trước khai báo → `ReferenceError` |
+  | ESM live binding | `import` là tham chiếu sống tới binding của module xuất | `export let n` thay đổi → importer thấy giá trị mới |
+  | Generator / iterator | Function tạm dừng được (`yield`), trả iterator lazy | Duyệt API phân trang bằng `for await...of` |
+  | WeakMap / WeakRef | Giữ reference **không ngăn GC** thu hồi key/target | Metadata gắn vào DOM node / request object |
+  | Number (IEEE 754 double) | Mọi `number` là float 64-bit; số nguyên an toàn tới `2^53 - 1` | `0.1 + 0.2 !== 0.3`; id 64-bit từ DB phải là string/`BigInt` |
+
+  ## Cơ chế hoạt động
+
+  ### Event loop (browser & Node, mô hình chung)
+
+  ```mermaid
+  flowchart TD
+    A["Run sync code<br/>(call stack)"] --> B{"Stack empty?"}
+    B -- no --> A
+    B -- yes --> C["Drain ALL microtasks<br/>(promise.then, queueMicrotask)"]
+    C --> D["Take ONE macrotask<br/>(setTimeout, I/O, message)"]
+    D --> A
+    C -. "browser" .-> R["Render (if needed)"]
+    R --> D
+  ```
+
+  > Node.js có thêm `process.nextTick` queue (chạy trước promise microtasks) và các phase của libuv — xem track **05 Node.js Internals**.
+
+  ### Promise lifecycle & error propagation
+
+  ```mermaid
+  flowchart LR
+    P["pending"] -- "resolve(v)" --> F["fulfilled"]
+    P -- "reject(e) / throw" --> R["rejected"]
+    F -- ".then(onF)" --> N1["promise mới<br/>(giá trị return của onF)"]
+    R -- ".then(onF) không có onR" --> N2["promise mới<br/>vẫn rejected (lỗi đi tiếp)"]
+    R -- ".catch(onR)" --> N3["promise mới<br/>fulfilled nếu onR return bình thường"]
+    N2 -- "không ai handle" --> U["unhandledrejection<br/>(Node ≥ 15: crash)"]
+  ```
+
+  - Mỗi `.then/.catch` trả về **promise mới**; lỗi "trôi" xuống tới handler gần nhất.
+  - `return` trong `.then` quan trọng: quên `return` (hoặc quên `await`) = promise bị "floating", lỗi không tới caller.
+
+  ### Scope chain & closure
+
+  ```mermaid
+  flowchart TD
+    G["Global scope<br/>(config)"] --> M["Module scope<br/>(cache = new Map())"]
+    M --> F["function handler(req)<br/>(userId)"]
+    F --> C["callback () => cache.get(userId)"]
+    C -. "tra cứu biến đi ngược lên" .-> F
+    C -. "giữ reference → cache sống mãi" .-> M
+  ```
+
+  Closure giữ **cả environment**, không chỉ biến nó dùng (engine có tối ưu, nhưng đừng dựa vào) → callback sống lâu (timer, listener, cache) có thể giữ object lớn khỏi GC.
+
+  ## Trade-offs
+
+  | Lựa chọn | Ưu | Nhược | Dùng khi |
+  |---|---|---|---|
+  | `async/await` tuần tự | Dễ đọc, stack trace rõ | Chậm nếu các bước độc lập | Bước sau phụ thuộc bước trước |
+  | `Promise.all` | Song song, fail-fast | Không giới hạn concurrency, không huỷ phần còn lại | Vài request độc lập bắt buộc |
+  | Promise pool / `p-limit` | Song song có giới hạn | Thêm code/dependency | Hàng trăm+ task gọi DB/API |
+  | Callback / EventEmitter | Nhiều sự kiện theo thời gian, không cần promise | Dễ leak listener, lỗi không propagate | Stream, socket, event bus |
+  | Async iterator (`for await`) | Lazy, có backpressure tự nhiên | Tuần tự theo mặc định | Duyệt phân trang, stream lớn |
+  | `class` | Rõ ràng, private `#field`, tooling tốt | `this` binding khi truyền method làm callback | Domain object có state |
+  | Closure / factory | Private tự nhiên, không lo `this` | Mỗi instance một bản function (memory) | Module nhỏ, hook, middleware |
+  | `number` | Nhanh, native | Mất chính xác với tiền/số lớn | Đếm, tính toán thông thường |
+  | `BigInt` / decimal lib / minor units | Chính xác | Chậm hơn, không trộn với `number` | Tiền, id 64-bit |
+
+  ## Pitfalls
+
+  - `forEach(async ...)` không chờ gì cả; `array.map(async)` mà quên `Promise.all`.
+  - Truyền `obj.method` làm callback → mất `this`; sửa bằng arrow field hoặc `.bind`.
+  - `const` chỉ chặn **gán lại**, không làm object bất biến; `Object.freeze` chỉ freeze **một tầng**.
+  - Spread `{...obj}` / `[...arr]` là **shallow copy** → mutate nested vẫn ảnh hưởng bản gốc (state React, Redux).
+  - `sort`, `reverse`, `splice` **mutate** mảng gốc — dùng `toSorted`, `toReversed`, `toSpliced` (ES2023).
+  - `JSON.parse` id 64-bit (`9007199254740993`) → mất chính xác; `JSON.stringify` BigInt → `TypeError`.
+  - `new Date('2026-09-29')` là **UTC** nhưng `new Date('2026-09-29T00:00')` là **local time** → lệch ngày theo timezone.
+  - Event listener / interval không cleanup → memory leak (SPA, Socket.IO client, long-running Node).
+  - `||` thay cho `??` làm mất giá trị hợp lệ `0`, `''`, `false`.
+
+  ## Cheat sheet
+
+  - `Promise.all` fail-fast · `allSettled` không bao giờ reject · `race` = cái settle đầu tiên · `any` = cái fulfill đầu tiên (reject bằng `AggregateError` nếu tất cả fail).
+  - `async` function **luôn** trả về Promise; `throw` trong nó = reject.
+  - `==` coercion: `null == undefined` là `true`, nhưng `null == 0` là `false`.
+  - `typeof null === "object"` (bug lịch sử) · `typeof function(){} === "function"`.
+  - Arrow function: không có `this`, `arguments`, `prototype`; không dùng làm constructor.
+  - `var` function-scoped + hoisted `undefined` · `let/const` block-scoped + TDZ · function declaration hoisted **cả body**.
+  - `??` chỉ fallback khi `null/undefined` · `?.` short-circuit khi `null/undefined`.
+  - `Number.MAX_SAFE_INTEGER = 2^53 - 1`; so sánh float dùng epsilon; tiền dùng minor units (cents) hoặc decimal library.
+  - `structuredClone` cho deep copy; spread chỉ shallow.
+  - `WeakMap` key phải là object (hoặc non-registered symbol); không iterate được, không có `size`.
+  - Microtask chạy **hết** trước macrotask kế tiếp → vòng lặp microtask vô hạn làm treo cả timer và render.
+  - `for...in` duyệt key enumerable (kể cả kế thừa) · `for...of` duyệt giá trị qua iterator.
+notionRefs: []
+references:
+  - title: MDN — Event loop / concurrency model
+    url: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Event_loop
+  - title: MDN — Closures
+    url: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Closures
+  - title: javascript.info — Microtasks
+    url: https://javascript.info/microtask-queue
+  - title: MDN — Using promises
+    url: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Using_promises
+  - title: MDN — this
+    url: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Operators/this
+  - title: MDN — Inheritance and the prototype chain
+    url: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Inheritance_and_the_prototype_chain
+  - title: MDN — Memory management
+    url: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Memory_management
+  - title: MDN — Iterators and generators
+    url: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Iterators_and_generators
+  - title: MDN — JavaScript modules
+    url: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Modules
+  - title: ECMAScript Language Specification (latest)
+    url: https://tc39.es/ecma262/
+  - title: Node.js — Modules — ECMAScript modules
+    url: https://nodejs.org/api/esm.html
+  - title: HTML Standard — Event loops
+    url: https://html.spec.whatwg.org/multipage/webappapis.html#event-loops
+questions:
+  - id: javascript-001
+    level: easy
+    type: concept
+    q: What is a closure, and give one practical use case in production code?
+    hint: |-
+      Closure = function + **lexical environment** nơi nó được tạo; nó giữ reference (không phải bản copy) tới biến bên ngoài.
+      Use case thực tế: data privacy (module pattern), factory (`createLogger(prefix)`), memoize, debounce/throttle, React hooks (mỗi render là một closure mới).
+    example: |-
+      ```ts
+      function createRateLimiter(max: number) {
+        let used = 0; // private, chỉ closure truy cập được
+        return () => (used < max ? (++used, true) : false);
+      }
+      const allow = createRateLimiter(2);
+      allow(); allow(); allow(); // true, true, false
+      ```
+    followUp: Can a closure cause a memory leak? Show how.
+    redFlags:
+      - "Closure copies the outer variables"
+      - Only gives the textbook counter example with no real use case
+    tags: [scope, closure]
+  - id: javascript-002
+    level: easy
+    type: output
+    q: What does this print, and why? How do you fix it without changing `var` to `let`?
+    example: |-
+      ```js
+      for (var i = 0; i < 3; i++) {
+        setTimeout(() => console.log(i), 0);
+      }
+      ```
+    hint: |-
+      In ra `3 3 3`. `var` là function-scoped → cả 3 callback cùng tham chiếu **một** biến `i`; khi callback chạy (sau vòng lặp), `i` đã là 3.
+      Fix không đổi `let`: IIFE tạo scope mới `((j) => setTimeout(() => console.log(j)))(i)`, hoặc truyền tham số thứ 3 của `setTimeout(fn, 0, i)`.
+      Với `let`, mỗi iteration có binding riêng → `0 1 2`.
+    followUp: Why does `let` fix it — what does the spec do per iteration?
+    tags: [scope, event-loop]
+  - id: javascript-003
+    level: easy
+    type: concept
+    q: Explain the four rules that determine `this` in a regular function call, in order of precedence.
+    hint: |-
+      1. `new` binding → object mới tạo.
+      2. Explicit: `call` / `apply` / `bind`.
+      3. Implicit: gọi qua object `obj.fn()` → `obj`.
+      4. Default: `undefined` (strict mode) hoặc `globalThis` (sloppy).
+      Arrow function **không** theo 4 rule này — nó lấy `this` của scope bao ngoài (lexical).
+    followUp: What happens to `this` when you pass `obj.method` as a callback to `setTimeout` or an event listener?
+    redFlags:
+      - "`this` refers to the function itself"
+    tags: [this]
+  - id: javascript-004
+    level: easy
+    type: compare
+    q: Compare `Promise.all`, `Promise.allSettled`, `Promise.race` and `Promise.any`. When do you use each?
+    hint: |-
+      - `all`: resolve khi **tất cả** fulfill; reject ngay khi **một** cái reject (fail-fast) — dữ liệu bắt buộc (user + config).
+      - `allSettled`: luôn resolve với `{status, value|reason}[]` — batch job, gửi nhiều notification.
+      - `race`: settle theo cái **đầu tiên** (kể cả reject) — timeout wrapper.
+      - `any`: fulfill theo cái **thành công đầu tiên**; reject `AggregateError` nếu tất cả fail — nhiều mirror/CDN.
+      Lưu ý: fail-fast **không huỷ** các promise còn lại — chúng vẫn chạy (cần `AbortController`).
+    followUp: With `Promise.all`, the first request fails — are the other HTTP requests cancelled? How would you cancel them?
+    tags: [promise, async]
+  - id: javascript-005
+    level: medium
+    type: output
+    q: Predict the output order and explain it in terms of the call stack, microtask and macrotask queues.
+    example: |-
+      ```js
+      console.log('1');
+      setTimeout(() => console.log('2'), 0);
+      Promise.resolve().then(() => console.log('3'));
+      queueMicrotask(() => console.log('4'));
+      (async () => {
+        console.log('5');
+        await null;
+        console.log('6');
+      })();
+      console.log('7');
+      ```
+    hint: |-
+      Output: `1 5 7 3 4 6 2`.
+      - Sync: `1`, `5` (phần trước `await` chạy đồng bộ), `7`.
+      - Microtasks theo thứ tự enqueue: `3`, `4`, rồi phần sau `await` (`6`).
+      - Macrotask: `2`.
+      Key insight: `await` = "phần còn lại của function được đẩy vào microtask".
+    followUp: What changes in Node.js if you add `process.nextTick(() => console.log('8'))` right after line 1?
+    redFlags:
+      - "setTimeout 0 runs immediately"
+      - Thinks everything inside an async function is asynchronous
+    tags: [event-loop, promise, async]
+  - id: javascript-006
+    level: medium
+    type: debug
+    q: This function is supposed to save all orders in parallel and report failures, but errors are silently lost in production. Find the bugs.
+    example: |-
+      ```ts
+      async function saveAll(orders: Order[]) {
+        const results = [];
+        orders.forEach(async (o) => {
+          try {
+            results.push(await db.save(o));
+          } catch (e) {
+            logger.error(e);
+          }
+        });
+        return results; // always []
+      }
+      ```
+    hint: |-
+      - `forEach` **không await** callback async → hàm return `[]` ngay, lỗi xảy ra sau khi caller đã "xong"; nếu bỏ try/catch sẽ thành unhandled rejection.
+      - Fix: `const settled = await Promise.allSettled(orders.map((o) => db.save(o)))` rồi tách fulfilled/rejected.
+      - Nếu hàng nghìn order: giới hạn concurrency (p-limit / chunking) để không cạn DB connection pool.
+    followUp: 10,000 orders — how do you cap concurrency at 20 without a library?
+    redFlags:
+      - Switches to a sequential `for...of` + `await` without mentioning the latency cost
+    tags: [async, promise, gotcha]
+  - id: javascript-007
+    level: medium
+    type: concept
+    q: How does prototypal inheritance work, and what does `class` actually compile down to?
+    hint: |-
+      Mỗi object có internal `[[Prototype]]`; khi đọc property không có, engine đi lên chuỗi prototype tới `null`.
+      `class A { m() {} }` ≈ `function A() {}` + `A.prototype.m = function () {}`; `extends` nối `B.prototype.__proto__ = A.prototype` **và** `B.__proto__ = A` (static inheritance).
+      Khác biệt thật của `class`: body luôn strict, không gọi được khi thiếu `new`, method non-enumerable, có TDZ.
+    followUp: What's the performance risk of modifying an object's prototype at runtime (`Object.setPrototypeOf`)?
+    tags: [prototype, class]
+  - id: javascript-008
+    level: medium
+    type: gotcha
+    q: Why is `JSON.parse(JSON.stringify(obj))` a bad deep clone, and what do you use instead?
+    hint: |-
+      Mất/đổi dữ liệu: `Date` → string, `undefined`/function/Symbol bị bỏ, `Map`/`Set` → `{}`, `NaN`/`Infinity` → `null`, `BigInt` → throw, circular reference → throw.
+      Dùng `structuredClone()` (có sẵn trong browser hiện đại và Node ≥ 17): hỗ trợ Date, Map, Set, circular; **không** clone function, DOM node, class prototype (instance thành plain object).
+    followUp: When would you avoid deep cloning entirely (immutability patterns, structural sharing)?
+    tags: [objects, gotcha]
+  - id: javascript-009
+    level: medium
+    type: compare
+    q: CommonJS vs ES Modules — what are the real differences that bite you in a Node/Next.js codebase?
+    hint: |-
+      - Load: CJS `require` đồng bộ, lúc runtime; ESM phân tích **tĩnh** (import hoisted) → tree-shaking, top-level `await`.
+      - Binding: CJS export là **bản copy giá trị** của `module.exports`; ESM export là **live binding**.
+      - Interop: ESM import được CJS (default = `module.exports`); CJS `require()` ESM từng không được — Node mới hơn đã hỗ trợ `require(esm)` đồng bộ nếu module không có top-level await (verify theo version Node).
+      - Không có `__dirname`/`require` trong ESM → dùng `import.meta.dirname` / `import.meta.url`.
+    followUp: A library ships ESM-only and your Jest setup is CJS — what breaks and how do you fix it?
+    verify: true
+    tags: [modules, node]
+  - id: javascript-010
+    level: hard
+    type: debug
+    q: A long-running Node service's heap grows ~50 MB/hour. The code below is suspected. Explain the leak and fix it.
+    example: |-
+      ```ts
+      const cache = new Map<string, User>();
+      export async function getUser(req: Request) {
+        const key = `${req.headers.get('x-request-id')}:${req.userId}`;
+        if (!cache.has(key)) cache.set(key, await db.users.find(req.userId));
+        return cache.get(key)!;
+      }
+      ```
+    hint: |-
+      - Key chứa `x-request-id` → **mỗi request một key mới**, cache không bao giờ hit và không có eviction → Map lớn vô hạn (GC không thu được vì Map còn giữ reference).
+      - Fix: key theo `userId` (+ tenant), dùng LRU có `max` + TTL (`lru-cache`), hoặc đẩy ra Redis.
+      - `WeakMap` chỉ giúp khi key là **object** có vòng đời riêng — không dùng cho string key.
+      - Cách chứng minh: 2 heap snapshot cách nhau vài phút → Comparison view → `Map` retained size tăng.
+    followUp: How would you confirm this leak in production without restarting the service?
+    redFlags:
+      - Says "V8's GC will eventually clean it up"
+      - Suggests just increasing `--max-old-space-size`
+    tags: [memory, node, debug]
+  - id: javascript-011
+    level: hard
+    type: scenario
+    q: A CPU-heavy function (e.g. parsing a 50 MB JSON) freezes your UI / API for 2 seconds. Walk through your options.
+    hint: |-
+      - Chẩn đoán trước: Performance tab / `--cpu-prof` — có đúng là CPU hay là GC?
+      - Browser: Web Worker (transfer `ArrayBuffer` để tránh copy), chia nhỏ việc với `scheduler.yield()`/`setTimeout` chunking để trả quyền render.
+      - Node: `worker_threads` / piscina pool; streaming parser (không parse cả file một lần); đẩy sang job queue nếu không cần kết quả đồng bộ.
+      - Tốt nhất: tránh việc đó — pagination, NDJSON, xử lý ở server/DB.
+      - Chú ý: `async` **không** làm code CPU-bound chạy song song.
+    followUp: Why doesn't wrapping the work in a Promise or `async` function help?
+    tags: [event-loop, performance]
+  - id: javascript-012
+    level: hard
+    type: gotcha
+    q: What happens to an error thrown inside a `.then()` that has no `.catch()`, in the browser vs Node.js? How should a production service handle it?
+    hint: |-
+      - Promise bị reject và không có handler → event `unhandledrejection` (browser: log console, app vẫn chạy).
+      - Node ≥ 15: mặc định `--unhandled-rejections=throw` → **process crash**.
+      - Production: lint `no-floating-promises` (typescript-eslint), luôn `await`/return promise, handler `process.on('unhandledRejection')` chỉ để **log + graceful shutdown**, không để tiếp tục chạy ở trạng thái không rõ.
+    followUp: Why is "log and continue" in `uncaughtException` considered dangerous?
+    verify: true
+    tags: [promise, error-handling, node]
+  - id: javascript-013
+    level: senior
+    type: open
+    q: You join a team whose codebase mixes callbacks, raw promises, and async/await, with inconsistent error handling. How do you standardize it without a big-bang rewrite?
+    hint: |-
+      Không có đáp án duy nhất — đo độ trưởng thành:
+      - Chuẩn hoá quy tắc trước (ADR ngắn): async/await, error types (`AppError` có `code`/`cause`), không nuốt lỗi.
+      - Enforce bằng tooling: `@typescript-eslint/no-floating-promises`, `no-misused-promises`, `promisify` cho callback API.
+      - Boy-scout rule + ưu tiên module có incident nhiều nhất; codemod cho pattern lặp.
+      - Observability: đếm unhandled rejection / error theo module để chứng minh tiến bộ.
+    followUp: How do you get buy-in from a team that thinks "it works, don't touch it"?
+    tags: [async, leadership, refactoring]
+  - id: javascript-014
+    level: cv
+    type: scenario
+    q: On a React SPA you optimized rendering with memoization. Walk me through one concrete case — how did you know memoization was the fix, and when did it make things worse?
+    hint: |-
+      Trả lời bằng một case thật (STAR ngắn): triệu chứng (list 500 dòng lag khi gõ search) → đo bằng React Profiler (component nào render lại, bao lâu) → nguyên nhân (object/callback prop mới mỗi render phá `React.memo`) → fix (`useMemo`/`useCallback`, tách state, virtualization) → kết quả **có số**.
+      Khi nào tệ hơn: memo cho component rẻ, dependency array sai → stale data, so sánh props tốn hơn render.
+    followUp: With the React Compiler, would you still write `useMemo` by hand?
+    tags: [react, performance, closure]
+  - id: javascript-015
+    level: easy
+    type: output
+    q: What happens when this runs, and what does it teach you about hoisting and the TDZ?
+    example: |-
+      ```js
+      console.log(typeof a, typeof b);
+      var a = 1;
+      let b = 2;
+      ```
+    hint: |-
+      - Không in gì — ném `ReferenceError: Cannot access 'b' before initialization`.
+      - `var a` được hoisted và khởi tạo `undefined` → `typeof a` là `"undefined"`.
+      - `let b` cũng hoisted nhưng nằm trong **TDZ** tới dòng khai báo → mọi truy cập (kể cả `typeof`, vốn "an toàn" với biến chưa khai báo) đều throw.
+      - Function declaration hoisted **cả body**; function expression gán vào `const` thì không.
+    followUp: Why was the TDZ designed to throw instead of returning `undefined` like `var`?
+    redFlags:
+      - "`typeof` never throws"
+    tags: [hoisting, tdz, scope]
+  - id: javascript-016
+    level: easy
+    type: compare
+    q: '`==` vs `===`, and `||` vs `??` — which do you use for defaults from a config or API response, and why?'
+    hint: |-
+      - `===` không ép kiểu; `==` ép kiểu theo luật phức tạp (`[] == false` là `true`, `null == 0` là `false`, nhưng `null >= 0` là `true`). Mặc định dùng `===`; ngoại lệ chấp nhận được: `x == null` để bắt cả `null` và `undefined`.
+      - `a || b` fallback khi `a` **falsy** (`0`, `''`, `false`, `NaN` cũng bị thay) → bug với `pageSize: 0`, `discount: 0`, `enabled: false`.
+      - `a ?? b` chỉ fallback khi `null`/`undefined` → đúng cho default.
+      - `NaN === NaN` là `false` → dùng `Number.isNaN` hoặc `Object.is`.
+    example: |-
+      ```ts
+      const cfg = { retries: 0, label: '' };
+      cfg.retries || 3; // 3  (bug)
+      cfg.retries ?? 3; // 0
+      ```
+    followUp: Can you mix `??` with `||` without parentheses? What does the parser do?
+    tags: [coercion, operators]
+  - id: javascript-017
+    level: easy
+    type: gotcha
+    q: Why does updating a copied object sometimes change the original? Show it with object spread and nested data.
+    example: |-
+      ```ts
+      const cart = { id: 'c1', items: [{ sku: 'A', qty: 1 }] };
+      const next = { ...cart };
+      next.items[0].qty = 5;
+      console.log(cart.items[0].qty); // ?
+      ```
+    hint: |-
+      - In `5`. Spread (`{...obj}`, `[...arr]`, `Object.assign`) là **shallow copy**: chỉ tầng đầu là object mới, `items` vẫn là **cùng reference**.
+      - Trong React/Redux: mutate nested → reference cha không đổi hoặc state cũ bị sửa → component không render lại / time-travel sai.
+      - Fix: copy theo đường thay đổi (`{...cart, items: cart.items.map((i, k) => k === 0 ? {...i, qty: 5} : i)}`), Immer, hoặc `structuredClone` khi thật sự cần deep copy.
+      - `const` và `Object.freeze` cũng chỉ tác động tầng đầu.
+    followUp: How does Immer let you write "mutating" code while producing immutable updates?
+    tags: [objects, immutability, react]
+  - id: javascript-018
+    level: easy
+    type: output
+    q: What does `['1', '7', '11'].map(parseInt)` return, and why?
+    hint: |-
+      - `[1, NaN, 3]`.
+      - `map` gọi callback với `(value, index, array)` → thực chất là `parseInt('1', 0)`, `parseInt('7', 1)`, `parseInt('11', 2)`.
+      - Radix `0` → coi như 10 → `1`; radix `1` không hợp lệ → `NaN`; `'11'` hệ 2 → `3`.
+      - Bài học: truyền function "point-free" vào `map`/`forEach` nguy hiểm khi function có tham số tuỳ chọn; viết `map((s) => Number.parseInt(s, 10))` hoặc `map(Number)`.
+    followUp: What's the difference between `Number('12px')`, `parseInt('12px', 10)` and `+'12px'`?
+    tags: [output, coercion, array]
+  - id: javascript-019
+    level: easy
+    type: compare
+    q: Arrow functions vs regular functions — list the real behavioural differences, and when an arrow function is the wrong choice.
+    hint: |-
+      - Arrow: `this`, `arguments`, `super`, `new.target` lấy từ scope bao ngoài (lexical); không có `prototype`; không gọi được với `new`; `call/apply/bind` không đổi được `this`.
+      - Đúng chỗ: callback trong method, promise chain, React handler.
+      - Sai chỗ: method trên object literal cần `this` của object; method prototype (mỗi instance có bản copy nếu khai báo là class field); handler DOM cần `this === element`; function cần `arguments`/làm constructor.
+      - Class field arrow (`handle = () => {}`) giải quyết mất `this` khi truyền callback, nhưng tốn memory mỗi instance và không override bằng `super.handle` được.
+    followUp: Why can't you spy on or override an arrow-function class field via the prototype in tests?
+    tags: [functions, this]
+  - id: javascript-020
+    level: medium
+    type: output
+    q: Predict the output order — microtasks scheduled from inside microtasks, and timers scheduled from inside microtasks.
+    example: |-
+      ```js
+      setTimeout(() => console.log('t1'), 0);
+      Promise.resolve().then(() => {
+        console.log('p1');
+        setTimeout(() => console.log('t2'), 0);
+        Promise.resolve().then(() => console.log('p2'));
+      });
+      Promise.resolve().then(() => console.log('p3'));
+      console.log('s');
+      ```
+    hint: |-
+      Output: `s p1 p3 p2 t1 t2`.
+      - Sync: `s`.
+      - Microtask queue ban đầu: [p1-callback, p3-callback]. Chạy p1 → enqueue p2 (vào **cuối** microtask queue), enqueue t2 vào timer queue.
+      - Tiếp tục drain: `p3`, rồi `p2` — microtask queue phải **rỗng** trước khi sang macrotask.
+      - Timers theo thứ tự đăng ký: `t1`, `t2`.
+    followUp: What happens to `t1` if the p1 callback keeps scheduling a new microtask forever?
+    tags: [event-loop, output, promise]
+  - id: javascript-021
+    level: medium
+    type: output
+    q: What does this print, and how do you make passing `c.inc` as a callback safe?
+    example: |-
+      ```ts
+      class Counter {
+        count = 0;
+        inc() { this.count++; }
+      }
+      const c = new Counter();
+      const { inc } = c;
+      try { inc(); } catch (e) { console.log((e as Error).constructor.name); }
+      setTimeout(c.inc, 0);
+      ```
+    hint: |-
+      - In `TypeError`: class body luôn **strict mode** → gọi "trơn" `inc()` thì `this` là `undefined` → `undefined.count` throw.
+      - `setTimeout(c.inc, 0)`: trong Node, timer gọi callback với `this` là object `Timeout` → không throw nhưng tăng `count` của **object sai** (tạo `NaN`); trong browser `this` là `undefined`/`window` tuỳ context → lỗi hoặc bug im lặng.
+      - Fix: `setTimeout(() => c.inc(), 0)`, `c.inc.bind(c)`, hoặc khai báo `inc = () => { this.count++; }`.
+    followUp: Why does the same bug appear in React class components with `onClick={this.handleClick}`?
+    verify: true
+    tags: [this, class, output]
+  - id: javascript-022
+    level: medium
+    type: gotcha
+    q: What's the difference between `return promise` and `return await promise` inside a `try/catch` in an async function?
+    example: |-
+      ```ts
+      async function f() {
+        try { return Promise.reject(new Error('x')); } catch { return 'caught'; }
+      }
+      async function g() {
+        try { return await Promise.reject(new Error('x')); } catch { return 'caught'; }
+      }
+      // f() → ?   g() → ?
+      ```
+    hint: |-
+      - `f()` **reject** với `Error('x')`: `return promise` thoát khỏi `try` ngay, promise reject sau đó → `catch` không bao giờ chạy.
+      - `g()` resolve `'caught'`: `await` làm lỗi được throw **bên trong** `try`.
+      - Tương tự với `finally` (release lock/connection): không `await` → `finally` chạy **trước** khi công việc xong.
+      - Ngoài `try`, `return await` chỉ thêm (rất ít) chi phí nhưng giúp stack trace async đầy đủ hơn; lint `@typescript-eslint/return-await` với `in-try-catch`.
+    followUp: Show how a missing `await` inside `try/finally` can release a DB connection while the query is still running.
+    tags: [async, error-handling, gotcha]
+  - id: javascript-023
+    level: medium
+    type: gotcha
+    q: Why is `0.1 + 0.2 !== 0.3`, and how should an e-commerce backend and frontend represent money and large IDs?
+    hint: |-
+      - `number` là IEEE 754 double: 0.1 không biểu diễn chính xác ở hệ nhị phân → `0.30000000000000004`; `(1.005).toFixed(2)` → `"1.00"`.
+      - Tiền: lưu **minor units** (số nguyên cents/đồng) hoặc `DECIMAL`/`NUMERIC` ở DB, xử lý bằng decimal library khi cần chia/nhân tỉ lệ; quy tắc làm tròn rõ ràng (banker's rounding hay half-up) và làm tròn **một chỗ**.
+      - Số nguyên an toàn tới `2^53 - 1`: ID `BIGINT` từ DB (`9007199254740993`) qua `JSON.parse` thành `...992` → trả ID dạng **string** trong API; driver (pg) mặc định trả `bigint`/`numeric` dạng string vì lý do này.
+      - Hiển thị: `Intl.NumberFormat` với currency.
+    example: |-
+      ```ts
+      0.1 + 0.2;                                   // 0.30000000000000004
+      JSON.parse('{"id":9007199254740993}').id;    // 9007199254740992
+      new Intl.NumberFormat('vi-VN', { style: 'currency', currency: 'VND' }).format(125000);
+      ```
+    followUp: A 3-for-2 promotion splits a 100,000 VND total across 3 items. How do you allocate the remainder so the sum still matches?
+    tags: [number, money, json]
+  - id: javascript-024
+    level: medium
+    type: design
+    q: Use an async generator to iterate over a cursor-paginated API. Why is it better than collecting all pages into an array?
+    example: |-
+      ```ts
+      async function* products(client: Api, signal?: AbortSignal) {
+        let cursor: string | undefined;
+        do {
+          const page = await client.list({ cursor, limit: 100, signal });
+          yield* page.items;
+          cursor = page.nextCursor;
+        } while (cursor);
+      }
+
+      for await (const p of products(api)) {
+        await indexer.push(p);   // natural backpressure: next page fetched only when needed
+        if (done()) break;       // break → generator's finally/return runs
+      }
+      ```
+    hint: |-
+      - **Lazy**: chỉ fetch trang tiếp khi consumer cần → memory O(một trang), có **backpressure** tự nhiên.
+      - Consumer `break`/`return` → generator dừng, không fetch thừa; `finally` trong generator chạy để cleanup.
+      - Tách "cách lấy dữ liệu" khỏi "cách xử lý" → dễ test, tái sử dụng (sync provider, indexer).
+      - Nhược: tuần tự theo mặc định; muốn prefetch/song song phải tự thêm buffer.
+    followUp: How would you prefetch the next page while the current page is being processed, without unbounded memory?
+    tags: [generator, async-iterator, pagination]
+  - id: javascript-025
+    level: medium
+    type: compare
+    q: '`Map` vs `WeakMap` vs `WeakRef` — when would you use each, and why can''t a `WeakMap` be used as a general-purpose cache?'
+    hint: |-
+      - `Map`: giữ **strong reference** tới key và value → không bao giờ bị GC khi còn trong map.
+      - `WeakMap`: key là object (hoặc non-registered symbol), giữ key **yếu** → khi key không còn ai tham chiếu, entry tự biến mất. Dùng để gắn metadata vào object có vòng đời riêng (DOM node, request object, instance) mà không leak. Không iterate, không `size`.
+      - Không làm cache theo **string key** (userId) được — string không phải object; và cache cần eviction theo thời gian/kích thước, không theo GC.
+      - `WeakRef` + `FinalizationRegistry`: tham chiếu yếu tới object, GC **không xác định thời điểm** → chỉ dùng cho tối ưu hoá, không cho logic đúng/sai.
+    followUp: Why must code using `WeakRef.deref()` always handle `undefined`?
+    tags: [memory, weakmap, gc]
+  - id: javascript-026
+    level: medium
+    type: design
+    q: How do you put a timeout on a `fetch` call and cancel all in-flight requests when the user navigates away or the parent request is cancelled?
+    example: |-
+      ```ts
+      async function getJson<T>(url: string, parent?: AbortSignal): Promise<T> {
+        const signal = AbortSignal.any([AbortSignal.timeout(3000), ...(parent ? [parent] : [])]);
+        const res = await fetch(url, { signal });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`, { cause: { url, status: res.status } });
+        return res.json() as Promise<T>;
+      }
+      ```
+    hint: |-
+      - `AbortController`/`AbortSignal` là cơ chế huỷ chuẩn cho `fetch`, stream, nhiều API Node (`fs`, `timers/promises`, `events.once`).
+      - `AbortSignal.timeout(ms)` → reject với `TimeoutError`; abort thủ công → `AbortError`; phân biệt để retry đúng.
+      - `AbortSignal.any([...])` gộp nhiều nguồn huỷ (timeout + request cha + unmount) — có trong browser hiện đại và Node 20+.
+      - Huỷ ở client **không** huỷ công việc ở server nếu server không lắng nghe `req.on('close')`/signal.
+      - React: abort trong cleanup của `useEffect` để tránh set state từ response cũ.
+    followUp: Your Express handler calls three downstream services. How do you propagate the client disconnect to cancel them?
+    verify: true
+    tags: [async, abort-controller, fetch]
+  - id: javascript-027
+    level: medium
+    type: output
+    q: What do the two versions print, and what does that show about ESM live bindings vs CommonJS exports?
+    example: |-
+      ```js
+      // counter.mjs                     // counter.cjs
+      export let count = 0;              let count = 0;
+      export function inc() { count++; } module.exports = { count, inc: () => { count++; } };
+
+      // main.mjs                        // main.cjs
+      import { count, inc } from './counter.mjs';
+      inc(); console.log(count);         const { count, inc } = require('./counter.cjs');
+                                         inc(); console.log(count);
+      ```
+    hint: |-
+      - ESM: in `1` — `count` import là **live binding** tới biến trong module xuất (read-only phía importer: gán `count = 5` là `TypeError`).
+      - CJS: in `0` — `module.exports.count` là **giá trị copy** tại thời điểm tạo object; destructure lại copy thêm lần nữa.
+      - Hệ quả: singleton/state trong module ESM được chia sẻ "sống"; khi bundler/transpiler chuyển ESM → CJS có thể giả lập live binding bằng getter.
+      - Module chỉ được evaluate **một lần** mỗi specifier đã resolve (cache) — hai đường dẫn khác nhau tới cùng file (symlink, CJS vs ESM build) có thể tạo **hai instance** (dual package hazard).
+    followUp: What is the "dual package hazard" and how does it break `instanceof` checks between two copies of a library?
+    tags: [modules, esm, output]
+  - id: javascript-028
+    level: medium
+    type: debug
+    q: Customers in the US see their delivery date one day earlier than customers in Vietnam. Find the bug.
+    example: |-
+      ```ts
+      // API returns: { "deliveryDate": "2026-03-08" }
+      const d = new Date(order.deliveryDate);
+      label.textContent = `${d.getMonth() + 1}/${d.getDate()}`; // US users see 3/7
+      ```
+    hint: |-
+      - Chuỗi **date-only** ISO (`YYYY-MM-DD`) được parse là **UTC midnight**; `getDate()` đọc theo **local timezone** → ở UTC-5, 00:00Z ngày 8 là 19:00 ngày 7.
+      - Ngược lại `new Date('2026-03-08T00:00')` (date-time không offset) được parse là **local time** — hai quy tắc khác nhau dễ nhầm.
+      - Fix: ngày "lịch" (không có giờ) giữ nguyên là string hoặc parse thủ công; nếu dùng `Date` thì đọc bằng `getUTC*` hoặc `Intl.DateTimeFormat(..., { timeZone: 'UTC' })`; timestamp thật thì lưu UTC + hiển thị theo timezone rõ ràng.
+      - `Temporal.PlainDate` biểu diễn đúng khái niệm này (kiểm tra hỗ trợ runtime).
+    followUp: How should you store and compare "store opening hours" for tenants in different timezones, including DST changes?
+    verify: true
+    tags: [date, timezone, debug]
+  - id: javascript-029
+    level: medium
+    type: concept
+    q: How do tagged template literals work, and how do libraries use them to build SQL safely?
+    example: |-
+      ```ts
+      function sql(strings: TemplateStringsArray, ...values: unknown[]) {
+        const text = strings.reduce((acc, s, i) => acc + s + (i < values.length ? `$${i + 1}` : ''), '');
+        return { text, values };
+      }
+      const q = sql`SELECT * FROM orders WHERE tenant_id = ${tenantId} AND id = ${orderId}`;
+      // { text: 'SELECT * FROM orders WHERE tenant_id = $1 AND id = $2', values: [tenantId, orderId] }
+      ```
+    hint: |-
+      - Tag function nhận mảng **phần chuỗi tĩnh** (`strings`, có cả `.raw`) và các giá trị nội suy **tách riêng** → library biến giá trị thành **parameter** (`$1`, `$2`) thay vì nối chuỗi → chống SQL injection.
+      - `strings` là cùng một object cho cùng một call site → có thể cache prepared statement.
+      - Gotcha: nội suy **tên cột/bảng** không parameter hoá được → cần helper riêng (whitelist/identifier escaping); gọi `sql(...)` như function thường với chuỗi đã nối là mất hết bảo vệ.
+      - Dùng thêm cho: `graphql`, `css`, i18n, `String.raw`.
+    followUp: A teammate writes ``sql`ORDER BY ${sortColumn}` `` with user input. What happens and how do you fix it?
+    tags: [template-literals, security, sql]
+  - id: javascript-030
+    level: medium
+    type: concept
+    q: How do you design custom error classes in a TypeScript backend, and what do `error.cause` and `instanceof` pitfalls look like?
+    example: |-
+      ```ts
+      class AppError extends Error {
+        constructor(public code: string, message: string, options?: { cause?: unknown; status?: number }) {
+          super(message, { cause: options?.cause });
+          this.name = new.target.name;
+        }
+      }
+      class NotFound extends AppError {}
+
+      try { await repo.get(id); }
+      catch (e) { throw new AppError('ORDER_LOAD_FAILED', 'Cannot load order', { cause: e }); }
+      ```
+    hint: |-
+      - Subclass `Error` để có `stack`; đặt `name`, `code` ổn định cho client/log; map sang HTTP status ở **một** error middleware.
+      - `cause` (ES2022) giữ lỗi gốc khi wrap → log đầy đủ chuỗi nguyên nhân mà không mất stack.
+      - `instanceof` hỏng khi: có **hai bản** thư viện (dual package, monorepo nhiều version), lỗi đến từ **realm** khác (iframe, `vm`, worker) → kiểm tra theo `code`/`name` hoặc type guard.
+      - Không throw string/object literal — mất stack; `catch (e)` trong TS là `unknown` → phải thu hẹp kiểu.
+    followUp: How do you decide which error details are safe to return to the client versus only log?
+    tags: [error-handling, typescript, class]
+  - id: javascript-031
+    level: medium
+    type: debug
+    q: This React component's timer always shows 1 and never goes higher. Explain the closure bug and give two fixes.
+    example: |-
+      ```tsx
+      function Elapsed() {
+        const [sec, setSec] = useState(0);
+        useEffect(() => {
+          const id = setInterval(() => setSec(sec + 1), 1000);
+          return () => clearInterval(id);
+        }, []);
+        return <span>{sec}s</span>;
+      }
+      ```
+    hint: |-
+      - **Stale closure**: effect chạy một lần (deps `[]`), callback của interval đóng gói `sec` của render đầu tiên = `0` → mãi mãi `setSec(0 + 1)`.
+      - Fix 1: functional update `setSec((s) => s + 1)` — không phụ thuộc biến bị đóng gói.
+      - Fix 2: đưa `sec` vào deps (interval bị tạo lại mỗi giây — chạy được nhưng kém), hoặc dùng `useRef` giữ giá trị mới nhất; React có `useEffectEvent` cho handler cần giá trị mới nhất mà không re-subscribe.
+      - Lint `react-hooks/exhaustive-deps` bắt được lỗi này.
+    followUp: Where else do stale closures show up in hooks (event listeners, debounced callbacks, subscriptions)?
+    verify: true
+    tags: [closure, react, debug]
+  - id: javascript-032
+    level: hard
+    type: gotcha
+    q: Can promise-based code starve timers, I/O and rendering? Show how, and how you'd yield properly in a long processing loop.
+    example: |-
+      ```ts
+      async function processAll(items: Item[]) {
+        for (const it of items) {
+          await transform(it); // transform is sync work wrapped in an async function
+        }
+      }
+      ```
+    hint: |-
+      - Có. `await` một promise đã resolve chỉ đẩy phần còn lại vào **microtask** queue; event loop drain **toàn bộ** microtask trước khi chạy timer, I/O callback hay render → vòng lặp 1 triệu item vẫn chặn server/UI dù "toàn async".
+      - `process.nextTick` đệ quy trong Node còn tệ hơn (chạy trước cả promise microtasks).
+      - Nhường thật sự = về **macrotask**: `await new Promise((r) => setImmediate(r))` (Node) hoặc `setTimeout(0)`/`scheduler.yield()` (browser) mỗi N item; hoặc chuyển sang worker.
+      - Đo bằng event-loop lag (`monitorEventLoopDelay`) trước và sau.
+    followUp: Why does `setImmediate` yield to I/O but a resolved `await` does not?
+    verify: true
+    tags: [event-loop, performance, gotcha]
+  - id: javascript-033
+    level: hard
+    type: gotcha
+    q: A developer schedules a "30-day trial expiry" with `setTimeout(expire, 30 * 24 * 3600 * 1000)`. What happens, and what's the real design problem?
+    hint: |-
+      - Delay được lưu dạng **signed 32-bit** (tối đa `2^31 - 1` ms ≈ 24.8 ngày). Vượt quá → Node cảnh báo `TimeoutOverflowWarning` và đặt delay **1 ms** → `expire` chạy **ngay lập tức**; browser cũng coi như 0.
+      - Vấn đề thiết kế lớn hơn: timer in-memory mất khi process restart/deploy, nhân bản khi có nhiều pod.
+      - Đúng: lưu `expires_at` trong DB và check khi truy cập (lazy), cộng job scheduler bền vững (cron/queue delayed job) cho side effect.
+      - Liên quan: browser clamp nested timer ≥ 4ms sau 5 tầng lồng, và throttle timer ở tab nền.
+    example: |-
+      ```ts
+      setTimeout(() => console.log('fired'), 30 * 24 * 3600 * 1000);
+      // (node) TimeoutOverflowWarning: 2592000000 does not fit into a 32-bit signed integer.
+      // Timeout duration was set to 1.   → prints "fired" almost immediately
+      ```
+    followUp: How would you implement "expire trials at exactly their end time" for a million users?
+    tags: [timers, gotcha, node]
+  - id: javascript-034
+    level: hard
+    type: debug
+    q: After a refactor, `config.ts` imports from `logger.ts` and vice versa. In CommonJS some values are mysteriously `undefined`; after switching to ESM you get a `ReferenceError`. Explain.
+    example: |-
+      ```ts
+      // config.ts
+      import { log } from './logger';
+      export const config = { level: process.env.LOG_LEVEL ?? 'info' };
+      log('config loaded');
+
+      // logger.ts
+      import { config } from './config';
+      export function log(msg: string) { if (config.level !== 'silent') console.log(msg); }
+      // entry: import './config'
+      ```
+    hint: |-
+      - Circular dependency: `config` bắt đầu evaluate → import `logger` → `logger` evaluate xong (chỉ khai báo function) → quay lại `config`, gọi `log` **trước** khi dòng `export const config` chạy.
+      - ESM: `config` đang ở **TDZ** → `ReferenceError: Cannot access 'config' before initialization`.
+      - CJS: `require('./config')` trong logger trả về `module.exports` **chưa hoàn tất** (`{}`) → `config` là `undefined` → lỗi lệch chỗ, khó hiểu.
+      - Fix: tách phần dùng chung ra module thứ ba (config thuần không import gì), đảo hướng phụ thuộc (inject logger), lazy access trong function; phát hiện bằng `madge --circular` / `eslint-plugin-import` `no-cycle`.
+    followUp: Why do circular imports often "work" until someone adds a top-level side effect?
+    tags: [modules, esm, commonjs, debug]
+  - id: javascript-035
+    level: hard
+    type: debug
+    q: This Node service crashes intermittently with an unhandled rejection that has no useful stack trace. Why doesn't the try/catch help?
+    example: |-
+      ```ts
+      import { EventEmitter } from 'node:events';
+      const bus = new EventEmitter();
+
+      bus.on('order.created', async (order) => {
+        await inventory.reserve(order); // may reject
+      });
+
+      try {
+        bus.emit('order.created', order);
+      } catch (e) {
+        logger.error(e); // never runs
+      }
+      ```
+    hint: |-
+      - `emit` gọi listener **đồng bộ** và bỏ qua giá trị trả về → promise của listener async bị "floating"; rejection xảy ra **sau** khi `try` đã kết thúc → unhandled rejection → Node ≥ 15 crash.
+      - `try/catch` chỉ bắt lỗi throw **đồng bộ** hoặc được `await` trong cùng function; lỗi trong callback `setTimeout`, listener, promise không await đều thoát ra ngoài.
+      - Fix: try/catch **bên trong** listener; `new EventEmitter({ captureRejections: true })` để chuyển rejection thành event `'error'`; hoặc dùng queue/outbox thay vì event in-process cho việc quan trọng.
+      - Stack trace async: `await` đúng chỗ giúp V8 zero-cost async stack traces hoạt động.
+    followUp: For something as important as reserving inventory, why is an in-process EventEmitter the wrong tool?
+    verify: true
+    tags: [error-handling, events, node, debug]
+  - id: javascript-036
+    level: hard
+    type: concept
+    q: How does V8's garbage collector work at a high level, and what kinds of code create GC pressure or pause spikes in a Node API?
+    hint: |-
+      - **Generational**: young generation (object mới, thu gom nhanh bằng Scavenger/semi-space copy — đa số object chết trẻ) và old generation (object sống sót, Mark-Sweep-Compact, phần lớn chạy **incremental/concurrent** để giảm pause).
+      - Áp lực GC: tạo nhiều object tạm trên hot path (map/filter/spread lặp nhiều tầng trên mảng lớn), string concat lớn, `JSON.parse/stringify` payload lớn, cache không giới hạn đẩy object lên old space.
+      - Triệu chứng: p99 latency spike, CPU cao mà profile thấy `GC`; đo bằng `--trace-gc`, `perf_hooks` GC entries.
+      - Không bao giờ bị GC: object còn được tham chiếu từ root (global, module cache, closure sống, timer, listener, pending promise được giữ).
+    followUp: Why can raising `--max-old-space-size` make latency worse even though it prevents crashes?
+    verify: true
+    tags: [gc, memory, v8, performance]
+  - id: javascript-037
+    level: hard
+    type: debug
+    q: This deep-merge helper is used to apply tenant settings from a JSON request body. What's the security bug?
+    example: |-
+      ```ts
+      function merge(target: any, src: any) {
+        for (const key in src) {
+          if (typeof src[key] === 'object' && src[key] !== null) {
+            target[key] ??= {};
+            merge(target[key], src[key]);
+          } else {
+            target[key] = src[key];
+          }
+        }
+        return target;
+      }
+      merge(settings, JSON.parse('{"__proto__": {"isAdmin": true}}'));
+      console.log(({} as any).isAdmin); // true
+      ```
+    hint: |-
+      - **Prototype pollution**: `JSON.parse` tạo own property tên `__proto__`; `target['__proto__']` trỏ tới `Object.prototype` → merge ghi `isAdmin: true` lên prototype của **mọi object** trong process.
+      - Hậu quả: bypass check quyền (`if (user.isAdmin)`), đổi option mặc định, thậm chí RCE qua gadget trong thư viện (template engine, `child_process` options).
+      - Fix: bỏ qua key `__proto__`, `constructor`, `prototype`; chỉ merge own property (`Object.hasOwn`); dùng `Object.create(null)`/`Map` cho dữ liệu động; **validate schema** (zod) với danh sách field cho phép; `node --disable-proto=delete`.
+    followUp: Why is validating the request body with a strict schema a better fix than patching the merge function?
+    tags: [security, prototype, debug]
+  - id: javascript-038
+    level: hard
+    type: scenario
+    q: A long-lived SPA page (dashboard open all day) grows from 150 MB to 1.5 GB of memory. How do you find and fix the leak?
+    hint: |-
+      - Tái hiện: lặp lại một thao tác (mở/đóng modal, chuyển route) N lần; Chrome DevTools **heap snapshot** trước/sau → Comparison, lọc **Detached** DOM nodes; Allocation timeline.
+      - Nghi phạm thường gặp: `addEventListener`/`window.onresize` không remove; `setInterval` không clear; subscription (WebSocket/Socket.IO, store) không unsubscribe khi unmount; cache module-level (Map) giữ response; closure trong listener giữ component/DOM cũ; chart library không `destroy()`.
+      - Fix: cleanup trong `useEffect` return, `AbortController` signal cho listener (`addEventListener(type, fn, { signal })`), giới hạn cache, paginate/virtualize dữ liệu realtime (không append vô hạn vào mảng state).
+    followUp: How does `addEventListener(..., { signal })` simplify cleanup when a component registers many listeners?
+    tags: [memory, browser, react, scenario]
+  - id: javascript-039
+    level: hard
+    type: scenario
+    q: 'Order IDs shown in the admin UI occasionally don''t match the database, and "open order" links 404 for some rows. The API returns `{ "id": 1234567890123456789 }`. What''s happening end to end?'
+    hint: |-
+      - ID `BIGINT` vượt `Number.MAX_SAFE_INTEGER` (2^53 − 1) → `JSON.parse` ở frontend (hoặc service Node trung gian) làm tròn thành số gần nhất biểu diễn được → ID sai, link 404; lỗi **im lặng** và chỉ xảy ra với ID lớn.
+      - Fix hợp đồng API: serialize ID dạng **string**; phía server Node đọc DB bigint dạng string/`BigInt`, không `Number()`.
+      - Nếu không đổi API được: parser hỗ trợ big number (`JSON.parse` reviver với `context.source` ở runtime mới, hoặc thư viện như `json-bigint`).
+      - Kiểm tra toàn chuỗi: DB driver → ORM → serializer → cache (Redis JSON) → client.
+    followUp: Why is `BigInt` not a drop-in replacement for `number` in this pipeline (JSON, arithmetic, libraries)?
+    verify: true
+    tags: [number, json, api, scenario]
+  - id: javascript-040
+    level: hard
+    type: gotcha
+    q: Which errors does a `try/catch` around this code catch, and which escape? Explain each case.
+    example: |-
+      ```ts
+      async function run() {
+        try {
+          JSON.parse('{bad');                             // (1)
+          setTimeout(() => { throw new Error('t'); }, 0);  // (2)
+          doAsyncThing();                                  // (3) returns a rejected promise, not awaited
+          await Promise.reject(new Error('a'));            // (4)
+        } catch (e) {
+          console.log('caught', (e as Error).message);
+        }
+      }
+      ```
+    hint: |-
+      - (1) Bắt được — throw đồng bộ trong `try`. (Thực tế dừng luôn ở đây; xét từng dòng riêng lẻ.)
+      - (2) **Thoát**: callback chạy ở macrotask sau, stack của `try` đã kết thúc → `uncaughtException`.
+      - (3) **Thoát**: promise không được `await`/return → unhandled rejection.
+      - (4) Bắt được — `await` throw lỗi tại chỗ.
+      - Nguyên tắc: try/catch chỉ bao phủ những gì chạy **đồng bộ** hoặc được **await** trong cùng async function; lint `no-floating-promises` bắt (3).
+    followUp: How would you make a timer-based callback's errors reach your centralized error handler?
+    tags: [error-handling, async, gotcha]
+  - id: javascript-041
+    level: hard
+    type: concept
+    q: What are hidden classes (shapes) and inline caches in V8, and what coding patterns make hot functions slower?
+    hint: |-
+      - V8 gán cho object một **hidden class/shape** theo tập property và **thứ tự** thêm; property access trong hàm được tối ưu bằng **inline cache** ghi nhớ shape đã thấy.
+      - Hàm thấy 1 shape (monomorphic) nhanh nhất; vài shape (polymorphic) chậm hơn; quá nhiều (megamorphic) → tra cứu chậm.
+      - Pattern xấu: thêm property sau constructor theo thứ tự khác nhau, `delete obj.prop` (đổi shape/chuyển dictionary mode), trộn kiểu trong cùng mảng/field (int vs double vs object), object "túi đồ" dùng làm hash map động.
+      - Thực tế: chỉ quan trọng trên hot path đã được profile; khởi tạo đủ field trong constructor, dùng `Map` cho key động, `undefined` thay vì `delete`.
+    followUp: How would you confirm a deoptimization is behind a performance regression (`--trace-deopt`, CPU profile)?
+    verify: true
+    tags: [v8, performance]
+  - id: javascript-042
+    level: senior
+    type: design
+    q: Design a reusable `httpClient` wrapper for a Node/TypeScript codebase — timeouts, retries, cancellation, error typing. What goes in, and what deliberately stays out?
+    hint: |-
+      Hướng trả lời mạnh:
+      - Timeout mặc định **bắt buộc** (`AbortSignal.timeout`) + nhận signal cha để propagate cancel.
+      - Retry chỉ cho request **idempotent** hoặc có idempotency key; exponential backoff + **jitter**; tôn trọng `Retry-After`; retry budget để không khuếch đại sự cố.
+      - Error typing: phân biệt network/timeout/HTTP 4xx/5xx/parse error bằng class hoặc `code`, giữ `cause`.
+      - Connection reuse (một undici `Agent` dùng chung), observability (trace header, metric latency/status theo upstream), không log body nhạy cảm.
+      - Để ngoài: business logic, cache (lớp riêng), circuit breaker có thể là lớp riêng — giữ wrapper nhỏ và dễ test.
+    followUp: How would you test the retry and timeout behaviour deterministically?
+    tags: [design, async, http, error-handling]
+  - id: javascript-043
+    level: senior
+    type: open
+    q: You own the lint and language conventions for a 40-engineer TypeScript monorepo. Which JavaScript features or patterns would you restrict, and how do you roll the rules out?
+    hint: |-
+      Đo judgment, không có đáp án duy nhất:
+      - Rules có giá trị cao (bắt bug thật): `no-floating-promises`, `no-misused-promises`, `await-thenable`, `eqeqeq` (cho phép `== null`), `no-param-reassign` cho state, `no-restricted-syntax` với `for...in` trên array, `import/no-cycle`, cấm `any` ngầm.
+      - Hạn chế: mutation mảng trong reducer, default export (tuỳ team), `enum` TS (tuỳ), magic string error.
+      - Rollout: bật **warn** trước, đo số vi phạm, autofix/codemod, rồi chuyển **error** cho code mới (ratchet), không big-bang.
+      - Giải thích "vì sao" bằng incident thật; review định kỳ để bỏ rule chỉ gây phiền.
+    followUp: A senior engineer argues the rules slow the team down. How do you respond with data?
+    tags: [tooling, leadership, lint]
+  - id: javascript-044
+    level: senior
+    type: open
+    q: Your Node monorepo is CommonJS and a critical dependency just went ESM-only. Plan the migration.
+    hint: |-
+      - Lựa chọn ngắn hạn: `await import()` trong CJS (async); Node đời mới hỗ trợ `require(esm)` đồng bộ nếu module không có top-level await → kiểm tra version Node đang chạy và cảnh báo liên quan.
+      - Dài hạn: chuyển package sang `"type": "module"` theo **từng package lá trước**, cập nhật `tsconfig` (`module`/`moduleResolution: nodenext`), đuôi file trong import tương đối, thay `__dirname` bằng `import.meta.dirname`.
+      - Test runner (Jest CJS) là điểm vướng lớn → cân nhắc Vitest hoặc Node test runner.
+      - Rủi ro: dual package hazard, JSON import (import attributes), mocking module ESM khó hơn.
+      - Rollout có CI check, không trộn đổi hành vi vào cùng PR migrate.
+    followUp: How do you publish an internal library that must be consumed by both CJS and ESM services?
+    verify: true
+    tags: [modules, esm, migration]
+  - id: javascript-045
+    level: senior
+    type: design
+    q: How would you set up memory-leak detection and response for a fleet of long-running Node services, so leaks are caught before they cause OOM kills?
+    hint: |-
+      - Metric liên tục: `heapUsed`, `rss`, `external`, GC pause/count theo pod; alert trên **xu hướng** (tăng tuyến tính sau N giờ), không chỉ ngưỡng tuyệt đối.
+      - Thu bằng chứng an toàn: heap snapshot theo yêu cầu (`v8.writeHeapSnapshot()` hoặc signal `--heapsnapshot-signal`) trên **một** pod đã rút khỏi LB (snapshot dừng event loop và tốn memory ~ bằng heap); `--heapsnapshot-near-heap-limit`.
+      - Phân tích: so sánh 2–3 snapshot, retainers tree; nghi phạm quen thuộc (Map cache, listener, closure, timer, pending promises).
+      - Giảm thiệt hại tạm: restart theo lịch có kiểm soát là băng cá nhân, không phải fix.
+      - Phòng ngừa: load test dài (soak test) trong CI/staging, review cache có giới hạn.
+    followUp: Taking a heap snapshot doubles memory for a moment. How do you avoid killing the pod you're investigating?
+    verify: true
+    tags: [memory, observability, node, design]
+  - id: javascript-046
+    level: cv
+    type: scenario
+    q: On a banking SPA you introduced code splitting and lazy loading with dynamic imports. After a deploy, some users hit "Loading chunk failed" errors. What causes it and how did (or would) you handle it?
+    hint: |-
+      Câu trả lời mạnh gồm:
+      - Cơ chế: `import()` trả promise, bundler tạo chunk có **hash** trong tên; user đang mở bản cũ yêu cầu chunk cũ đã bị xoá khỏi CDN/server sau deploy → 404 → `ChunkLoadError`.
+      - Xử lý: giữ asset của vài bản trước trên CDN; bắt lỗi trong `React.lazy`/error boundary → reload một lần (có cờ chống loop) hoặc báo "có phiên bản mới"; retry import có backoff cho lỗi mạng.
+      - Cách bạn quyết định chia chunk (theo route, theo feature nặng như chart/PDF), đo bundle size và thời gian tải trước/sau (điền số liệu thật của bạn).
+      - Trade-off: quá nhiều chunk nhỏ → waterfall request; prefetch chunk của route kế tiếp.
+    followUp: How did you verify that code splitting actually improved load time for real users rather than just bundle size?
+    tags: [cv, code-splitting, dynamic-import, react]
+  - id: javascript-047
+    level: cv
+    type: behavioral
+    q: You built custom hooks to separate business logic from UI in a React + Redux Toolkit app. Show one hook you'd be proud of and one closure or dependency bug you hit while writing hooks.
+    hint: |-
+      STAR ngắn:
+      - Hook cụ thể (vd `useTransferForm`, `usePagedTransactions`): trách nhiệm, input/output, vì sao tách (test được không cần render, tái sử dụng giữa màn hình).
+      - Bug thật: stale closure trong callback/interval, dependency array thiếu → dữ liệu cũ, hoặc thừa → effect chạy lặp/gọi API liên tục; cách phát hiện (lint `exhaustive-deps`, React DevTools, log request).
+      - Fix và bài học: functional update, `useRef`, tách effect; cách test hook (`renderHook`).
+      - Kết quả: số màn hình tái sử dụng, bug giảm (điền số liệu thật của bạn).
+    followUp: When would you put the logic in a Redux thunk or RTK Query instead of a custom hook?
+    tags: [cv, react, hooks, closure]
+  - id: javascript-048
+    level: cv
+    type: scenario
+    q: On a financial platform you implemented real-time updates with Socket.IO. How did you manage listeners, reconnection and ordering on the client so the UI never showed stale or duplicated data?
+    hint: |-
+      Câu trả lời mạnh gồm:
+      - Đăng ký listener một lần và **gỡ** khi unmount (`socket.off(event, handler)` với cùng reference) — tránh listener nhân đôi sau mỗi re-render/route change (memory leak + xử lý trùng).
+      - Reconnect: khi `connect` lại, **resync** trạng thái (fetch snapshot hoặc gửi `lastSeq`) vì event trong lúc mất kết nối đã bị lỡ.
+      - Ordering/dedupe: sequence number hoặc `updatedAt` theo entity, bỏ qua event cũ hơn state hiện tại; idempotent reducer.
+      - Batching cập nhật tần suất cao (throttle render), backpressure khi tab ở nền.
+      - Server scale nhiều instance: sticky session + adapter pub/sub (điền kiến trúc thật của bạn).
+    followUp: A user reports balances flickering between two values. What's your first hypothesis?
+    tags: [cv, websocket, realtime, events]
+  - id: javascript-049
+    level: cv
+    type: scenario
+    q: You fixed a CSV processing bottleneck on a Node/Express financial platform. What was the bottleneck, how did you prove it, and what changed in the code?
+    hint: |-
+      Câu trả lời mạnh gồm:
+      - Triệu chứng và cách đo: thời gian xử lý, memory, event-loop lag, API khác bị chậm theo (điền số liệu thật của bạn).
+      - Nguyên nhân điển hình: đọc cả file vào memory (`readFile` + `split('\n')`), parse đồng bộ chặn event loop, insert từng dòng (N round-trip), `Promise.all` không giới hạn.
+      - Fix: **stream** (`fs.createReadStream` → CSV parser stream → `pipeline`), batch insert/bulk copy, giới hạn concurrency, hoặc đẩy sang worker/job queue và trả trạng thái async cho client.
+      - Kiểm chứng: load test/benchmark trước–sau với file thật cỡ lớn nhất; xử lý lỗi từng dòng (report dòng lỗi thay vì fail toàn file).
+    followUp: How did you handle a malformed row halfway through a 2-million-row file — abort, skip, or partial commit?
+    tags: [cv, streams, performance, node]
+  - id: javascript-050
+    level: cv
+    type: scenario
+    q: Your Data Enrichment Service normalizes product data from external providers. What JavaScript-level pitfalls did you guard against when parsing and transforming their payloads?
+    hint: |-
+      Câu trả lời mạnh gồm:
+      - **Validate tại biên** bằng schema (zod) thay vì tin kiểu TS; phân biệt `null` / thiếu field / `''`; dùng `??` không dùng `||` cho giá trị `0`/`false`.
+      - Số: giá dạng string có dấu phân cách/locale, float precision → chuyển về minor units/decimal; ID lớn giữ string.
+      - Ngày: timezone của provider, date-only vs timestamp.
+      - Chuẩn hoá chuỗi: `trim`, Unicode normalize (`normalize('NFC')`) cho tiếng Việt có dấu trước khi so khớp/dedupe.
+      - Tránh prototype pollution khi merge payload động; giới hạn kích thước payload, xử lý provider chậm (timeout, retry idempotent), log mẫu dữ liệu lỗi (điền ví dụ thật của bạn).
+    followUp: Two providers send conflicting values for the same product attribute. How did you decide which one wins?
+    tags: [cv, data-normalization, validation, json]
+  - id: javascript-051
+    level: cv
+    type: behavioral
+    q: You use AI-assisted development (Claude Code, Cursor) with human review. What JavaScript/async mistakes do you specifically look for when reviewing AI-generated code?
+    hint: |-
+      Câu trả lời mạnh gồm:
+      - Checklist cụ thể: promise không được await (`forEach(async)`), `Promise.all` không giới hạn trên dữ liệu lớn, try/catch nuốt lỗi, thiếu timeout/cancel, race check-then-act, `||` thay `??`, mutate state, dùng API không tồn tại/deprecated (hallucination), sai version Node/React.
+      - Quy trình: yêu cầu test kèm theo, chạy lint strict (`no-floating-promises`), đọc diff như code của đồng nghiệp junior, không merge code mình không giải thích được.
+      - Một ví dụ thật: lỗi AI tạo ra mà review bắt được, và bạn đã chỉnh prompt/rule thế nào (điền ví dụ thật của bạn).
+      - Reflection: AI tăng tốc phần boilerplate, trách nhiệm đúng đắn vẫn là của người review.
+    followUp: How do you measure whether AI assistance actually improved your team's delivery without hurting quality?
+    tags: [cv, ai-assisted, code-review, async]

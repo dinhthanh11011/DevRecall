@@ -1,0 +1,908 @@
+id: 04-typescript
+slug: typescript
+title: TypeScript
+tier: 1
+status: drafted
+summary: Structural typing, generics, narrowing, conditional/mapped types, satisfies, type erasure & runtime validation, tsconfig và các gotcha khi scale codebase.
+cvLinked: true
+prerequisites: []
+overview: |-
+  ## TL;DR
+
+  - TypeScript là **type checker chạy lúc compile**; lúc runtime chỉ còn JavaScript (**type erasure**). Mọi dữ liệu đi qua boundary (HTTP body, JSON, Kafka message, env) phải **validate runtime** (zod/valibot) rồi mới tin type.
+  - Hệ thống type là **structural** (so sánh theo shape), không phải nominal — cần **branded types** nếu muốn phân biệt `TenantId` với `UserId`.
+  - Senior interview hỏi về **narrowing, discriminated union, generics có constraint, conditional/mapped types, variance** và **chỗ nào TS unsound** (`as`, `any`, `!`, index access, type guard sai).
+  - Tooling quan trọng không kém: `strict`, `noUncheckedIndexedAccess`, `verbatimModuleSyntax`, `moduleResolution`, và tốc độ type-check trên monorepo lớn (TS 7 native compiler — verify version khi đọc).
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Structural typing | Hai type tương thích nếu shape tương thích, không quan tâm tên | `type A = {id: string}` nhận được object `{id, name}` qua biến |
+  | `unknown` vs `any` | `any` tắt type check; `unknown` bắt phải narrow trước khi dùng | `JSON.parse` nên được coi là `unknown` |
+  | `never` | Tập rỗng — giá trị không thể tồn tại | Exhaustive check trong `switch` |
+  | Narrowing | TS thu hẹp type theo control flow | `if (typeof x === "string")` |
+  | Discriminated union | Union có field literal chung để phân nhánh | `{status: "ok", data} \| {status: "err", error}` |
+  | Generics + constraint | Tham số hoá type, giới hạn bằng `extends` | `<T, K extends keyof T>(o: T, k: K) => T[K]` |
+  | Conditional type | "if/else" ở tầng type, **distributive** trên union | `T extends string ? "s" : "o"` |
+  | Mapped type | "for-loop" qua key | `{ [K in keyof T]?: T[K] }` = `Partial<T>` |
+  | `satisfies` | Kiểm tra value khớp type **mà không làm mất** literal type đã infer | `const cfg = {...} satisfies Config` |
+  | Branded type | Giả lập nominal typing bằng phantom property | `type TenantId = string & { __brand: "TenantId" }` |
+
+  ## Cơ chế hoạt động
+
+  TypeScript chỉ tồn tại ở build time. Có hai con đường từ `.ts` ra runtime, và cả hai đều **xoá type**:
+
+  ```mermaid
+  flowchart LR
+    SRC["source .ts"] --> TC["tsc --noEmit<br/>(type check)"]
+    SRC --> EMIT["Transpile / strip types<br/>(tsc emit, esbuild, swc,<br/>Node type stripping)"]
+    TC -- "errors" --> CI["CI fails"]
+    EMIT --> JS["plain JavaScript<br/>(no types)"]
+    JS --> RT["Runtime: Node / browser"]
+    EXT["HTTP body / JSON / Kafka / env"] --> VAL{"Runtime validation<br/>(zod parse)"}
+    VAL -- "ok: typed value" --> RT
+    VAL -- "fail" --> ERR["400 / DLQ / crash early"]
+  ```
+
+  - Transpiler kiểu esbuild/swc/Node type stripping **không type-check** — phải chạy `tsc --noEmit` riêng trong CI.
+  - Node (v22.18+/v23.6+) chạy được `.ts` trực tiếp bằng **type stripping**, nhưng không hỗ trợ syntax cần transform (enum, namespace có runtime code, parameter properties, decorators) và **bỏ qua tsconfig** — xem `erasableSyntaxOnly`. (verify theo version Node)
+
+  Narrowing theo control flow:
+
+  ```mermaid
+  flowchart TD
+    A["x: string | number | User | null"] --> B{"x === null?"}
+    B -- yes --> N["x: null"]
+    B -- no --> C{"typeof x === 'string'?"}
+    C -- yes --> S["x: string"]
+    C -- no --> D{"typeof x === 'number'?"}
+    D -- yes --> NUM["x: number"]
+    D -- no --> U["x: User"]
+  ```
+
+  ## Trade-offs
+
+  | Lựa chọn | Ưu | Nhược | Dùng khi |
+  |---|---|---|---|
+  | `interface` | Declaration merging, error message gọn, `extends` báo lỗi xung đột sớm | Không biểu diễn union/tuple/conditional | Object contract, public API, module augmentation |
+  | `type` alias | Union, intersection, mapped, conditional | Không merge; `&` xung đột → `never` âm thầm | Logic ở tầng type, state machine |
+  | `enum` | Có runtime object, reverse mapping (numeric) | Sinh code, không erasable, numeric enum dễ nhận số bất kỳ | Hiếm; ưu tiên union literal / `as const` object |
+  | `as` cast | Nhanh | Nói dối compiler, không kiểm tra runtime | Chỉ khi bạn biết hơn compiler (DOM, test) |
+  | zod schema → `z.infer` | Một nguồn sự thật cho runtime + type | Chi phí parse, bundle size | Mọi boundary không tin cậy |
+  | Transpile-only (swc/esbuild) | Build rất nhanh | Không check type, `isolatedModules` hạn chế | Dev loop; CI vẫn cần `tsc --noEmit` |
+
+  ## Pitfalls
+
+  - Tin `as User` cho response API → crash runtime ở chỗ xa nguồn lỗi.
+  - `obj[key]` với index signature trả `T` chứ không phải `T | undefined` nếu không bật `noUncheckedIndexedAccess`.
+  - `Object.keys(obj)` trả `string[]` — đúng thiết kế vì structural typing cho phép thừa property.
+  - Type guard tự viết (`x is T`) **không được compiler kiểm tra** — viết sai là unsound.
+  - Array là **covariant** (unsound): `Dog[]` gán được cho `Animal[]` rồi `push(cat)`.
+  - Method shorthand trong interface bị **bivariant** kể cả khi bật `strictFunctionTypes`.
+  - `useDefineForClassFields` (mặc định `true` khi `target >= ES2022`) đổi semantics class field — có thể ghi đè giá trị do base class/decorator set.
+  - Conditional type **distributive** trên union — `IsString<string | number>` ra `boolean`, không phải `false`.
+
+  ## Cheat sheet
+
+  - Assignability: mọi thứ → `unknown` ✅; `any` → mọi thứ ✅; `unknown` → type cụ thể ❌ (phải narrow); `never` → mọi thứ ✅; không gì → `never` (trừ `never`/`any`).
+  - Exhaustive: `default: { const _x: never = value; throw new Error(...) }`.
+  - `satisfies` giữ literal type; annotation `: T` widen về `T`; `as T` bỏ qua check.
+  - Tắt distributive: `[T] extends [U] ? X : Y`. Check `never`: `[T] extends [never]`.
+  - `infer` chỉ dùng trong nhánh `extends` của conditional type.
+  - Version cần nhớ (verify): `satisfies` 4.9 · `const` type params & `verbatimModuleSyntax` 5.0 · `using` 5.2 · `NoInfer` 5.4 · inferred type predicates & `isolatedDeclarations` 5.5 · `erasableSyntaxOnly` 5.8 · TS 6.0 đổi default (`strict: true`, `module: esnext`, `types: []`) · TS 7.0 = compiler viết lại bằng Go.
+notionRefs:
+  - title: TypeScript
+    url: https://app.notion.com/p/2cfef77f8ab280888794e04d677157b6
+references:
+  - title: TypeScript Handbook
+    url: https://www.typescriptlang.org/docs/handbook/intro.html
+  - title: TypeScript Handbook — Narrowing
+    url: https://www.typescriptlang.org/docs/handbook/2/narrowing.html
+  - title: TypeScript Handbook — Conditional Types
+    url: https://www.typescriptlang.org/docs/handbook/2/conditional-types.html
+  - title: TypeScript Handbook — Mapped Types
+    url: https://www.typescriptlang.org/docs/handbook/2/mapped-types.html
+  - title: TSConfig Reference
+    url: https://www.typescriptlang.org/tsconfig/
+  - title: TypeScript Release Notes
+    url: https://www.typescriptlang.org/docs/handbook/release-notes/overview.html
+  - title: Node.js — Modules — TypeScript (type stripping)
+    url: https://nodejs.org/api/typescript.html
+  - title: TypeScript Wiki — Performance
+    url: https://github.com/microsoft/TypeScript/wiki/Performance
+questions:
+  - id: typescript-001
+    level: easy
+    type: compare
+    q: What is the difference between `any`, `unknown` and `never`? Which assignments compile?
+    hint: |-
+      - `any`: tắt type check hoàn toàn, "lây" sang mọi biểu thức dùng nó; gán được **đi và đến** mọi type.
+      - `unknown`: top type an toàn — mọi thứ gán **vào** được, nhưng muốn dùng (gọi method, gán sang `string`) phải narrow (`typeof`, `instanceof`, zod parse).
+      - `never`: bottom type, tập rỗng — gán **đi** mọi type được, không gì gán **vào** được (trừ `never`).
+      - `u = a` (any → unknown) là **hợp lệ**; `s = u` (unknown → string) là lỗi.
+      - Thực tế: `JSON.parse`, `catch (e)`, payload external nên là `unknown`.
+    example: |-
+      ```ts
+      let a: any; let u: unknown; let s: string;
+      s = a; // ok
+      u = a; // ok
+      a = u; // ok
+      s = u; // error: unknown is not assignable to string
+      if (typeof u === "string") s = u; // ok after narrowing
+      ```
+    followUp: Why is `catch (e)` typed as `unknown` under `strict`, and how do you safely read `e.message`?
+    redFlags:
+      - "unknown is the same as any but stricter in some cases"
+      - "You cannot assign any to unknown"
+    tags: [types, unknown, never]
+  - id: typescript-002
+    level: easy
+    type: compare
+    q: "`type` vs `interface`: what can each do that the other cannot, and what is your default?"
+    hint: |-
+      - Chỉ `interface`: **declaration merging** (augment `Express.Request`, `Window`, `NodeJS.ProcessEnv`), `extends` báo lỗi ngay khi property xung đột.
+      - Chỉ `type`: union, tuple, primitive alias, conditional/mapped/template literal types.
+      - Cả hai: object shape, function type, `implements` bởi class (với `type` là object type).
+      - Intersection `A & B` với property xung đột (`x: string` & `x: number`) → `x: never`, không báo lỗi ở chỗ khai báo.
+      - Default hợp lý: `interface` cho object contract; `type` cho union/logic. Quan trọng là **nhất quán** trong team.
+    followUp: Show how you would add a `user` property to Express's `Request` type. Why can't you do it with `type`?
+    redFlags:
+      - "They are exactly the same, it is only preference"
+      - "Interfaces exist at runtime"
+    tags: [types, interface]
+  - id: typescript-003
+    level: easy
+    type: concept
+    q: TypeScript is structurally typed. What does that mean, and when does it bite you?
+    hint: |-
+      - Tương thích theo **shape**, không theo tên: object có đủ property yêu cầu là gán được, kể cả có thêm property.
+      - Bite 1: `UserId` và `OrderId` đều là `string` → truyền nhầm vẫn compile. Fix: **branded type**.
+      - Bite 2: `Object.keys(obj)` trả `string[]` vì object thật có thể có thêm key.
+      - Bite 3: class có cùng shape thay thế nhau được (trừ khi có `private`/`#private` member — khi đó thành nominal-ish).
+      - Excess property check chỉ áp dụng cho **object literal "tươi"**, không áp dụng khi gán qua biến.
+    example: |-
+      ```ts
+      type Point = { x: number; y: number };
+      const p3 = { x: 1, y: 2, z: 3 };
+      const p: Point = p3;            // ok (structural)
+      const q: Point = { x: 1, y: 2, z: 3 }; // error: excess property 'z'
+      ```
+    followUp: How would you make `TenantId` and `UserId` incompatible at compile time with zero runtime cost?
+    tags: [structural-typing]
+  - id: typescript-004
+    level: easy
+    type: compare
+    q: "What is the difference between `age?: number` and `age: number | undefined`? What does `exactOptionalPropertyTypes` change?"
+    hint: |-
+      - `age?: number`: key **có thể vắng mặt**; mặc định cũng chấp nhận `age: undefined`.
+      - `age: number | undefined`: key **bắt buộc có mặt**, value có thể `undefined`.
+      - Bật `exactOptionalPropertyTypes`: `age?: number` **không** nhận `undefined` explicit nữa → phân biệt "không gửi" vs "gửi undefined" (quan trọng cho PATCH: bỏ qua field vs xoá field).
+      - Lưu ý runtime: `"age" in obj` và `JSON.stringify` (bỏ key có value `undefined`) cư xử khác nhau.
+    example: |-
+      ```ts
+      interface Patch { nickname?: string }
+      const a: Patch = {};                      // ok
+      const b: Patch = { nickname: undefined }; // error only with exactOptionalPropertyTypes
+      ```
+    followUp: How do you model a PATCH body where "field missing" means keep and `null` means clear?
+    tags: [optional, tsconfig]
+  - id: typescript-005
+    level: easy
+    type: concept
+    q: What does `as const` do, and how is it different from `Readonly<T>` and `Object.freeze`?
+    hint: |-
+      - `as const`: infer **literal type** + `readonly` sâu (deep) cho object/array literal, tuple thay vì array. Chỉ compile-time.
+      - `Readonly<T>`: chỉ `readonly` **một tầng**, không đổi `number` thành literal.
+      - `Object.freeze`: runtime, **shallow**; type trả về là `Readonly<T>`.
+      - Use case: bảng hằng số → derive union: `type Role = (typeof ROLES)[number]`.
+    example: |-
+      ```ts
+      const ROLES = ["admin", "staff", "customer"] as const;
+      type Role = (typeof ROLES)[number]; // "admin" | "staff" | "customer"
+      const cfg = { retries: 3 } as const; // { readonly retries: 3 }
+      ```
+    followUp: Why do many teams replace `enum` with an `as const` object plus a derived union type?
+    tags: [literal-types, as-const]
+  - id: typescript-006
+    level: easy
+    type: concept
+    q: 'What does `"strict": true` actually turn on, and which extra flags would you add on a new backend project?'
+    hint: |-
+      - `strict` bật một nhóm flag: `strictNullChecks`, `noImplicitAny`, `strictFunctionTypes`, `strictBindCallApply`, `strictPropertyInitialization`, `noImplicitThis`, `useUnknownInCatchVariables`, `alwaysStrict` (và các flag strict mới hơn theo version).
+      - Nên thêm: `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes` (cân nhắc), `noImplicitOverride`, `noFallthroughCasesInSwitch`, `verbatimModuleSyntax`, `isolatedModules`.
+      - TS 6.0 đổi default thành `strict: true` (verify) — nhưng vẫn nên ghi explicit trong tsconfig.
+      - Lint bổ sung: `@typescript-eslint/no-floating-promises`, `no-unsafe-*`, `no-explicit-any`.
+    followUp: You turn on `noUncheckedIndexedAccess` on a big codebase and get 800 errors. How do you roll it out?
+    verify: true
+    tags: [tsconfig, strict]
+  - id: typescript-007
+    level: easy
+    type: concept
+    q: TypeScript types are erased at runtime. What are the practical consequences for a backend API?
+    hint: |-
+      - Không thể `if (x instanceof User)` với `interface`/`type`; không có reflection của type (trừ decorator metadata hạn chế).
+      - `req.body as CreateOrderDto` **không validate gì** — client gửi gì thì có đó.
+      - Cần runtime validation ở mọi boundary: HTTP, queue message, env vars, response từ provider bên ngoài, DB JSON column.
+      - Pattern: schema là nguồn sự thật → `type T = z.infer<typeof Schema>`; parse một lần ở edge, bên trong tin type.
+    example: |-
+      ```ts
+      const CreateOrder = z.object({ sku: z.string(), qty: z.number().int().positive() });
+      type CreateOrder = z.infer<typeof CreateOrder>;
+      app.post("/orders", (req, res) => {
+        const body = CreateOrder.parse(req.body); // throws ZodError -> 400
+        // body is CreateOrder from here on
+      });
+      ```
+    followUp: Where exactly should parsing happen — controller, middleware, or service — and why?
+    redFlags:
+      - "TypeScript validates the request body for us"
+    tags: [runtime-validation, zod]
+  - id: typescript-008
+    level: easy
+    type: concept
+    q: Name the utility types you use most and implement `Partial` and `Pick` yourself.
+    hint: |-
+      - Hay dùng: `Partial`, `Required`, `Readonly`, `Pick`, `Omit`, `Record`, `ReturnType`, `Parameters`, `Awaited`, `NonNullable`, `Extract`, `Exclude`.
+      - `Partial<T> = { [K in keyof T]?: T[K] }` — mapped type.
+      - `Pick<T, K extends keyof T> = { [P in K]: T[P] }`.
+      - Gotcha: `Omit<T, K>` **không** check `K` là key của `T` (`K extends keyof any`) → gõ sai tên key không báo lỗi.
+      - `Partial` chỉ một tầng — cần `DeepPartial` tự viết cho nested.
+    example: |-
+      ```ts
+      type MyPartial<T> = { [K in keyof T]?: T[K] };
+      type MyPick<T, K extends keyof T> = { [P in K]: T[P] };
+      type UserPreview = MyPick<User, "id" | "name">;
+      ```
+    followUp: Why is `Omit<User, "passwrod">` (typo) not an error, and how would you write a strict `Omit`?
+    tags: [utility-types, mapped-types]
+  - id: typescript-009
+    level: medium
+    type: concept
+    q: List the ways TypeScript narrows a type, and explain the difference between a type predicate and an assertion function.
+    hint: |-
+      - `typeof`, `instanceof`, `in`, equality (`=== null`), truthiness, discriminant property (`x.kind === "a"`), `Array.isArray`, control flow sau `return`/`throw`.
+      - Type predicate `function isUser(x: unknown): x is User` → narrow trong nhánh `if`.
+      - Assertion function `function assertUser(x: unknown): asserts x is User` → narrow **mọi code phía sau** lời gọi, throw nếu sai.
+      - Cả hai **không được compiler kiểm chứng** — logic sai là unsound.
+      - TS 5.5+ tự infer type predicate cho arrow đơn giản như `x => x !== undefined` (verify).
+    example: |-
+      ```ts
+      function assertDefined<T>(v: T, msg: string): asserts v is NonNullable<T> {
+        if (v == null) throw new Error(msg);
+      }
+      const user = await repo.find(id);
+      assertDefined(user, "user not found");
+      user.email; // User, not User | null
+      ```
+    followUp: Why must an assertion function be called through an explicitly typed reference (not an inferred arrow const)?
+    verify: true
+    tags: [narrowing, type-guards]
+  - id: typescript-010
+    level: medium
+    type: concept
+    q: Model an API result or UI state with a discriminated union and make the compiler force you to handle every case.
+    hint: |-
+      - Union các object có một field **literal chung** (`status`, `kind`, `type`) → `switch` trên field đó narrow từng nhánh.
+      - Exhaustive: nhánh `default` gán vào `never` → thêm variant mới mà quên xử lý là **compile error**.
+      - Tốt hơn "bag of optionals" (`{ loading: boolean; data?: T; error?: string }`) vì loại bỏ trạng thái không hợp lệ (vừa `data` vừa `error`).
+      - Destructure field discriminant ra biến riêng vẫn narrow được (TS 4.6+).
+    example: |-
+      ```ts
+      type PaymentResult =
+        | { status: "succeeded"; chargeId: string }
+        | { status: "requires_action"; redirectUrl: string }
+        | { status: "failed"; reason: string };
+
+      function handle(r: PaymentResult) {
+        switch (r.status) {
+          case "succeeded": return ok(r.chargeId);
+          case "requires_action": return redirect(r.redirectUrl);
+          case "failed": return fail(r.reason);
+          default: { const _never: never = r; throw new Error("unhandled"); }
+        }
+      }
+      ```
+    followUp: A new status `"refunded"` arrives from the payment provider before your code is updated. What happens at runtime, and how do you guard against it?
+    tags: [discriminated-union, exhaustiveness]
+  - id: typescript-011
+    level: medium
+    type: compare
+    q: "Compare `const x: T = ...`, `const x = ... as T`, and `const x = ... satisfies T`. When do you use `satisfies`?"
+    hint: |-
+      - Annotation `: T`: check + **widen** về `T` → mất literal/key cụ thể (vd `Record<string, Route>` làm mất tên key).
+      - `as T`: **không check** đầy đủ (chỉ cần "overlap"), nói dối compiler → nguy hiểm.
+      - `satisfies T` (TS 4.9): check value khớp `T`, excess property check vẫn chạy, nhưng type của biến giữ **type đã infer** (literal, key cụ thể).
+      - Use case: config map, route table, permission matrix — vừa muốn validate vừa muốn autocomplete key.
+    example: |-
+      ```ts
+      type Route = { path: string; auth: boolean };
+      const routes = {
+        home: { path: "/", auth: false },
+        orders: { path: "/orders", auth: true },
+      } satisfies Record<string, Route>;
+      routes.orders.path; // ok, key "orders" is known
+      routes.nope;        // error — would be allowed with ': Record<string, Route>'
+      ```
+    followUp: Can `satisfies` replace runtime validation for config loaded from a JSON file? Why not?
+    tags: [satisfies, inference]
+  - id: typescript-012
+    level: medium
+    type: concept
+    q: Write a type-safe `getProperty(obj, key)` and a `pluck(items, key)`. Explain the role of `K extends keyof T`.
+    hint: |-
+      - `K extends keyof T` giới hạn key hợp lệ; return `T[K]` (indexed access) giữ type chính xác cho từng key.
+      - Generic được infer từ argument → không cần truyền `<User, "email">` thủ công.
+      - Constraint (`extends`) ≠ default (`= ...`): constraint giới hạn, default chỉ dùng khi không infer được.
+      - Tránh generic "vô nghĩa" chỉ xuất hiện một lần (`<T>(x: T): void`) — dùng type trực tiếp.
+    example: |-
+      ```ts
+      function getProperty<T, K extends keyof T>(obj: T, key: K): T[K] {
+        return obj[key];
+      }
+      function pluck<T, K extends keyof T>(items: T[], key: K): T[K][] {
+        return items.map((i) => i[key]);
+      }
+      const emails = pluck(users, "email"); // string[]
+      pluck(users, "emali"); // error
+      ```
+    followUp: How would you type `pick(obj, ...keys)` so the return type contains only the picked keys?
+    tags: [generics, keyof]
+  - id: typescript-013
+    level: medium
+    type: gotcha
+    q: Why does assigning an object literal with an extra property fail, but assigning the same object through a variable succeeds?
+    hint: |-
+      - **Excess property checking** chỉ áp dụng cho object literal "tươi" gán trực tiếp vào vị trí có type — heuristic bắt lỗi typo, không phải quy tắc structural.
+      - Qua biến trung gian, object không còn "tươi" → chỉ check structural → thừa property vẫn ok.
+      - Hệ quả thực tế: DTO có thể mang thêm field lạ (vd `isAdmin: true`) nếu bạn spread `req.body` vào entity → **mass assignment**. Runtime cần `strict()`/`whitelist`.
+    example: |-
+      ```ts
+      interface UpdateProfile { name: string }
+      const body = { name: "A", role: "admin" };
+      const dto: UpdateProfile = body; // compiles
+      await db.user.update({ where: { id }, data: { ...dto } }); // role leaks through at runtime
+      ```
+    followUp: 'How do zod''s `.strict()` and NestJS `whitelist: true` each protect against mass assignment?'
+    tags: [excess-property, security]
+  - id: typescript-014
+    level: medium
+    type: gotcha
+    q: What is `strictFunctionTypes`, and why does it not apply to method-shorthand signatures?
+    hint: |-
+      - Parameter của function nên **contravariant**: handler nhận `Animal` thay được handler nhận `Dog`, không ngược lại.
+      - `strictFunctionTypes` check contravariant cho **function-type property** (`handle: (x: Dog) => void`).
+      - Method shorthand (`handle(x: Dog): void`) vẫn **bivariant** để tương thích các API cũ (vd `Array<T>` methods, DOM) → unsound.
+      - Thực tế: khai báo callback trong interface dạng property arrow để được check chặt.
+    example: |-
+      ```ts
+      class Animal { name = "" }
+      class Dog extends Animal { bark() {} }
+      interface A { handle(x: Animal): void }      // method shorthand: bivariant
+      interface B { handle: (x: Animal) => void }  // property: contravariant under strict
+      const onlyDogs = (d: Dog) => d.bark();
+      const a: A = { handle: onlyDogs }; // compiles (unsound): a.handle(new Animal()) crashes
+      const b: B = { handle: onlyDogs }; // error
+      ```
+    followUp: Is `Array<Dog>` assignable to `Array<Animal>`? What runtime bug does that allow?
+    tags: [variance, tsconfig]
+  - id: typescript-015
+    level: medium
+    type: output
+    q: What do these conditional types evaluate to, and why? How do you turn off distribution?
+    example: |-
+      ```ts
+      type IsString<T> = T extends string ? true : false;
+      type A = IsString<string | number>;  // ?
+      type B = IsString<never>;            // ?
+      type ToArray<T> = T extends unknown ? T[] : never;
+      type C = ToArray<string | number>;   // ?
+      type IsStringStrict<T> = [T] extends [string] ? true : false;
+      type D = IsStringStrict<string | number>; // ?
+      ```
+    hint: |-
+      - `A = boolean` (`true | false`): conditional type trên **naked type parameter** phân phối qua từng member của union.
+      - `B = never`: phân phối trên union rỗng → rỗng.
+      - `C = string[] | number[]` (không phải `(string | number)[]`).
+      - `D = false`: bọc trong tuple `[T]` tắt distribution.
+      - Pattern check never: `type IsNever<T> = [T] extends [never] ? true : false`.
+    followUp: Implement `Exclude<T, U>` and explain why it relies on distribution.
+    tags: [conditional-types]
+  - id: typescript-016
+    level: medium
+    type: concept
+    q: Use mapped types with key remapping and template literal types to derive `onXxx` handler names from an event map.
+    hint: |-
+      - Mapped type + `as` (TS 4.1) đổi tên key; template literal type ghép chuỗi ở tầng type; `Capitalize` là intrinsic.
+      - Lọc key: remap về `never` để bỏ key (`as T[K] extends Function ? never : K`).
+      - Ứng dụng thật: typed event emitter, permission string `${Resource}:${Action}`, config env key `APP_${Upper}`.
+      - Cẩn thận: template literal × union lớn tạo **tích Descartes** → type explosion, chậm compiler.
+    example: |-
+      ```ts
+      type Events = { orderCreated: { id: string }; orderPaid: { id: string; amount: number } };
+      type Handlers = {
+        [K in keyof Events as `on${Capitalize<string & K>}`]: (payload: Events[K]) => void;
+      };
+      // { onOrderCreated: (p: {id: string}) => void; onOrderPaid: (p: {...}) => void }
+      ```
+    followUp: Type a permission string like `"order:read" | "order:write" | "user:read"` from two unions. What happens with 50 resources × 10 actions?
+    tags: [mapped-types, template-literal]
+  - id: typescript-017
+    level: medium
+    type: concept
+    q: What does `infer` do? Write a type that extracts route params from `"/tenants/:tenantId/orders/:orderId"`.
+    hint: |-
+      - `infer X` khai báo biến type được "bắt" trong nhánh `extends` của conditional type (pattern matching ở tầng type).
+      - Ví dụ chuẩn: `ReturnType`, `Awaited`, `Parameters` đều dùng `infer`.
+      - Kết hợp template literal + recursion để parse chuỗi (Express/Next.js typed routes dùng kỹ thuật này).
+      - Recursion quá sâu → lỗi "Type instantiation is excessively deep" — giữ đơn giản.
+    example: |-
+      ```ts
+      type Params<P extends string> =
+        P extends `${string}:${infer Name}/${infer Rest}`
+          ? { [K in Name | keyof Params<`/${Rest}`>]: string }
+          : P extends `${string}:${infer Name}`
+            ? { [K in Name]: string }
+            : {};
+      type X = Params<"/tenants/:tenantId/orders/:orderId">;
+      // { tenantId: string; orderId: string }
+      ```
+    followUp: How would you implement `Awaited<T>` for nested promises?
+    tags: [infer, template-literal]
+  - id: typescript-018
+    level: medium
+    type: compare
+    q: "`enum` vs `const enum` vs string-literal union vs `as const` object — which do you pick for order statuses, and why?"
+    hint: |-
+      - `enum` sinh runtime object; numeric enum có reverse mapping; không phải "erasable syntax" → không chạy được với Node type stripping / `erasableSyntaxOnly`.
+      - `const enum` được inline khi compile, nhưng gãy với `isolatedModules` (swc/esbuild/Babel transpile từng file) và khi publish `.d.ts`.
+      - String-literal union: zero runtime, dễ dùng với JSON/DB, narrowing tốt; thiếu danh sách runtime để iterate.
+      - `as const` object + `type Status = (typeof Status)[keyof typeof Status]`: có cả giá trị runtime lẫn union — lựa chọn phổ biến hiện nay.
+    example: |-
+      ```ts
+      export const OrderStatus = { Pending: "pending", Paid: "paid", Shipped: "shipped" } as const;
+      export type OrderStatus = (typeof OrderStatus)[keyof typeof OrderStatus];
+      const s: OrderStatus = "paid"; // ok, works with JSON from DB
+      ```
+    followUp: How does this choice interact with a DB enum column or an Elasticsearch keyword field?
+    verify: true
+    tags: [enum, erasable-syntax]
+  - id: typescript-019
+    level: medium
+    type: concept
+    q: How do you add `req.user` and `req.tenantId` to Express's Request type properly? What are the risks?
+    hint: |-
+      - **Module augmentation** / declaration merging: `declare global { namespace Express { interface Request { user?: AuthUser } } }` trong file `.d.ts` được include (hoặc file module có `export {}`).
+      - Rủi ro: augmentation là **global** — mọi route đều "có" `req.user` kể cả route public → phải để optional và check, hoặc dùng type riêng cho authenticated handler.
+      - Thay thế type-safe hơn: `res.locals` có type riêng, hoặc wrapper `authed((req: AuthedRequest, res) => ...)`.
+      - Lỗi thường gặp: file augmentation không nằm trong `include` của tsconfig → type biến mất ở CI nhưng IDE vẫn thấy.
+    example: |-
+      ```ts
+      // src/types/express.d.ts
+      import type { AuthUser } from "../auth/types";
+      declare global {
+        namespace Express {
+          interface Request { user?: AuthUser; tenantId?: string }
+        }
+      }
+      export {};
+      ```
+    followUp: How would you make handlers behind the auth middleware see `req.user` as non-optional without a `!`?
+    tags: [declaration-merging, express]
+  - id: typescript-020
+    level: medium
+    type: concept
+    q: What problem do `import type` and `verbatimModuleSyntax` solve?
+    hint: |-
+      - Transpiler chạy từng file (swc, esbuild, Babel, Node type stripping) không biết import nào chỉ là type → có thể giữ lại import tới module chỉ có type → lỗi runtime hoặc side-effect không mong muốn.
+      - `import type { X }` đảm bảo bị xoá hoàn toàn.
+      - `verbatimModuleSyntax` (TS 5.0): import/export không có `type` được **giữ nguyên**, có `type` bị xoá — quy tắc đơn giản, dự đoán được; thay cho `importsNotUsedAsValues`/`preserveValueImports`.
+      - Cũng làm lộ lỗi ESM/CJS: dùng `import x = require()` hay `export =` phải khớp module format.
+    followUp: Why does a circular import between two files that only share types cause a runtime problem without `import type`?
+    tags: [modules, tsconfig]
+  - id: typescript-021
+    level: medium
+    type: gotcha
+    q: "With `const cache: Record<string, User> = {}`, what is the type of `cache[id]`, and why is that dangerous?"
+    hint: |-
+      - Mặc định `cache[id]` có type `User` — TS giả định key luôn tồn tại → `cache[id].email` compile nhưng crash khi miss.
+      - Bật `noUncheckedIndexedAccess` → type thành `User | undefined` cho index signature và array index.
+      - Thay thế: `Map<string, User>` (`get` trả `User | undefined` sẵn), hoặc `Partial<Record<...>>`.
+      - `Record<"a" | "b", T>` (key hữu hạn) thì khác: key bắt buộc đầy đủ và index bằng literal an toàn.
+    example: |-
+      ```ts
+      const cache: Record<string, User> = {};
+      function email(id: string) {
+        return cache[id].email; // compiles; TypeError at runtime on a miss
+      }
+      ```
+    followUp: Why does `for (let i = 0; i < arr.length; i++) arr[i]` become annoying with `noUncheckedIndexedAccess`, and what idioms avoid it?
+    tags: [index-signature, tsconfig]
+  - id: typescript-022
+    level: medium
+    type: compare
+    q: Function overloads vs a union parameter vs a generic — how do you choose?
+    hint: |-
+      - Overload: khi **return type phụ thuộc** vào kiểu input và quan hệ không biểu diễn gọn bằng generic (`parse(x: string): A; parse(x: Buffer): B`). Implementation signature không được caller thấy.
+      - Union parameter: khi xử lý như nhau và return không đổi — đơn giản nhất.
+      - Generic: khi output **giữ/biến đổi** type input (`identity`, `pluck`).
+      - Gotcha: overload chọn theo **thứ tự khai báo** — đặt signature cụ thể lên trước; không gọi được với giá trị có type union của các overload.
+    example: |-
+      ```ts
+      function find(id: string): Promise<User | null>;
+      function find(ids: string[]): Promise<User[]>;
+      function find(x: string | string[]) { /* impl */ return null as any; }
+      declare const v: string | string[];
+      find(v); // error: no overload matches a union argument
+      ```
+    followUp: How would you rewrite that overload with a conditional return type, and what's the downside inside the implementation?
+    tags: [overloads, generics]
+  - id: typescript-023
+    level: medium
+    type: compare
+    q: "`moduleResolution: nodenext` vs `bundler` — why do imports need `.js` extensions in one but not the other?"
+    hint: |-
+      - `nodenext`/`node16`: mô phỏng đúng thuật toán resolve của Node — ESM phải có đường dẫn đầy đủ nên source viết `import "./util.js"` (TS map về `util.ts`); tôn trọng `"type"`, `exports`, `.mts/.cts`.
+      - `bundler`: dành cho code đi qua bundler (Vite, webpack, Next.js) — cho phép bỏ extension, vẫn đọc `exports`.
+      - Chọn sai: build pass nhưng runtime Node báo `ERR_MODULE_NOT_FOUND`, hoặc lib publish ra không dùng được ở ESM.
+      - TS 6.0 deprecate `moduleResolution: node` (node10) (verify).
+    followUp: A library you publish works in the Next.js app but crashes when imported from a plain Node ESM service. What do you check?
+    verify: true
+    tags: [modules, tsconfig, esm]
+  - id: typescript-024
+    level: medium
+    type: concept
+    q: How do `const` type parameters and `NoInfer` help library-style APIs?
+    hint: |-
+      - `const T` (TS 5.0): infer literal/readonly như thể caller viết `as const` → `defineRoutes(["a","b"])` ra `readonly ["a","b"]` thay vì `string[]`.
+      - `NoInfer<T>` (TS 5.4): chặn một vị trí tham số tham gia inference → `T` chỉ được infer từ tham số "chính".
+      - Ví dụ: `createMachine(states, initial: NoInfer<S>)` → `initial` phải là một trong `states`, không mở rộng union.
+      - Cả hai giảm nhu cầu caller phải truyền generic thủ công.
+    example: |-
+      ```ts
+      function createFSM<S extends string>(states: S[], initial: NoInfer<S>) { /* ... */ }
+      createFSM(["idle", "loading"], "idle");   // ok
+      createFSM(["idle", "loading"], "crashed"); // error (without NoInfer, S would widen)
+      ```
+    followUp: Without `NoInfer`, what trick did people use before TS 5.4?
+    verify: true
+    tags: [generics, inference]
+  - id: typescript-025
+    level: hard
+    type: debug
+    q: This type guard passes code review but production logs show `TypeError` on `user.email.toLowerCase()`. What's wrong?
+    example: |-
+      ```ts
+      interface User { id: string; email: string }
+      function isUser(x: unknown): x is User {
+        return typeof x === "object" && x !== null && "id" in x;
+      }
+      const payload: unknown = await res.json();
+      if (isUser(payload)) {
+        sendMail(payload.email.toLowerCase());
+      }
+      ```
+    hint: |-
+      - Type predicate **không được compiler kiểm chứng** — guard chỉ check `id` nhưng khẳng định cả `email: string` → unsound.
+      - Provider trả `{ id, email: null }` hoặc thiếu `email` → guard vẫn `true`.
+      - Fix: check đủ field + type, hoặc tốt hơn dùng schema (`UserSchema.safeParse`) để guard và type đến từ **một nguồn**.
+      - Review rule: mọi `x is T` thủ công phải có unit test với payload xấu.
+    followUp: How do you keep hand-written guards in sync when `User` gains a new required field?
+    redFlags:
+      - "TypeScript would have caught it if the guard was wrong"
+    tags: [type-guards, runtime-validation, debug]
+  - id: typescript-026
+    level: hard
+    type: debug
+    q: 'The response type says `total: number`, but the UI shows `"1000100"` when adding a fee. Explain and fix.'
+    example: |-
+      ```ts
+      type Invoice = { id: string; total: number };
+      async function getInvoice(id: string): Promise<Invoice> {
+        const r = await fetch(`/api/invoices/${id}`);
+        return (await r.json()) as Invoice;
+      }
+      const inv = await getInvoice("1");
+      render(inv.total + 100); // "1000100"
+      ```
+    hint: |-
+      - `res.json()` trả `any`; `as Invoice` không đổi dữ liệu → backend (hoặc SQL Server `DECIMAL`/`BIGINT` qua driver) serialize `total` thành **string** → `+` thành nối chuỗi.
+      - Nguồn phổ biến: driver trả `DECIMAL`/`NUMERIC`/`BIGINT` dạng string để tránh mất precision; JSON không có decimal.
+      - Fix: parse ở boundary (`z.object({ total: z.coerce.number() })` hoặc giữ tiền dạng integer minor units/decimal string có type rõ ràng); lint `no-unsafe-*` để cấm dùng `any` chưa parse.
+      - Với tiền tệ: đừng dùng float — dùng integer cents hoặc decimal library.
+    followUp: Should money be `number`, `string`, or `bigint` in your API contract? Defend your choice.
+    tags: [runtime-validation, debug, money]
+  - id: typescript-027
+    level: hard
+    type: debug
+    q: "Why doesn't `filter(Boolean)` narrow here while `filter((x) => x !== undefined)` does (in recent TS)? What changed?"
+    example: |-
+      ```ts
+      const ids: (string | undefined)[] = ["a", undefined, "b"];
+      const a = ids.filter(Boolean);                 // (string | undefined)[]
+      const b = ids.filter((x) => x !== undefined);  // string[] on TS >= 5.5
+      const c = ids.filter((x): x is string => !!x); // string[] on any version
+      ```
+    hint: |-
+      - `filter` có overload nhận **type predicate** `(v) => v is S`. TS 5.5 thêm **inferred type predicates**: arrow đơn giản trả về biểu thức narrowing được infer thành predicate.
+      - `Boolean` là constructor có signature `(value?: unknown) => boolean`, không phải predicate → không narrow.
+      - Gotcha của `!!x`/`Boolean`: loại cả `""` và `0` — với `number[]` sẽ mất số 0.
+      - Trên TS cũ: viết predicate explicit hoặc helper `isDefined<T>(x: T): x is NonNullable<T>`.
+    followUp: Why doesn't TS infer a predicate for `(x) => !!x` on `(string | undefined)[]`?
+    verify: true
+    tags: [narrowing, arrays, debug]
+  - id: typescript-028
+    level: hard
+    type: debug
+    q: After bumping `target` to `ES2022`, entity fields set by a base class/ORM decorator are suddenly `undefined`. Why?
+    example: |-
+      ```ts
+      class Base {
+        constructor(data: Record<string, unknown>) { Object.assign(this, data); }
+      }
+      class Order extends Base {
+        id!: string;
+        total!: number;
+      }
+      new Order({ id: "o1", total: 10 }).id; // undefined after the upgrade
+      ```
+    hint: |-
+      - `useDefineForClassFields` mặc định `true` khi `target >= ES2022`/`ESNext` → class field dùng semantics **[[Define]]** chuẩn TC39: sau khi `super()` chạy, field được define lại thành `undefined`, ghi đè giá trị base class vừa gán.
+      - Declare field bằng `declare id: string;` (chỉ type, không emit) hoặc set `useDefineForClassFields: false` (legacy semantics).
+      - Ảnh hưởng thư viện dựa vào legacy decorators/property assignment (một số ORM, MobX cũ).
+      - Bài học: nâng `target` là thay đổi **runtime semantics**, không chỉ syntax.
+    followUp: 'What''s the difference between `id!: string` and `declare id: string` in emitted JS?'
+    verify: true
+    tags: [classes, tsconfig, debug]
+  - id: typescript-029
+    level: hard
+    type: design
+    q: Implement branded types for `TenantId` and `ProductId`. Where do values get branded, and what does this prevent?
+    hint: |-
+      - Brand = intersection với phantom property: `type TenantId = string & { readonly __brand: "TenantId" }`. Zero runtime cost.
+      - Chỉ tạo brand ở **một chỗ đáng tin**: sau khi validate (zod `.brand<"TenantId">()`) hoặc khi đọc từ auth context/DB.
+      - Ngăn: truyền nhầm thứ tự tham số `(productId, tenantId)`, dùng `tenantId` từ body thay vì từ token.
+      - Giới hạn: `as TenantId` vẫn bypass được → cấm bằng lint/code review; brand không qua được JSON (sau parse phải brand lại).
+    example: |-
+      ```ts
+      declare const brand: unique symbol;
+      type Brand<T, B> = T & { readonly [brand]: B };
+      type TenantId = Brand<string, "TenantId">;
+      type ProductId = Brand<string, "ProductId">;
+      function getProduct(tenant: TenantId, id: ProductId) { /* ... */ }
+      getProduct(productId, tenantId); // compile error — swapped
+      ```
+    followUp: How would branded IDs look across an HTTP boundary between a Next.js frontend and an Express API?
+    tags: [branded-types, multi-tenant]
+  - id: typescript-030
+    level: hard
+    type: gotcha
+    q: Arrays in TypeScript are covariant. Demonstrate the unsoundness and explain how `readonly` arrays help.
+    hint: |-
+      - `Dog[]` gán được cho `Animal[]` (covariant) → qua alias `Animal[]` có thể `push(cat)` → mảng `Dog[]` chứa `Cat`.
+      - TS chấp nhận unsound này vì tính thực dụng (array cực phổ biến).
+      - `ReadonlyArray<T>`/`readonly T[]` không có method mutate → covariance an toàn. Nhận `readonly T[]` ở parameter khi hàm không mutate.
+      - Variance annotation `in`/`out` (TS 4.7) cho generic type tự định nghĩa — chủ yếu để tăng tốc/làm rõ, không sửa unsoundness của built-in.
+    example: |-
+      ```ts
+      class Animal { name = "" }
+      class Dog extends Animal { bark() {} }
+      class Cat extends Animal { meow() {} }
+      const dogs: Dog[] = [new Dog()];
+      const animals: Animal[] = dogs;
+      animals.push(new Cat());
+      dogs[1].bark(); // TypeError at runtime
+      ```
+    followUp: Name two other places where TypeScript is intentionally unsound.
+    tags: [variance, soundness]
+  - id: typescript-031
+    level: hard
+    type: scenario
+    q: A production crash reads `Cannot read properties of undefined (reading 'price')` in code that compiled under `strict`. How can that happen, and how do you prevent the class of bugs?
+    hint: |-
+      Nguồn unsoundness phổ biến:
+      - `as`/`any` (kể cả `any` "lây" từ lib không type, `JSON.parse`, `res.json()`).
+      - Index access không bật `noUncheckedIndexedAccess` (`items[0].price`).
+      - Non-null assertion `!`, type guard viết sai, `.d.ts` của lib sai/lỗi thời.
+      - Dữ liệu external lệch contract (schema drift).
+      Phòng ngừa: parse ở boundary, bật `noUncheckedIndexedAccess`, lint `no-unsafe-member-access`/`no-non-null-assertion`, test contract với payload thật, alert khi parse fail.
+    followUp: How would you find every `any` that flows into your domain layer in a 200k-line codebase?
+    tags: [soundness, scenario, production]
+  - id: typescript-032
+    level: hard
+    type: scenario
+    q: "`tsc` takes 4 minutes in CI and the IDE lags on a monorepo. How do you diagnose and speed it up?"
+    hint: |-
+      - Đo: `tsc --extendedDiagnostics` (check time, số type instantiation), `--generateTrace` + `@typescript/analyze-trace` tìm file/type nóng.
+      - Thủ phạm hay gặp: conditional/template literal type đệ quy, union rất lớn, intersection lồng nhau, return type không annotate của hàm export lớn, `include` quét cả `dist`/`node_modules`.
+      - Kiến trúc: **project references** + `composite` + `incremental`, `isolatedDeclarations` để tạo `.d.ts` song song, `skipLibCheck`, tách type-check khỏi transpile (swc/esbuild).
+      - Nâng cấp compiler: TS 7 (native, viết bằng Go) nhanh hơn đáng kể theo công bố — kiểm tra tương thích plugin/API trước (verify).
+      - Ưu tiên `interface extends` hơn intersection lớn (theo TS performance wiki).
+    followUp: What trade-off does `isolatedDeclarations` impose on how developers write exported functions?
+    verify: true
+    tags: [performance, tooling, monorepo, scenario]
+  - id: typescript-033
+    level: hard
+    type: concept
+    q: How do you type errors in TypeScript services, given `throw` is untyped?
+    hint: |-
+      - TS không có checked exception: `catch (e)` là `unknown` (với `useUnknownInCatchVariables`), function signature không mô tả lỗi.
+      - Option 1: class lỗi có `code` (`AppError`, `NotFoundError`) + `instanceof` narrow + `Error.cause` để giữ chain.
+      - Option 2: **Result type** `{ ok: true; value } | { ok: false; error }` cho lỗi **nghiệp vụ dự đoán được** (hết hàng, voucher hết hạn); vẫn `throw` cho lỗi hạ tầng.
+      - Gotcha: `instanceof` gãy khi có 2 bản copy package (monorepo, dual CJS/ESM) → check `code`/`name` thay vì class.
+    example: |-
+      ```ts
+      type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+      type CheckoutError = { kind: "OUT_OF_STOCK"; sku: string } | { kind: "PRICE_CHANGED" };
+      async function checkout(cart: Cart): Promise<Result<Order, CheckoutError>> { /* ... */ }
+      ```
+    followUp: When does a Result type make code worse rather than better?
+    tags: [errors, result-type]
+  - id: typescript-034
+    level: hard
+    type: gotcha
+    q: "Why does `for (const k in obj)` / `Object.keys(obj)` give `string` instead of `keyof T`, and when is a cast acceptable?"
+    hint: |-
+      - Structural typing: value có type `T` có thể mang **thêm key** ngoài `keyof T` → TS trả `string` là đúng (sound).
+      - Cast `Object.keys(o) as (keyof T)[]` chấp nhận được khi object do chính bạn tạo (literal cục bộ, `as const` config) — không nên cho data external.
+      - `Object.entries` tương tự: `[string, T[keyof T]]` chỉ khi có index signature.
+      - Nguy cơ thật: iterate object DTO từ client để build SQL `SET` → key lạ lọt vào query (injection/mass assignment). Luôn whitelist key.
+    followUp: Write a helper `typedKeys` and argue when it's safe to use.
+    tags: [structural-typing, gotcha]
+  - id: typescript-035
+    level: hard
+    type: concept
+    q: You need types for an untyped internal JS package. How do you write and ship declaration files, and what does `skipLibCheck` trade off?
+    hint: |-
+      - Viết `index.d.ts` cạnh package (hoặc `declare module "pkg" { ... }` trong `types/`), trỏ bằng field `types`/`exports` → `"types"` condition.
+      - Bắt đầu với API thật sự dùng, không cố type toàn bộ; test type bằng `tsd`/`expectTypeOf` hoặc `// @ts-expect-error`.
+      - Dual package (CJS+ESM) cần `.d.cts`/`.d.mts` khớp format — kiểm tra bằng "Are The Types Wrong?" (attw).
+      - `skipLibCheck: true`: bỏ check **nội bộ** các `.d.ts` → nhanh hơn, tránh lỗi từ lib bên thứ ba; đổi lại không phát hiện `.d.ts` mâu thuẫn/sai của chính bạn.
+    followUp: A `.d.ts` says a function returns `User`, but it actually returns `User | null`. Who catches this, and when?
+    tags: [declaration-files, tooling]
+  - id: typescript-036
+    level: hard
+    type: concept
+    q: Explain how decorators work in TypeScript today — legacy `experimentalDecorators` vs standard (TC39) decorators — and why it matters for NestJS or type stripping.
+    hint: |-
+      - Legacy (`experimentalDecorators` + `emitDecoratorMetadata`): semantics cũ, hỗ trợ **parameter decorators** và metadata type (`design:paramtypes`) — NestJS, TypeORM, class-validator dựa vào đây.
+      - Standard decorators (TS 5.0, stage 3): API khác (`context` object), **không có parameter decorator**, không emit metadata type.
+      - Decorator cần transform → Node type stripping không chạy được; phải qua tsc/swc.
+      - `emitDecoratorMetadata` cần thông tin type → transpiler từng file có giới hạn (swc hỗ trợ ở mức nhất định).
+    followUp: What breaks if you enable `isolatedModules` and import a type used only in a Nest constructor parameter?
+    verify: true
+    tags: [decorators, nestjs, tooling]
+  - id: typescript-037
+    level: senior
+    type: design
+    q: Design how types are shared between a Next.js frontend and a Node/Express API in a monorepo. What is the source of truth?
+    hint: |-
+      Không có đáp án duy nhất — trình bày trade-off:
+      - **Schema-first** (zod/valibot trong package `contracts`): dùng chung runtime validation + `z.infer`; FE/BE import cùng version.
+      - **OpenAPI-first**: spec là nguồn sự thật, codegen client/types; hợp khi có consumer ngoài monorepo.
+      - **tRPC/ts-rest**: type end-to-end, nhưng gắn chặt FE-BE, khó cho public API.
+      - Bắt buộc: versioning khi deploy lệch (FE cũ gọi BE mới) → thêm field optional, không đổi nghĩa field cũ; contract test trong CI.
+      - Tránh: FE import trực tiếp entity/ORM type của BE (lộ field nội bộ, kéo dependency server vào bundle).
+    followUp: A mobile app pinned to an old version still calls your API. How does that constrain your shared-types approach?
+    tags: [monorepo, contracts, design]
+  - id: typescript-038
+    level: senior
+    type: open
+    q: How strict should a production TypeScript codebase be? How do you manage `any`, `@ts-ignore` and escape hatches in a team?
+    hint: |-
+      Đo độ trưởng thành:
+      - Mặc định strict + lint `no-explicit-any`, `no-unsafe-*`, `ban-ts-comment` (cho phép `@ts-expect-error` kèm mô tả, cấm `@ts-ignore`).
+      - Escape hatch có chỗ: boundary với lib không type, test, migration — nhưng **khoanh vùng** (adapter layer) và có ticket.
+      - Đo "any budget" (type-coverage), không tăng theo thời gian; ratchet trong CI.
+      - Cân bằng: type quá "thông minh" làm onboarding khó, error message khó đọc — ưu tiên type dễ đọc hơn type "đẹp".
+    followUp: When have you deliberately chosen a simpler, less precise type over a clever one?
+    tags: [team-practices, open]
+  - id: typescript-039
+    level: senior
+    type: design
+    q: Design a type-safe data-access layer for a multi-tenant service so a query without tenant scoping is hard to write.
+    hint: |-
+      - Repository nhận `TenantContext` (branded `TenantId` lấy từ auth, không từ body) là **tham số bắt buộc** hoặc được bind khi tạo repository per request.
+      - Không export query builder/ORM client thô ra ngoài layer; chỉ export method đã scope.
+      - Type giúp nhưng không đủ: thêm defense-in-depth ở DB (Row-Level Security trên PostgreSQL, filter bắt buộc), test kiểm tra cross-tenant access.
+      - Cẩn thận admin/cross-tenant job: API riêng, đặt tên rõ (`unsafeCrossTenant...`), audit log.
+    example: |-
+      ```ts
+      type TenantScoped<T> = { readonly tenantId: TenantId } & T;
+      interface OrderRepo {
+        findById(ctx: TenantCtx, id: OrderId): Promise<Order | null>;
+        list(ctx: TenantCtx, q: OrderQuery): Promise<Order[]>;
+      }
+      ```
+    followUp: How would you prove in code review or tests that no endpoint can read another tenant's orders?
+    tags: [multi-tenant, design, branded-types]
+  - id: typescript-040
+    level: senior
+    type: open
+    q: Your org is several major TypeScript versions behind (TS 5.x) and TS 6/7 are out. How do you plan the upgrade for dozens of packages?
+    hint: |-
+      - Đọc release notes: TS 6.0 là bản "cầu nối" đổi default (`strict`, `module`, `target`, `types: []`) và deprecate option cũ (`moduleResolution: node`, `baseUrl`, `target: es5`...); TS 7 là compiler native (verify chi tiết).
+      - Ghi explicit mọi option trong tsconfig base trước khi nâng → default đổi không làm vỡ ngầm.
+      - Kiểm tra tool phụ thuộc API compiler: ts-jest, typescript-eslint, ts-morph, plugin transformer, NestJS CLI.
+      - Rollout: nâng một package leaf trước, CI matrix, so sánh `.d.ts` output (API không đổi), rồi nâng dần.
+      - Đo lợi ích (thời gian CI, IDE) để justify.
+    followUp: Which tools in your stack depend on the TypeScript compiler API and might block the upgrade?
+    verify: true
+    tags: [upgrade, tooling, open]
+  - id: typescript-041
+    level: cv
+    type: design
+    q: On a multi-tenant B2B2C e-commerce platform you owned tenant-aware data access. How did TypeScript help prevent cross-tenant data leaks, and where did it not help?
+    hint: |-
+      Câu trả lời mạnh có:
+      - Cơ chế cụ thể: tenant lấy từ token/middleware, đưa vào request context; repository/service **bắt buộc** nhận tenant (type/tham số), không nhận từ body.
+      - Nếu đã dùng branded type hoặc wrapper type — nói rõ; nếu chưa, nói thẳng và nêu sẽ làm gì.
+      - Chỗ TS không giúp: raw SQL string, job chạy nền không có request context, cache key thiếu tenant, Elasticsearch query thiếu filter tenant → cần test + review checklist.
+      - Một incident/near-miss thật (điền chi tiết thật của bạn) và bài học.
+    followUp: Show me the signature of one repository method from that codebase and explain each parameter.
+    redFlags:
+      - '"The ORM handles tenants automatically" without explaining how'
+    tags: [cv, multi-tenant]
+  - id: typescript-042
+    level: cv
+    type: design
+    q: You implemented RBAC and permission checks. How did you model roles and permissions in TypeScript so a typo in a permission name fails the build?
+    hint: |-
+      - Nguồn sự thật: `as const` object/array các permission → derive union (`"order:read" | ...`) hoặc template literal `${Resource}:${Action}`.
+      - Middleware/guard nhận `Permission` (union) → gõ sai là compile error; role → permission map dùng `satisfies Record<Role, readonly Permission[]>`.
+      - Runtime: permission lưu DB (nếu động) phải validate khi load; mismatch giữa DB và code xử lý thế nào.
+      - Phân biệt RBAC (role → permission) với check **ownership/tenant** (resource-level) — type không thay thế được check này.
+      - (điền số role/permission thật của bạn và cách team review thay đổi quyền)
+    followUp: A tenant wants a custom role defined at runtime. How does your compile-time model survive that?
+    tags: [cv, rbac, auth]
+  - id: typescript-043
+    level: cv
+    type: scenario
+    q: Your Data Enrichment Service normalizes product data from external providers. How did you type untrusted provider payloads, and what happened when a provider changed its schema?
+    hint: |-
+      Câu trả lời mạnh có:
+      - Pipeline: raw payload `unknown` → schema theo **từng provider** (parse/`safeParse`) → map sang domain type chuẩn hoá chung.
+      - Xử lý drift: field mới bị bỏ qua (non-strict) nhưng log; field bắt buộc thiếu → record vào DLQ/quarantine thay vì crash cả batch; metric tỉ lệ parse fail + alert.
+      - Normalization: đơn vị, currency, category mapping — type domain tách biệt type provider.
+      - Kể một lần provider đổi schema thật và bạn phát hiện thế nào (điền chi tiết/số liệu thật của bạn).
+    followUp: Would you make provider schemas strict (reject unknown fields) or passthrough? Why?
+    redFlags:
+      - "We cast the response to the provider's interface"
+    tags: [cv, runtime-validation, integration]
+  - id: typescript-044
+    level: cv
+    type: design
+    q: For the Indexer Service that transforms products into Elasticsearch, how did you keep the TypeScript document type and the index mapping consistent?
+    hint: |-
+      - Nêu nguồn sự thật: mapping JSON ↔ TS type viết tay, hay generate một chiều (type từ mapping hoặc mapping từ schema).
+      - Transform function có type rõ `(p: Product) => ProductDoc`; test snapshot của document; CI kiểm tra mapping khi đổi type.
+      - Rủi ro thực tế: dynamic mapping ES tự tạo field sai type (string vs keyword, date format), đổi type field cần reindex → alias + reindex zero-downtime.
+      - Kết nối multi-tenant: field `tenantId` là `keyword`, filter bắt buộc trong query builder.
+      - (điền chi tiết thật: số document, tần suất reindex)
+    followUp: You need to change a field from `text` to `keyword`. Walk me through the rollout.
+    tags: [cv, elasticsearch]
+  - id: typescript-045
+    level: cv
+    type: design
+    q: When migrating a legacy monolith to Node/Express microservices communicating over Kafka, how did you type event contracts and keep backward compatibility?
+    hint: |-
+      - Contract package dùng chung (hoặc schema registry với Avro/JSON Schema/Protobuf); event là discriminated union theo `type` + `version`.
+      - Quy tắc tương thích: chỉ thêm field optional; không đổi nghĩa/xoá field; consumer chịu được field lạ; version mới → event type mới hoặc upcaster.
+      - Consumer luôn parse runtime (message có thể do producer cũ/khác ngôn ngữ gửi).
+      - Trong giai đoạn chuyển đổi: monolith và service mới cùng produce/consume — cách tránh double-processing (idempotency key).
+      - (điền chi tiết thật: số service, cách rollout)
+    followUp: A consumer deployed before the producer receives an event with a field it doesn't know. What happens in your setup?
+    tags: [cv, kafka, contracts]
+  - id: typescript-046
+    level: cv
+    type: behavioral
+    q: You use AI-assisted development (Claude Code/Cursor) with human review. What TypeScript-level mistakes have you caught in AI-generated code, and how do types help the review?
+    hint: |-
+      STAR ngắn:
+      - Situation/Task: loại task giao cho AI (refactor, endpoint mới, test).
+      - Action: lỗi hay gặp — `as any`/`as unknown as T` để "cho qua", non-null `!`, type guard lỏng, bỏ qua tenant/permission check, sửa type thay vì sửa logic.
+      - Cách kiểm soát: strict + lint `no-unsafe-*` chặn trong CI, yêu cầu test, review diff type public API.
+      - Result: (điền ví dụ/số liệu thật của bạn).
+      - Reflection: types là "hợp đồng" giúp review nhanh hơn, nhưng AI có thể làm type khớp mà logic sai.
+    followUp: How do you decide which tasks are safe to delegate to an AI assistant in a multi-tenant codebase?
+    tags: [cv, ai-assisted, behavioral]

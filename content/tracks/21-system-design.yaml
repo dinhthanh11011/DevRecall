@@ -1,0 +1,942 @@
+id: 21-system-design
+slug: system-design
+title: System Design
+tier: 5
+status: drafted
+summary: "Phương pháp phỏng vấn system design + bài toán kinh điển: rate limiter, chat, checkout, catalog ingestion, multi-tenant SaaS."
+cvLinked: true
+prerequisites: []
+overview: |-
+  ## TL;DR
+
+  - System design interview không chấm "đáp án đúng" — chấm **quy trình**: làm rõ yêu cầu, ước lượng, chọn thành phần có lý do, đào sâu chỗ khó, và **nói rõ trade-off**.
+  - Khung 8 bước: **requirements → estimates → API → data model → high-level design → deep dive → bottlenecks → trade-offs**. Dành 5–8 phút cho requirements; đừng vẽ Kafka ở phút thứ hai.
+  - Mọi thiết kế đều xoay quanh vài câu hỏi lặp lại: dữ liệu nào là **source of truth**, **consistency** cần mạnh tới đâu, chỗ nào **hot** (key, partition, tenant), chuyện gì xảy ra khi **retry/duplicate**, và hệ thống **degrade** thế nào khi một phần chết.
+  - Với senior: nối thiết kế với kinh nghiệm thật (multi-tenant, checkout, indexer, Socket.IO) — số liệu thật của bạn đáng giá hơn số trong sách.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Functional vs non-functional req | Hệ thống **làm gì** vs **tốt tới mức nào** (latency, availability, consistency, scale) | "p99 < 200 ms, 99.9% availability, không oversell" |
+  | Back-of-envelope | Ước lượng bậc độ lớn để chọn kiến trúc | 10M DAU × 20 req ÷ 86 400 s ≈ 2.3k QPS avg |
+  | Stateless service | Không giữ state theo user trong process → scale ngang tự do | Session trong Redis, không trong memory |
+  | Replication | Bản sao dữ liệu để đọc nhiều / chịu lỗi | Primary + 2 read replica, lag vài trăm ms |
+  | Sharding / partitioning | Chia dữ liệu theo key sang nhiều node | `hash(user_id) % 64` |
+  | Idempotency | Gọi lại nhiều lần = một lần | `Idempotency-Key` trên `POST /payments` |
+  | Fan-out | Đẩy một sự kiện tới nhiều người nhận | Feed: fan-out on write vs on read |
+  | Backpressure | Bên nhận làm chậm bên gửi khi quá tải | Queue depth → giảm consumer fetch, trả 429 |
+  | Consistent hashing | Thêm/bớt node chỉ di chuyển ~1/N key | Distributed cache ring với virtual nodes |
+
+  ## Cơ chế hoạt động
+
+  ### Quy trình phỏng vấn
+
+  ```mermaid
+  flowchart LR
+    R["1 Requirements<br/>functional + NFR<br/>(5-8 min)"] --> E["2 Estimates<br/>QPS, storage, bandwidth"]
+    E --> A["3 API<br/>endpoints / events"]
+    A --> D["4 Data model<br/>entities, keys, access patterns"]
+    D --> H["5 High-level design<br/>boxes + arrows"]
+    H --> DD["6 Deep dive<br/>1-2 hardest parts"]
+    DD --> B["7 Bottlenecks<br/>hot keys, SPOF, failure"]
+    B --> T["8 Trade-offs<br/>what you'd change at 10x"]
+    T -. "interviewer pushes" .-> DD
+  ```
+
+  ### Một kiến trúc web "mặc định" để bắt đầu
+
+  ```mermaid
+  flowchart LR
+    U["Client"] --> CDN["CDN<br/>static + cache"]
+    U --> LB["Load balancer (L7)"]
+    LB --> API["Stateless API x N"]
+    API --> C["Redis<br/>cache / rate limit / session"]
+    API --> DB[("Primary DB")]
+    DB --> RR[("Read replicas")]
+    API --> Q["Queue / Kafka"]
+    Q --> W["Workers"]
+    W --> S["Object storage (S3)"]
+    W --> ES["Search index"]
+  ```
+
+  Bắt đầu từ đây rồi **bỏ bớt / thêm** theo yêu cầu — đừng thêm component nào mà không nói được nó giải quyết vấn đề gì.
+
+  ### Back-of-envelope numbers (bậc độ lớn)
+
+  | Thao tác | Xấp xỉ |
+  |---|---|
+  | L1 cache / main memory reference | ~1 ns / ~100 ns |
+  | SSD random read | ~100 µs |
+  | Round trip trong cùng datacenter | ~0.5 ms |
+  | Redis GET qua mạng (cùng AZ) | ~0.2–1 ms |
+  | Query DB có index | ~1–10 ms |
+  | Round trip xuyên lục địa | ~100–150 ms |
+  | 1 ngày | 86 400 s ≈ 10⁵ s |
+  | 1M request/ngày | ≈ 12 QPS trung bình |
+
+  Peak thường ×2–×5 so với trung bình (flash sale có thể ×50). Luôn nói giả định ra.
+
+  ## Trade-offs
+
+  | Quyết định | Lựa chọn A | Lựa chọn B | Chọn A khi |
+  |---|---|---|---|
+  | Consistency | Strong (single leader, transaction) | Eventual (replica, async) | Tiền, tồn kho, quyền truy cập |
+  | Feed | Fan-out on write | Fan-out on read | Đa số user ít follower; celebrity → hybrid |
+  | Realtime | WebSocket | SSE / polling | Cần hai chiều, độ trễ thấp |
+  | ID | UUIDv7 / Snowflake | DB sequence | Nhiều writer, không muốn round trip DB |
+  | Pagination | Cursor (keyset) | Offset | Dataset lớn, dữ liệu thay đổi liên tục |
+  | Tenant isolation | Pool (shared schema + `tenant_id`) | Silo (DB riêng) | Nhiều tenant nhỏ; silo cho enterprise/compliance |
+  | Communication | Sync (HTTP/gRPC) | Async (queue/event) | Cần kết quả ngay, chuỗi ngắn |
+
+  ## Pitfalls
+
+  - Nhảy vào vẽ ngay mà không hỏi **scale, consistency, read/write ratio**.
+  - Ước lượng xong nhưng **không dùng** con số để ra quyết định.
+  - "Thêm cache" mà không nói invalidation, TTL, stampede, cache key theo tenant.
+  - Bỏ qua **retry + duplicate** (webhook, queue at-least-once, user bấm hai lần).
+  - Single point of failure ẩn: một Redis, một cron instance, một region.
+  - Dùng distributed transaction (2PC) cho mọi thứ thay vì saga + idempotency.
+  - Lưu thời gian lịch làm việc bằng offset cố định (`+07:00`) thay vì IANA time zone.
+  - Không nói về **observability** và cách hệ thống degrade.
+
+  ## Cheat sheet
+
+  - Khung: Req → Estimate → API → Data → HLD → Deep dive → Bottleneck → Trade-off.
+  - QPS = DAU × req/user/day ÷ 86 400; peak ×2–5. Storage = records × size × retention × replication.
+  - Rate limiter: token bucket trong Redis bằng Lua (atomic), key theo user/IP/tenant, fail-open vs fail-closed phải quyết định.
+  - Chat: WebSocket gateway stateless + pub/sub (Redis adapter/Kafka), message store phân vùng theo `conversation_id`, sequence per conversation, ack + resend khi reconnect.
+  - Checkout: reserve stock bằng conditional update, idempotency key, payment state machine, webhook + reconciliation, outbox cho event.
+  - Search indexing: DB là source of truth → CDC/outbox → indexer idempotent (version) → alias swap khi reindex.
+  - Scheduler: lưu job trong DB/queue, lease + heartbeat, at-least-once + idempotent handler.
+  - Time zone: lưu IANA zone + local wall time cho lịch lặp; lưu UTC instant cho occurrence cụ thể.
+notionRefs:
+  - title: System Design
+    url: https://app.notion.com/p/ed0e517463524594b36f44975c604edc
+  - title: Schedule Jobs
+    url: https://app.notion.com/p/381ef77f8ab280e48da0cded9cf4b158
+references:
+  - title: System Design Primer (donnemartin)
+    url: https://github.com/donnemartin/system-design-primer
+  - title: Martin Kleppmann — Designing Data-Intensive Applications
+    url: https://dataintensive.net/
+  - title: Latency numbers every programmer should know (interactive)
+    url: https://colin-scott.github.io/personal_website/research/interactive_latency.html
+  - title: Stripe — Designing robust and predictable APIs with idempotency
+    url: https://stripe.com/blog/idempotency
+  - title: Socket.IO — Using multiple nodes
+    url: https://socket.io/docs/v4/using-multiple-nodes/
+  - title: Redis — Sorted sets
+    url: https://redis.io/docs/latest/develop/data-types/sorted-sets/
+  - title: Elasticsearch — Aliases
+    url: https://www.elastic.co/docs/manage-data/data-store/aliases
+  - title: AWS Builders' Library — Timeouts, retries and backoff with jitter
+    url: https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/
+  - title: RFC 9562 — Universally Unique IDentifiers (UUIDv7)
+    url: https://www.rfc-editor.org/rfc/rfc9562
+  - title: Martin Fowler — Strangler Fig Application
+    url: https://martinfowler.com/bliki/StranglerFigApplication.html
+  - title: Microservices.io — Transactional outbox
+    url: https://microservices.io/patterns/data/transactional-outbox.html
+questions:
+  - id: system-design-001
+    level: easy
+    type: concept
+    q: Walk me through how you structure a 45-minute system design interview. How much time goes to each step?
+    hint: |-
+      ~5–8' **requirements** (functional + NFR, scope in/out) → ~3–5' **estimates** (QPS, storage, read/write ratio) → ~3' **API** → ~5' **data model** + access patterns → ~8' **high-level design** → ~10–15' **deep dive** 1–2 phần khó nhất → ~5' **bottlenecks, failure modes, trade-offs**, "ở 10x sẽ đổi gì".
+      Nói to suy nghĩ, chốt giả định, hỏi interviewer muốn đào sâu phần nào.
+      Lỗi phổ biến: bỏ requirements, thiết kế cho Google-scale khi đề bài là 10k user.
+    followUp: The interviewer says "you decide the requirements". What do you do?
+    redFlags:
+      - "Starts drawing boxes before asking a single question"
+    tags: [interview-method]
+  - id: system-design-002
+    level: easy
+    type: concept
+    q: What non-functional requirements do you always clarify, and how do they change the design?
+    hint: |-
+      - **Scale**: DAU, QPS peak, dữ liệu tăng bao nhiêu/năm → sharding, cache.
+      - **Latency**: p50/p99 mục tiêu → cache, CDN, precompute.
+      - **Availability** (99.9% ≈ 8.8h downtime/năm; 99.99% ≈ 53 phút) → multi-AZ, failover.
+      - **Consistency**: chỗ nào bắt buộc strong (tiền, tồn kho, quyền) vs eventual (feed, count like).
+      - **Durability**, **security/compliance** (PII, tenant isolation), **cost**, read/write ratio, geo.
+      Mỗi NFR phải dẫn tới một quyết định cụ thể trong thiết kế.
+    followUp: How does 99.99% vs 99.9% availability change your architecture and cost?
+    tags: [interview-method, requirements]
+  - id: system-design-003
+    level: easy
+    type: concept
+    q: Which latency numbers do you keep in your head for back-of-envelope reasoning, and how do you use them?
+    hint: |-
+      Bậc độ lớn: memory ~100 ns, SSD random read ~100 µs, round trip cùng DC ~0.5 ms, Redis GET ~<1 ms, query DB có index ~1–10 ms, xuyên lục địa ~100–150 ms.
+      Dùng để: biết **N+1 query** 100 lần × 5 ms = 500 ms; biết gọi service ở region khác mỗi request là không ổn; biết cache in-process nhanh hơn Redis ~1000 lần.
+      Con số chính xác thay đổi theo phần cứng — quan trọng là **tỷ lệ** giữa chúng.
+    followUp: A page makes 30 sequential calls to a service in the same datacenter. What's the latency floor, and how do you cut it?
+    verify: true
+    tags: [estimation, latency]
+  - id: system-design-004
+    level: easy
+    type: concept
+    q: Estimate the QPS and storage for a service with 10 million DAU, each making 20 reads and 2 writes per day, each write 1 KB, kept for 3 years.
+    hint: |-
+      - Reads: 10M × 20 / 86 400 ≈ **2 300 QPS** avg; peak ×3 ≈ 7k QPS.
+      - Writes: 10M × 2 / 86 400 ≈ **230 QPS** avg.
+      - Storage: 20M writes/ngày × 1 KB = 20 GB/ngày × 365 × 3 ≈ **22 TB**, × replication 3 ≈ 66 TB (chưa tính index).
+      Kết luận: read-heavy 10:1 → cache + read replica; 22 TB → cần partitioning/archival, không nhét một instance.
+      Làm tròn mạnh tay (86 400 ≈ 10⁵), nói giả định.
+    followUp: Which of these numbers actually changes your architecture, and which is just noise?
+    tags: [estimation]
+  - id: system-design-005
+    level: easy
+    type: compare
+    q: Vertical vs horizontal scaling — what must be true of a service before you can scale it horizontally?
+    hint: |-
+      - **Vertical**: máy to hơn — đơn giản, có trần, SPOF, downtime khi nâng cấp.
+      - **Horizontal**: thêm instance — cần service **stateless** (session/cache/upload tạm không ở local memory/disk), idempotent với retry, không có cron chạy trên mọi instance, connection pool tổng không vượt giới hạn DB.
+      DB thường là thứ scale ngang khó nhất → read replica, cache, partitioning.
+    followUp: You scale an API from 4 to 40 pods and the database starts refusing connections. Why?
+    tags: [scaling, stateless]
+  - id: system-design-006
+    level: easy
+    type: compare
+    q: L4 vs L7 load balancing — what can each do, and when does it matter in a design?
+    hint: |-
+      - **L4** (TCP/UDP): route theo IP/port, rất nhanh, không đọc HTTP; hợp cho TCP thuần, WebSocket passthrough, throughput cao (AWS NLB).
+      - **L7** (HTTP): route theo path/host/header/cookie, TLS termination, sticky session bằng cookie, retry, rate limit, WAF (AWS ALB, Nginx, Envoy).
+      Ảnh hưởng: WebSocket cần LB hỗ trợ upgrade + idle timeout dài; sticky session cần cho Socket.IO long-polling; health check phải phản ánh readiness thật.
+    followUp: Why do WebSocket connections sometimes drop after exactly 60 seconds behind a load balancer?
+    tags: [load-balancer, networking]
+  - id: system-design-007
+    level: easy
+    type: concept
+    q: Explain CAP and PACELC in practical terms. Where do they actually influence a design decision?
+    hint: |-
+      CAP: khi có **network partition**, phải chọn Consistency hoặc Availability. Không có partition thì câu hỏi là PACELC: **Else** chọn **Latency** hay **Consistency**.
+      Thực tế: chọn per use case, không per hệ thống. Tồn kho/tiền → CP (từ chối ghi khi không chắc). Feed/like count → AP (cho đọc stale).
+      Ví dụ: đọc từ replica = chọn latency, chấp nhận stale; quorum read = chọn consistency, trả latency.
+    followUp: Is PostgreSQL with async read replicas CP or AP?
+    redFlags:
+      - "You pick two of the three"
+    tags: [cap, consistency]
+  - id: system-design-008
+    level: easy
+    type: concept
+    q: Where can you place caches in a typical web system, and what does each layer protect?
+    hint: |-
+      Browser cache (Cache-Control) → **CDN** (static, public GET) → API gateway/reverse proxy → **in-process cache** (LRU, rất nhanh, không chia sẻ giữa pod) → **distributed cache** (Redis) → DB buffer pool.
+      Mỗi lớp: phải nói **key, TTL, invalidation, cái gì không được cache** (dữ liệu per-user/per-tenant trên CDN!).
+      Rủi ro: stale data, cache stampede, cache key thiếu tenant/locale.
+    followUp: Which responses must never be cached by a CDN, and how do you enforce it?
+    tags: [caching]
+  - id: system-design-009
+    level: medium
+    type: compare
+    q: How do you choose between a relational database and a NoSQL store in a design interview?
+    hint: |-
+      Bắt đầu từ **access patterns** và **consistency**, không từ hype.
+      - SQL: quan hệ, transaction nhiều bảng, ràng buộc (unique, FK), query ad-hoc, reporting → orders, payments, inventory.
+      - Key-value/wide-column (DynamoDB, Cassandra): access pattern biết trước, write throughput rất cao, partition key rõ → chat messages, event log, session.
+      - Document (MongoDB): aggregate tự nhiên dạng document, schema linh hoạt → catalog attributes.
+      - Search (Elasticsearch): full-text, facet — **không** là source of truth.
+      Polyglot persistence OK nhưng mỗi store thêm chi phí vận hành + sync.
+    followUp: Why is Elasticsearch a poor primary datastore for orders?
+    tags: [databases, data-model]
+  - id: system-design-010
+    level: medium
+    type: concept
+    q: You add read replicas and users complain "I updated my profile but still see the old value". Explain and fix.
+    hint: |-
+      **Replication lag** (async): ghi vào primary, đọc ngay từ replica chưa kịp apply.
+      Fix: **read-your-writes** — đọc từ primary trong N giây sau khi user ghi (flag trong session/cookie), hoặc route theo LSN/GTID (chờ replica đạt vị trí), hoặc trả luôn dữ liệu mới từ response của write rồi cập nhật client state.
+      Chỉ đọc replica cho dữ liệu chịu được stale (list, report). Monitor replication lag, cắt replica chậm khỏi pool.
+    followUp: How would you implement "read from primary for 5 seconds after a write" in a Node API behind a load balancer?
+    tags: [replication, consistency]
+  - id: system-design-011
+    level: medium
+    type: compare
+    q: Compare range, hash and directory-based sharding. What is a hot shard and how do you fix one?
+    hint: |-
+      - **Range** (theo `created_at`, `tenant_id` range): range query tốt; dễ hot (mọi write mới vào shard cuối).
+      - **Hash** (`hash(key) % N` hoặc consistent hashing): phân tán đều; mất range query; reshard tốn nếu dùng modulo.
+      - **Directory/lookup** (bảng map `tenant → shard`): linh hoạt, di chuyển tenant lớn riêng; lookup là dependency thêm.
+      Hot shard: một key quá lớn (tenant enterprise, celebrity). Fix: tách tenant lớn ra shard riêng (directory), salting key (`key#0..9`) cho write, cache đọc, chia nhỏ theo sub-key.
+    followUp: For a multi-tenant SaaS, would you shard by tenant_id? What happens when one tenant is 40% of traffic?
+    tags: [sharding, partitioning]
+  - id: system-design-012
+    level: medium
+    type: concept
+    q: What problem does consistent hashing solve, and why do implementations use virtual nodes?
+    hint: |-
+      `hash % N`: thêm/bớt một node → gần như **mọi key** đổi chỗ → cache miss toàn bộ / di chuyển dữ liệu lớn.
+      Consistent hashing: node và key cùng nằm trên một vòng hash; key thuộc node kế tiếp theo chiều kim đồng hồ → thêm/bớt node chỉ di chuyển ~**1/N** key.
+      **Virtual nodes**: mỗi node vật lý có nhiều điểm trên vòng → phân tải đều hơn, node mạnh có nhiều vnode hơn, khi node chết tải chia đều cho nhiều node.
+      Dùng ở: Cassandra/Dynamo, client-side sharding memcached. Redis Cluster dùng **16 384 hash slots** — ý tưởng tương tự nhưng không phải ring.
+    followUp: How does Redis Cluster's hash-slot model differ from a consistent hashing ring?
+    tags: [consistent-hashing, distributed-cache]
+  - id: system-design-013
+    level: medium
+    type: compare
+    q: When do you put a queue between two services instead of calling synchronously?
+    hint: |-
+      Queue khi: người gọi **không cần kết quả ngay** (email, index, thumbnail), cần **hấp thụ burst** (flash sale), consumer chậm/không ổn định, fan-out nhiều consumer, retry có kiểm soát + DLQ.
+      Sync khi: cần kết quả để trả cho user (giá, check tồn kho), chuỗi ngắn, latency quan trọng.
+      Chi phí async: eventual consistency, at-least-once → consumer idempotent, ordering (per partition), monitor lag, khó debug (cần trace id).
+    followUp: How do you show the user a status for work that is now asynchronous?
+    tags: [messaging, async]
+  - id: system-design-014
+    level: medium
+    type: concept
+    q: How do you make a `POST /orders` or `POST /payments` endpoint idempotent?
+    hint: |-
+      Client sinh **`Idempotency-Key`** (UUID) cho mỗi ý định; server lưu `(tenant_id, key) → request hash, status, response` với **unique constraint**.
+      Luồng: insert key trạng thái `processing` (nếu trùng → trả response đã lưu, hoặc 409 nếu đang xử lý, 422 nếu body khác) → xử lý → lưu response → TTL (Stripe giữ ít nhất 24h).
+      Downstream cũng phải nhận key (payment provider). Ghi key và business row **trong cùng transaction** nếu có thể.
+    example: |-
+      ```sql
+      CREATE TABLE idempotency_keys (
+        tenant_id    uuid NOT NULL,
+        key          text NOT NULL,
+        request_hash text NOT NULL,
+        status       text NOT NULL,          -- processing | done
+        response     jsonb,
+        created_at   timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (tenant_id, key)
+      );
+      ```
+    followUp: The first request crashes after charging the card but before saving the response. What happens on retry?
+    verify: true
+    tags: [idempotency, api, payments]
+  - id: system-design-015
+    level: medium
+    type: compare
+    q: Offset vs cursor (keyset) pagination — which do you pick for an infinite-scroll product list and an admin table?
+    hint: |-
+      - **Offset** (`LIMIT 20 OFFSET 10000`): DB vẫn phải quét và bỏ 10 000 dòng → chậm dần; dữ liệu chèn thêm làm trùng/sót item giữa các trang. Tốt cho admin table có "trang 5/40", dữ liệu nhỏ.
+      - **Cursor/keyset** (`WHERE (created_at, id) < ($1, $2) ORDER BY created_at DESC, id DESC LIMIT 20`): O(log n) với index, ổn định khi dữ liệu thay đổi; không nhảy tới trang bất kỳ.
+      Cursor phải có **tie-breaker** duy nhất (id) và encode opaque (base64) để client không phụ thuộc cấu trúc.
+    followUp: How does cursor pagination work when the list is sorted by relevance from Elasticsearch?
+    tags: [pagination, api, sql]
+  - id: system-design-016
+    level: medium
+    type: compare
+    q: Compare token bucket, leaky bucket, fixed window, sliding log and sliding window counter for rate limiting.
+    hint: |-
+      - **Fixed window**: đếm theo phút — đơn giản, nhưng burst **gấp đôi** ở ranh giới cửa sổ.
+      - **Sliding log**: lưu timestamp từng request — chính xác, tốn bộ nhớ.
+      - **Sliding window counter**: nội suy giữa cửa sổ hiện tại và trước — gần chính xác, rẻ.
+      - **Token bucket**: refill r token/s, dung lượng b → cho **burst** tới b, trung bình r. Phổ biến cho API.
+      - **Leaky bucket**: queue xả đều → làm mượt output, thêm latency.
+      Chọn token bucket cho API public; sliding window counter khi cần giới hạn "N/phút" dễ giải thích.
+    followUp: Which of these can you implement atomically in Redis with a single Lua script, and why does atomicity matter?
+    tags: [rate-limiting, algorithms]
+  - id: system-design-017
+    level: medium
+    type: concept
+    q: Estimate storage and bandwidth for a URL shortener with 100 million new links per month and a 100:1 read/write ratio.
+    hint: |-
+      - Writes: 100M / (30 × 86 400) ≈ **40/s**; reads ≈ **4 000/s** avg, peak ~×5.
+      - Record ~500 B (code, long URL, owner, created_at) → 100M × 500 B = **50 GB/tháng**, ~6 TB cho 10 năm.
+      - Keyspace: base62 7 ký tự = 62⁷ ≈ **3.5 × 10¹²** → dư dùng.
+      - Bandwidth đọc nhỏ (redirect 301/302 vài trăm byte).
+      Kết luận: read-heavy → cache hot link (80/20), KV store hoặc SQL + cache đều ổn; không cần sharding sớm.
+    followUp: 301 or 302 for the redirect — and how does that choice affect your analytics?
+    tags: [estimation, url-shortener]
+  - id: system-design-018
+    level: medium
+    type: compare
+    q: News feed — fan-out on write vs fan-out on read. What about users with 10 million followers?
+    hint: |-
+      - **On write (push)**: khi post, ghi post_id vào feed cache của từng follower → đọc cực nhanh; ghi tốn O(followers), lãng phí cho user không online.
+      - **On read (pull)**: khi mở feed, lấy post từ những người mình follow rồi merge → ghi rẻ, đọc chậm/tốn.
+      - **Hybrid**: push cho user thường; **celebrity** (> ngưỡng follower) không fan-out, merge lúc đọc. Chỉ fan-out cho follower active gần đây.
+      Feed cache: Redis list/sorted set giới hạn ~vài trăm id, hydrate post/user riêng.
+    followUp: How do you handle a user unfollowing someone or a post being deleted with fan-out on write?
+    tags: [news-feed, fan-out]
+  - id: system-design-019
+    level: medium
+    type: compare
+    q: WebSocket vs Server-Sent Events vs long polling — how do you choose for notifications, chat and live prices?
+    hint: |-
+      - **WebSocket**: full-duplex, độ trễ thấp → chat, collaborative editing, trading. Cần LB hỗ trợ upgrade, sticky/pub-sub khi scale, tự làm reconnect/heartbeat.
+      - **SSE**: server → client qua HTTP, auto-reconnect với `Last-Event-ID`, text only → notification, live price một chiều, progress. Qua proxy/HTTP/2 dễ hơn.
+      - **Long polling**: fallback tương thích mọi nơi, tốn request.
+      Socket.IO: lib trên WebSocket (fallback HTTP long-polling) + rooms, ack, reconnect — **không** tương thích client WebSocket thuần.
+    followUp: With HTTP/1.1, what browser connection limit hurts SSE, and how does HTTP/2 change it?
+    tags: [realtime, websocket, sse]
+  - id: system-design-020
+    level: medium
+    type: concept
+    q: How do you serve user-uploaded images and files at scale without routing the bytes through your API servers?
+    hint: |-
+      - Upload: API cấp **presigned URL** (S3 PUT/POST, có giới hạn content-type, size, TTL ngắn) → client upload thẳng lên object storage; multipart upload cho file lớn.
+      - Sau upload: event (S3 notification → queue) → worker scan virus, validate magic bytes, tạo thumbnail, cập nhật trạng thái `pending → ready`.
+      - Download: CDN trước bucket (private bucket + origin access), signed URL/cookie cho file riêng tư.
+      - Key đặt theo `tenant/…/uuid`, không dùng tên file của user.
+    followUp: How do you stop someone from using your presigned upload URL to host a 5 GB file of their own?
+    tags: [file-upload, s3, cdn]
+  - id: system-design-021
+    level: medium
+    type: concept
+    q: Why not just use SQL `LIKE '%term%'` for product search? How do you keep a search index in sync with the database?
+    hint: |-
+      `LIKE '%x%'` không dùng B-tree index → full scan; không có relevance, stemming, typo tolerance, facet, tiếng Việt có dấu/không dấu.
+      Search engine dùng **inverted index** (term → danh sách doc), analyzer (tokenize, lowercase, ASCII folding), BM25 scoring.
+      Sync: DB là source of truth → **outbox/CDC** (Debezium) → queue → indexer idempotent (dùng version/`updated_at` để bỏ event cũ, ES `version_type=external`) → bulk API. Reindex toàn bộ qua **alias swap**. Chấp nhận lag vài giây; trang chi tiết đọc từ DB.
+    followUp: An event arrives out of order and overwrites a newer document in the index. How do you prevent it?
+    tags: [search, elasticsearch, cdc]
+  - id: system-design-022
+    level: medium
+    type: compare
+    q: How do you generate unique IDs in a distributed system? Compare auto-increment, UUIDv4, UUIDv7 and Snowflake-style IDs.
+    hint: |-
+      - **Auto-increment**: đơn giản, sắp theo thời gian, nhưng cần round trip DB, lộ số lượng (`/orders/1042`), khó merge nhiều shard.
+      - **UUIDv4**: random, sinh ở đâu cũng được; random insert làm **B-tree index phân mảnh**, 16 byte.
+      - **UUIDv7** (RFC 9562): timestamp ms ở đầu + random → gần như tăng dần, index-friendly, vẫn phân tán.
+      - **Snowflake**: 64-bit = timestamp + machine id + sequence → gọn, sắp theo thời gian; cần gán machine id và xử lý clock đi lùi.
+      Ghi chú: ID public không nên đoán được nếu thiếu authorization check (IDOR).
+    followUp: What happens to a Snowflake generator if the server clock jumps backwards?
+    tags: [id-generation, uuid]
+  - id: system-design-023
+    level: medium
+    type: concept
+    q: How do timeouts, retries with backoff and jitter, and circuit breakers work together to prevent cascading failure?
+    hint: |-
+      - **Timeout** ở mọi lời gọi mạng (connect + request), nhỏ hơn timeout của caller (deadline propagation).
+      - **Retry** chỉ cho lỗi tạm thời và request **idempotent**; exponential backoff + **jitter** để tránh retry đồng loạt; giới hạn số lần và retry budget (vd ≤10% traffic).
+      - **Circuit breaker**: lỗi vượt ngưỡng → open (fail fast, trả fallback), sau một thời gian half-open thử lại.
+      - **Bulkhead**: pool riêng cho từng dependency.
+      Thiếu jitter/budget → retry storm nhân tải lên dependency đang yếu.
+    followUp: Three layers each retry 3 times. How many calls hit the database when it fails?
+    tags: [resilience, retries, circuit-breaker]
+  - id: system-design-024
+    level: medium
+    type: debug
+    q: This Redis rate limiter lets through far more than 100 requests per minute under concurrency. Why, and how do you fix it?
+    example: |-
+      ```ts
+      async function allow(userId: string): Promise<boolean> {
+        const key = `rl:${userId}:${Math.floor(Date.now() / 60_000)}`;
+        const count = Number(await redis.get(key) ?? 0);
+        if (count >= 100) return false;
+        await redis.set(key, count + 1, 'EX', 60);
+        return true;
+      }
+      ```
+    hint: |-
+      **Race condition read-modify-write**: nhiều request cùng đọc `count = 50` rồi cùng ghi `51` → đếm thiếu. Thêm: fixed window cho burst ×2 ở ranh giới phút.
+      Fix tối thiểu: `INCR` (atomic) rồi `EXPIRE` khi giá trị = 1 (hoặc `SET NX EX` + `INCR` trong `MULTI`).
+      Tốt hơn: token bucket/sliding window trong **một Lua script** (`EVAL`) để check-and-update atomic.
+      Quyết định thêm: Redis chết thì **fail-open** (cho qua, log) hay **fail-closed** (chặn) — tuỳ endpoint (login nên closed hơn).
+    followUp: Write the Lua script for a token bucket and explain what state it stores.
+    tags: [rate-limiting, redis, race-condition]
+  - id: system-design-025
+    level: medium
+    type: debug
+    q: Customers are occasionally charged twice even though the payment endpoint checks an idempotency key. Find the flaw.
+    example: |-
+      ```ts
+      app.post('/payments', async (req, res) => {
+        const key = req.header('Idempotency-Key')!;
+        const existing = await db.payment.findUnique({ where: { idempotencyKey: key } });
+        if (existing) return res.json(existing);
+
+        const charge = await psp.charge(req.body.amount, req.body.token);
+        const payment = await db.payment.create({ data: { idempotencyKey: key, chargeId: charge.id } });
+        res.json(payment);
+      });
+      ```
+    hint: |-
+      **Check-then-act race**: hai request trùng key đến cùng lúc (double click, client retry do timeout) đều thấy `existing = null` → cùng gọi `psp.charge` → trừ tiền hai lần. Unique constraint (nếu có) chỉ chặn ở `create` — **sau khi** đã charge.
+      Fix: **claim key trước** — `INSERT ... (status='processing')` với unique constraint; ai insert thành công mới được charge; request kia nhận 409/đợi rồi trả kết quả.
+      Truyền idempotency key xuống PSP (Stripe hỗ trợ) để PSP cũng dedupe. Nếu crash giữa chừng → trạng thái `processing` được reconciliation job kiểm tra với PSP.
+    followUp: How does your reconciliation job decide whether a stuck "processing" payment was actually charged?
+    tags: [idempotency, race-condition, payments]
+  - id: system-design-026
+    level: medium
+    type: debug
+    q: A weekly recurring shift "Monday 09:00–17:00" stored as below shows up as 08:00–16:00 for half the year for staff in Sydney. Why?
+    example: |-
+      ```ts
+      // stored when the shift template was created in May (AEST, UTC+10)
+      const template = { weekday: 1, startUtc: '23:00', endUtc: '07:00' }; // Sunday 23:00 UTC
+
+      function occurrence(date: Date) {
+        return { start: atUtcTime(date, template.startUtc), end: atUtcTime(nextDay(date), template.endUtc) };
+      }
+      ```
+    hint: |-
+      Lịch lặp được lưu bằng **giờ UTC cố định** tính từ offset tại thời điểm tạo (+10). Sydney có **DST** (AEDT, UTC+11 từ đầu tháng 10 tới đầu tháng 4) → cùng giờ UTC giờ hiển thị lệch 1 tiếng.
+      Fix: lưu **wall-clock local time + IANA zone** (`09:00`, `Australia/Sydney`) cho template; khi sinh occurrence mới chuyển sang UTC instant cho ngày cụ thể (Temporal / Luxon / date-fns-tz).
+      Xử lý thêm: giờ **không tồn tại** (gap khi vặn đồng hồ tới) và giờ **lặp** (overlap khi vặn lùi) — chính sách rõ ràng; shift qua đêm; lương tính theo giờ thực làm (7h hay 9h trong đêm đổi giờ).
+    followUp: Staff work across two locations in different time zones. Whose time zone does the shift belong to?
+    verify: true
+    tags: [time-zones, scheduling, dst]
+  - id: system-design-027
+    level: hard
+    type: design
+    q: Design a URL shortener like bit.ly. Go deep on key generation and the redirect path.
+    hint: |-
+      - **Req**: tạo short link (custom alias tuỳ chọn, expiry), redirect nhanh (p99 < 50 ms), analytics; read:write ~100:1; link không đoán được nếu private.
+      - **Components**: API tạo link → KV/SQL `code → long_url`; redirect service stateless + Redis cache + CDN edge; click event → queue → analytics store (ClickHouse).
+      - **Key gen**: (a) counter/ID range cấp theo block cho từng node + base62 — không trùng, đoán được; (b) random 7 ký tự + unique constraint, retry khi trùng; (c) hash(url) cắt ngắn — trùng phải xử lý. Tránh round trip DB tập trung.
+      - **Trade-offs**: 301 (cache ở browser, mất analytics) vs 302; dedupe cùng URL hay không; consistency khi tạo xong redirect ngay (đọc primary/cache write-through).
+      - **Failure**: hot link → cache/CDN; abuse (phishing) → scan URL, rate limit; cache miss storm cho link không tồn tại → cache negative.
+    followUp: How would you support 100k redirects per second for a single viral link?
+    tags: [design, url-shortener]
+  - id: system-design-028
+    level: hard
+    type: design
+    q: Design a distributed rate limiter for a multi-tenant public API (limits per API key, per tenant plan, and per IP).
+    hint: |-
+      - **Req**: nhiều rule (per key 100 req/s burst 200, per tenant plan, per IP cho endpoint login), latency thêm < 2 ms, headers `RateLimit-*`/`Retry-After`, cấu hình động.
+      - **Components**: middleware/gateway → Redis Cluster lưu bucket (Lua script atomic, key `rl:{tenant}:{key}` dùng hash tag), rule config cache local refresh định kỳ.
+      - **Data**: token bucket `{tokens, last_refill}` TTL tự hết.
+      - **Trade-offs**: chính xác toàn cục (Redis mỗi request) vs local counter + sync định kỳ (nhanh, lệch vài %); **fail-open vs fail-closed**; limit ở edge (CDN/WAF) cho DDoS vs ở app cho business quota.
+      - **Failure**: Redis chậm → timeout ngắn + fallback local limiter; hot tenant làm hot shard → shard theo key, không theo tenant; clock skew → dùng thời gian của Redis (`TIME`).
+    followUp: A customer complains they're throttled at 80% of their quota. How do you investigate?
+    tags: [design, rate-limiting, multi-tenancy]
+  - id: system-design-029
+    level: hard
+    type: design
+    q: Design a notification system that sends email, SMS and push for order updates, with user preferences and no duplicates.
+    hint: |-
+      - **Req**: nhiều kênh, template đa ngôn ngữ, preference/opt-out, quiet hours theo time zone, retry, **không gửi trùng**, ưu tiên (OTP > marketing), audit.
+      - **Components**: producer phát event (`order.shipped`) qua outbox → notification service: resolve recipient + preference + template → queue **per channel** (tách để SMS chậm không chặn push) → worker gọi provider (SES, Twilio, FCM/APNs) → status/webhook về.
+      - **Data**: `notifications(id, dedupe_key, user_id, channel, status, attempts)`, unique `dedupe_key = event_id + channel`.
+      - **Trade-offs**: at-least-once + dedupe vs chấp nhận hiếm khi trùng; provider failover; batch digest vs realtime.
+      - **Failure**: provider rate limit → token bucket per provider; token push hết hạn → xoá; bounce/complaint → suppress list.
+    followUp: OTP SMS must arrive within 10 seconds even during a marketing blast. How do you guarantee it?
+    tags: [design, notifications, queue]
+  - id: system-design-030
+    level: hard
+    type: design
+    q: Design a real-time leaderboard for a game or sales competition with 10 million players — top 100 and "my rank".
+    hint: |-
+      - **Req**: cập nhật điểm realtime, top-N, rank của tôi + người xung quanh, leaderboard theo ngày/tuần/tenant, tie-break.
+      - **Core**: Redis **sorted set** — `ZINCRBY lb:week:2026-39 delta userId`, top: `ZREVRANGE 0 99 WITHSCORES`, rank: `ZREVRANK` — O(log N).
+      - Tie-break: encode score = `points * 10^k + (MAX_TS - ts)` hoặc dùng score kép.
+      - Durability: event điểm lưu DB/Kafka là source of truth; Redis rebuild được.
+      - **Trade-offs**: một sorted set 10M member vẫn ổn về RAM (~ vài trăm MB–1 GB, cần đo) nhưng là **hot key** một shard → shard theo bucket điểm hoặc tính top-N gần đúng; approximate rank cho người ngoài top.
+      - **Failure**: replay event trùng → idempotent theo event id; reset kỳ bằng key mới + TTL.
+    followUp: How would you shard the leaderboard across a Redis Cluster and still answer "what is my global rank"?
+    verify: true
+    tags: [design, leaderboard, redis]
+  - id: system-design-031
+    level: hard
+    type: design
+    q: Design a distributed in-memory cache (like a simplified Memcached/Redis Cluster). How do clients find data, and what happens when a node dies?
+    hint: |-
+      - **Req**: GET/SET/DELETE < 1 ms, TTL, eviction LRU/LFU, scale ngang, chịu mất node.
+      - **Partitioning**: consistent hashing + virtual nodes (hoặc hash slots); client-side routing (smart client có bản đồ) hoặc proxy (twemproxy/Envoy).
+      - **Replication**: primary + replica per shard, failover qua gossip/quorum; replication async → có thể mất write gần nhất.
+      - **Eviction**: LRU xấp xỉ bằng sampling; memory limit per node.
+      - **Trade-offs**: consistency (cache không phải source of truth → chấp nhận mất), hot key (replicate đọc, client-side local cache), resharding online (di chuyển slot).
+      - **Failure**: node chết → key chuyển sang node kế → miss storm vào DB → request coalescing, warmup.
+    followUp: One key gets 200k reads per second. What do you do?
+    tags: [design, distributed-cache, consistent-hashing]
+  - id: system-design-032
+    level: hard
+    type: design
+    q: Design a distributed job scheduler that runs millions of one-off and cron jobs (e.g., "send reminder at 09:00 in the user's time zone") exactly when due.
+    hint: |-
+      - **Req**: delay chính xác tới giây–phút, cron + one-off, retry/backoff, không chạy trùng (hoặc idempotent), survive restart, observability.
+      - **Components**: API ghi job vào DB (`jobs(id, run_at_utc, status, lease_until, attempts)`, index `(status, run_at)`) → nhiều **dispatcher** poll `WHERE run_at <= now() AND status='queued' FOR UPDATE SKIP LOCKED LIMIT 100` → đẩy vào queue → worker thực thi, heartbeat gia hạn lease.
+      - Cron: lưu biểu thức + IANA zone; sau mỗi lần chạy tính `next_run_at` (xử lý DST).
+      - **Trade-offs**: DB polling (đơn giản, tới ~nghìn job/s) vs time-bucketed wheel/Redis ZSET (`ZRANGEBYSCORE`) vs managed (EventBridge Scheduler); at-least-once + idempotent handler.
+      - **Failure**: worker chết → lease hết hạn → job được nhặt lại; missed schedule khi downtime → chính sách catch-up vs skip; thundering herd lúc 00:00 → jitter.
+    followUp: Your scheduler runs on 3 instances with node-cron and the nightly report is sent 3 times. Walk me through the fixes.
+    tags: [design, scheduler, jobs]
+  - id: system-design-033
+    level: hard
+    type: design
+    q: Design a file upload pipeline for invoices and product images (up to 2 GB), with virus scanning, thumbnails and tenant isolation.
+    hint: |-
+      - **Req**: upload file lớn resumable, không qua API server, scan trước khi ai tải được, thumbnail/metadata, giới hạn quota per tenant, private theo tenant.
+      - **Flow**: `POST /uploads` tạo record `pending` + presigned **multipart** URL (key `tenants/{t}/uploads/{uuid}`) → client upload trực tiếp → `complete` → S3 event → queue → worker: validate magic bytes/size, **antivirus**, EXIF strip, thumbnail → move sang bucket/prefix `clean` → status `ready`.
+      - **Access**: tải qua CDN signed URL TTL ngắn, check authorization theo tenant trước khi ký.
+      - **Trade-offs**: scan đồng bộ (chậm) vs async (file chưa dùng được ngay); lưu bản gốc hay chỉ bản xử lý; lifecycle policy xoá upload dở dang.
+      - **Failure**: worker chết giữa chừng → idempotent theo object key/version; file độc → quarantine + alert.
+    followUp: How do you prevent a tenant from reading another tenant's files if the object keys leak?
+    tags: [design, file-upload, s3, multi-tenancy]
+  - id: system-design-034
+    level: hard
+    type: scenario
+    q: During a flash sale, 500 units of a product sold 540 times. Walk me through why this happens and how you would redesign stock reservation.
+    hint: |-
+      Nguyên nhân kinh điển: **read-check-write** không atomic (`SELECT stock` → `if > 0` → `UPDATE stock = x - 1`), cache tồn kho stale, trừ kho sau thanh toán async nhưng không có reservation, retry không idempotent.
+      Fix:
+      - Trừ kho **atomic có điều kiện**: `UPDATE inventory SET available = available - $n WHERE sku = $1 AND available >= $n` → rowcount 0 = hết hàng.
+      - Mô hình **reservation** có TTL (`reserved`, `available`) → hết hạn thanh toán thì trả lại.
+      - Hot SKU: Redis `DECRBY` trong Lua làm lớp gác cổng + DB là source of truth; hoặc queue tuần tự per SKU; chia stock thành nhiều bucket.
+      - Idempotency key cho checkout; oversell còn sót → policy nghiệp vụ (backorder, huỷ + voucher).
+    followUp: How do you release reservations when a user abandons payment, and what if the release job is down?
+    tags: [scenario, inventory, concurrency, e-commerce]
+  - id: system-design-035
+    level: hard
+    type: scenario
+    q: A celebrity with 20 million followers posts and your feed service's Redis cluster CPU spikes to 100% on one node. What is happening and what do you do now and later?
+    hint: |-
+      **Hot key / hot shard**: fan-out on write ghi vào 20M feed (write storm) và/hoặc mọi người cùng đọc một post key trên một node.
+      Ngay: bật degrade — tạm dừng fan-out cho account này, phục vụ post từ cache local/CDN, rate limit fan-out worker.
+      Lâu dài: **hybrid fan-out** (celebrity merge lúc đọc), replicate hot key (`post:123#r1..rN` đọc ngẫu nhiên), client-side/in-process cache TTL ngắn cho hot object, detect hot key (Redis `--hotkeys` với LFU, metrics).
+      Bài học: thiết kế phải có ngưỡng cho **outlier**, không chỉ cho trung bình.
+    followUp: How do you detect hot keys automatically before they cause an incident?
+    tags: [scenario, hot-key, news-feed, redis]
+  - id: system-design-036
+    level: hard
+    type: scenario
+    q: Traffic doubled after a marketing campaign and p99 latency went from 200 ms to 4 s. Database CPU is at 95%. How do you find and fix the bottleneck?
+    hint: |-
+      - Ổn định trước: bật cache/feature degrade, rate limit endpoint không quan trọng, scale read replica nếu phần lớn là read.
+      - Tìm nguyên nhân: slow query log / `pg_stat_statements` (SQL Server: Query Store) theo **tổng thời gian**, không chỉ query chậm nhất; N+1 từ ORM; missing index; lock contention; connection pool bão hoà (chờ pool trông giống chậm DB).
+      - Fix theo đòn bẩy: index/viết lại query top 3 → cache read hot → giảm query/request → tách read replica → async hoá việc nặng → partition.
+      - Sau đó: load test tái hiện, capacity plan, alert trên saturation.
+    followUp: How do you tell whether the latency comes from slow queries or from waiting for a pool connection?
+    tags: [scenario, performance, database]
+  - id: system-design-037
+    level: hard
+    type: scenario
+    q: Your checkout calls the payment provider, which times out after 30 seconds. You don't know whether the customer was charged. What should the system do?
+    hint: |-
+      Timeout = **trạng thái không xác định**, không phải thất bại. Không được tự động charge lại bằng request mới.
+      - Payment state machine có trạng thái `unknown/pending`; đơn hàng chờ, UI hiển thị "đang xác nhận".
+      - Retry với **cùng idempotency key** (PSP dedupe) hoặc query trạng thái theo reference id của mình.
+      - Chờ **webhook** của PSP; **reconciliation job** định kỳ đối chiếu với báo cáo PSP.
+      - Nếu cuối cùng charged nhưng đơn đã huỷ → refund tự động (compensation).
+      - Timeout client nên ngắn hơn và có circuit breaker; không giữ DB transaction mở trong lúc gọi PSP.
+    followUp: How do you design the order and payment state machines so every transition is idempotent?
+    tags: [scenario, payments, idempotency]
+  - id: system-design-038
+    level: hard
+    type: concept
+    q: What is a cache stampede (thundering herd), and what are the mitigations?
+    hint: |-
+      Key hot hết hạn (hoặc cache vừa restart) → hàng nghìn request cùng miss và cùng query DB → DB quá tải → càng chậm càng nhiều request dồn.
+      Mitigations:
+      - **Request coalescing / single-flight**: một request rebuild, còn lại chờ (lock Redis `SET NX PX` hoặc promise map in-process).
+      - **Stale-while-revalidate**: trả dữ liệu cũ trong khi refresh nền; soft TTL < hard TTL.
+      - **Probabilistic early expiration** (XFetch) · **TTL jitter** để key không hết hạn cùng lúc.
+      - Warm cache trước sự kiện; giới hạn concurrency vào DB.
+    example: |-
+      ```ts
+      const inflight = new Map<string, Promise<unknown>>();
+      async function getOnce<T>(key: string, load: () => Promise<T>): Promise<T> {
+        const cached = await redis.get(key);
+        if (cached) return JSON.parse(cached);
+        if (!inflight.has(key)) inflight.set(key, load().finally(() => inflight.delete(key)));
+        return inflight.get(key) as Promise<T>;   // coalesce within this process only
+      }
+      ```
+    followUp: The in-process single-flight above still lets 40 pods hit the DB at once. How do you coalesce across pods?
+    tags: [caching, stampede]
+  - id: system-design-039
+    level: hard
+    type: compare
+    q: Active-passive vs active-active multi-region. What's the real cost of active-active for an e-commerce platform?
+    hint: |-
+      - **Active-passive**: một region ghi, region kia standby (replica async) → đơn giản, RPO > 0 (mất vài giây dữ liệu khi failover), RTO phút; failover phải được **diễn tập**.
+      - **Active-active**: cả hai nhận ghi → latency thấp cho user gần, chịu mất region; nhưng **conflict** khi cùng sửa một bản ghi (tồn kho, số dư!), cần CRDT/last-write-wins (sai với tiền), hoặc **home region per entity** (tenant/user gắn một region).
+      Thực tế: active-active cho read + stateless, dữ liệu mạnh (inventory, payment) giữ single-writer per key.
+    followUp: How would you partition tenants across regions so writes stay single-leader?
+    tags: [multi-region, availability, consistency]
+  - id: system-design-040
+    level: hard
+    type: concept
+    q: "Someone says: \"We use Kafka, so we have exactly-once delivery.\" How do you respond, and how do you actually get effectively-once processing?"
+    hint: |-
+      Kafka exactly-once (idempotent producer + transactions) chỉ đúng trong phạm vi **read-process-write trong Kafka**. Khi side effect ra ngoài (DB, email, PSP) → quay về **at-least-once**.
+      Effectively-once = at-least-once delivery + **idempotent consumer**: dedup theo event id (bảng `processed_events` unique, ghi cùng transaction với business change), upsert theo version, commit offset **sau** khi xử lý.
+      Phía producer: **transactional outbox** để tránh dual write DB + Kafka.
+    followUp: Your consumer writes to the DB and then commits the offset. It crashes between the two. What happens?
+    verify: true
+    tags: [messaging, kafka, idempotency]
+  - id: system-design-041
+    level: hard
+    type: debug
+    q: A Socket.IO chat worked on one server. After scaling to three instances behind a load balancer, clients reconnect in loops and some messages never arrive. What's missing?
+    example: |-
+      ```ts
+      const io = new Server(httpServer, { cors: { origin: APP_ORIGIN } });
+
+      io.on('connection', (socket) => {
+        socket.on('join', (roomId) => socket.join(roomId));
+        socket.on('message', (msg) => io.to(msg.roomId).emit('message', msg));
+      });
+      // deployed as 3 replicas behind a round-robin load balancer
+      ```
+    hint: |-
+      Hai lỗi:
+      1. **Không có sticky session**: Socket.IO bắt đầu bằng HTTP long-polling, nhiều request của cùng session rơi vào instance khác → "Session ID unknown" → reconnect loop. Fix: sticky session (cookie/IP hash) hoặc ép `transports: ['websocket']` (mất fallback).
+      2. **Không có adapter**: `io.to(room).emit` chỉ gửi tới socket trên **instance hiện tại**. Fix: `@socket.io/redis-adapter` (Redis pub/sub) hoặc Redis Streams adapter để broadcast qua các node.
+      Thêm: message phải được **lưu** trước khi emit (persistence + sequence), client resync khi reconnect — adapter không đảm bảo delivery.
+    followUp: Redis pub/sub is fire-and-forget. What happens to messages during a Redis failover, and how does the client recover?
+    verify: true
+    tags: [websocket, socket-io, scaling]
+  - id: system-design-042
+    level: hard
+    type: concept
+    q: Estimate the core numbers for a chat system with 50 million DAU, 40 messages sent per user per day, and 10% of users online at peak.
+    hint: |-
+      - Messages: 50M × 40 = **2 tỷ/ngày** ≈ 23k msg/s avg, peak ×3 ≈ 70k/s (ghi) — mỗi message fan-out tới thành viên (group) nhân thêm.
+      - Storage: ~200 B/message → 400 GB/ngày ≈ **146 TB/năm** (× replication) → cần store phân vùng theo `conversation_id` (Cassandra/ScyllaDB/DynamoDB), TTL/archival.
+      - Connections: 5M concurrent WebSocket; ~50k–100k connection/instance (tuỳ memory) → **50–100 gateway**.
+      - Bandwidth nhỏ so với connection count; heartbeat 5M/30s ≈ 170k packet/s.
+      Kết luận: bài toán chính là **connection management + fan-out**, không phải CPU.
+    followUp: Which of these numbers would push you away from a relational database for message storage?
+    tags: [estimation, chat]
+  - id: system-design-043
+    level: senior
+    type: design
+    q: Design a chat system (1:1 and groups up to 500 members) using WebSockets/Socket.IO, with delivery receipts, offline sync and message ordering.
+    hint: |-
+      - **Req**: gửi/nhận realtime, lịch sử, offline → online sync, sent/delivered/read, ordering trong một conversation, multi-device, presence (best-effort).
+      - **Components**: WebSocket gateway stateless (Socket.IO + Redis/Kafka adapter hoặc routing theo `user → gateway`), chat service ghi message, message store partition theo `conversation_id` (clustering key = `seq`), push service cho offline (FCM/APNs), presence trong Redis TTL.
+      - **Ordering**: sequence tăng dần **per conversation** (cấp bởi service owner của conversation / counter atomic), client sắp theo `seq`, dedupe theo `client_msg_id`.
+      - **Delivery**: persist trước → ack cho sender → fan-out; client gửi `lastSeq` khi reconnect để kéo phần thiếu.
+      - **Trade-offs**: fan-out on write cho group nhỏ vs on read cho group lớn; presence chính xác vs chi phí; E2E encryption làm mất server-side search.
+      - **Failure**: gateway chết → client reconnect nơi khác + resync; duplicate do retry → idempotent `client_msg_id`.
+    followUp: How do you make read receipts cheap for a 500-member group?
+    tags: [design, chat, websocket, socket-io]
+  - id: system-design-044
+    level: senior
+    type: design
+    q: Design a news feed (like the home timeline of a social app) with ranking, for 100 million DAU.
+    hint: |-
+      - **Req**: feed cá nhân hoá, mới + ranking, load < 300 ms, post mới xuất hiện trong vài giây, pagination ổn định.
+      - **Components**: post service (source of truth) → event → fan-out workers ghi `post_id` vào feed cache (Redis ZSET giới hạn ~500) của follower active; celebrity pull lúc đọc; feed service merge + **ranking** (feature store, model) + hydrate (post, author, counters) qua cache batch.
+      - **Data**: follow graph (sharded by user), posts (by author), feed cache (by viewer).
+      - **Trade-offs**: push/pull/hybrid; ranking online vs precompute; cursor ổn định khi ranking đổi (snapshot feed theo session).
+      - **Failure**: fan-out lag → hiển thị post của chính mình ngay (read-your-writes); cache mất → rebuild từ pull; post bị xoá → filter lúc hydrate.
+    followUp: How do you keep pagination stable when the ranking changes between page 1 and page 2?
+    tags: [design, news-feed, fan-out]
+  - id: system-design-045
+    level: senior
+    type: design
+    q: Design checkout and inventory for a multi-tenant e-commerce platform. Cover overselling, idempotency, payments and what happens when each dependency fails.
+    hint: |-
+      - **Req**: không oversell, không double charge, giá tại checkout = giá hiển thị (hoặc báo đổi), nhiều payment method, hoàn tiền, p99 checkout < 1–2 s.
+      - **Flow**: cart → `POST /checkout` (Idempotency-Key) → validate giá/khuyến mãi (snapshot giá vào order) → **reserve stock** (conditional update, TTL) → tạo order `pending_payment` + outbox → payment (redirect/3DS/webhook) → `paid` → commit reservation → event cho fulfillment/notification.
+      - **Saga** thay 2PC: bước lỗi → compensation (release stock, refund).
+      - **Data**: `orders`, `order_lines` (snapshot giá, thuế), `inventory(sku, available, reserved)`, `reservations(order_id, ttl)`, `payments(state, psp_ref)`, mọi bảng có `tenant_id`.
+      - **Failure**: PSP timeout → state `unknown` + reconciliation; webhook trùng/đến trước response → idempotent theo event id; reservation hết hạn khi user vẫn đang trả tiền → policy rõ ràng; hot SKU flash sale → gate bằng Redis/queue.
+    followUp: The payment succeeded but the reservation already expired and the stock was sold to someone else. What now?
+    tags: [design, checkout, inventory, payments, e-commerce]
+  - id: system-design-046
+    level: senior
+    type: design
+    q: Design a product catalog ingestion pipeline — suppliers push CSV/API feeds of millions of SKUs daily — that enriches data and keeps a search index fresh.
+    hint: |-
+      - **Req**: nhận feed nhiều định dạng, validate, **enrich** (category mapping, attribute normalization, image, giá), dedupe SKU, cập nhật search trong phút, không làm chậm DB giao dịch, audit/lỗi theo dòng.
+      - **Pipeline**: upload → object storage → job chia chunk → parse/validate → **staging** → enrichment workers (idempotent, cache lookup) → upsert catalog DB (source of truth, `version`) → outbox/CDC → **indexer** bulk vào Elasticsearch.
+      - **Index**: mapping + analyzer tiếng Việt (ASCII folding), `version_type=external` để bỏ update cũ; full reindex vào index mới → **alias swap** zero-downtime.
+      - **Trade-offs**: batch vs streaming; delta vs full; enrichment đồng bộ hay sau (hiển thị sản phẩm chưa enrich?).
+      - **Failure**: feed lỗi một phần → báo lỗi theo dòng, không fail cả file; poison record → DLQ; backpressure khi ES chậm (bulk size, retry 429).
+    followUp: A supplier sends a feed that would delete 60% of their catalog. How does the pipeline protect you?
+    tags: [design, ingestion, elasticsearch, search-indexing]
+  - id: system-design-047
+    level: senior
+    type: design
+    q: Design a multi-tenant B2B SaaS platform with tenant isolation and role-based access control, where users can belong to multiple tenants.
+    hint: |-
+      - **Req**: cô lập dữ liệu tuyệt đối giữa tenant, một user nhiều tenant với role khác nhau, custom role, audit, tenant enterprise cần isolation mạnh hơn, noisy neighbor.
+      - **Tenancy model**: pool (shared schema, `tenant_id` mọi bảng + index bắt đầu bằng `tenant_id` + Postgres **RLS** làm defense-in-depth), bridge (schema per tenant), silo (DB per tenant) — hybrid theo plan.
+      - **Tenant resolution**: subdomain/header → verify user có **membership** trong tenant (không tin header) → context (`AsyncLocalStorage`) → repository tự áp filter.
+      - **AuthZ**: `memberships(user_id, tenant_id, role_id)`, `role_permissions`, check ở **resource level** (object thuộc tenant + permission) trong service, không chỉ ở route.
+      - **Trade-offs**: pool rẻ nhưng blast radius lớn; silo tốn vận hành/migration; cache key có tenant.
+      - **Failure**: query quên tenant filter → RLS chặn; noisy neighbor → rate limit + quota per tenant.
+    followUp: How do you run a schema migration across 2,000 tenant databases in the silo model?
+    tags: [design, multi-tenancy, rbac, authorization]
+  - id: system-design-048
+    level: senior
+    type: design
+    q: Design shift scheduling for a retail chain with stores in multiple time zones — templates, recurring shifts, swaps, overtime rules and notifications.
+    hint: |-
+      - **Req**: template tuần lặp, ca qua đêm, nhân viên làm nhiều cửa hàng, đổi ca/nhận ca, không chồng ca, luật giờ làm (tối đa giờ/tuần, nghỉ giữa ca), nhắc trước ca.
+      - **Data**: `stores(tz IANA)`, `shift_templates(store_id, weekday, start_local, end_local)`, `shifts(start_utc, end_utc, store_id, tz snapshot)`, `assignments`. Template lưu **wall time + zone**; occurrence cụ thể lưu **UTC instant**.
+      - **Rules**: chống chồng ca bằng exclusion constraint (Postgres `EXCLUDE USING gist` trên `tstzrange` per employee) hoặc check trong transaction có lock per employee.
+      - **DST**: ca rơi vào gap/overlap → policy rõ; giờ làm tính theo duration thực.
+      - **Notifications**: scheduler theo UTC instant; hiển thị theo tz của store (không của trình duyệt).
+      - **Trade-offs**: sinh sẵn occurrence N tuần (query dễ, phải regenerate khi sửa template) vs tính động.
+    followUp: A store changes its time zone rule (a country abolishes DST). What happens to shifts already generated?
+    verify: true
+    tags: [design, scheduling, time-zones]
+  - id: system-design-049
+    level: senior
+    type: design
+    q: Design a webhook delivery system that lets your platform notify thousands of tenant endpoints reliably.
+    hint: |-
+      - **Req**: at-least-once, retry với backoff tới ~24–72h, ký payload (HMAC + timestamp chống replay), ordering best-effort, không để một endpoint chậm làm chậm tất cả, dashboard/redeliver.
+      - **Components**: event → outbox → dispatcher → **queue per endpoint** (hoặc partition theo endpoint) → sender workers với timeout ngắn (5–10s), circuit breaker per endpoint, DLQ; log attempt.
+      - **Security**: chống **SSRF** (chặn IP private/metadata, resolve DNS rồi pin IP), HTTPS bắt buộc, secret rotation (2 secret song song).
+      - **Trade-offs**: ordering vs throughput; payload đầy đủ vs "thin event" (consumer gọi API lấy dữ liệu mới nhất).
+      - **Failure**: endpoint down lâu → tự disable + email; consumer nhận trùng → gửi `event_id` để dedupe.
+    followUp: Why would you send "thin" events instead of full payloads?
+    tags: [design, webhooks, security]
+  - id: system-design-050
+    level: senior
+    type: design
+    q: Design real-time price and account-balance streaming for a financial web app — 200k concurrent users, updates many times per second.
+    hint: |-
+      - **Req**: độ trễ thấp (< 200 ms), dữ liệu per-user (balance) + dữ liệu chung (ticker), không hiển thị giá sai thứ tự, reconnect không mất trạng thái, bảo mật (auth trên socket).
+      - **Components**: market data → Kafka (partition theo symbol) → fan-out service → WebSocket/Socket.IO gateway (room theo symbol, room theo user) → client.
+      - **Conflation**: gộp update — chỉ gửi giá mới nhất mỗi 100–250 ms per symbol cho client chậm (không cần mọi tick); backpressure khi buffer socket đầy → drop cũ, không queue vô hạn.
+      - **Ordering/consistency**: kèm `seq`/timestamp; client bỏ update cũ hơn; khi reconnect lấy **snapshot** rồi áp delta.
+      - **Auth**: xác thực khi handshake + re-validate định kỳ (token hết hạn), authorization khi join room user.
+      - **Failure**: gateway chết → reconnect + snapshot; Kafka lag → hiển thị "delayed".
+    followUp: How do you authenticate a long-lived WebSocket connection when the access token expires every 10 minutes?
+    tags: [design, realtime, websocket, finance]
+  - id: system-design-051
+    level: senior
+    type: open
+    q: The interviewer gives you a deliberately vague prompt ("design Instagram"). How do you scope it down in the first five minutes, and what do you consciously leave out?
+    hint: |-
+      - Chốt **core use case** 2–3 cái (đăng ảnh, follow, xem feed) và nói rõ bỏ gì (DM, story, ads, search).
+      - Hỏi scale + NFR quan trọng nhất (latency feed, durability ảnh), region, mobile vs web.
+      - Nêu giả định bằng con số, viết lên bảng, xin xác nhận.
+      - Đề xuất thứ tự: HLD toàn bộ nhanh → deep dive phần interviewer quan tâm.
+      Senior signal: chủ động **prioritize**, dám cắt scope, giải thích vì sao cắt.
+    followUp: Halfway through, the interviewer adds "and it must work offline". How do you adapt without starting over?
+    tags: [interview-method, scoping]
+  - id: system-design-052
+    level: senior
+    type: open
+    q: Build vs buy — when do you choose a managed service (managed Kafka, OpenSearch Service, Auth0/Cognito, EventBridge Scheduler) over running it yourself?
+    hint: |-
+      Tiêu chí: **core differentiator** hay commodity; chi phí vận hành thật (on-call, upgrade, bảo mật) vs tiền dịch vụ; yêu cầu compliance/data residency; lock-in và exit cost; giới hạn của managed (quota, feature thiếu, noisy neighbor); năng lực team.
+      Thường: buy cho infra commodity (queue, DB, auth nếu không có yêu cầu đặc biệt), build cho logic nghiệp vụ tạo khác biệt.
+      Luôn đặt abstraction mỏng ở biên (adapter) để giảm lock-in, nhưng không trừu tượng hoá mọi tính năng.
+    followUp: What's the hidden cost of self-hosting Elasticsearch that teams underestimate?
+    tags: [build-vs-buy, judgment]
+  - id: system-design-053
+    level: senior
+    type: open
+    q: You're splitting a monolith into services. How do you decide service boundaries and data ownership, and what do you refuse to split?
+    hint: |-
+      - Boundary theo **bounded context** và nhóm thay đổi cùng nhau (team, domain), không theo layer kỹ thuật (không "user-db-service").
+      - Mỗi service **own dữ liệu** của nó; service khác truy cập qua API/event, không join DB chéo.
+      - Bắt đầu tách phần có lý do rõ (scale khác biệt, deploy độc lập, team riêng) bằng **Strangler Fig** + anti-corruption layer.
+      - Từ chối tách: phần có transaction chặt với nhau (order + order lines), khi team quá nhỏ, khi chưa có observability/CI-CD → nguy cơ **distributed monolith**.
+      - Giữ **backward compatibility**: versioned API/event, expand-contract migration.
+    followUp: Two services need to join orders and customers for a report. What are your options?
+    tags: [microservices, boundaries, migration]
+  - id: system-design-054
+    level: senior
+    type: open
+    q: How do you bring reliability into a design discussion — SLOs, error budgets, graceful degradation — instead of just adding replicas?
+    hint: |-
+      - Định nghĩa **SLI/SLO** theo hành trình user (checkout thành công < 1s ở 99.5%), không theo CPU.
+      - Phân loại dependency: critical (DB, payment) vs non-critical (recommendation, review) → non-critical phải có **timeout + fallback** (ẩn widget).
+      - Degradation plan: read-only mode, tắt feature bằng flag, queue ghi, static fallback.
+      - Error budget quyết định tốc độ release vs đầu tư reliability.
+      - Observability: RED/USE metrics, trace id xuyên service, alert theo symptom.
+    followUp: Recommendation service is down. Walk me through what the product page shows and how you'd test that behavior.
+    tags: [reliability, slo, observability]
+  - id: system-design-055
+    level: senior
+    type: compare
+    q: Monolith with a job queue vs event-driven microservices with Kafka for a mid-size e-commerce company (15 engineers). Argue both sides and pick one.
+    hint: |-
+      - **Modular monolith + queue (BullMQ/SQS)**: một deploy, transaction ACID xuyên module, debug dễ, chi phí vận hành thấp; rủi ro: coupling nếu không có module boundary.
+      - **Kafka microservices**: scale/deploy độc lập, event replay, nhiều consumer; chi phí: eventual consistency, schema registry, idempotency khắp nơi, observability phân tán, on-call nặng.
+      - Với 15 engineer: thường chọn **modular monolith** + outbox + queue, tách service khi có lực đẩy thật (team, scale, compliance). Nêu tiêu chí sẽ khiến bạn đổi quyết định.
+      Không có đáp án duy nhất — chấm lập luận.
+    followUp: What signals would tell you it's time to extract the first service?
+    tags: [architecture, microservices, monolith, judgment]
+  - id: system-design-056
+    level: cv
+    type: design
+    q: You designed tenant-aware data access on a multi-tenant B2B2C e-commerce platform. Walk me through how a request is bound to a tenant and how you guarantee no query can leak another tenant's data.
+    hint: |-
+      Câu trả lời mạnh có:
+      - Mô hình tenancy đã chọn (shared schema + `tenant_id`? DB riêng cho tenant lớn?) và **lý do**.
+      - Tenant resolution: nguồn (subdomain/header/token claim) + **kiểm tra membership** của user với tenant.
+      - Cơ chế ép filter: base repository/ORM middleware, context theo request (`AsyncLocalStorage`), index `(tenant_id, …)`; SQL Server: Row-Level Security với security policy nếu có dùng.
+      - Cache key, search index (Elasticsearch filter theo tenant/alias per tenant), file storage prefix đều có tenant.
+      - Test/guardrail: test cross-tenant tự động, audit log.
+      (điền số liệu thật của bạn: số tenant, tỷ lệ tenant lớn, incident nếu có)
+    followUp: What happened the one time a query did slip through without a tenant filter — or how would you detect it if it did?
+    tags: [cv, multi-tenancy, data-access]
+  - id: system-design-057
+    level: cv
+    type: scenario
+    q: You built the Checkout module. How did you prevent double orders from double-clicks or retries, and how did you keep stock consistent under concurrent purchases?
+    hint: |-
+      Câu trả lời mạnh có:
+      - Idempotency: key sinh ở client/cart, unique constraint, xử lý request đang `processing`.
+      - Tồn kho: conditional update hay reservation có TTL; trên SQL Server: `UPDATE ... WHERE available >= @qty` + kiểm `@@ROWCOUNT`, hoặc lock hints (`UPDLOCK, ROWLOCK`) — nói rõ vì sao chọn.
+      - Payment: state machine, webhook idempotent, reconciliation.
+      - Giá: snapshot giá/khuyến mãi vào order line.
+      - Một bug thật đã gặp và cách fix.
+      (điền số liệu thật của bạn: số order/ngày, peak, tỷ lệ lỗi)
+    followUp: If you rebuilt it today, what would you change first?
+    tags: [cv, checkout, idempotency, inventory]
+  - id: system-design-058
+    level: cv
+    type: design
+    q: You built a Data Enrichment service and an Elasticsearch Indexer. Draw the pipeline, and explain how you reindex without downtime and handle out-of-order updates.
+    hint: |-
+      Câu trả lời mạnh có:
+      - Nguồn thay đổi (event từ service, outbox, CDC hay polling `updated_at`) và vì sao.
+      - Enrichment: bước nào, cache lookup, xử lý lỗi từng record (DLQ/retry).
+      - Indexer: bulk size, retry 429/backpressure, idempotent bằng `version`/`version_type=external` hoặc so sánh `updated_at`.
+      - Reindex: index mới + alias swap, dual-write trong lúc reindex hoặc replay từ checkpoint.
+      - Tenant trong index: filter theo `tenant_id` hay index/alias per tenant.
+      (điền số liệu thật của bạn: số document, thời gian full reindex, lag trung bình)
+    followUp: How did you monitor that the index was in sync with the database?
+    tags: [cv, elasticsearch, indexing, pipeline]
+  - id: system-design-059
+    level: cv
+    type: scenario
+    q: You built Shift Management. How did you model shifts across time zones and prevent overlapping assignments?
+    hint: |-
+      Câu trả lời mạnh có:
+      - Lưu gì: local time + IANA zone cho template, UTC cho occurrence; DST xử lý thế nào.
+      - Chống chồng ca: check trong transaction có lock theo nhân viên, hay constraint ở DB; SQL Server không có exclusion constraint như Postgres → cách thay thế bạn dùng.
+      - Ca qua nửa đêm, đổi ca, tính giờ làm.
+      - Một bug liên quan time zone đã gặp (nếu có) và bài học.
+      (điền số liệu thật của bạn: số store/nhân viên, số time zone)
+    followUp: How did you test DST transitions?
+    tags: [cv, scheduling, time-zones]
+  - id: system-design-060
+    level: cv
+    type: scenario
+    q: You migrated a monolith to Node.js microservices with Kafka while keeping backward compatibility. How did you run old and new side by side, and how did you evolve event schemas?
+    hint: |-
+      Câu trả lời mạnh có:
+      - Chiến lược: Strangler Fig, routing theo feature/tenant, dual-write hay outbox/CDC từ monolith.
+      - Backward compatibility API: versioning, adapter/anti-corruption layer.
+      - Event schema: chỉ thêm field optional, không đổi nghĩa field; schema registry/compat mode (nếu có); consumer tolerant reader.
+      - Partition key và ordering; idempotent consumer.
+      - Cách rollback nếu service mới lỗi.
+      (điền số liệu thật của bạn: số service tách, thời gian migration, incident)
+    followUp: What was the hardest piece of data ownership to untangle from the monolith?
+    tags: [cv, microservices, kafka, migration]
+  - id: system-design-061
+    level: cv
+    type: scenario
+    q: On the financial platform you used Socket.IO for real-time updates. How did you scale it across instances and ensure clients didn't miss or misorder updates after reconnecting?
+    hint: |-
+      Câu trả lời mạnh có:
+      - Scaling: sticky session hay websocket-only; adapter (Redis) hay cơ chế khác.
+      - Auth handshake và re-auth khi token hết hạn; authorization khi join room.
+      - Reconnect: snapshot + delta theo `seq`/timestamp; hoặc Socket.IO connection state recovery (nếu dùng — nêu giới hạn).
+      - Throttle/conflation cho client chậm.
+      - Đo gì: số connection đồng thời, latency end-to-end.
+      (điền số liệu thật của bạn)
+    followUp: What happened when you deployed a new version and all sockets reconnected at once?
+    verify: true
+    tags: [cv, socket-io, realtime]
+  - id: system-design-062
+    level: cv
+    type: scenario
+    q: You used Redis on the e-commerce platform. What exactly did you cache, how did you invalidate it on writes, and what went wrong at least once?
+    hint: |-
+      Câu trả lời mạnh có:
+      - Danh sách use case cụ thể (cache catalog/giá, session, rate limit, lock) và vì sao Redis.
+      - Pattern: cache-aside + TTL, invalidate khi ghi (delete key sau commit) hay event-based; key có `tenant_id`.
+      - Stampede/hot key đã gặp và cách xử lý.
+      - Redis chết thì hệ thống làm gì (fail-open, fallback DB).
+      (điền số liệu thật của bạn: hit rate, latency trước/sau)
+    followUp: Why delete the cache key after the DB commit rather than update it before?
+    tags: [cv, caching, redis]

