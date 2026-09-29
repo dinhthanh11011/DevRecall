@@ -1,0 +1,1256 @@
+id: 31-scenario-performance-scale
+slug: scenario-scale
+title: "Scenarios: Performance, Scale & Memory"
+tier: 9
+status: drafted
+summary: Mock interview tình huống production — 10k rps, peak ×1000, slow API, 3MB JSON, JSON.stringify block event loop, memory leak, CPU 100%, pool exhaustion, logs 100GB/ngày và log dữ liệu nhạy cảm.
+cvLinked: true
+prerequisites: [05-nodejs, 16-caching, 21-system-design]
+overview: |-
+  ## TL;DR
+
+  - Đây là track **mock interview**: câu hỏi là một tình huống production ("API phải chịu 10k rps", "RAM tăng 100% sau 2 ngày", "JSON 3MB"). Điểm không nằm ở việc kể tên công nghệ mà ở **thứ tự suy nghĩ**: hỏi lại → ước lượng → đo → khoanh vùng → fix theo ưu tiên → nói trade-off.
+  - Mọi câu "scale" đều quy về vài con số: **throughput (rps)**, **latency (p50/p99)**, **concurrency = rps × latency** (Little's Law), và **tài nguyên hữu hạn** đầu tiên cạn (CPU event loop, DB connection, memory, quota bên thứ ba).
+  - Node.js có một điểm yếu cố định: **một event loop cho mọi request**. Việc sync nặng (`JSON.stringify` vài MB, regex backtracking, bcrypt sync, vòng lặp O(n²)) làm chậm **tất cả** request chứ không chỉ request đó.
+  - Memory leak = **heap tăng đơn điệu sau GC**, không phải "RSS cao". Chứng minh bằng heap snapshot (3-snapshot technique), mitigation trước (restart có kiểm soát, giới hạn cache), root cause sau.
+  - Quá tải là chuyện **khi nào**, không phải **nếu**: thiết kế sẵn rate limit (429), load shedding (503 + `Retry-After`), queue làm buffer (202), backpressure, và timeout/retry có budget.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Throughput vs latency | Số request/giây vs thời gian một request | 10k rps, p99 = 120 ms |
+  | Little's Law | `L = λ × W`: số request đang xử lý = arrival rate × thời gian ở trong hệ thống | 2000 rps × 0.05 s = 100 request in-flight |
+  | Percentile (p50/p95/p99) | Giá trị mà X% request nhanh hơn | p99 = 800 ms: 1/100 request chậm hơn 800 ms |
+  | Tail amplification | Request gọi N dependency → xác suất dính 1 cái chậm tăng nhanh | 100 call, mỗi call 1% chậm → 63% request chậm |
+  | Event loop lag / ELU | Độ trễ timer so với lịch / tỷ lệ thời gian event loop bận | `monitorEventLoopDelay()` p99 = 250 ms |
+  | Pool wait | Thời gian chờ **lấy** connection, trước khi query chạy | `pool.waitingCount = 180` |
+  | Backpressure | Tín hiệu "chậm lại" từ phía nhận truyền ngược về phía gửi | `res.write()` trả `false` → chờ `'drain'` |
+  | Load shedding | Chủ động từ chối một phần request để phần còn lại sống | Lag > 200 ms → `503` + `Retry-After: 2` |
+  | Rate limiting | Giới hạn theo client/key, lỗi phía client | `429 Too Many Requests` |
+  | 202 Accepted + queue | Nhận việc, xử lý sau, trả link theo dõi | `POST /exports` → `202`, `Location: /jobs/42` |
+  | Heap vs RSS vs external | V8 heap (JS object) / toàn bộ memory process / Buffer ngoài heap | `heapUsed 300MB`, `rss 1.1GB`, `external 600MB` |
+  | Retained size | Memory được giải phóng nếu object này bị GC | `Map` 1 entry nhưng retain 400 MB |
+  | Structured clone | Thuật toán copy object giữa thread (`workerData`, `postMessage`) | Gửi object 3MB sang worker = copy trên main thread |
+  | Redaction | Xoá/che field nhạy cảm **trước khi** log được ghi | pino `redact: ['req.headers.authorization']` |
+
+  ## Cơ chế hoạt động
+
+  ### Một request đi qua đâu và thời gian nằm ở đâu
+
+  ```mermaid
+  sequenceDiagram
+    participant U as Client
+    participant L as LB / CDN
+    participant N as Node (event loop)
+    participant P as DB pool
+    participant D as Postgres
+    participant X as 3rd-party API
+    U->>L: HTTPS (DNS, TCP, TLS)
+    L->>N: forward
+    Note over N: chờ event loop rảnh (lag)
+    N->>P: acquire connection (pool wait)
+    P->>D: query
+    D-->>N: rows
+    N->>X: HTTP call (timeout!)
+    X-->>N: response
+    Note over N: JSON.stringify + gzip (CPU, sync)
+    N-->>U: body 3MB (network download)
+  ```
+
+  Mỗi mũi tên là một nơi latency có thể nằm. "API chậm" chỉ có ý nghĩa khi biết **đoạn nào** chậm: đo bằng tracing (span cho DB, HTTP), `Server-Timing`, metric pool wait, event loop lag.
+
+  ### Quyết định khi quá tải
+
+  ```mermaid
+  flowchart TD
+    S["Traffic tăng / latency tăng"] --> Q{"Tài nguyên nào cạn trước?"}
+    Q -- "CPU / event loop lag" --> C["Profile (--cpu-prof)<br/>bỏ việc sync nặng<br/>scale ngang"]
+    Q -- "DB pool wait / DB CPU" --> D["Cache, bỏ N+1, index<br/>read replica, PgBouncer"]
+    Q -- "Memory tăng dần" --> M["Heap snapshot<br/>giới hạn cache/buffer"]
+    Q -- "3rd party chậm" --> X["Timeout, circuit breaker<br/>bounded concurrency"]
+    Q -- "Spike ngắn, có thể xử lý sau" --> B["Queue + 202<br/>worker scale theo lag"]
+    C & D & M & X & B --> P{"Vẫn vượt capacity?"}
+    P -- yes --> SH["Rate limit (429) theo client<br/>load shedding (503 + Retry-After)"]
+    P -- no --> OK["Ổn định → load test lại, đặt alert"]
+  ```
+
+  ### Peak ×1000: API nhận nhanh, worker xử lý đều
+
+  ```mermaid
+  flowchart LR
+    C[Client] --> LB[LB] --> API["API stateless<br/>validate + auth + enqueue"]
+    API -- "202 + jobId" --> C
+    API --> Q[("Queue / Kafka / SQS")]
+    Q --> W["Workers<br/>autoscale theo lag"]
+    W --> DB[("DB: batch write<br/>idempotency key")]
+    SCH["Scheduled scale-up<br/>trước giờ cao điểm"] -.-> API
+    SCH -.-> W
+  ```
+
+  ### Memory leak: 3-snapshot technique
+
+  ```mermaid
+  flowchart LR
+    A["Warm up<br/>(chạy tải vài phút)"] --> S1["Snapshot 1"]
+    S1 --> L1["Chạy tải N lần"] --> S2["Snapshot 2"]
+    S2 --> L2["Chạy tải N lần"] --> S3["Snapshot 3"]
+    S3 --> CMP["Xem object allocated giữa S1 và S2<br/>mà VẪN còn trong S3"]
+    CMP --> R["Retainers → ai giữ reference<br/>(Map, listener, closure, timer)"]
+  ```
+
+  ## Khung trả lời
+
+  Dùng lại cho mọi câu "hệ thống chậm / quá tải / phải chịu X rps":
+
+  1. **Hỏi lại (30 giây)**: loại request (đọc/ghi, CPU/I-O), payload size, SLO (p99 bao nhiêu), peak vs trung bình, data có cache được không, consistency yêu cầu gì.
+  2. **Ước lượng**: rps peak, concurrency (Little's Law), số instance, số DB connection, bandwidth (rps × payload).
+  3. **Cầm máu trước (nếu đang cháy)**: rate limit, tắt feature nặng bằng flag, trả stale cache, scale ngang, rollback deploy.
+  4. **Đo, không đoán**: tracing, RED metrics theo endpoint, event loop lag, pool wait, DB slow query, heap/RSS.
+  5. **Fix theo ưu tiên**: làm ít việc hơn (cache, projection, pagination) → làm việc rẻ hơn (index, batch, bỏ N+1) → làm song song có giới hạn → scale ngang → đổi kiến trúc (queue, CQRS, sharding).
+  6. **Trade-off + chứng minh**: nói cái giá (stale data, eventual consistency, chi phí, độ phức tạp) và cách verify (load test, dashboard, alert).
+
+  ## Trade-offs
+
+  | Lựa chọn | Được | Mất | Khi nào |
+  |---|---|---|---|
+  | Scale ngang thêm pod | Nhanh, không đổi code | Dồn tải xuống DB, tốn tiền, DB connection tăng theo số pod | Bottleneck là CPU app, app stateless |
+  | Cache (CDN/Redis/in-process) | Giảm DB load mạnh nhất cho read-heavy | Stale data, invalidation, stampede | Đọc nhiều, chấp nhận stale vài giây–phút |
+  | Queue + 202 | Hấp thụ spike, worker chạy đều | Không có kết quả ngay, cần idempotency, UX polling/webhook | Việc không cần kết quả sync (order processing, export, email) |
+  | Rate limit (429) | Bảo vệ khỏi 1 client/tenant ồn ào | Có thể chặn nhầm client hợp lệ | Multi-tenant, public API |
+  | Load shedding (503) | Giữ latency cho phần request được nhận | Một phần user bị lỗi | Toàn hệ thống vượt capacity |
+  | Compression ở proxy/CDN | Giảm bandwidth 5–10× với JSON (verify theo data) | CPU (nhất là brotli quality cao) | Payload > vài KB, client mạng chậm |
+  | Pre-serialize + cache string | Bỏ hẳn chi phí stringify mỗi request | Memory, invalidation | Response giống nhau cho nhiều user |
+  | worker_threads | Không block event loop chính | Chi phí clone dữ liệu vào/ra, pool phức tạp | CPU nặng với input nhỏ, output nhỏ |
+  | Provision cho peak | Đơn giản, không lo scale lag | Tốn tiền 23/24 giờ | Peak không đoán trước, cost không quan trọng |
+  | Scheduled + reactive autoscale | Rẻ, chịu được peak đã biết | Phải dự đoán; reactive scale mất vài phút | Peak có giờ cố định |
+
+  ## Pitfalls
+
+  - Trả lời "scale thêm server" trước khi hỏi bottleneck là gì — thêm pod khi DB đang 95% CPU chỉ làm DB chết nhanh hơn.
+  - Nói về **average latency**; interviewer muốn nghe p99 và tail.
+  - `Promise.all` trên 10k phần tử — tự DDoS DB/bên thứ ba, cạn pool.
+  - Retry ở mọi tầng không có budget → retry storm nhân tải lên 10–30×.
+  - Autoscale theo CPU cho worker I/O-bound, hoặc tin rằng autoscale phản ứng kịp spike 30 giây.
+  - Tin rằng `worker_threads` làm `JSON.stringify` "miễn phí" — dữ liệu phải clone qua thread.
+  - Stream JSON mà quên dấu phẩy, quên backpressure, gọi `res.end()` trước khi data tới.
+  - Nhầm RSS cao là leak; hoặc set `--max-old-space-size` lớn hơn memory limit của container.
+  - Không consume body của `fetch` response → giữ socket/memory.
+  - Log `req.headers`/`req.body` nguyên con → token, password, số thẻ nằm trong log store 30 ngày và ai cũng đọc được.
+
+  ## Cheat sheet
+
+  - Little's Law: `in-flight = rps × latency(s)`. 2000 rps × 50 ms = 100 concurrent → pool 20/pod × 5 pod là vừa khít, không có headroom.
+  - Postgres `max_connections` mặc định 100; `pods × pool size` phải nhỏ hơn con số đó (trừ connection cho admin/replication) → PgBouncer khi nhiều pod.
+  - Fan-out tail: `P(slow) = 1 - (1 - p)^N`; p = 1%, N = 100 → 63%.
+  - Bandwidth: 3 MB × 1000 rps = 3 GB/s = 24 Gbit/s — một endpoint có thể làm đầy NIC trước khi CPU cạn.
+  - Log: 100 MB/ngày ≈ 1.2 KB/s (không phải vấn đề); 100 GB/ngày ≈ 1.2 MB/s ≈ ~1,200 dòng 1 KB mỗi giây (vấn đề là chi phí lưu trữ + index).
+  - 429 = client vượt quota của **nó**; 503 = server không còn capacity. Cả hai nên có `Retry-After`.
+  - Đo event loop: `perf_hooks.monitorEventLoopDelay()`, `performance.eventLoopUtilization()`; CPU: `node --cpu-prof`; memory: `--heapsnapshot-signal=SIGUSR2`, `--heapsnapshot-near-heap-limit=3`.
+  - `--max-old-space-size` ≈ 70–75% memory limit container (phần còn lại cho Buffer, native, stack) — con số kinh nghiệm, verify với workload.
+  - Log an toàn: redact ở logger, không bao giờ log password/token/PAN/CVV, retention có hạn, quyền đọc log theo vai trò.
+notionRefs:
+  - title: Mock Questions — Technical - Page 1
+    url: https://app.notion.com/p/2c4ef77f8ab2802cba3de5b0d2d34dda
+  - title: Memory Leak
+    url: https://app.notion.com/p/2c4ef77f8ab2802dadc8cefc4697b0fc
+  - title: Mock Questions — Topic
+    url: https://app.notion.com/p/2ddef77f8ab28030a76fcbaaa3dde966
+references:
+  - title: Node.js — Diagnostics guide (memory, CPU profiling, heap snapshots)
+    url: https://nodejs.org/en/learn/diagnostics/memory
+  - title: Node.js — Don't block the event loop
+    url: https://nodejs.org/en/learn/asynchronous-work/dont-block-the-event-loop
+  - title: Node.js — perf_hooks (monitorEventLoopDelay, eventLoopUtilization)
+    url: https://nodejs.org/api/perf_hooks.html
+  - title: Node.js — worker_threads (workerData, structured clone)
+    url: https://nodejs.org/api/worker_threads.html
+  - title: Node.js — Command-line options (--cpu-prof, --heapsnapshot-signal, --max-old-space-size)
+    url: https://nodejs.org/api/cli.html
+  - title: Node.js — process I/O (stdout synchronous/asynchronous)
+    url: https://nodejs.org/api/process.html#a-note-on-process-io
+  - title: Node.js — Backpressuring in streams
+    url: https://nodejs.org/en/learn/modules/backpressuring-in-streams
+  - title: PostgreSQL — Connections and authentication (max_connections)
+    url: https://www.postgresql.org/docs/current/runtime-config-connection.html
+  - title: PostgreSQL — COPY
+    url: https://www.postgresql.org/docs/current/sql-copy.html
+  - title: Kubernetes — Horizontal Pod Autoscaling
+    url: https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/
+  - title: Kubernetes — Resource management for pods and containers (CPU limits, memory limits)
+    url: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+  - title: AWS — Scheduled scaling for Amazon EC2 Auto Scaling
+    url: https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-scheduled-scaling.html
+  - title: RFC 9110 — HTTP Semantics (503, Retry-After, conditional requests)
+    url: https://www.rfc-editor.org/rfc/rfc9110
+  - title: RFC 6585 — Additional HTTP Status Codes (429)
+    url: https://www.rfc-editor.org/rfc/rfc6585
+  - title: MDN — Content-Encoding
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Encoding
+  - title: MDN — Server-Timing
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Server-Timing
+  - title: MDN — ETag
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/ETag
+  - title: OWASP — Logging Cheat Sheet
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html
+  - title: pino — Redaction
+    url: https://getpino.io/#/docs/redaction
+  - title: Fastify — Validation and serialization (fast-json-stringify)
+    url: https://fastify.dev/docs/latest/Reference/Validation-and-Serialization/
+questions:
+  - id: scenario-scale-001
+    level: easy
+    type: scenario
+    q: "The interviewer says: \"We have an API that must handle 10,000 requests per second.\" What do you ask before proposing anything?"
+    hint: |-
+      (1) Không đề xuất gì trước khi hỏi: **10k là peak hay trung bình?** kéo dài bao lâu? đọc hay ghi? payload bao lớn? SLO là gì (p99 < 200 ms?).
+      (2) Request làm gì: chỉ đọc cache (rẻ), query DB (pool là giới hạn), gọi bên thứ ba (quota + latency), hay tính toán CPU (event loop là giới hạn)?
+      (3) Data có cache được không, stale bao lâu thì chấp nhận được; có cần strong consistency không; multi-tenant không.
+      (4) Mục đích: 10k rps đọc cache ~ vài pod Node; 10k rps **ghi** có transaction ~ bài toán DB (batch, queue, sharding) — hai câu trả lời khác hẳn nhau.
+    followUp: "Assume 95% are reads of a product page that can be 30 seconds stale, and 5% are writes. Now size it."
+    redFlags:
+      - "Immediately says 'use Kubernetes and Redis' without asking what the requests do"
+      - "Never asks for a latency target, so 'handles 10k rps' has no definition of success"
+    tags: [capacity, clarify, 10k-rps]
+  - id: scenario-scale-002
+    level: easy
+    type: concept
+    q: "Your API receives 2,000 requests per second with an average latency of 50 ms. How many requests are in flight at once, and what does that tell you about the database pool?"
+    hint: |-
+      (1) Little's Law: `L = λ × W` = 2000 × 0.05 s = **100 request đồng thời** (trung bình; peak và tail cao hơn).
+      (2) Nếu mỗi request giữ 1 DB connection trong toàn bộ 50 ms → cần ~100 connection **tổng** trên mọi pod. 5 pod × pool 10 = 50 → request chờ pool, latency tăng, và L tăng tiếp (vòng xoáy).
+      (3) Nhưng request chỉ giữ connection trong thời gian query (vd 5 ms) → 2000 × 0.005 = 10 connection là đủ. Đây là lý do **không giữ connection khi gọi HTTP/bên thứ ba**.
+      (4) Thêm headroom 1.5–2× cho spike và tail; kiểm tra tổng không vượt `max_connections` của Postgres (mặc định 100).
+    example: |-
+      ```text
+      rps = 2000, W_request = 50 ms  → in-flight requests = 100
+      W_db_hold = 5 ms               → busy connections   = 2000 × 0.005 = 10
+      pods = 5, pool = 4/pod         → 20 connections (2× headroom) ✓
+      ```
+    followUp: Latency doubles because a dependency slows down. What happens to in-flight requests and memory per pod?
+    redFlags:
+      - "Sets pool size to 'as many as possible' without relating it to rps × hold time"
+    tags: [littles-law, connection-pool, capacity]
+  - id: scenario-scale-003
+    level: hard
+    type: scenario
+    q: "Estimate how many Node.js instances you need for 10k rps where each request does one Redis GET, 20% miss and run a 5 ms Postgres query, and the response is a 5 KB JSON. Show your reasoning."
+    hint: |-
+      (1) Bottleneck của Node là **CPU event loop**, không phải I/O chờ. Ước lượng CPU/request: parse HTTP + Redis round-trip + stringify 5 KB + log ≈ 0.5–1 ms CPU (verify bằng load test 1 pod) → **~1,000–2,000 rps/core** trong trường hợp tốt.
+      (2) Chạy mỗi pod ở ≤ 60–70% CPU để có headroom: 10k / (1,000 × 0.65) ≈ 15 pod 1-vCPU (hoặc ~8 nếu đo được 2k rps/core). Thêm N+1 pod cho rolling deploy/AZ failure.
+      (3) DB: 20% × 10k = 2k query/s × 5 ms = 10 connection bận → pool nhỏ là đủ, nhưng 15 pod × pool 10 = 150 > 100 → giảm pool/pod hoặc dùng PgBouncer.
+      (4) Redis: 10k GET/s là nhẹ với một node Redis; bandwidth response: 10k × 5 KB = 50 MB/s ≈ 400 Mbit/s — vẫn ổn. Câu chốt: **con số phải đo bằng load test 1 pod rồi nhân lên**, không dựa vào benchmark trên mạng.
+    followUp: Your load test shows one pod tops out at 600 rps with CPU at only 35%. What is limiting it?
+    redFlags:
+      - "Quotes a framework benchmark ('Fastify does 70k rps') as capacity for a real endpoint"
+      - "Sizes app pods but forgets that pods × pool size must fit the database's connection limit"
+    verify: true
+    tags: [capacity, estimation, 10k-rps]
+  - id: scenario-scale-004
+    level: medium
+    type: concept
+    q: "The dashboard shows average latency 80 ms, but users complain the page is slow. The page calls 40 backend endpoints. Explain what's going on with percentiles."
+    hint: |-
+      (1) Average che tail: 99 request 50 ms + 1 request 3 s → average ~80 ms, nhưng p99 = 3 s. Hỏi ngay p95/p99 **theo endpoint**.
+      (2) Fan-out: page chờ **cái chậm nhất** trong 40 call. Nếu mỗi call có 1% chậm (p99), xác suất page dính ít nhất 1 call chậm = `1 - 0.99^40` ≈ **33%**; 100 call → 63%.
+      (3) Vì vậy với request fan-out, p99 của từng service là **p50 của trải nghiệm user**.
+      (4) Fix: giảm số call (BFF/aggregate endpoint), giảm tail từng service (timeout, hedged request cho đọc idempotent, cache), render từng phần thay vì chờ tất cả.
+    example: |-
+      ```text
+      P(page slow) = 1 - (1 - 0.01)^N
+      N = 1   → 1%
+      N = 40  → 33%
+      N = 100 → 63%
+      ```
+    followUp: What is a hedged request, and when is it dangerous?
+    redFlags:
+      - "Uses average latency as the SLO"
+      - "Averages percentiles across pods (p99 of pod A + pod B / 2)"
+    tags: [latency, percentiles, tail-latency]
+  - id: scenario-scale-005
+    level: medium
+    type: scenario
+    q: "You run autocannon from your laptop against staging and it tops out at 2,000 rps. Product needs 10,000. Is the service the bottleneck or the test? How do you tell?"
+    hint: |-
+      (1) Nhìn **cả hai phía**: CPU của máy chạy load test (autocannon/k6 cũng single-process/CPU-bound), network laptop → staging (Wi-Fi, VPN), và CPU/event loop lag của service. Nếu service CPU 30% và lag thấp → test là bottleneck.
+      (2) Chạy load generator gần service (cùng VPC/region), nhiều instance, bật keep-alive (connection reuse), đủ số connection (`-c`) theo Little's Law.
+      (3) Đo phía server: rps thật ở LB/APM, p99, event loop delay, pool wait, DB CPU — không chỉ con số client in ra.
+      (4) Dùng open-model (arrival rate cố định, k6 `constant-arrival-rate`) để không bị **coordinated omission**: closed-model tự giảm tải khi server chậm nên che mất latency thật.
+    example: |-
+      ```bash
+      # closed model: 100 connections, mỗi connection chờ response rồi mới gửi tiếp
+      npx autocannon -c 100 -d 60 https://staging.example.com/products/42
+      # k6 open model: giữ 10k req/s bất kể server chậm
+      # scenarios: { load: { executor: 'constant-arrival-rate', rate: 10000, timeUnit: '1s',
+      #   duration: '5m', preAllocatedVUs: 2000, maxVUs: 5000 } }
+      ```
+    followUp: Staging has 2 pods and a small database; production has 20 pods. How do you extrapolate results safely?
+    redFlags:
+      - "Trusts the client-side rps number without checking server metrics"
+      - "Load tests against a single cached URL and reports that as capacity"
+    tags: [load-testing, k6, autocannon]
+  - id: scenario-scale-006
+    level: hard
+    type: scenario
+    q: "To handle more traffic you scaled the API from 4 to 20 pods. Error rate went up, not down, and logs show `sorry, too many clients already`. Explain and fix."
+    hint: |-
+      (1) Đó là lỗi Postgres khi vượt `max_connections` (mặc định 100). 20 pod × pool 10 = 200 connection → pod mới không kết nối được; mỗi connection Postgres là **một process** (tốn memory vài MB), nên tăng `max_connections` lên 1000 không phải fix đúng.
+      (2) Ngắn hạn: giảm pool/pod (vd 4), đặt `connectionTimeoutMillis` để fail nhanh thay vì treo, rollback số pod nếu DB đang quá tải.
+      (3) Dài hạn: **PgBouncer / RDS Proxy** ở transaction pooling mode (nhiều client connection → ít server connection); read replica cho query đọc; cache để giảm query.
+      (4) Trade-off transaction pooling: không dùng được session state (`SET`, advisory lock theo session, `LISTEN`); prepared statement cần PgBouncer bản mới có hỗ trợ protocol-level (verify version).
+    example: |-
+      ```ts
+      import { Pool } from 'pg';
+      // 20 pods × max 10 = 200 connections > max_connections = 100
+      export const pool = new Pool({
+        max: 10,
+        // default connectionTimeoutMillis = 0 → wait forever for a free client
+      });
+      ```
+    followUp: How do you pick the pool size per pod once PgBouncer is in front of Postgres?
+    redFlags:
+      - "Fixes it by raising max_connections to 2000"
+      - "Does not realise scaling app pods multiplies database connections"
+    verify: true
+    tags: [connection-pool, postgres, pgbouncer, scaling]
+  - id: scenario-scale-007
+    level: hard
+    type: debug
+    q: "Under load, every request eventually hangs and pool metrics show `waitingCount` climbing while `idleCount` is 0. The DB is almost idle. Find the bug."
+    example: |-
+      ```ts
+      app.post('/orders/:id/confirm', async (req, res) => {
+        const client = await pool.connect();
+        await client.query('BEGIN');
+        const { rows } = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [req.params.id]);
+        if (rows.length === 0) return res.status(404).end();          // (a)
+
+        const payment = await paymentApi.capture(rows[0].payment_id);  // (b) 300 ms – 30 s
+        await client.query('UPDATE orders SET status = $1 WHERE id = $2', ['confirmed', req.params.id]);
+        await client.query('COMMIT');
+        client.release();
+        res.json({ ok: true, payment });
+      });
+      ```
+    hint: |-
+      (1) Pool exhaustion kiểu **leak**: nhánh (a) return mà không `ROLLBACK` + `release()` → mỗi 404 mất vĩnh viễn 1 connection; exception bất kỳ cũng leak (không có `try/finally`).
+      (2) (b): gọi HTTP bên thứ ba **trong transaction, giữ connection và row lock** tới 30 s → Little's Law: 50 rps × 30 s = 1500 connection cần giữ. DB rảnh vì connection chỉ ngồi chờ.
+      (3) Fix: `try { … } catch { ROLLBACK } finally { client.release() }`; đưa call thanh toán **ra ngoài** transaction (đọc → gọi payment có idempotency key → transaction ngắn cập nhật trạng thái), timeout cho `paymentApi`.
+      (4) Phòng ngừa: `connectionTimeoutMillis`, metric `waitingCount`, Postgres `idle_in_transaction_session_timeout`.
+    followUp: After moving the payment call out of the transaction, how do you handle the case where the payment succeeds but the UPDATE fails?
+    redFlags:
+      - "Only increases the pool size"
+      - "Misses that an early return leaks the client"
+    tags: [connection-pool, debug, transaction]
+  - id: scenario-scale-008
+    level: medium
+    type: debug
+    q: "This endpoint is fine in development but at 500 rps in production database CPU hits 90%. What is wrong?"
+    example: |-
+      ```ts
+      app.get('/orders', async (req, res) => {
+        const orders = await db.query('SELECT * FROM orders WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 50', [req.user.id]);
+        for (const o of orders.rows) {
+          o.items = (await db.query('SELECT * FROM order_items WHERE order_id = $1', [o.id])).rows;
+          o.shipping = (await db.query('SELECT * FROM shipments WHERE order_id = $1', [o.id])).rows[0];
+        }
+        res.json(orders.rows);
+      });
+      ```
+    hint: |-
+      (1) **N+1**: 1 + 50 × 2 = 101 query/request, tuần tự → 500 rps × 101 = ~50k query/s; dev có 3 order nên không thấy.
+      (2) Còn latency: 101 round-trip × 1 ms = ≥100 ms dù mỗi query nhanh, và giữ connection suốt thời gian đó.
+      (3) Fix: 3 query với `WHERE order_id = ANY($1::bigint[])` rồi group trong code, hoặc 1 query `JOIN`/`json_agg`; với GraphQL/ORM dùng DataLoader hoặc eager loading (`include`). Chỉ select cột cần.
+      (4) Phát hiện: `pg_stat_statements` (calls rất cao, mean thấp), tracing thấy "cầu thang" span, log số query mỗi request.
+    followUp: Would `Promise.all` over the 50 orders fix it? What does it change and what does it break?
+    redFlags:
+      - "Suggests adding an index as the only fix"
+    tags: [n-plus-one, postgres, debug]
+  - id: scenario-scale-009
+    level: hard
+    type: scenario
+    q: "p99 latency is 2 seconds. App CPU is 40%, database CPU is 20%, and slow query log is empty. Where is the time going?"
+    hint: |-
+      (1) Khi CPU hai phía đều thấp, thời gian đang nằm ở **chờ**: pool wait (chờ connection), lock wait trong DB, chờ bên thứ ba, hoặc event loop bị block từng đợt (CPU trung bình 40% vẫn có spike 500 ms).
+      (2) Đo từng loại: span "acquire connection" riêng trong tracing, `pool.waitingCount`; `pg_stat_activity` với `wait_event_type = 'Lock'`; span HTTP outbound; `monitorEventLoopDelay` p99.
+      (3) Nguyên nhân hay gặp: pool nhỏ + connection giữ lâu (transaction bao HTTP call), `idle in transaction`, row lock nóng (cùng 1 row counter), DNS/TLS handshake do không keep-alive, CPU throttling do k8s CPU limit.
+      (4) Nguyên tắc trả lời: "slow query log trống" chỉ nói query **chạy** nhanh, không nói request **chờ** bao lâu trước khi query chạy.
+    example: |-
+      ```sql
+      SELECT pid, state, wait_event_type, wait_event, now() - xact_start AS tx_age, left(query, 80)
+      FROM pg_stat_activity
+      WHERE state <> 'idle'
+      ORDER BY tx_age DESC NULLS LAST;
+      ```
+    followUp: How would you instrument the pool so the wait shows up as its own span in traces?
+    redFlags:
+      - "Concludes 'the database is fine' because CPU is low"
+    tags: [latency, connection-pool, locks, debugging]
+  - id: scenario-scale-010
+    level: senior
+    type: design
+    q: "Design a read API that serves product details at a sustained 10k rps, peak 30k rps, p99 under 150 ms, data can be 60 seconds stale. What breaks first as traffic grows?"
+    hint: |-
+      (1) Tầng cache từ ngoài vào: **CDN** với `Cache-Control: public, max-age=30, stale-while-revalidate=30` (nếu response không phụ thuộc user) → phần lớn traffic không tới origin; Redis cache-aside cho miss; in-process LRU nhỏ cho key rất nóng.
+      (2) Origin: pod Node stateless, response pre-serialized (lưu string/Buffer đã gzip trong cache), CPU ≤ 65%; HPA theo rps/CPU + min replica đủ cho peak đã biết.
+      (3) DB: chỉ nhận miss → read replica, index đúng, PgBouncer; chống stampede bằng singleflight + stale-while-revalidate.
+      (4) Cái vỡ trước theo thứ tự thường gặp: cache stampede khi key nóng hết hạn → DB connection → Redis hot key/bandwidth → egress cost. Nói rõ bạn sẽ load test ở 1.5× peak và có load shedding khi vượt.
+    followUp: The product page now shows a per-user price. How does that change your CDN strategy?
+    redFlags:
+      - "Puts everything behind Redis but forgets stampede and hot keys"
+      - "Uses a CDN for a response that contains user-specific data without a cache key strategy"
+    tags: [design, caching, cdn, 10k-rps]
+  - id: scenario-scale-011
+    level: easy
+    type: concept
+    q: "Why would an API return `202 Accepted` instead of `201 Created` during a traffic spike, and what does the client need in the response?"
+    hint: |-
+      (1) `202` = "đã nhận, chưa xử lý xong" (RFC 9110). API chỉ validate + auth + ghi vào queue (vài ms), việc nặng để worker làm → API chịu burst tốt.
+      (2) Client cần: **job id** và cách biết kết quả — `Location: /jobs/{id}` để poll, webhook, hoặc push (WebSocket/SSE).
+      (3) Điều kiện: client gửi **idempotency key** (retry không tạo job trùng); queue phải durable (không phải array trong memory).
+      (4) Trade-off: UX không có kết quả ngay; không hợp cho thao tác user cần biết ngay (đăng nhập, kiểm tra tồn kho lúc thanh toán).
+    example: |-
+      ```http
+      POST /orders HTTP/1.1
+      Idempotency-Key: 7f3c...
+
+      HTTP/1.1 202 Accepted
+      Location: /orders/jobs/8812
+      Retry-After: 2
+      ```
+    followUp: The queue is down. What does the API return, and do you lose the order?
+    tags: [async, queue, http]
+  - id: scenario-scale-012
+    level: senior
+    type: design
+    q: "For 23 hours a day the system handles a few requests per minute. For one hour, traffic jumps 1000×. Design for this without paying for peak all day."
+    hint: |-
+      (1) Hỏi lại: peak **có giờ cố định** không (flash sale 20:00) hay bất ngờ? việc nào cần kết quả sync? SLO ở peak có được nới không?
+      (2) Tách **nhận** và **xử lý**: API stateless chỉ validate + enqueue → `202`; queue (SQS/Kafka) hấp thụ phần dư; worker autoscale theo **queue lag/depth**, không theo CPU.
+      (3) Scale kịp: peak đã biết → **scheduled scaling** 15–30 phút trước (pod API, worker, và cả DB/Redis nếu cần), pre-warm cache, warm pool node; reactive HPA chỉ để bù sai số. Cold start (node mới + image pull + app boot) tính bằng phút.
+      (4) Bảo vệ tầng dưới: rate limit theo user, load shedding khi vượt, batch write, idempotency; phần đọc qua CDN/cache. Cost: trả tiền peak ~1–2 giờ thay vì 24 giờ; nêu lựa chọn serverless (Lambda) cho API nếu concurrency limit và cold start chấp nhận được.
+    followUp: The peak is not predictable — it comes from a viral post. What changes?
+    redFlags:
+      - "Relies purely on CPU-based autoscaling reacting within seconds"
+      - "Adds a queue but still makes the client wait synchronously for the result"
+    tags: [spike, autoscaling, queue, cost]
+  - id: scenario-scale-013
+    level: hard
+    type: scenario
+    q: "Traffic goes from 100 to 50,000 rps in about 30 seconds at a flash sale. HPA is configured on CPU at 70%. What actually happens in the first five minutes?"
+    hint: |-
+      (1) Timeline: metrics-server/HPA lấy mẫu ~15 s → quyết định scale; pod mới cần **node** (cluster autoscaler thêm node: 1–3 phút+), image pull, app boot, readiness probe, warm connection/cache → 2–5 phút (verify theo môi trường). Trong thời gian đó pod cũ nhận 500× tải.
+      (2) Pod cũ quá tải → event loop lag → readiness/liveness fail → bị kill/rút khỏi LB → pod còn lại càng quá tải (cascading failure).
+      (3) Fix: scheduled scale-up trước giờ sale, overprovision (pause pod / buffer node), minReplicas cao trong khung giờ đó, scale theo metric dẫn trước (rps, queue depth) thay vì CPU; liveness không phụ thuộc DB/latency.
+      (4) Luôn có phanh: rate limit + load shedding ở gateway để pod cũ trả 503 nhanh thay vì chết; waiting room/queue cho flash sale.
+    followUp: Why is a liveness probe that checks the database dangerous during a spike?
+    redFlags:
+      - "Assumes new pods are ready in a few seconds"
+    verify: true
+    tags: [autoscaling, kubernetes, spike]
+  - id: scenario-scale-014
+    level: medium
+    type: gotcha
+    q: "Your queue consumers are autoscaled on CPU. During peak the queue lag grows to 2 million messages but the HPA never adds pods. Why?"
+    hint: |-
+      (1) Consumer I/O-bound (gọi DB/HTTP) → CPU thấp dù đang tụt lại; CPU không phải tín hiệu của "việc tồn đọng".
+      (2) Scale theo **lag/depth**: KEDA với Kafka consumer lag hoặc SQS `ApproximateNumberOfMessagesVisible`, hoặc HPA external metric; target = lag / (throughput mỗi pod × thời gian drain mong muốn).
+      (3) Giới hạn: Kafka — số consumer có ích ≤ số **partition** của topic; thêm pod quá số partition thì pod thừa ngồi không. SQS không có giới hạn đó nhưng DB phía sau có.
+      (4) Scale consumer = tăng tải lên DB/downstream → đặt maxReplicas theo capacity downstream, không theo lag.
+    followUp: You have 12 partitions and need 3× more throughput. What are your options?
+    redFlags:
+      - "Suggests lowering the CPU target to 10%"
+    tags: [autoscaling, kafka, queue]
+  - id: scenario-scale-015
+    level: hard
+    type: scenario
+    q: "The whole system is over capacity for 20 minutes and you cannot scale further. How do you decide which requests to drop, and where do you drop them?"
+    hint: |-
+      (1) Mục tiêu: giữ **goodput** (request thành công đúng hạn) thay vì để mọi request cùng chậm và timeout. Không shed = latency tăng vô hạn, rồi sập.
+      (2) Drop ở **càng sớm càng rẻ**: CDN/gateway (rate limit, waiting room) → LB → app (admission control theo event loop lag hoặc số in-flight request) → trước khi gọi DB.
+      (3) Ưu tiên: giữ checkout/đăng nhập, bỏ recommendation, search suggestion, analytics, request của bot; tenant/plan có SLA cao hơn được giữ; request đã chờ quá deadline thì bỏ luôn (client đã timeout).
+      (4) Trả `503` + `Retry-After` (có jitter) nhanh trong vài ms; client retry có backoff. Đo tỷ lệ shed như một SLI.
+    example: |-
+      ```ts
+      import { monitorEventLoopDelay } from 'node:perf_hooks';
+      const h = monitorEventLoopDelay({ resolution: 20 }); h.enable();
+      let inFlight = 0;
+      app.use((req, res, next) => {
+        const lagMs = h.percentile(99) / 1e6;
+        if ((lagMs > 200 || inFlight > 500) && !req.path.startsWith('/checkout')) {
+          res.set('Retry-After', String(1 + Math.floor(Math.random() * 3)));
+          return res.status(503).json({ error: 'overloaded' });
+        }
+        inFlight++; res.on('close', () => inFlight--); next();
+      });
+      setInterval(() => h.reset(), 5000).unref();
+      ```
+    followUp: How do you prevent clients from coming back all at once when you stop shedding?
+    redFlags:
+      - "Queues every request in memory 'so nothing is lost'"
+    tags: [load-shedding, overload, backpressure]
+  - id: scenario-scale-016
+    level: medium
+    type: compare
+    q: "When overloaded, should your API return `429` or `503`? What should the client do in each case?"
+    hint: |-
+      (1) `429 Too Many Requests` (RFC 6585): **client này** vượt quota của nó (per user/API key/tenant) — lỗi thuộc phía client, server vẫn khoẻ.
+      (2) `503 Service Unavailable` (RFC 9110): **server** không còn capacity hoặc đang bảo trì — không liên quan client cụ thể nào; load shedding dùng 503.
+      (3) Cả hai nên có `Retry-After`; client: exponential backoff + jitter, tôn trọng `Retry-After`, không retry request không idempotent nếu không có idempotency key.
+      (4) Gotcha: LB/CDN có thể biến 503 của bạn thành trang lỗi hoặc tự retry; alert tách riêng 429 (thường là bình thường) và 503 (sự cố).
+    followUp: A partner's SDK retries 429 immediately in a tight loop. How do you protect yourself?
+    redFlags:
+      - "Returns 500 for every overload case"
+      - "Uses 429 for global overload, so clients think they did something wrong"
+    tags: [http, rate-limiting, load-shedding]
+  - id: scenario-scale-017
+    level: senior
+    type: open
+    q: "For the 1-hour-a-day peak, compare: provision for peak all day, scheduled plus reactive autoscaling on containers, and serverless functions. Which would you pick and why?"
+    hint: |-
+      (1) Provision cho peak: đơn giản, không scale lag, nhưng trả tiền 24 giờ cho 1 giờ dùng; hợp khi peak không đoán trước và downtime rất đắt.
+      (2) Container + scheduled/reactive: rẻ nhất khi peak có giờ cố định; cần dự báo, vẫn có vài phút lag cho phần vượt dự báo; DB/Redis cũng phải scale theo lịch hoặc được size cho peak.
+      (3) Serverless (Lambda): scale nhanh theo request, không trả tiền lúc idle; nhưng có **concurrency limit theo account/region** (mặc định thường 1,000 — verify, có thể xin tăng), cold start, mỗi invocation mở DB connection → cần RDS Proxy; giá theo GB-s đắt hơn container ở tải cao liên tục.
+      (4) Chọn theo: độ đoán trước của peak, SLO, chi phí engineer vận hành, và **tầng dưới** (DB thường là giới hạn thật, không phải compute). Thường: API serverless hoặc container scheduled + queue + worker, DB size cho peak.
+    followUp: With Lambda, 3,000 concurrent executions each open a Postgres connection. What happens and how do you fix it?
+    redFlags:
+      - "Says serverless has infinite scale and no limits"
+    verify: true
+    tags: [cost, autoscaling, serverless]
+  - id: scenario-scale-018
+    level: hard
+    type: scenario
+    q: "At peak, 100,000 orders per minute arrive and your workers process 20,000 per minute. The peak lasts 60 minutes. The business wants each order processed within 10 minutes. Is the queue design OK?"
+    hint: |-
+      (1) Tính: dư 80k/phút × 60 phút = **4.8 triệu message backlog** ở cuối peak; drain với 20k/phút = **240 phút** → order cuối chờ ~4 giờ. Queue chỉ đổi "sập" thành "chậm", không tạo thêm capacity.
+      (2) Để giữ 10 phút: throughput worker ≥ tốc độ vào (100k/phút) với backlog tối đa 10 phút × throughput; tức cần ~5× worker **và** downstream (DB, payment) phải chịu 100k/phút.
+      (3) Nếu DB không chịu nổi: batch write, tách phần bắt buộc sync (giữ chỗ tồn kho) và phần để sau (email, analytics), hoặc thương lượng SLO (xác nhận nhận order ngay, xử lý trong 1 giờ).
+      (4) Theo dõi **age of oldest message** (không chỉ depth) và alert khi vượt SLO; kiểm tra retention của queue (SQS mặc định 4 ngày, Kafka theo `retention.ms`).
+    example: |-
+      ```text
+      inflow  = 100k/min, capacity = 20k/min, duration = 60 min
+      backlog = (100k - 20k) × 60 = 4.8M
+      drain   = 4.8M / 20k = 240 min after peak (if inflow drops to 0)
+      ```
+    followUp: Which metric do you autoscale on, depth or oldest-message age, and why?
+    redFlags:
+      - "Says 'the queue absorbs it' without doing the arithmetic"
+    verify: true
+    tags: [queue, capacity, estimation]
+  - id: scenario-scale-019
+    level: easy
+    type: compare
+    q: "A handler awaits three independent calls one after another: user (40 ms), cart (60 ms), recommendations (120 ms). What is the latency, and how do you improve it?"
+    hint: |-
+      (1) Tuần tự: 40 + 60 + 120 = **220 ms**. `Promise.all` với 3 call độc lập: ≈ max = **120 ms**.
+      (2) Chỉ song song khi **không phụ thuộc dữ liệu** nhau; nếu cart cần userId thì user phải chạy trước.
+      (3) Cái chậm nhất quyết định latency → call không quan trọng (recommendations) nên có timeout ngắn và fallback, dùng `Promise.allSettled` để một cái lỗi không làm hỏng cả response.
+      (4) Song song hoá cũng tăng **concurrency tức thời** lên downstream (3 connection cùng lúc thay vì 1).
+    example: |-
+      ```ts
+      const [user, cart, recs] = await Promise.allSettled([
+        getUser(id),
+        getCart(id),
+        getRecs(id, { signal: AbortSignal.timeout(80) }),
+      ]);
+      ```
+    followUp: What happens to the other two calls if `getUser` rejects inside `Promise.all`?
+    tags: [concurrency, promise-all]
+  - id: scenario-scale-020
+    level: medium
+    type: debug
+    q: "A nightly job enriches 20,000 products by calling a supplier API. It worked with 200 products; now the supplier returns 429s and the job's DB pool errors out. Fix it."
+    example: |-
+      ```ts
+      const products = await repo.findAllToEnrich(); // 20,000 rows
+      await Promise.all(
+        products.map(async (p) => {
+          const data = await supplier.get(`/items/${p.sku}`);
+          await repo.update(p.id, data);
+        }),
+      );
+      ```
+    hint: |-
+      (1) `Promise.all` trên 20k phần tử = **20k request bắn cùng lúc** (unbounded concurrency) → vượt rate limit bên cung cấp, 20k `repo.update` tranh pool 10 connection, memory giữ 20k promise + response.
+      (2) Fix: bounded concurrency (`p-limit`/`p-map` với `concurrency: 10`), tốc độ theo quota bên cung cấp (token bucket), retry 429/5xx có backoff + jitter + tôn trọng `Retry-After`.
+      (3) Đọc DB theo batch/cursor thay vì load 20k row một lần; ghi batch (`UPDATE … FROM unnest(...)`).
+      (4) Một lỗi trong `Promise.all` làm job "fail" nhưng các request khác vẫn chạy tiếp — dùng `allSettled` hoặc thu thập lỗi từng item + checkpoint để chạy lại được.
+    followUp: How do you pick the concurrency number — 5, 50 or 500?
+    redFlags:
+      - "Replaces Promise.all with a sequential for-await loop and calls it done (20,000 × 200 ms = 67 minutes)"
+    tags: [concurrency, p-limit, rate-limit, debug]
+  - id: scenario-scale-021
+    level: medium
+    type: gotcha
+    q: "`Promise.all` rejected after 50 ms because one call failed. Are the other calls cancelled? What are the consequences in production?"
+    hint: |-
+      (1) **Không**. Promise không có cancel: `Promise.all` chỉ reject sớm, các call khác vẫn chạy, vẫn giữ connection, vẫn ghi DB, và kết quả bị bỏ.
+      (2) Hệ quả: tải vô ích khi downstream đang lỗi; side effect (ghi DB, trừ tiền) vẫn xảy ra dù client đã nhận 500; các rejection đến sau không gây unhandled rejection (`Promise.all` đã gắn handler) nhưng bị **nuốt mất**, không ai log.
+      (3) Muốn huỷ thật: truyền `AbortSignal` chung xuống `fetch`/DB driver hỗ trợ, `controller.abort()` khi một cái lỗi; hoặc huỷ khi client ngắt (`req.on('close')`).
+      (4) Chọn `all` (cần tất cả), `allSettled` (partial response), `any`/`race` (lấy cái nhanh nhất — hedged request).
+    example: |-
+      ```ts
+      const ac = new AbortController();
+      try {
+        const [a, b] = await Promise.all([
+          fetch(urlA, { signal: ac.signal }),
+          fetch(urlB, { signal: ac.signal }),
+        ]);
+      } catch (e) {
+        ac.abort(); // stop the calls that are still running
+        throw e;
+      }
+      ```
+    followUp: How do you cancel a Postgres query that is already running when the client disconnects?
+    tags: [promise-all, cancellation, abortcontroller]
+  - id: scenario-scale-022
+    level: hard
+    type: scenario
+    q: "A downstream service slows down from 50 ms to 2 s. Within minutes its traffic triples and it falls over completely. You have gateway → API → service, each with 3 retries. Explain and fix."
+    hint: |-
+      (1) **Retry storm**: timeout ở mỗi tầng → retry 3 lần ở mỗi tầng = tối đa (1+3)³ = **64×** tải tại service cuối (hoặc 27× nếu tính 3 lần thử/tầng). Service chậm vì quá tải, retry làm nó quá tải hơn.
+      (2) Fix theo ưu tiên: retry ở **một tầng** thôi (thường gần client nhất có idempotency), exponential backoff + **jitter**, **retry budget** (retry ≤ 10% số request), không retry khi nhận 503/`Retry-After` quá sớm.
+      (3) Circuit breaker: lỗi/timeout vượt ngưỡng → fail fast một thời gian, trả fallback; timeout tầng ngoài > tổng timeout tầng trong (deadline propagation).
+      (4) Server bị gọi nên load shed và trả 503 nhanh; client nên có concurrency limit tới dependency (bulkhead).
+    example: |-
+      ```text
+      gateway (3 retries) → api (3 retries) → service (3 retries) → db
+      1 user request can become up to 4 × 4 × 4 = 64 DB calls
+      ```
+    followUp: Where does the idempotency key get checked so that a retried write is safe?
+    redFlags:
+      - "Adds more retries 'to improve reliability'"
+      - "Retries immediately without jitter"
+    tags: [retry-storm, circuit-breaker, resilience]
+  - id: scenario-scale-023
+    level: medium
+    type: design
+    q: "`POST /orders` validates, writes the order, sends an email, pushes a notification, syncs to CRM, and writes an audit log — all before responding. p99 is 3 s. How do you split it?"
+    hint: |-
+      (1) Giữ **sync** chỉ những gì client cần để biết kết quả: validate, kiểm tra/giữ tồn kho, ghi order (transaction ngắn). Trả `201` ngay.
+      (2) Còn lại async: email, push, CRM, analytics → publish event. Để không mất event khi crash giữa "ghi DB" và "publish": **transactional outbox** (ghi order + outbox row trong cùng transaction, relay publish sau).
+      (3) Audit log: nếu là yêu cầu compliance → ghi cùng transaction (hoặc outbox), không fire-and-forget không await.
+      (4) Trade-off: eventual consistency (CRM chậm vài giây), consumer phải idempotent, cần DLQ + alert khi một bước async lỗi.
+    followUp: Why is "write to DB, then `await producer.send()`" not enough?
+    redFlags:
+      - "Uses fire-and-forget promises without await as the 'async' part"
+    tags: [async, outbox, latency]
+  - id: scenario-scale-024
+    level: medium
+    type: scenario
+    q: "An API is reported as \"slow\". Walk me through how you find where the time is spent, step by step."
+    hint: |-
+      (1) Làm rõ: chậm với **ai** (1 user, 1 tenant, 1 region, mọi người), **từ khi nào** (deploy? traffic tăng?), p50 hay p99 chậm, endpoint nào.
+      (2) Chia đoạn: client/network (DNS, TLS, download) → LB → app (event loop lag, CPU) → DB (pool wait, query, lock) → bên thứ ba. Dùng distributed tracing (OpenTelemetry) để thấy span dài nhất; không có tracing thì log timing từng bước + header `Server-Timing`.
+      (3) Áp RED (Rate, Errors, Duration) cho endpoint và USE (Utilization, Saturation, Errors) cho tài nguyên (CPU, pool, memory, disk).
+      (4) Fix đúng đoạn: query → `EXPLAIN (ANALYZE, BUFFERS)`, index; N+1 → gộp query; bên thứ ba → timeout/cache; CPU → profile. Đo lại sau fix.
+    example: |-
+      ```http
+      HTTP/1.1 200 OK
+      Server-Timing: db;dur=412, cache;desc="miss";dur=2, render;dur=38, ext-pricing;dur=910
+      ```
+    followUp: Tracing shows a 900 ms gap with no child span inside the request. What could that be?
+    redFlags:
+      - "Starts by rewriting code or adding cache before measuring"
+      - "Only checks the database"
+    tags: [latency, methodology, tracing]
+  - id: scenario-scale-025
+    level: medium
+    type: scenario
+    q: "Server-side logs say the endpoint takes 40 ms, but users on mobile see 3 seconds. What's in between?"
+    hint: |-
+      (1) Server đo từ lúc nhận request tới lúc **ghi xong vào socket buffer**, không tính: DNS, TCP + TLS handshake (2–3 RTT, mobile RTT 100–300 ms), thời gian **tải body**, và thời gian chờ ở LB/queue trước khi tới Node.
+      (2) Payload lớn: 3 MB trên mạng 10 Mbit/s = 24 Mbit / 10 = **2.4 s** chỉ để tải, dù server 40 ms.
+      (3) Đo: RUM (Navigation/Resource Timing API: `responseStart`, `responseEnd`), LB access log (target processing time vs total), so sánh TTFB với content download.
+      (4) Fix: nén (gzip/brotli ở proxy/CDN), giảm payload (pagination, projection), CDN gần user, keep-alive/HTTP2 để bỏ handshake lặp.
+    followUp: How do you measure what the user actually experienced, not what the server thinks?
+    redFlags:
+      - "Blames the user's phone without checking payload size or TTFB vs download"
+    tags: [latency, network, payload]
+  - id: scenario-scale-026
+    level: hard
+    type: scenario
+    q: "p99 spikes to 1.2 s on some pods while their average CPU is 45% of the limit. The pods have `resources.limits.cpu: 1`. What's a likely cause that doesn't show in average CPU?"
+    hint: |-
+      (1) **CPU throttling (CFS quota)**: limit 1 CPU = 100 ms CPU mỗi chu kỳ 100 ms. Node dùng nhiều thread (V8 GC, libuv threadpool) → burst dùng hết quota sớm trong chu kỳ, cả process bị dừng tới chu kỳ sau → latency nhảy từng bậc ~100 ms, dù trung bình chỉ 45%.
+      (2) Xác nhận: metric `container_cpu_cfs_throttled_periods_total` / `throttled_seconds`, so với latency; event loop lag spike cùng lúc.
+      (3) Fix: tăng hoặc bỏ CPU limit (giữ request), dùng pod nhỏ số lượng nhiều, giảm việc CPU burst (GC do allocation lớn, stringify payload to), `UV_THREADPOOL_SIZE` hợp với CPU thật.
+      (4) Nguyên nhân tail khác cần loại trừ: GC pause dài (heap lớn), noisy neighbour, pod vừa start chưa warm (JIT, connection).
+    followUp: Why can a Node process use more than one CPU even though JavaScript runs on one thread?
+    redFlags:
+      - "Says CPU is fine because average utilisation is below the limit"
+    verify: true
+    tags: [kubernetes, cpu-throttling, tail-latency]
+  - id: scenario-scale-027
+    level: medium
+    type: debug
+    q: "This timing middleware reports every request at 0–1 ms, yet users see 800 ms. What's wrong with the measurement?"
+    example: |-
+      ```ts
+      app.use((req, res, next) => {
+        const start = Date.now();
+        next();
+        const ms = Date.now() - start;
+        metrics.histogram('http_duration_ms', ms, { route: req.path });
+      });
+      ```
+    hint: |-
+      (1) `next()` trả về ngay khi handler async bắt đầu `await` → đo được thời gian **đồng bộ** trước `await` đầu tiên, không phải thời gian request.
+      (2) Fix: đo khi response kết thúc — `res.on('finish')` (đã gửi xong) và `res.on('close')` (client ngắt sớm); dùng `performance.now()`/`process.hrtime.bigint()` thay `Date.now()` (monotonic, chính xác hơn).
+      (3) Label bằng **route template** (`/orders/:id`), không phải `req.path` (`/orders/123`) → tránh cardinality bùng nổ trong Prometheus.
+      (4) Tốt hơn: dùng OpenTelemetry HTTP instrumentation thay vì tự viết.
+    followUp: "The fixed version shows p99 of 800 ms, but tracing shows the handler took 50 ms. Where did 750 ms go?"
+    tags: [metrics, debug, latency]
+  - id: scenario-scale-028
+    level: hard
+    type: scenario
+    q: "A read-heavy endpoint (product listing) suddenly goes from 500 to 8,000 rps and the database is at 100% CPU. What do you do in the first 15 minutes, and after?"
+    hint: |-
+      (1) **Cầm máu**: rate limit endpoint/IP/key, giảm page size tối đa, tắt filter/sort nặng bằng feature flag, trả stale cache thay vì lỗi. Không tối ưu code khi đang cháy.
+      (2) Xác định nguồn: traffic thật (campaign) hay **bot/crawler/bug client** (retry loop, polling mỗi 100 ms)? Top IP/user-agent/API key trong access log; cache hit ratio có tụt (deploy đổi cache key, Redis restart → stampede)?
+      (3) Sau đó: cache-aside + stale-while-revalidate + singleflight, CDN cho response public, keyset pagination thay OFFSET, index đúng cho WHERE + ORDER BY, read replica.
+      (4) Scale app không giúp khi DB là bottleneck — nói rõ điều đó. Kết thúc bằng postmortem: alert trên cache hit ratio và DB CPU, rate limit mặc định.
+    followUp: Hit ratio dropped from 95% to 20% right after a deploy. What are the likely causes?
+    redFlags:
+      - "Scales the API pods first"
+    tags: [read-heavy, overload, incident, caching]
+  - id: scenario-scale-029
+    level: senior
+    type: design
+    q: "A write-heavy endpoint (event ingestion, 5k writes/s normally) gets a 10× spike. How do you protect the database and the correctness of the data?"
+    hint: |-
+      (1) Ưu tiên **không mất và không trùng** data hơn là latency. Ngay lập tức: rate limit theo client, reject sớm payload sai, `429`/`503` + `Retry-After` thay vì để DB chết.
+      (2) Tách nhận khỏi ghi: API validate → ghi vào log/queue durable (Kafka/SQS/Kinesis) → `202`; worker ghi DB với tốc độ DB chịu được (backpressure = consumer kéo, không bị đẩy).
+      (3) Ghi hiệu quả: batch insert (multi-row `INSERT`, `COPY`), append-only thay update, partition theo thời gian; idempotency (unique key `event_id` + `ON CONFLICT DO NOTHING`) vì queue là at-least-once.
+      (4) Hot partition: key phân bố đều (không dùng 1 tenant lớn làm partition key duy nhất). Đo: queue depth/age, write latency, DLQ rate. Trade-off: data vào DB chậm vài giây–phút (eventual).
+    followUp: Your queue is full too. What is the last line of defence?
+    redFlags:
+      - "Buffers writes in an in-memory array in the API process"
+      - "Forgets idempotency when adding a queue"
+    tags: [write-heavy, queue, idempotency, backpressure]
+  - id: scenario-scale-030
+    level: medium
+    type: debug
+    q: "A worker writes events to Postgres at 5,000 per second and the database is saturated. Improve this."
+    example: |-
+      ```ts
+      consumer.on('message', async (e) => {
+        await db.query(
+          'INSERT INTO events (id, tenant_id, type, payload, created_at) VALUES ($1, $2, $3, $4, $5)',
+          [e.id, e.tenantId, e.type, e.payload, e.createdAt],
+        );
+      });
+      ```
+    hint: |-
+      (1) Mỗi event = 1 round-trip + 1 transaction commit (WAL fsync) → 5k commit/s. Gom **batch** (vd 500 row hoặc 200 ms, cái nào tới trước).
+      (2) Postgres: 1 câu `INSERT … SELECT * FROM unnest($1::uuid[], $2::text[], …)` (số parameter cố định, không vướng giới hạn 65,535 parameter), hoặc `COPY … FROM STDIN` (nhanh nhất cho lượng lớn). Thêm `ON CONFLICT (id) DO NOTHING` cho idempotent.
+      (3) Commit offset/ack **sau khi batch ghi thành công**; batch lỗi → chia nhỏ để tìm row hỏng → DLQ.
+      (4) SQL Server khác: giới hạn 2,100 parameter/câu và 1,000 row cho `VALUES` → dùng table-valued parameter hoặc `SqlBulkCopy`.
+    followUp: Batching adds up to 200 ms of latency per event. When is that unacceptable?
+    tags: [batch-write, postgres, sql-server, debug]
+  - id: scenario-scale-031
+    level: hard
+    type: debug
+    q: "To survive write spikes, someone added an in-memory buffer that flushes to the database every second. During the last spike pods were OOMKilled and events were lost. Review it."
+    example: |-
+      ```ts
+      const buffer: Event[] = [];
+      app.post('/events', (req, res) => {
+        buffer.push(req.body);
+        res.status(202).end();
+      });
+      setInterval(async () => {
+        const batch = buffer.splice(0, buffer.length);
+        if (batch.length) await repo.insertMany(batch);
+      }, 1000);
+      ```
+    hint: |-
+      (1) **Unbounded buffer**: khi DB chậm hơn tốc độ vào, `buffer` tăng không giới hạn → OOM. Không có backpressure: API luôn trả 202 dù không thể xử lý.
+      (2) **Mất data**: đã trả 202 nhưng event chỉ nằm trong RAM → pod crash/deploy/OOM là mất; `insertMany` lỗi thì `batch` đã bị `splice` ra và bị bỏ; `setInterval` async có thể chạy chồng nhau khi insert > 1 s.
+      (3) Fix: ghi vào queue/log **durable** trước khi trả 202 (Kafka/SQS), worker tách riêng ghi batch; nếu buộc phải buffer trong process thì **giới hạn** (max N item/bytes) và trả `503` khi đầy, flush khi SIGTERM, retry batch lỗi.
+      (4) Nguyên tắc: 202 là **lời hứa** — chỉ trả khi dữ liệu đã được lưu ở nơi sống sót qua crash.
+    followUp: How do you drain the buffer correctly on SIGTERM during a rolling deploy?
+    redFlags:
+      - "Only suggests increasing pod memory"
+    tags: [backpressure, memory, data-loss, debug]
+  - id: scenario-scale-032
+    level: easy
+    type: scenario
+    q: "An endpoint returns a 3 MB JSON response and it's slow. Before optimising, what do you want to know?"
+    hint: |-
+      (1) **Ai dùng** và dùng bao nhiêu: UI chỉ hiển thị 20 dòng hay job export cần toàn bộ? Client cần field nào?
+      (2) **Tần suất & độ tươi**: gọi bao nhiêu lần/giây, dữ liệu đổi bao lâu một lần, giống nhau cho mọi user hay theo user/tenant?
+      (3) **Chậm ở đâu**: query DB, `JSON.stringify` (CPU), nén, hay tải qua mạng (3 MB trên 10 Mbit/s ≈ 2.4 s)?
+      (4) Từ đó chọn: pagination/projection (làm ít việc hơn), nén ở proxy, cache response đã serialize, hoặc stream/NDJSON cho export.
+    followUp: The client really needs all 20,000 rows for an offline mode. What now?
+    tags: [payload, clarify, json]
+  - id: scenario-scale-033
+    level: medium
+    type: compare
+    q: "gzip or brotli for a dynamic 3 MB JSON API response? Where should compression happen?"
+    hint: |-
+      (1) JSON lặp key nhiều nên nén rất tốt (thường vài lần đến >10×, **phụ thuộc data — đo trên payload thật**). Brotli thường nhỏ hơn gzip ở mức cùng tốc độ, nhưng **brotli quality cao (10–11) rất tốn CPU** — hợp cho asset tĩnh nén trước, không hợp cho response động mỗi request.
+      (2) Cho response động: gzip level ~6 hoặc brotli quality thấp (4–5); đo CPU/request và kích thước. Node `zlib` brotli mặc định quality 11 nếu không set (verify với thư viện bạn dùng).
+      (3) Nén ở **reverse proxy/CDN** (nginx, ALB/CloudFront, Cloudflare) thay vì trong Node: không chiếm event loop/threadpool của app, CDN có thể cache bản đã nén.
+      (4) Nén không thay được việc giảm payload: client vẫn phải giải nén và parse 3 MB JSON (tốn CPU điện thoại).
+    followUp: "What does `Vary: Accept-Encoding` do, and what breaks if it's missing behind a CDN?"
+    redFlags:
+      - "Quotes a fixed ratio like '3 MB → 400 KB' as a fact"
+      - "Enables brotli at maximum quality for every dynamic response"
+    verify: true
+    tags: [compression, brotli, gzip, payload]
+  - id: scenario-scale-034
+    level: medium
+    type: gotcha
+    q: "After adding `app.use(compression())`, CPU per request went up, the CDN still compresses, and your Server-Sent Events endpoint stopped delivering events in real time. Explain."
+    hint: |-
+      (1) Nén 2 lần/lãng phí: Node nén, CDN/proxy nhận body đã nén (hoặc giải nén rồi nén lại) → CPU app tăng mà không có lợi. Chỉ nén **một chỗ**, tốt nhất ở proxy/CDN.
+      (2) SSE/streaming: middleware nén **buffer** dữ liệu cho tới khi đủ block → event bị giữ lại. Cần gọi `res.flush()` (middleware `compression` thêm method này) sau mỗi event, hoặc tắt nén cho `text/event-stream`.
+      (3) Nén chạy trong libuv threadpool (zlib async) — nhiều response lớn cùng lúc có thể chiếm threadpool (mặc định 4 thread) và làm chậm `fs`/`dns.lookup`/crypto.
+      (4) Payload nhỏ (< ~1 KB) không nên nén (middleware có `threshold`).
+    example: |-
+      ```ts
+      app.use(compression({
+        threshold: 1024,
+        filter: (req, res) =>
+          res.getHeader('Content-Type')?.toString().startsWith('text/event-stream')
+            ? false
+            : compression.filter(req, res),
+      }));
+      ```
+    followUp: Which Node APIs share the libuv threadpool with zlib?
+    verify: true
+    tags: [compression, sse, gotcha]
+  - id: scenario-scale-035
+    level: medium
+    type: gotcha
+    q: "You added ETags so clients get `304 Not Modified`. Bandwidth dropped, but server CPU for the 3 MB endpoint did not. Why?"
+    hint: |-
+      (1) Express mặc định tạo **weak ETag bằng cách hash body** trong `res.send` → server vẫn query DB, vẫn `JSON.stringify` 3 MB, vẫn hash, rồi mới biết trả 304. ETag kiểu này tiết kiệm **bandwidth**, không tiết kiệm **CPU**.
+      (2) Fix: tính ETag **trước khi** làm việc nặng — từ version/`updated_at` của dữ liệu (`W/"catalog-v1842"`), so với `If-None-Match` và trả 304 sớm.
+      (3) Kết hợp cache: lưu sẵn string/Buffer đã serialize (và đã nén) theo version; `Cache-Control: max-age` để client không cần hỏi lại trong X giây.
+      (4) Chú ý ETag phải khác nhau theo user/tenant nếu response khác nhau, và theo `Content-Encoding`.
+    example: |-
+      ```ts
+      app.get('/catalog', async (req, res) => {
+        const version = await redis.get('catalog:version');       // cheap
+        const etag = `W/"catalog-${version}"`;
+        if (req.headers['if-none-match'] === etag) return res.status(304).end();
+        const body = await getSerializedCatalog(version);          // cached string
+        res.set({ ETag: etag, 'Cache-Control': 'private, max-age=30' }).type('json').send(body);
+      });
+      ```
+    followUp: How do you make this work when the response differs per tenant?
+    tags: [etag, http-caching, gotcha]
+  - id: scenario-scale-036
+    level: senior
+    type: design
+    q: "Redesign an endpoint that returns a 3 MB product catalog JSON and is called 200 times per second by a mobile app. Give the options in the order you'd apply them and the trade-offs."
+    hint: |-
+      (1) Bandwidth hiện tại: 200 × 3 MB = 600 MB/s ≈ 4.8 Gbit/s egress → chi phí và CPU stringify là vấn đề chính.
+      (2) Làm ít hơn: **pagination** (keyset) + **projection** (`?fields=`) → mỗi màn hình vài chục KB; **delta sync** (`?since=version`) cho app cần offline.
+      (3) Làm rẻ hơn: pre-serialize theo version, lưu Buffer đã gzip trong Redis/memory, ETag theo version → 304; đưa lên **CDN** nếu cùng nội dung cho nhiều user (hoặc file tĩnh trên S3 + CDN, tạo lại khi catalog đổi).
+      (4) Trade-off: pagination/delta cần đổi client (app cũ vẫn gọi endpoint cũ → giữ version API); CDN/static snapshot có độ trễ cập nhật; delta sync phải xử lý xoá (tombstone).
+    followUp: How do you roll this out when old app versions in the store still call the 3 MB endpoint?
+    redFlags:
+      - "Only adds compression"
+    tags: [payload, design, cdn, pagination]
+  - id: scenario-scale-037
+    level: easy
+    type: concept
+    q: "Why does `JSON.stringify` on a 3 MB object affect every other request on a Node server, and how do you measure how long it blocks?"
+    hint: |-
+      (1) `JSON.stringify` chạy **đồng bộ** trên main thread, không yield → trong lúc đó event loop không xử lý request, timer, I/O callback, heartbeat WebSocket khác.
+      (2) Thời gian phụ thuộc CPU, hình dạng object (nhiều object nhỏ lồng nhau chậm hơn vài string dài), `toJSON`/replacer — **đo, đừng tin bảng số trên mạng**. Thường là vài ms đến vài chục ms cho vài MB (verify).
+      (3) Đo: `performance.now()` quanh lời gọi với payload thật; production dùng `monitorEventLoopDelay()` (p99 lag), `--cpu-prof` để thấy `JSON.stringify` trong flame graph.
+      (4) Hệ quả nhân lên: 50 request cùng lúc × 20 ms = 1 s event loop bận → p99 của **mọi** endpoint tăng.
+    example: |-
+      ```ts
+      import { performance } from 'node:perf_hooks';
+      const t0 = performance.now();
+      const s = JSON.stringify(bigObject);
+      console.log({ ms: performance.now() - t0, mb: Buffer.byteLength(s) / 1e6 });
+      ```
+    followUp: How would you prove in production that stringify is the cause of p99 spikes?
+    verify: true
+    tags: [event-loop, json, measurement]
+  - id: scenario-scale-038
+    level: hard
+    type: debug
+    q: "This \"streaming JSON\" endpoint was meant to avoid a big `JSON.stringify`. Clients receive broken JSON and memory still spikes. Find every bug."
+    example: |-
+      ```ts
+      app.get('/export', (req, res) => {
+        const stream = db.queryStream('SELECT * FROM orders'); // object mode, one row per 'data'
+        res.write('[');
+        stream.on('data', (row) => {
+          res.write(JSON.stringify(row));
+        });
+        res.end(']');
+      });
+      ```
+    hint: |-
+      (1) `res.end(']')` chạy **ngay lập tức** (đồng bộ), trước khi row nào tới → response kết thúc là `[]`, rồi `res.write` sau đó ném `ERR_STREAM_WRITE_AFTER_END`.
+      (2) Thiếu **dấu phẩy** giữa các phần tử → `[{…}{…}]` không phải JSON hợp lệ.
+      (3) Bỏ qua **backpressure**: `res.write()` trả `false` khi buffer đầy nhưng code vẫn đọc tiếp → client chậm thì mọi row dồn vào memory. Không xử lý `error` của stream DB và client ngắt kết nối (`close`) → query chạy tiếp.
+      (4) Fix: `pipeline(dbStream, transform thêm '[' , ',' , ']', res)` hoặc async iteration + `await once(res, 'drain')` khi `write` trả false; set `Content-Type`; cân nhắc **NDJSON** (mỗi dòng 1 object) để khỏi quản lý dấu phẩy.
+    followUp: "Show the async-iterator version with correct backpressure, commas and error handling."
+    redFlags:
+      - "Only spots the missing commas"
+    tags: [streams, backpressure, json, debug]
+  - id: scenario-scale-039
+    level: hard
+    type: gotcha
+    q: "A colleague proposes: \"Move `JSON.stringify(bigObject)` into a worker thread by passing `bigObject` as `workerData`, so the main thread isn't blocked.\" Does it work?"
+    hint: |-
+      (1) **Không như mong đợi**: `workerData`/`postMessage` dùng **structured clone** — main thread phải serialize (clone) toàn bộ object 3 MB **đồng bộ** trước khi gửi. Chi phí chỉ **chuyển chỗ**, thường tương đương hoặc hơn chính `stringify`.
+      (2) Chiều về: string kết quả cũng bị copy lại main thread. Tạo `new Worker` mỗi request còn tốn thêm chục ms khởi động isolate.
+      (3) Worker có ích khi **input/output nhỏ, tính toán lớn** (hash, resize ảnh từ buffer, parse file đọc ngay trong worker) hoặc dữ liệu được **transfer** (`ArrayBuffer` trong `transferList`, zero-copy), và luôn qua worker pool (piscina) có giới hạn.
+      (4) Với 3 MB JSON, fix đúng là **không tạo object to trên main thread**: để worker tự query DB và stringify, stream, pre-serialize + cache, hoặc `fast-json-stringify`.
+    example: |-
+      ```ts
+      // main thread still pays: structured clone of bigObject (sync)
+      new Worker('./stringify.js', { workerData: bigObject });
+      // better: pass a small query and let the worker load + serialize
+      pool.run({ reportId: 42 }); // piscina, worker returns a transferable Buffer
+      ```
+    followUp: What can be passed in `transferList`, and what happens to it on the sending side?
+    redFlags:
+      - "Says worker_threads make any CPU cost free for the main thread"
+    tags: [worker-threads, structured-clone, json, gotcha]
+  - id: scenario-scale-040
+    level: medium
+    type: concept
+    q: "What is `fast-json-stringify` (used by Fastify response schemas), why is it faster, and what are the pitfalls?"
+    hint: |-
+      (1) Từ **JSON Schema** của response, nó sinh sẵn hàm serialize chuyên cho shape đó → không phải duyệt/đoán kiểu từng key như `JSON.stringify` tổng quát. Nhanh hơn rõ với object có shape cố định (mức tăng phụ thuộc payload — đo).
+      (2) Lợi ích phụ: **field không có trong schema bị bỏ** → không vô tình trả `passwordHash`, field nội bộ.
+      (3) Pitfall: schema sai/lỗi thời → field mới **im lặng biến mất**; type mismatch bị ép kiểu (vd string thành number) thay vì lỗi; vẫn là đồng bộ — payload 30 MB vẫn block.
+      (4) Nó giảm hằng số, không đổi bài toán: payload quá lớn vẫn phải pagination/stream.
+    example: |-
+      ```ts
+      app.get('/products', {
+        schema: { response: { 200: { type: 'array', items: {
+          type: 'object',
+          properties: { id: { type: 'string' }, name: { type: 'string' }, price: { type: 'number' } },
+        } } } },
+      }, async () => repo.list());
+      ```
+    followUp: A new field `discount` was added to the DB model but clients never receive it. What's the first thing you check?
+    verify: true
+    tags: [fastify, serialization, json]
+  - id: scenario-scale-041
+    level: medium
+    type: scenario
+    q: "The same 3 MB catalog JSON is served to thousands of users and it changes about once an hour. How do you stop paying the serialization and compression cost on every request?"
+    hint: |-
+      (1) **Pre-serialize** khi dữ liệu đổi (event/cron), không phải khi request tới: tạo string JSON **và** Buffer đã gzip/brotli một lần, gắn version.
+      (2) Lưu ở memory của pod (vài MB là rẻ) hoặc Redis/S3; request chỉ `res.end(buffer)` với `Content-Encoding` đúng theo `Accept-Encoding` → gần như 0 CPU.
+      (3) Invalidate: version tăng → rebuild; tránh nhiều pod cùng rebuild một lúc (lock/singleflight hoặc 1 job build rồi publish).
+      (4) Thêm ETag theo version + CDN; trade-off: memory mỗi pod, dữ liệu stale tới khi rebuild xong.
+    example: |-
+      ```ts
+      import { gzipSync } from 'node:zlib';
+      let snapshot: { version: string; gz: Buffer } | undefined;
+      async function rebuild(version: string) {              // off the request path
+        const json = JSON.stringify(await repo.loadCatalog());
+        snapshot = { version, gz: gzipSync(json, { level: 6 }) }; // once per change
+      }
+      app.get('/catalog', (req, res) => {
+        res.set({ 'Content-Type': 'application/json', 'Content-Encoding': 'gzip', ETag: `W/"${snapshot!.version}"` });
+        res.end(snapshot!.gz);
+      });
+      ```
+    followUp: "A client doesn't send `Accept-Encoding: gzip`. What do you serve?"
+    tags: [serialization, caching, compression]
+  - id: scenario-scale-042
+    level: medium
+    type: compare
+    q: "For a large export over HTTP, compare streaming a JSON array vs NDJSON (newline-delimited JSON). Which would you choose?"
+    hint: |-
+      (1) JSON array stream: client chuẩn (`res.json()`) đọc được, nhưng server phải tự quản lý `[`, `,`, `]`, và client thường vẫn **parse cả khối** vào memory (trừ khi dùng streaming parser như `stream-json`).
+      (2) NDJSON (`application/x-ndjson`): mỗi dòng 1 object → server `write(JSON.stringify(row) + '\n')`, client parse **từng dòng**, xử lý dần, resume từ dòng N dễ; lỗi giữa chừng chỉ hỏng phần cuối.
+      (3) Cả hai đều cần backpressure và xử lý lỗi sau khi đã gửi `200` (không đổi được status code nữa → ghi một dòng/trailer lỗi hoặc cắt kết nối để client biết là không đầy đủ).
+      (4) Export rất lớn/lâu → không stream qua request: job nền ghi file lên S3, trả link (xem thêm 33-scenario-files-streaming).
+    followUp: The stream fails after 2 million rows. How does the client know the export is incomplete?
+    tags: [ndjson, streaming, export]
+  - id: scenario-scale-043
+    level: easy
+    type: scenario
+    q: "Your dashboard shows a Node pod at 1.2 GB RSS. Is that a memory leak? What would convince you either way?"
+    hint: |-
+      (1) Một con số không nói gì — cần **đường cong theo thời gian**. Leak: `heapUsed` **sau GC** tăng đều theo thời gian/số request, không bao giờ về lại mức nền. Không leak: răng cưa (sawtooth) ổn định, hoặc lên một mức rồi phẳng (cache đã đầy, V8 giữ heap đã cấp).
+      (2) Tách thành phần với `process.memoryUsage()`: `heapUsed` (JS object), `external`/`arrayBuffers` (Buffer), `rss` (tất cả, gồm native, stack, fragmentation). RSS cao mà heap nhỏ → nghi Buffer/native addon.
+      (3) Dấu hiệu khác: GC chạy nhiều và lâu hơn, latency tăng dần, cuối cùng `JavaScript heap out of memory` hoặc OOMKilled (exit 137).
+      (4) RSS thường không giảm ngay kể cả khi heap đã được GC (allocator giữ lại page) → đừng kết luận từ RSS một mình.
+    followUp: heapUsed is flat at 300 MB but RSS grows 50 MB per hour. Where do you look?
+    tags: [memory, leak, rss, heap]
+  - id: scenario-scale-044
+    level: medium
+    type: scenario
+    q: "Explain the 3-snapshot technique for finding a memory leak in Node, and how you'd do it safely against production traffic."
+    hint: |-
+      (1) Warm up (cache, JIT đã ổn) → snapshot 1 → chạy tải/thao tác nghi ngờ N lần → snapshot 2 → lặp lại → snapshot 3. Trong DevTools, xem object **được tạo giữa S1 và S2 mà vẫn còn ở S3** (Summary "Objects allocated between…" / Comparison) → đó là thứ không được giải phóng.
+      (2) Sắp theo **retained size**, mở **Retainers** để đi ngược đường giữ reference: `Map` trong module, listener của EventEmitter, closure của `setInterval`, mảng global.
+      (3) Production: chụp trên **1 pod đã rút khỏi LB**; snapshot dừng process (stop-the-world) vài giây và cần thêm memory (có thể xấp xỉ bằng heap hiện tại — verify) → dễ bị OOMKill chính pod đó; dùng `--heapsnapshot-signal=SIGUSR2` hoặc `v8.writeHeapSnapshot()` qua endpoint admin có bảo vệ.
+      (4) Snapshot chứa **dữ liệu thật** (token, PII) → xử lý như dữ liệu nhạy cảm, không upload lên ticket công khai.
+    followUp: The heap snapshot is 1.5 GB and DevTools can't open it. What are your alternatives?
+    verify: true
+    tags: [memory, heap-snapshot, leak]
+  - id: scenario-scale-045
+    level: medium
+    type: debug
+    q: "Memory grows ~200 MB per day on this service until it's OOMKilled. Find the leak and fix it."
+    example: |-
+      ```ts
+      const priceCache = new Map<string, { value: Price; at: number }>();
+
+      export async function getPrice(tenantId: string, sku: string, currency: string, userId: string) {
+        const key = `${tenantId}:${sku}:${currency}:${userId}`;
+        const hit = priceCache.get(key);
+        if (hit && Date.now() - hit.at < 60_000) return hit.value;
+        const value = await pricing.compute(tenantId, sku, currency, userId);
+        priceCache.set(key, { value, at: Date.now() });
+        return value;
+      }
+      ```
+    hint: |-
+      (1) `Map` ở module scope **không bao giờ xoá**: TTL chỉ được kiểm tra khi đọc, entry hết hạn vẫn nằm đó. Key có `userId` → số key = users × SKU × currency → tăng không giới hạn.
+      (2) Fix: cache có giới hạn — `lru-cache` với `max` (số entry) và/hoặc `maxSize` (bytes) + `ttl`; xem lại key: có cần `userId` không (giá thường theo nhóm/tier, không theo từng user).
+      (3) Cache chia sẻ giữa pod → Redis với TTL (và `maxmemory-policy`), không phải memory mỗi pod.
+      (4) Chứng minh: heap snapshot → `Map` có retained size lớn, số entry tăng giữa các snapshot; metric `priceCache.size`.
+    followUp: Why is `WeakMap` not a fix here?
+    redFlags:
+      - "Adds a nightly restart as the fix"
+    tags: [memory-leak, cache, debug]
+  - id: scenario-scale-046
+    level: medium
+    type: debug
+    q: "Each WebSocket connection to this service seems to leave something behind: memory grows with the number of connections ever opened, not currently open. Find the leaks."
+    example: |-
+      ```ts
+      io.on('connection', (socket) => {
+        const session = loadSessionSnapshot(socket.data.userId); // ~200 KB
+        priceBus.on('tick', (t) => {
+          if (session.watchlist.includes(t.symbol)) socket.emit('tick', t);
+        });
+        setInterval(() => {
+          socket.emit('heartbeat', { at: Date.now(), watched: session.watchlist.length });
+        }, 10_000);
+      });
+      ```
+    hint: |-
+      (1) Listener `priceBus.on('tick')` không bao giờ được gỡ → closure giữ `socket` và `session` (200 KB) mãi sau khi client ngắt; mỗi tick còn gọi `emit` trên socket đã chết.
+      (2) `setInterval` không `clearInterval` → timer sống mãi, closure giữ `session` và `socket`.
+      (3) Fix: lưu reference handler và timer, gỡ trong `socket.on('disconnect')`: `priceBus.off('tick', onTick)`, `clearInterval(timer)`; tốt hơn: dùng room/subscription theo symbol thay vì mỗi socket một listener toàn cục.
+      (4) Dấu hiệu: `MaxListenersExceededWarning`, `priceBus.listenerCount('tick')` tăng mãi, heap snapshot có nhiều `Socket` trạng thái disconnected được giữ bởi `EventEmitter._events`.
+    followUp: How would you write a test that catches this kind of leak before production?
+    tags: [memory-leak, event-listener, timers, debug]
+  - id: scenario-scale-047
+    level: hard
+    type: debug
+    q: "This health-aggregator calls 30 services with `fetch` every 5 seconds. After a few hours, requests start timing out and memory is high, but only when some services return errors. Why?"
+    example: |-
+      ```ts
+      async function check(url: string) {
+        const res = await fetch(url, { signal: AbortSignal.timeout(2000) });
+        if (!res.ok) return { url, ok: false, status: res.status }; // body never read
+        return { url, ok: true, data: await res.json() };
+      }
+      ```
+    hint: |-
+      (1) Với `fetch` của Node (undici), response body **chưa được đọc hoặc huỷ** vẫn giữ connection/socket và buffer tới khi GC dọn — mà GC không chạy theo lịch của bạn. Nhánh lỗi không đọc body → connection không trả về pool → pool cạn → request mới chờ/timeout; memory giữ buffer.
+      (2) Fix: luôn consume hoặc cancel body: `await res.body?.cancel()` (hoặc `await res.text()` nếu cần log lỗi), kể cả nhánh lỗi.
+      (3) Tương tự với stream khác: readable không được consume/`destroy()` → giữ file descriptor/socket (xem thêm 05-nodejs về `pipeline`).
+      (4) Chứng minh: số socket mở (`ss -tanp`, metric agent của undici), heap snapshot thấy nhiều response/body pending.
+    followUp: Why is relying on garbage collection to release sockets a bad idea in general?
+    redFlags:
+      - "Increases the timeout"
+    verify: true
+    tags: [fetch, undici, connection-leak, debug]
+  - id: scenario-scale-048
+    level: hard
+    type: gotcha
+    q: "A container has a 2 GiB memory limit and the team set `--max-old-space-size=4096` \"so Node never runs out of heap\". What happens under load, and how do you size it?"
+    hint: |-
+      (1) V8 nghĩ nó còn tới 4 GB nên **GC lười**; RSS vượt 2 GiB trước khi V8 thấy áp lực → kernel/cgroup **OOMKill** (exit 137, `OOMKilled`), không có stack trace, không có heap snapshot, request đang chạy mất sạch.
+      (2) Đặt old space ≈ **70–75% memory limit** (vd 1536 MB cho 2 GiB), phần còn lại cho Buffer/`external`, native addon, stack thread, code. Workload nhiều Buffer (upload, zlib) cần tỷ lệ thấp hơn.
+      (3) Khi heap thật sự chạm giới hạn, Node crash có kiểm soát ("JavaScript heap out of memory") và có thể kèm `--heapsnapshot-near-heap-limit` để lấy bằng chứng.
+      (4) Node bản mới tính heap mặc định theo memory khả dụng (có thể cả cgroup limit) — đừng dựa vào mặc định, set rõ và kiểm tra bằng `v8.getHeapStatistics().heap_size_limit` (verify theo version).
+    example: |-
+      ```bash
+      node --max-old-space-size=1536 --heapsnapshot-near-heap-limit=2 dist/main.js
+      node -e "console.log(require('v8').getHeapStatistics().heap_size_limit / 2**20, 'MB')"
+      ```
+    followUp: "The pod is OOMKilled but the heap is only 600 MB. What else uses memory?"
+    verify: true
+    tags: [memory, kubernetes, v8, oom]
+  - id: scenario-scale-049
+    level: senior
+    type: open
+    q: "You've confirmed a slow memory leak in production: pods get OOMKilled every ~30 hours. The root-cause fix will take a week. What do you do in the meantime, and how do you avoid it becoming permanent?"
+    hint: |-
+      (1) **Mitigation có kiểm soát**: restart trước khi OOM — rolling restart định kỳ, hoặc để liveness/memory threshold trigger graceful shutdown (drain, xong request) thay vì OOMKill giữa request. Đủ replica để restart không giảm capacity.
+      (2) Giảm tốc độ leak nếu tìm được nguồn: tắt feature nghi ngờ bằng flag, giới hạn cache, rollback version gây ra (so sánh memory curve theo deploy).
+      (3) Thu bằng chứng: `--heapsnapshot-near-heap-limit`, snapshot trên pod đã rút khỏi LB, alert theo **tốc độ tăng** memory chứ không chỉ ngưỡng.
+      (4) Chống "tạm thời vĩnh viễn": ticket có owner và deadline, restart job ghi rõ là workaround trong runbook, metric leak rate trên dashboard; tiêu chí gỡ workaround = memory phẳng 3 ngày sau fix.
+    followUp: A peer says "just restart nightly forever, it's cheaper". How do you argue?
+    redFlags:
+      - "Just raises the memory limit"
+    tags: [memory-leak, incident, mitigation, judgement]
+  - id: scenario-scale-050
+    level: hard
+    type: gotcha
+    q: "You store the whole `req` object in `AsyncLocalStorage` for logging. Memory grows, and occasionally logs from a background job show a requestId from a request that finished hours ago. Explain."
+    hint: |-
+      (1) ALS store đi theo **mọi async resource được tạo trong context** (promise, timer, listener). Nếu trong request có tạo resource sống lâu — `setInterval`, lazy-init singleton/connection lần đầu, promise cache dùng chung — resource đó **giữ store** (và `req` to với body, socket) mãi.
+      (2) Log sai requestId: background job/timer được tạo lần đầu bên trong request A sẽ "thừa kế" context của A mãi về sau.
+      (3) Fix: store chỉ chứa **dữ liệu nhỏ** (`requestId`, `tenantId`, `userId`), không chứa `req`/`res`; khởi tạo singleton/timer ở startup (ngoài request); job nền tự `als.run(newContext, …)`; tránh `enterWith` trừ khi hiểu rõ phạm vi.
+      (4) Chứng minh: heap snapshot → retainers của `IncomingMessage` đi qua `AsyncLocalStorage`/async context frame.
+    followUp: Why is `als.run()` generally safer than `als.enterWith()`?
+    verify: true
+    tags: [async-local-storage, memory-leak, logging]
+  - id: scenario-scale-051
+    level: hard
+    type: scenario
+    q: "A Node pod sits at 100% CPU (one core), event loop lag is 2 seconds, and health checks start failing. How do you find the cause in production?"
+    hint: |-
+      (1) Cầm máu: rút pod khỏi LB (hoặc để HPA thêm pod), đừng restart hết — giữ lại 1 pod "bệnh" để điều tra. Xem có trùng deploy/traffic pattern/tenant cụ thể không.
+      (2) Profile: `node --cpu-prof` (ghi `.cpuprofile` khi process thoát), `--inspect` + DevTools Profiler trên pod đã cô lập, hoặc `perf`/0x/clinic flame trong staging với traffic tái hiện. Đọc flame graph: **thanh rộng nhất ở đỉnh** = hàm tốn CPU tự thân.
+      (3) Nghi phạm quen thuộc: regex backtracking (ReDoS) trên input user, `bcrypt`/`pbkdf2` **Sync**, `JSON.parse/stringify` payload lớn, vòng lặp O(n²) trên mảng lớn, GC thrashing gần giới hạn heap (xem `--trace-gc`).
+      (4) Fix theo nguyên nhân + phòng: giới hạn input size, timeout ở proxy, alert event loop lag, test hiệu năng cho input lớn.
+    followUp: The flame graph shows 70% in `RegExp.prototype.exec` from one validation function. What next?
+    tags: [cpu, profiling, event-loop, incident]
+  - id: scenario-scale-052
+    level: medium
+    type: debug
+    q: "This endpoint takes 4 seconds of pure CPU when a tenant has 20,000 products and 5,000 promotions. Why, and how do you fix it?"
+    example: |-
+      ```ts
+      function applyPromotions(products: Product[], promos: Promotion[]) {
+        return products.map((p) => {
+          const promo = promos.find((x) => x.skus.includes(p.sku)); // nested linear scans
+          return { ...p, finalPrice: promo ? p.price * (1 - promo.rate) : p.price };
+        });
+      }
+      ```
+    hint: |-
+      (1) Độ phức tạp: 20k product × (5k promo × số sku mỗi promo) → hàng trăm triệu phép so sánh, **đồng bộ** trên event loop → mọi request khác chờ 4 s.
+      (2) Fix: build index một lần — `Map<sku, Promotion>` (O(P + S)), rồi lookup O(1) mỗi product → vài ms.
+      (3) Làm ít hơn: chỉ tính cho trang hiện tại (pagination), hoặc tính trước và lưu (materialize) khi promotion thay đổi; đẩy join sang DB nếu dữ liệu ở đó.
+      (4) Bài học phỏng vấn: "Node chậm" thường là **thuật toán trên event loop**; test với dữ liệu kích thước production.
+    followUp: Two promotions apply to the same SKU. How does your Map-based version decide, and how do you make that rule explicit?
+    tags: [cpu, algorithm, event-loop, debug]
+  - id: scenario-scale-053
+    level: easy
+    type: scenario
+    q: "\"Our system produces 100 MB of logs per day. How would you handle that optimally?\" What's your first reaction, and what changes at 100 GB per day?"
+    hint: |-
+      (1) Tính trước: 100 MB/ngày ≈ **1.2 KB/s** — vài dòng log mỗi giây. Đây **không phải** bài toán scale; một log stack bình thường (CloudWatch/Loki/ELK nhỏ) xử lý dễ. Câu trả lời đúng là nói ra điều đó rồi tập trung vào **chất lượng** log: structured JSON, level, correlation ID, không log dữ liệu nhạy cảm, retention.
+      (2) 100 GB/ngày ≈ **1.2 MB/s** ≈ ~1,200 dòng 1 KB/giây; 30 ngày = 3 TB (chưa tính replica/index). Vấn đề trở thành **chi phí ingest + index + lưu**, và tốc độ truy vấn.
+      (3) Ở mức đó: giảm log DEBUG/INFO ồn ở production, sampling cho log thành công lặp lại, metrics thay cho log đếm, tiering (hot vài ngày → cold/S3 rẻ), retention theo loại log.
+      (4) Hỏi lại: log để debug, audit (compliance, giữ lâu, không được sampling) hay analytics? Mỗi loại có đường đi và retention khác nhau.
+    followUp: Which log lines would you never sample, even at 100 GB per day?
+    tags: [logging, capacity, estimation]
+  - id: scenario-scale-054
+    level: senior
+    type: design
+    q: "Design the logging pipeline for services producing 100 GB of logs per day across 50 services, with a budget constraint and a requirement to debug any failed request from the last 14 days."
+    hint: |-
+      (1) Ở app: structured JSON (pino), log ra **stdout** (12-factor), không tự ghi file/gửi HTTP từ trong app; field chuẩn `ts, level, service, env, traceId, requestId, tenantId, route, status, durationMs`; redact tại logger.
+      (2) Thu gom: agent/collector trên node (Fluent Bit, Vector, OpenTelemetry Collector) — buffer, retry, parse, **drop/sample** log ồn, redact lần hai, route theo loại (app log, audit log, access log) tới đích khác nhau.
+      (3) Lưu trữ theo tầng: hot (Loki/Elasticsearch/OpenSearch, 3–7 ngày, index ít field) → warm/cold (S3 + query theo nhu cầu: Athena/Loki trên object storage) tới 14 ngày+; ILM/retention tự động xoá. Audit log tách riêng, giữ theo yêu cầu pháp lý, không sampling.
+      (4) Để "debug mọi request lỗi": **luôn giữ** log ERROR/WARN và log của request lỗi (tail-based: giữ toàn bộ log của trace có lỗi), sampling log thành công; liên kết log ↔ trace ↔ metric qua `traceId`. Kiểm soát cost: quota log theo service, dashboard GB/ngày theo service, alert khi 1 service tăng đột biến.
+    followUp: One service suddenly starts logging 40 GB per hour in a loop. How does your pipeline protect itself and the budget?
+    redFlags:
+      - "Has each service ship logs directly to Elasticsearch over HTTP from the request path"
+      - "No retention policy"
+    tags: [logging, observability, design, cost]
+  - id: scenario-scale-055
+    level: medium
+    type: debug
+    q: "A security review found bearer tokens and passwords in your log store. Here is the logging setup. What's wrong and how do you fix it at the logger level?"
+    example: |-
+      ```ts
+      import pino from 'pino';
+      import pinoHttp from 'pino-http';
+      const logger = pino({ level: 'info' });
+      app.use(pinoHttp({ logger })); // logs req with headers (Authorization, Cookie)
+      app.post('/login', (req, res) => {
+        logger.info({ body: req.body }, 'login attempt'); // { email, password }
+        // ...
+      });
+      app.use((err, req, res, next) => {
+        logger.error({ err, config: err.config }, 'upstream failed'); // axios error: config.headers
+        res.status(500).end();
+      });
+      ```
+    hint: |-
+      (1) Rò rỉ 3 chỗ: header `authorization`/`cookie` qua request serializer, `password` trong body, và **error object của HTTP client** (`err.config.headers`, đôi khi cả body gửi đi) chứa token gọi bên thứ ba.
+      (2) Fix tại logger: `redact` của pino với path cụ thể và wildcard (`req.headers.authorization`, `req.headers.cookie`, `*.password`, `*.token`, `config.headers.Authorization`), `censor: '[REDACTED]'` hoặc `remove: true`; serializer tuỳ biến cho error chỉ giữ `message`, `code`, `status`, URL không query string.
+      (3) Không log nguyên `req.body`/`err` từ thư viện; log **allowlist** field cần thiết thay vì blocklist.
+      (4) Hậu quả đã xảy ra: token trong log là **bị lộ** → rotate/revoke token, xoá/giới hạn log đã có, rà ai đã truy cập log store.
+    followUp: Redaction by path misses a token that appears inside a free-text error message. What other layers do you add?
+    redFlags:
+      - "Only says 'be careful in code review'"
+    verify: true
+    tags: [logging, security, pino, redaction, debug]
+  - id: scenario-scale-056
+    level: hard
+    type: scenario
+    q: "Support says they sometimes need card numbers, national ID numbers or tokens in logs to debug payment issues. How do you meet the debugging need without logging sensitive data?"
+    hint: |-
+      (1) Mặc định **không log**: password, token/secret, session id, **PAN đầy đủ, CVV** (PCI DSS cấm lưu CVV sau authorization), số giấy tờ tuỳ thân. Mã hoá log hay đổi format **không** giải quyết vấn đề — ai đọc được log vẫn giải mã/đọc được, và log bị copy sang nhiều hệ thống.
+      (2) Thay thế cho nhu cầu debug: log **định danh không nhạy cảm** (orderId, paymentId, token của payment provider, `last4` + BIN nếu được phép), **hash có key (HMAC)** để tra cứu "cùng một giá trị" mà không lộ giá trị; tokenization ở vault, support tra qua công cụ có kiểm soát quyền và audit.
+      (3) Phòng thủ nhiều lớp: redaction ở logger + ở collector (pattern PAN/email), allowlist field, test tự động assert không có secret trong log.
+      (4) Quản trị: access control log theo vai trò, audit ai xem log, retention ngắn cho log có thể chứa PII, quy trình xoá; tham chiếu OWASP Logging Cheat Sheet.
+    followUp: A developer needs to debug one specific customer's request with full payload in production. What controlled process do you offer?
+    redFlags:
+      - "Suggests encrypting the logs as the main answer"
+      - "Logs full card numbers but 'restricts access'"
+    tags: [logging, security, pii, pci]
+  - id: scenario-scale-057
+    level: medium
+    type: gotcha
+    q: "At 3,000 rps, switching from `console.log(JSON.stringify(obj))` everywhere to pino cut p99 noticeably. Why can logging itself be a performance problem in Node?"
+    hint: |-
+      (1) Ghi `process.stdout` có thể **đồng bộ** tuỳ đích: file và TTY là synchronous trên POSIX, pipe trên Linux cũng synchronous (theo Node docs, verify) → mỗi dòng log chặn event loop khi đích chậm.
+      (2) Serialize tốn CPU: `console.log` với object dùng `util.inspect` (chậm), log object to (cả `req`) mỗi request; string template được build kể cả khi level bị tắt.
+      (3) pino: serializer nhanh, level check trước khi build, ghi async/batched (`pino.destination({ sync: false })` hoặc transport chạy trong worker thread) — đổi lại có thể mất vài dòng cuối khi crash nếu không flush.
+      (4) Giảm lượng log: không log mỗi request thành công ở INFO nếu đã có access log ở LB/metrics; sampling.
+    followUp: The process crashes on an uncaught exception. How do you make sure the last log lines (the useful ones) are not lost with async logging?
+    verify: true
+    tags: [logging, performance, event-loop]
+  - id: scenario-scale-058
+    level: senior
+    type: open
+    q: "The interviewer asks: \"Your current system handles 1,000 rps comfortably. Marketing says it'll be 10,000 next quarter. What breaks first, and what's your plan?\""
+    hint: |-
+      (1) Không đoán — **đo headroom từng tầng**: load test tăng dần tới 2–3× rồi 10× ở staging giống production, xem tài nguyên nào bão hoà trước (event loop CPU, DB connection/CPU/IOPS, Redis, bandwidth, quota bên thứ ba, rate limit của cloud API).
+      (2) Thường vỡ theo thứ tự: DB (connection, query không index lộ ra ở 10×, lock nóng) → cache stampede/hot key → dependency bên thứ ba (quota) → chi phí egress/log. App stateless thường là tầng dễ scale nhất.
+      (3) Kế hoạch: sửa bottleneck theo ROI (cache, bỏ N+1, index, PgBouncer, read replica), thêm cơ chế an toàn (rate limit, load shedding, circuit breaker, autoscaling có min replica), capacity model đơn giản (rps → pod, connection, cost).
+      (4) Nói về rủi ro & timeline: cái gì cần thay đổi kiến trúc (queue, sharding) phải bắt đầu sớm; game day/load test trước sự kiện; SLO và dashboard để biết đang ở đâu.
+    followUp: Your load test says the DB tops out at 4,000 rps of this traffic mix. What are your options, ranked by cost and time?
+    redFlags:
+      - "'Kubernetes will autoscale it'"
+    tags: [capacity-planning, scaling, judgement]
+  - id: scenario-scale-059
+    level: cv
+    type: behavioral
+    q: "Tell me about a time you found and fixed a performance bottleneck in a backend service under real load. How did you prove where the time went and that your fix worked?"
+    hint: |-
+      STAR: Situation (triệu chứng + con số: p99, rps, error rate), Task (SLO cần đạt), Action (cách đo: tracing/profile/`EXPLAIN ANALYZE`/load test; giả thuyết bị loại; fix cụ thể — cache, index, bỏ N+1, stream, batch), Result (số trước/sau, chi phí).
+      Nêu một giả thuyết sai bạn đã loại bằng dữ liệu — interviewer đánh giá cao phương pháp hơn kết quả.
+      Reflection: alert/test/load test nào được thêm để lỗi không quay lại. **(điền câu chuyện thật của bạn)**
+    followUp: What would you have done if the fix required a change another team owned?
+    tags: [cv, behavioral, performance]
+  - id: scenario-scale-060
+    level: cv
+    type: behavioral
+    q: "Tell me about a time memory or resource usage of a service kept growing in production. How did you narrow it down, and what did you change?"
+    hint: |-
+      STAR: Situation (đường cong memory/connection/FD theo thời gian, tần suất restart/OOMKilled), Task, Action (loại trừ: traffic tăng vs leak thật; heap vs RSS vs external; heap snapshot comparison; tìm retainer; mitigation tạm thời như restart có kiểm soát), Result (memory phẳng, số restart về 0).
+      Nguyên nhân hay gặp để gợi nhớ: cache Map không giới hạn, listener/timer không gỡ, connection không release, body `fetch` không đọc, buffer toàn bộ file.
+      Reflection: metric/alert theo tốc độ tăng memory, review checklist cho cache và listener. **(điền câu chuyện thật của bạn)**
+    followUp: How did you make sure the mitigation didn't hide a second leak?
+    tags: [cv, behavioral, memory-leak]

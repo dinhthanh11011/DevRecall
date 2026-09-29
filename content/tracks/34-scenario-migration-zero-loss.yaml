@@ -1,0 +1,1181 @@
+id: 34-scenario-migration-zero-loss
+slug: scenario-migration
+title: "Scenarios: Zero-Downtime Migration & Zero Data Loss"
+tier: 9
+status: drafted
+summary: "Mock interview tình huống production: đổi schema Postgres không downtime (lock queue, CONCURRENTLY, NOT VALID), backfill bảng lớn, đổi DB engine bằng snapshot + CDC, strangler fig cho legacy, outbox, drain Kafka backlog 10M, durability knobs và cutover/rollback."
+cvLinked: true
+prerequisites: [13-sql-postgres, 17-messaging-kafka, 25-devops-cicd]
+overview: |-
+  ## TL;DR
+
+  - "Zero-downtime" = **mọi bước đều tương thích với cả code version N và N-1 đang chạy song song** (rolling deploy, blue/green, canary). Công cụ chính: **expand → migrate → contract**, mỗi bước deploy riêng và rollback được.
+  - Postgres hiếm khi chết vì DDL *chậm*; nó chết vì **lock queue**: một `ALTER TABLE` cần `ACCESS EXCLUSIVE` xếp hàng sau một query dài và **chặn mọi query đến sau nó**. Luôn đặt `lock_timeout` (vài giây) + retry, dùng `CONCURRENTLY` / `NOT VALID` + `VALIDATE`.
+  - Đổi DB engine / cluster không downtime = **snapshot + CDC** (Debezium, AWS DMS, logical replication) → **verify** (count, checksum theo chunk, shadow read) → **cutover ngắn** (write freeze vài giây–phút) → **reverse replication** để có đường lui. Dual-write từ app là phương án cuối vì không atomic.
+  - "Zero data loss" không phải một config mà là một **chuỗi durability**: client retry + idempotency key → API chỉ ack khi đã durable → outbox / Kafka `acks=all` + `min.insync.replicas=2` → consumer commit **sau** xử lý → DB sync replication / PITR → **reconciliation** để chứng minh.
+  - Kafka backlog 10M: tính ETA trước (`backlog / (consume − produce)`), scale consumer **tối đa bằng số partition**, song song theo key bên trong partition nếu cần ordering, bảo vệ downstream bằng rate limit, **đừng tăng partition vội** vì nó đổi mapping key → partition.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Expand–contract (parallel change) | Thêm cái mới song song cái cũ, chuyển dần, rồi mới xoá cái cũ | `zip` → thêm `postal_code`, dual-write, backfill, đổi read, drop `zip` |
+  | Lock queue | Lock request chờ sẽ chặn các request đến sau xung đột với nó | `ALTER` chờ sau `SELECT` 10 phút → mọi `SELECT` mới cũng chờ |
+  | `lock_timeout` | Hủy statement nếu chờ lock quá N ms | `SET lock_timeout = '3s'` rồi retry có backoff |
+  | `NOT VALID` + `VALIDATE` | Tạo constraint chỉ áp cho row mới, validate row cũ sau với lock nhẹ | FK / CHECK trên bảng 500M rows |
+  | `CREATE INDEX CONCURRENTLY` | Build index không chặn write, đổi lại chậm hơn và có thể để lại index `INVALID` | Không chạy được trong transaction block |
+  | Backfill | Điền dữ liệu cho cột/bảng mới theo batch, idempotent, resume được | `UPDATE ... WHERE id BETWEEN $1 AND $2 AND new_col IS NULL` |
+  | CDC | Đọc change log (WAL / binlog / SQL Server CDC) để stream thay đổi | Debezium → Kafka → sink Postgres |
+  | Shadow read | Đọc cả nguồn cũ và mới, so sánh, vẫn trả kết quả cũ | Log diff 0.02% → tìm bug mapping |
+  | Strangler fig | Proxy route từng endpoint từ hệ cũ sang hệ mới | `/v1/orders/*` → Node, còn lại → PHP |
+  | RPO / RTO | Mất tối đa bao nhiêu dữ liệu / khôi phục trong bao lâu | RPO = 0, RTO = 5 phút cho payments |
+  | Transactional outbox | Ghi business row + event trong cùng transaction, relay publish sau | `orders` + `outbox` trong 1 `COMMIT` |
+  | Reconciliation | Job so sánh định kỳ nguồn và đích để phát hiện lệch | Count + sum amount mỗi giờ theo tenant |
+  | Rehash-on-login | Nâng cấp hash password dần khi user đăng nhập | MD5 → argon2id |
+
+  ## Cơ chế hoạt động
+
+  ### Expand–contract qua nhiều lần deploy
+
+  ```mermaid
+  flowchart LR
+    E1["1. Expand schema<br/>ADD COLUMN nullable<br/>(lock_timeout + retry)"] --> D1["2. Deploy code v2<br/>ghi cả cũ + mới<br/>đọc cũ"]
+    D1 --> B["3. Backfill theo batch<br/>idempotent, throttle<br/>theo replica lag"]
+    B --> V["4. Verify<br/>count mismatch = 0"]
+    V --> D2["5. Deploy code v3<br/>đọc mới, vẫn ghi cả hai"]
+    D2 --> D3["6. Deploy code v4<br/>chỉ dùng cột mới"]
+    D3 --> C["7. Contract<br/>DROP cột cũ<br/>(sau 1 chu kỳ rollback)"]
+    D2 -. "rollback an toàn:<br/>v2 vẫn đúng" .-> D1
+  ```
+
+  ### Lock queue: vì sao một ALTER "0.1 giây" làm sập API
+
+  ```mermaid
+  sequenceDiagram
+    participant R as Report query (T1)
+    participant M as Migration (T2)
+    participant A as API queries (T3..Tn)
+    R->>R: SELECT ... chạy 10 phút (ACCESS SHARE)
+    M->>M: ALTER TABLE orders ADD COLUMN ... (cần ACCESS EXCLUSIVE)
+    Note over M: Chờ T1 → vào lock queue
+    A->>A: SELECT * FROM orders (ACCESS SHARE)
+    Note over A: Xung đột với T2 đang chờ → cũng chờ
+    Note over A: Pool cạn, timeout, 5xx
+    Note over M: Fix: SET lock_timeout = '3s' → T2 tự hủy, API chạy tiếp, retry sau
+  ```
+
+  ### Đổi DB engine: snapshot + CDC + cutover + đường lui
+
+  ```mermaid
+  sequenceDiagram
+    participant App
+    participant Old as Old DB (SQL Server)
+    participant CDC as CDC (Debezium / DMS)
+    participant New as New DB (Postgres)
+    CDC->>Old: Ghi nhận vị trí log (LSN) + snapshot nhất quán
+    CDC->>New: Full load
+    loop Catch-up
+      Old-->>CDC: Changes từ LSN đã lưu
+      CDC->>New: Apply (idempotent upsert)
+    end
+    App->>Old: Read/write bình thường
+    App-->>New: Shadow read + so sánh (không trả cho user)
+    Note over App,New: Cutover: freeze write → chờ lag = 0 → verify → setval sequences → flip config
+    App->>New: Read/write
+    New-->>Old: Reverse replication (giữ đường rollback N ngày)
+  ```
+
+  ### Chuỗi durability (không ack cho tới khi durable)
+
+  ```mermaid
+  flowchart LR
+    C["Client<br/>retry + Idempotency-Key"] --> API["API<br/>ack SAU khi commit"]
+    API --> TX[("Postgres TX<br/>orders + outbox")]
+    TX --> RL["Relay / CDC<br/>at-least-once"]
+    RL --> K["Kafka<br/>acks=all, RF=3,<br/>min.insync=2"]
+    K --> CO["Consumer<br/>xử lý → commit offset"]
+    CO --> S[("Sink<br/>upsert idempotent")]
+    S --> REC["Reconciliation<br/>count / sum theo giờ"]
+    REC -. "lệch → replay từ outbox / offset" .-> RL
+  ```
+
+  ## Khung trả lời
+
+  Dùng lại cho mọi câu "migrate X không downtime / không mất dữ liệu":
+
+  1. **Làm rõ ràng buộc**: kích thước dữ liệu (rows, GB), QPS đọc/ghi, RPO/RTO, có được freeze write vài phút không, các app/consumer nào đang dùng, yêu cầu ordering.
+  2. **Liệt kê điều phải tương thích song song**: code N và N-1, schema cũ và mới, consumer cũ và mới, client cũ (mobile không update được).
+  3. **Chia bước reversible**: expand → dual (write / replicate) → backfill → verify → switch read → switch write → contract. Mỗi bước: cách rollback, tiêu chí go/no-go.
+  4. **Bảo vệ production khi chạy**: `lock_timeout`, batch + throttle, theo dõi replica lag / WAL / consumer lag / error rate, kill switch (feature flag).
+  5. **Chứng minh đúng**: count, checksum theo chunk, shadow read diff, reconciliation job, audit log.
+  6. **Cutover + rollback**: runbook, người quyết định, thời gian freeze, reverse replication, khi nào xoá đường lui.
+  7. **Nói trade-off bằng số**: "freeze 2 phút đổi lấy không phải dual-write 6 tuần", "sync commit thêm ~1–3 ms mỗi write trong cùng region".
+
+  ## Trade-offs
+
+  | Cách đồng bộ khi migrate | Consistency | Độ phức tạp | Rủi ro chính | Hợp khi |
+  |---|---|---|---|---|
+  | Downtime window (dump/restore) | Tuyệt đối | Thấp | Downtime tỉ lệ với data size | DB nhỏ, business chấp nhận maintenance |
+  | Dual-write từ app | Yếu (không atomic) | Trung bình | Lệch khi 1 bên fail, race ordering | Chỉ khi không có CDC, có reconciliation mạnh |
+  | CDC (Debezium / DMS / logical replication) | Tốt, theo commit order | Cao (vận hành connector) | Type mapping, DDL, lag, replication slot giữ WAL | Đa số migrate engine / cluster |
+  | Snapshot restore + native replication | Tốt | Thấp–TB | Chỉ cùng engine / version tương thích | Self-hosted PG → RDS/Aurora |
+  | Transactional outbox | Tốt, at-least-once | TB | Relay lag, bảng outbox phình | Sync SQL → NoSQL / event cho service khác |
+
+  | Knob "zero data loss" | Được gì | Trả giá gì |
+  |---|---|---|
+  | PG `synchronous_commit=on` + sync standby | RPO ≈ 0 khi mất primary | Latency mỗi commit + write dừng nếu standby chết (trừ khi có nhiều candidate) |
+  | Kafka `acks=all` + `min.insync.replicas=2` + RF=3 | Không mất message đã ack khi mất 1 broker | Latency cao hơn, mất 2 broker → producer bị từ chối |
+  | `unclean.leader.election.enable=false` | Không bầu replica lỗi thời làm leader | Partition offline cho tới khi replica ISR quay lại |
+  | Consumer commit sau xử lý | Không mất khi crash | Duplicate → cần idempotent sink |
+  | PITR (WAL archive) | Khôi phục tới thời điểm trước lỗi người dùng | Chi phí lưu trữ, RTO phụ thuộc lượng WAL replay |
+
+  ## Pitfalls
+
+  - Gộp migration và code dùng schema mới trong **một** deploy → pod cũ crash / pod mới crash tùy thứ tự.
+  - Migration không có `lock_timeout` → một `ALTER` "instant" chặn toàn bộ bảng phía sau một report query.
+  - `CREATE INDEX CONCURRENTLY` trong migration tool mặc định bọc transaction → lỗi ngay; hoặc chạy fail để lại index `INVALID` vẫn làm chậm write.
+  - Backfill bằng một `UPDATE` khổng lồ hoặc vòng lặp `OFFSET` → lock lâu, WAL bùng, replica lag, bloat.
+  - Tin rằng "sync xong row count bằng nhau" = đúng. Count bằng nhau vẫn có thể sai collation, time zone, precision, trailing space.
+  - Quên **reset sequence / identity** sau khi copy → `duplicate key` ngay khi app ghi vào DB mới.
+  - Outbox relay "publish rồi mark done" coi là exactly-once; polling `id > last_id` bỏ sót event commit muộn.
+  - Tăng partition Kafka giữa lúc backlog để "chạy nhanh hơn" → phá ordering theo key, không giảm lại được.
+  - Có backup nhưng **chưa từng restore thử** → không biết RTO thật, không biết backup hỏng.
+  - Traffic mirroring cho endpoint **ghi** → hệ mới gửi email/charge thẻ thật lần hai.
+
+  ## Cheat sheet
+
+  - Mọi DDL Postgres trong migration: `SET lock_timeout = '3s'; SET statement_timeout = '15min';` + retry có jitter.
+  - Thêm cột: nullable hoặc `DEFAULT` hằng/stable (PG11+ không rewrite). Default volatile (`gen_random_uuid()`, `clock_timestamp()`) → rewrite bảng.
+  - NOT NULL cột có sẵn: `ADD CONSTRAINT ... CHECK (c IS NOT NULL) NOT VALID` → `VALIDATE CONSTRAINT` → `SET NOT NULL` (PG12+ bỏ qua scan) → drop CHECK.
+  - FK: `ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID` → `VALIDATE CONSTRAINT` (lock nhẹ `SHARE UPDATE EXCLUSIVE`).
+  - Index: `CREATE INDEX CONCURRENTLY` ngoài transaction; fail → `DROP INDEX CONCURRENTLY` rồi làm lại; kiểm `pg_index.indisvalid`.
+  - MySQL: `ALGORITHM=INSTANT/INPLACE, LOCK=NONE`, bảng lớn dùng gh-ost / pt-online-schema-change. SQL Server: `WITH (ONLINE = ON, RESUMABLE = ON)` (edition-dependent).
+  - Backfill: keyset theo PK, batch 1k–10k, commit mỗi batch, sleep / throttle theo `replay_lag`, checkpoint để resume, `WHERE new IS NULL` để idempotent.
+  - DB migration: snapshot + CDC → count + checksum theo chunk + shadow read → freeze → lag 0 → `setval` → flip → reverse replication.
+  - Kafka zero loss: `acks=all`, idempotent producer, RF=3, `min.insync.replicas=2`, `unclean.leader.election.enable=false`, commit sau xử lý, sink idempotent.
+  - Backlog: ETA = backlog / (consume − produce); consumers ≤ partitions; per-key concurrency; rate limit downstream; park poison message; ưu tiên traffic mới.
+  - Legacy: strangler proxy, contract test, shadow traffic chỉ cho read, adapter XML ↔ JSON, `Deprecation` / `Sunset` header, feature flag theo tenant, canary.
+notionRefs:
+  - title: Technical - Page 1 (Mock Questions)
+    url: https://app.notion.com/p/2c4ef77f8ab2802cba3de5b0d2d34dda
+  - title: Technical - Page 5 (Mock Questions)
+    url: https://app.notion.com/p/381ef77f8ab281b29a62ec72658d0405
+  - title: Topic (Mock Questions)
+    url: https://app.notion.com/p/2ddef77f8ab28030a76fcbaaa3dde966
+references:
+  - title: PostgreSQL docs — ALTER TABLE
+    url: https://www.postgresql.org/docs/current/sql-altertable.html
+  - title: PostgreSQL docs — Explicit Locking
+    url: https://www.postgresql.org/docs/current/explicit-locking.html
+  - title: PostgreSQL docs — CREATE INDEX (Building Indexes Concurrently)
+    url: https://www.postgresql.org/docs/current/sql-createindex.html#SQL-CREATEINDEX-CONCURRENTLY
+  - title: PostgreSQL docs — Client Connection Defaults (lock_timeout, statement_timeout)
+    url: https://www.postgresql.org/docs/current/runtime-config-client.html
+  - title: PostgreSQL docs — WAL configuration (synchronous_commit)
+    url: https://www.postgresql.org/docs/current/runtime-config-wal.html
+  - title: PostgreSQL docs — Continuous Archiving and Point-in-Time Recovery
+    url: https://www.postgresql.org/docs/current/continuous-archiving.html
+  - title: PostgreSQL docs — Logical Replication
+    url: https://www.postgresql.org/docs/current/logical-replication.html
+  - title: PostgreSQL docs — Sequence Manipulation Functions (setval)
+    url: https://www.postgresql.org/docs/current/functions-sequence.html
+  - title: Apache Kafka documentation — Producer configs
+    url: https://kafka.apache.org/documentation/#producerconfigs
+  - title: Apache Kafka documentation — Broker / topic configs
+    url: https://kafka.apache.org/documentation/#topicconfigs
+  - title: Debezium documentation — SQL Server connector
+    url: https://debezium.io/documentation/reference/stable/connectors/sqlserver.html
+  - title: AWS DMS — Best practices
+    url: https://docs.aws.amazon.com/dms/latest/userguide/CHAP_BestPractices.html
+  - title: Amazon RDS — Multi-AZ deployments
+    url: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZ.html
+  - title: Amazon S3 — Replicating objects (including Batch Replication)
+    url: https://docs.aws.amazon.com/AmazonS3/latest/userguide/replication.html
+  - title: Elasticsearch — Aliases
+    url: https://www.elastic.co/guide/en/elasticsearch/reference/current/aliases.html
+  - title: Elasticsearch — Reindex API
+    url: https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-reindex.html
+  - title: Martin Fowler — Strangler Fig Application
+    url: https://martinfowler.com/bliki/StranglerFigApplication.html
+  - title: Martin Fowler — Parallel Change
+    url: https://martinfowler.com/bliki/ParallelChange.html
+  - title: microservices.io — Transactional outbox
+    url: https://microservices.io/patterns/data/transactional-outbox.html
+  - title: OWASP — Password Storage Cheat Sheet
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html
+  - title: RFC 8594 — The Sunset HTTP Header Field
+    url: https://www.rfc-editor.org/rfc/rfc8594
+  - title: gh-ost — GitHub's online schema migration for MySQL
+    url: https://github.com/github/gh-ost
+  - title: Knex.js — Migrations
+    url: https://knexjs.org/guide/migrations.html
+questions:
+  - id: scenario-migration-001
+    level: easy
+    type: scenario
+    q: "A PR adds a migration that renames `users.name` to `users.full_name` and, in the same deploy, updates all code to use `full_name`. The reviewer blocks it. Why?"
+    hint: |-
+      Rolling deploy nghĩa là trong vài phút có **cả pod cũ (N-1) và pod mới (N)** cùng chạy trên cùng một DB.
+      Nếu migration chạy trước: pod cũ `SELECT name` → lỗi `column does not exist`. Nếu chạy sau: pod mới lỗi. Rollback code cũng hỏng vì schema đã đổi.
+      Fix: **expand–contract** — thêm `full_name`, code ghi cả hai + đọc cũ, backfill, đọc mới, ngừng ghi cũ, cuối cùng drop `name` ở một release sau.
+      Quy tắc: **mỗi deploy chỉ thay một phía** (schema hoặc code), và schema luôn tương thích với code N và N-1.
+    followUp: How many separate deploys does the safe version take, and which of them can you roll back?
+    redFlags:
+      - "Suggests scheduling it at night instead of making it backward compatible"
+      - "Thinks RENAME COLUMN is dangerous because it rewrites the table (it is metadata-only; the danger is compatibility)"
+    tags: [expand-contract, rolling-deploy]
+  - id: scenario-migration-002
+    level: easy
+    type: concept
+    q: "The business says the new payments pipeline must have 'zero data loss and zero downtime'. Which two numbers do you pin down first, and how do they change the design?"
+    hint: |-
+      **RPO** (Recovery Point Objective) = mất tối đa bao nhiêu dữ liệu tính theo thời gian; **RTO** (Recovery Time Objective) = hệ thống được phép ngừng bao lâu.
+      RPO = 0 kéo theo synchronous replication / `acks=all`, idempotent retry, không ack trước khi durable → latency và chi phí cao hơn. RPO = 5 phút có thể chỉ cần async replica + backup.
+      RTO = vài giây cần automatic failover multi-AZ; RTO = 1 giờ có thể restore từ snapshot.
+      Hỏi thêm: RPO/RTO **cho loại sự cố nào** (mất 1 node, mất AZ, mất region, lỗi người/bug xoá data) — PITR mới cứu được lỗi logic, replication thì không.
+    followUp: Replication gives you RPO≈0 for a node failure. Why does it not help when a bad deploy deletes rows?
+    redFlags:
+      - "Answers 'use Kafka' without defining what loss or downtime means"
+      - "Treats replication as a backup"
+    tags: [rpo, rto, durability]
+  - id: scenario-migration-003
+    level: easy
+    type: compare
+    q: "What is the difference between `lock_timeout` and `statement_timeout` in Postgres, and which one protects production during a migration?"
+    hint: |-
+      `lock_timeout`: hủy statement nếu **chờ lấy lock** quá N ms. `statement_timeout`: hủy statement nếu **tổng thời gian chạy** (kể cả chờ) quá N ms.
+      Với DDL, nguy hiểm là **thời gian chờ lock** vì trong lúc chờ nó chặn mọi query sau nó → `lock_timeout` ngắn (1–5s) là lá chắn chính, kèm retry có backoff.
+      `statement_timeout` giới hạn backfill/VALIDATE chạy quá lâu. Đặt ở mức **session / role migration** (`SET` hoặc `ALTER ROLE migrator SET lock_timeout = '3s'`), không đặt global quá thấp cho app.
+      SQL Server tương đương: `SET LOCK_TIMEOUT 3000`; MySQL: `lock_wait_timeout` (cho metadata lock).
+    example: |-
+      ```sql
+      SET lock_timeout = '3s';
+      SET statement_timeout = '15min';
+      ALTER TABLE orders ADD COLUMN channel text;
+      ```
+    followUp: Your migration now fails with 'canceling statement due to lock timeout' every time. What do you do next?
+    redFlags:
+      - "Only sets statement_timeout and thinks the lock queue is handled"
+    tags: [postgres, locks, lock-timeout]
+  - id: scenario-migration-004
+    level: easy
+    type: compare
+    q: "What is change data capture (CDC), and why is it preferred over a nightly export when moving to a new database without downtime?"
+    hint: |-
+      CDC đọc **change log** của DB (Postgres WAL qua logical decoding, MySQL binlog, SQL Server CDC tables / transaction log) và stream từng insert/update/delete theo **thứ tự commit**.
+      Nightly export chỉ cho snapshot tại một thời điểm → khi cutover phải dừng ghi đủ lâu để export lại; delete giữa hai lần export dễ mất.
+      CDC: full load một lần + stream thay đổi liên tục → bản mới chỉ trễ vài giây, cutover chỉ cần freeze tới khi lag = 0.
+      Tools: Debezium (Kafka Connect), AWS DMS (full load + CDC), Postgres native logical replication.
+    followUp: How does the CDC tool make sure no change is lost between the end of the snapshot and the start of streaming?
+    redFlags:
+      - "Describes CDC as triggers polling a table every minute"
+    tags: [cdc, debezium, dms]
+  - id: scenario-migration-005
+    level: easy
+    type: concept
+    q: "You must replace a 10-year-old PHP monolith with Node services without a big-bang rewrite. What is the strangler fig pattern and where does the routing live?"
+    hint: |-
+      Đặt một **proxy / API gateway** (Nginx, Envoy, ALB rules, gateway riêng) trước monolith. Từng route (hoặc từng tenant) được chuyển sang service mới; monolith "bị bóp dần" tới khi không còn traffic.
+      Ưu: mỗi bước nhỏ, rollback bằng cách đổi route, business vẫn chạy. Nhược: giai đoạn chuyển tiếp dài, hai codebase cùng tồn tại, data ownership phải rõ.
+      Bắt đầu bằng route **read-only, ít rủi ro, có test tốt**; routing theo feature flag (% user / tenant) để canary.
+    followUp: Both systems need the same data during the transition. Who owns the database, and how does the new service read it?
+    redFlags:
+      - "Proposes rewriting everything and switching DNS on launch day"
+    tags: [strangler-fig, legacy]
+  - id: scenario-migration-006
+    level: easy
+    type: gotcha
+    q: "Your migration tool fails with `CREATE INDEX CONCURRENTLY cannot run inside a transaction block`. What is happening and how do you fix it?"
+    hint: |-
+      Nhiều tool (Knex, TypeORM, Flyway mặc định, node-pg-migrate) **bọc mỗi migration trong transaction**. `CREATE INDEX CONCURRENTLY` cần tự commit nhiều lần giữa các phase nên Postgres cấm chạy trong transaction block.
+      Fix: tắt transaction **cho riêng migration đó** (Knex `config = { transaction: false }`, TypeORM `transaction = false` trên class migration, node-pg-migrate `pgm.noTransaction()`), để nó ở migration file riêng, không kèm DDL khác.
+      Sau đó kiểm tra index có `indisvalid = true`; nếu fail, index `INVALID` còn lại → `DROP INDEX CONCURRENTLY` rồi chạy lại.
+    followUp: The index build failed halfway on a unique violation. Why is the leftover index still hurting write latency?
+    redFlags:
+      - "Removes CONCURRENTLY to make the error go away"
+    tags: [postgres, indexes, migration-tools]
+    verify: true
+  - id: scenario-migration-007
+    level: easy
+    type: concept
+    q: "You inherit 5M user accounts with unsalted MD5 password hashes. How do you move to argon2id without forcing every user to reset their password?"
+    hint: |-
+      Bạn không có password gốc, nên không thể rehash offline. Hai bước:
+      (1) **Ngay lập tức wrap**: với mọi user, lưu `argon2id(md5_hash)` + đánh dấu `scheme = 'argon2(md5)'` → MD5 lộ không còn dùng được, không chờ user login.
+      (2) **Rehash-on-login**: khi login, verify theo scheme hiện tại; thành công thì tính `argon2id(password)` và cập nhật `scheme = 'argon2'`.
+      Sau N tháng, user chưa login vẫn được bảo vệ bởi lớp wrap; có thể buộc reset cho nhóm này. Lưu `scheme`/params trong hash string (PHC format) để nâng cấp tiếp.
+    example: |-
+      ```ts
+      async function verify(user: User, pw: string): Promise<boolean> {
+        const ok =
+          user.scheme === "argon2" ? await argon2.verify(user.hash, pw)
+          : await argon2.verify(user.hash, md5hex(pw)); // wrapped legacy
+        if (ok && user.scheme !== "argon2") {
+          await users.update(user.id, { hash: await argon2.hash(pw), scheme: "argon2" });
+        }
+        return ok;
+      }
+      ```
+    followUp: Why is wrapping the old hash immediately better than waiting for users to log in?
+    redFlags:
+      - "Plans to brute-force or decrypt MD5 hashes to recover passwords"
+      - "Only rehashes on login and leaves inactive users on raw MD5"
+    tags: [passwords, security, migration]
+  - id: scenario-migration-008
+    level: easy
+    type: concept
+    q: "Your product search points directly at the Elasticsearch index `products_v1`. Why should the app read and write through an alias from day one?"
+    hint: |-
+      Alias là tên logic trỏ tới một hoặc nhiều index. App dùng `products` → khi đổi mapping/analyzer (không sửa được trên index cũ), bạn build `products_v2`, reindex, rồi **đổi alias atomic** bằng `_aliases` với `remove` + `add` trong cùng request.
+      Không có alias → phải deploy app để đổi tên index, và rollback cũng phải deploy lại.
+      Dùng `is_write_index` để tách alias đọc và ghi khi cần dual-index trong lúc reindex.
+    example: |-
+      ```json
+      POST _aliases
+      { "actions": [
+        { "remove": { "index": "products_v1", "alias": "products" } },
+        { "add":    { "index": "products_v2", "alias": "products" } }
+      ] }
+      ```
+    followUp: Writes keep arriving while you reindex 50M documents. How do you make sure v2 does not miss them?
+    redFlags:
+      - "Plans to delete and recreate the index in place"
+    tags: [elasticsearch, reindex, alias]
+  - id: scenario-migration-009
+    level: medium
+    type: gotcha
+    q: "On Postgres 15 you run `ALTER TABLE events ADD COLUMN id2 uuid NOT NULL DEFAULT gen_random_uuid()` on a 400M-row table and it takes 40 minutes with the table locked. A colleague's `ADD COLUMN created_by text DEFAULT 'system'` took 5 ms. Why the difference?"
+    hint: |-
+      PG11+ có **fast default**: `ADD COLUMN ... DEFAULT <non-volatile>` chỉ lưu default vào catalog (`pg_attribute.attmissingval`), không rewrite bảng. Hằng số và hàm STABLE như `now()` (tính 1 lần lúc ALTER) đều fast.
+      `gen_random_uuid()`, `clock_timestamp()`, `random()` là **VOLATILE** → mỗi row cần giá trị khác → **rewrite toàn bảng dưới ACCESS EXCLUSIVE**.
+      Fix: thêm cột nullable không default (hoặc default hằng), set default cho row mới bằng `ALTER COLUMN SET DEFAULT gen_random_uuid()` (chỉ ảnh hưởng row mới), backfill theo batch, rồi NOT NULL qua `CHECK NOT VALID` → `VALIDATE` → `SET NOT NULL`.
+      MySQL 8: `ALGORITHM=INSTANT` cho add column (8.0.12+); SQL Server 2012+ Enterprise: add NOT NULL column với default hằng là metadata-only.
+    followUp: After the batched backfill, how do you add NOT NULL without scanning the table under ACCESS EXCLUSIVE?
+    redFlags:
+      - "Says every ADD COLUMN with DEFAULT rewrites the table (true only before PG11 or for volatile defaults)"
+    tags: [postgres, ddl, fast-default]
+    verify: true
+  - id: scenario-migration-010
+    level: medium
+    type: debug
+    q: "This migration adds a foreign key from `order_items` (900M rows) to `orders`. During the deploy, checkout inserts hang for 12 minutes. What is wrong and what should it look like?"
+    example: |-
+      ```sql
+      -- migration 20260901_add_fk.sql
+      ALTER TABLE order_items
+        ADD CONSTRAINT order_items_order_fk
+        FOREIGN KEY (order_id) REFERENCES orders(id);
+      ```
+    hint: |-
+      `ADD FOREIGN KEY` lấy `SHARE ROW EXCLUSIVE` trên **cả hai bảng** và **scan toàn bộ 900M rows** để kiểm tra trong lúc giữ lock → insert/update vào `order_items` và `orders` bị chặn suốt thời gian scan.
+      Fix (2 migration riêng, đều có `lock_timeout`):
+      (1) `ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID` → chỉ lock ngắn, áp dụng cho row mới ngay.
+      (2) `ALTER TABLE order_items VALIDATE CONSTRAINT order_items_order_fk` → scan với `SHARE UPDATE EXCLUSIVE`, không chặn read/write thường.
+      Trước đó: tìm orphan rows (`LEFT JOIN orders ... WHERE o.id IS NULL`) và xử lý, nếu không VALIDATE sẽ fail. Có index trên `order_items(order_id)` để delete/update trên `orders` không phải seq scan.
+    followUp: VALIDATE fails because of 312 orphan rows created by an old bug. What do you do with them?
+    redFlags:
+      - "Suggests dropping the FK entirely because it is 'slow'"
+    tags: [postgres, foreign-key, not-valid]
+  - id: scenario-migration-011
+    level: medium
+    type: scenario
+    q: "In your Kubernetes pipeline, when exactly should database migrations run relative to the rollout, and which kinds of changes must go before vs after the code deploy?"
+    hint: |-
+      Thường chạy migration như **một Job / pre-deploy step** trước khi rollout pod mới (không chạy trong `main()` của mỗi pod — N replica cùng chạy migration → race, lock).
+      **Trước code**: thay đổi *additive* (add column nullable, add table, add index concurrently) — code cũ không biết tới nên vô hại.
+      **Sau code** (ở release sau): thay đổi *destructive* (drop column, drop table, thêm NOT NULL mà code cũ không ghi) — chỉ khi không còn pod nào dùng cái cũ.
+      Rollback code phải vẫn chạy được với schema đã expand → migration phải forward-only và additive trong release đó.
+    followUp: Your migration Job succeeds but the rollout fails health checks and auto-rolls back. What state are you in, and is it safe?
+    redFlags:
+      - "Runs migrations on app startup in every replica"
+      - "Puts DROP COLUMN in the same release that stops using the column"
+    tags: [deploy-ordering, kubernetes, migrations]
+  - id: scenario-migration-012
+    level: medium
+    type: debug
+    q: "After a deploy, a column with 3 years of data is empty in production. The service uses TypeORM. Find the cause in this config and explain how you would prevent it."
+    example: |-
+      ```ts
+      export const dataSource = new DataSource({
+        type: "postgres",
+        url: process.env.DATABASE_URL,
+        entities: [__dirname + "/entities/*.js"],
+        synchronize: true, // "so dev and prod stay in sync"
+        migrationsRun: false,
+      });
+      // Entity change in this release:
+      // @Column() referralCode: string;  (renamed from `refCode`)
+      ```
+    hint: |-
+      `synchronize: true` cho TypeORM tự so entity với schema và **tự ALTER** lúc app khởi động. Rename property = TypeORM thấy "cột `refCode` thừa, cột `referralCode` thiếu" → **DROP cột cũ + ADD cột mới** → mất dữ liệu. Nhiều pod khởi động cùng lúc còn race DDL.
+      Fix: `synchronize: false` ở mọi môi trường ngoài local; dùng migration file được review (generate rồi **đọc và sửa SQL**: rename phải là `RENAME COLUMN` hoặc expand–contract).
+      Phòng ngừa: CI lint migration (cấm `DROP COLUMN` không có flag duyệt), chạy migration bằng role riêng, app role không có quyền DDL. Khôi phục: PITR vào instance tạm rồi copy cột lại.
+      Prisma có bẫy tương tự: đổi tên field trong schema → `migrate dev` sinh DROP + ADD nếu không sửa tay.
+    followUp: How do you restore just that column from a PITR backup without rolling back the whole database?
+    redFlags:
+      - "Blames TypeORM without mentioning the app should not have DDL privileges"
+    tags: [typeorm, prisma, orm, data-loss]
+    verify: true
+  - id: scenario-migration-013
+    level: medium
+    type: debug
+    q: "This Knex migration works on staging but blocks writes to `orders` for 6 minutes in production. Fix it."
+    example: |-
+      ```ts
+      // migrations/20260910_orders_status_idx.ts
+      import type { Knex } from "knex";
+      export async function up(knex: Knex) {
+        await knex.schema.alterTable("orders", (t) => {
+          t.index(["tenant_id", "status", "created_at"], "orders_tenant_status_created_idx");
+        });
+      }
+      export async function down(knex: Knex) {
+        await knex.schema.alterTable("orders", (t) => t.dropIndex([], "orders_tenant_status_created_idx"));
+      }
+      ```
+    hint: |-
+      `t.index` sinh `CREATE INDEX` thường → giữ lock `SHARE` trên bảng suốt lúc build → **mọi INSERT/UPDATE/DELETE bị chặn**. Staging nhỏ nên build 2 giây, prod 300M rows build 6 phút.
+      Fix: raw SQL `CREATE INDEX CONCURRENTLY IF NOT EXISTS ...`, **tắt transaction** cho file này (`export const config = { transaction: false }`), đặt `lock_timeout`, và `down` dùng `DROP INDEX CONCURRENTLY`.
+      Thêm bước kiểm tra `indisvalid` sau khi build; nếu `INVALID` thì drop và retry. Test migration trên bản sao dữ liệu cỡ prod để đo thời gian.
+    followUp: CONCURRENTLY has been running for 40 minutes and seems stuck. What is it waiting for?
+    redFlags:
+      - "Says the fix is to run it off-peak without changing the statement"
+    tags: [knex, indexes, concurrently]
+  - id: scenario-migration-014
+    level: medium
+    type: debug
+    q: "This backfill script for a new `orders.total_cents` column took the primary to 95% CPU, replica lag hit 20 minutes, and it got slower every batch. What is wrong?"
+    example: |-
+      ```ts
+      const BATCH = 50_000;
+      await db.transaction(async (tx) => {
+        for (let offset = 0; ; offset += BATCH) {
+          const rows = await tx.query(
+            `SELECT id, total FROM orders ORDER BY id LIMIT $1 OFFSET $2`, [BATCH, offset]);
+          if (rows.length === 0) break;
+          for (const r of rows) {
+            await tx.query(`UPDATE orders SET total_cents = $1 WHERE id = $2`,
+              [Math.round(r.total * 100), r.id]);
+          }
+        }
+      });
+      ```
+    hint: |-
+      Lỗi: (1) **một transaction cho cả bảng** → giữ row lock, không cho VACUUM dọn dead tuple, rollback cuối = mất hết; (2) `OFFSET` → batch sau phải scan lại mọi row trước đó (O(n²)); (3) update từng row = 1 round-trip/row; (4) không throttle → WAL bùng, replica không kịp replay; (5) không resume được, không idempotent.
+      Fix: **keyset** theo PK (`WHERE id > $last ORDER BY id LIMIT 5000`), một `UPDATE ... FROM (VALUES ...)` hoặc `UPDATE ... WHERE id BETWEEN` mỗi batch, **commit mỗi batch**, `AND total_cents IS NULL` để chạy lại an toàn, lưu checkpoint, sleep và **dừng khi `replay_lag` > ngưỡng** (vd 5s).
+      Code mới phải dual-write `total_cents` **trước** khi backfill chạy, nếu không row được update giữa chừng sẽ lệch.
+    followUp: How do you decide the batch size and the sleep time, and how does the job adapt when traffic peaks?
+    redFlags:
+      - "Only suggests increasing the batch size"
+    tags: [backfill, postgres, replication-lag]
+  - id: scenario-migration-015
+    level: medium
+    type: compare
+    q: "For moving from SQL Server to Postgres, a teammate proposes dual writes from the application instead of CDC because 'it is simpler'. How do you respond?"
+    hint: |-
+      Dual-write: app ghi DB cũ rồi DB mới. **Không atomic** — ghi thứ nhất thành công, thứ hai fail/timeout → lệch; retry có thể duplicate; hai request đồng thời có thể ghi hai DB **theo thứ tự khác nhau** → last-write khác nhau.
+      Còn phải: backfill dữ liệu cũ riêng, sửa **mọi** đường ghi (job, script, admin tool, service khác, trigger) — sót một đường là lệch âm thầm.
+      CDC: đọc log theo **commit order**, bắt mọi writer, gồm cả delete; đổi lại vận hành connector, type mapping, lag.
+      Dual-write chỉ chấp nhận được khi có reconciliation mạnh và DB cũ vẫn là source of truth (DB mới chỉ là "best effort" tới khi verify).
+    followUp: If you are forced to dual-write, how do you design it so that a failure is detectable and repairable?
+    redFlags:
+      - "Wraps both writes in try/catch and calls it consistent"
+    tags: [dual-write, cdc, db-migration]
+  - id: scenario-migration-016
+    level: medium
+    type: scenario
+    q: "CDC has been replicating 1.2B rows from the old cluster to the new one for two weeks. Row counts match. How do you prove the data is actually identical before cutover?"
+    hint: |-
+      Count bằng nhau chưa đủ. Tầng verify:
+      (1) **Count theo chunk** (theo PK range / tenant / ngày) để khoanh vùng lệch.
+      (2) **Checksum theo chunk**: hash của các cột đã **chuẩn hoá** (timestamp về UTC, numeric cùng scale, text trim/collation) cho mỗi dải PK, so sánh hai bên; chunk lệch mới diff từng row.
+      (3) **Sample diff** ngẫu nhiên row-by-row qua code app (so object sau khi map).
+      (4) **Shadow read**: app đọc cả hai, log diff, trả kết quả cũ. Chạy verify khi CDC đang chạy → chấp nhận "lệch do lag" bằng cách so lại chunk lệch sau vài phút.
+    example: |-
+      ```sql
+      -- Postgres side, per 100k-id chunk
+      SELECT id / 100000 AS chunk, count(*),
+             md5(string_agg(concat_ws('|', id, status, amount_cents,
+                 to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US')), ',' ORDER BY id))
+      FROM orders GROUP BY 1 ORDER BY 1;
+      ```
+    followUp: The checksum differs only on rows with `datetime2` columns. What do you suspect?
+    redFlags:
+      - "Stops at matching row counts"
+    tags: [verification, checksum, db-migration]
+  - id: scenario-migration-017
+    level: medium
+    type: scenario
+    q: "A Kafka topic has a backlog of 10M messages. Producers add 2,000 msg/s and your consumers process 3,000 msg/s. The PM asks when it will be drained. What do you answer, and what do you check before scaling anything?"
+    hint: |-
+      ETA = backlog / (consume − produce) = 10M / 1,000 ≈ **2.8 giờ** — nếu tốc độ giữ nguyên. Nếu giờ cao điểm produce lên 3k/s thì **không bao giờ drain**.
+      Trước khi scale: (1) lag **theo partition** (đều hay dồn vào vài partition = hot key); (2) consumer bị nghẽn ở đâu — CPU, downstream DB/API latency, hay rebalance liên tục; (3) downstream còn headroom không — tăng consumer mà DB đã 90% CPU chỉ chuyển sự cố sang DB; (4) ordering có cần theo key không; (5) message có còn giá trị không (event cũ có thể skip/compact).
+      Tính max throughput = min(partitions × throughput/consumer, capacity downstream).
+    followUp: Lag is concentrated on 3 of 24 partitions. What does that tell you and what do you do?
+    redFlags:
+      - "Immediately proposes adding partitions and consumers without measuring"
+    tags: [kafka, backlog, capacity]
+  - id: scenario-migration-018
+    level: medium
+    type: gotcha
+    q: "To drain a backlog on a 12-partition topic, the team scales the consumer deployment from 6 to 48 pods. Throughput goes up only 2x and lag spikes during the scale-up. Why?"
+    hint: |-
+      Trong một consumer group, **mỗi partition chỉ gán cho 1 consumer** → tối đa 12 consumer làm việc, 36 pod còn lại idle.
+      Scale-up gây **rebalance**: với eager protocol mọi consumer dừng, commit, nhận lại partition → lag spike. Dùng cooperative-sticky assignor / static membership (`group.instance.id`) để giảm.
+      Muốn quá 12: (a) tăng song song **bên trong** mỗi consumer (xử lý nhiều message cùng lúc theo key), (b) batch ghi downstream, (c) tăng partition — nhưng có hệ quả với ordering theo key.
+    followUp: What does adding partitions do to messages with the same key that are already in the backlog versus new ones?
+    redFlags:
+      - "Believes more pods than partitions always increases throughput"
+    tags: [kafka, consumer-group, rebalance]
+  - id: scenario-migration-019
+    level: medium
+    type: debug
+    q: "After a consumer pod was OOM-killed, 1,800 order events never reached the database, though the topic still has them. Look at the consumer and explain the loss."
+    example: |-
+      ```ts
+      await consumer.run({
+        autoCommit: true,          // commits periodically in the background
+        eachBatchAutoResolve: true,
+        eachBatch: async ({ batch }) => {
+          for (const m of batch.messages) {
+            buffer.push(JSON.parse(m.value!.toString())); // in-memory
+          }
+          if (buffer.length >= 5000) {
+            await db.insertOrders(buffer.splice(0));       // flushed later
+          }
+        },
+      });
+      ```
+    hint: |-
+      Offset được **resolve/commit ngay khi `eachBatch` trả về**, nhưng message chỉ nằm trong `buffer` RAM. Pod chết trước khi flush → offset đã commit vượt qua các message chưa ghi DB → **mất** (Kafka vẫn giữ nhưng consumer group sẽ không đọc lại).
+      Fix: **chỉ commit sau khi ghi durable**: tắt auto-resolve, flush trong cùng batch, gọi `resolveOffset(m.offset)` + `commitOffsetsIfNecessary()` sau khi `insertOrders` commit; hoặc lưu offset **trong cùng transaction DB** với dữ liệu.
+      Hệ quả: at-least-once → crash sau khi ghi DB nhưng trước commit offset sẽ xử lý lại → insert phải **idempotent** (`ON CONFLICT (event_id) DO NOTHING`).
+      Recovery: reset offset của group về trước thời điểm crash (`kafka-consumer-groups --reset-offsets --to-datetime`) rồi replay — an toàn nhờ idempotency.
+    followUp: How do you find the exact offset range to replay, and why is replaying safe here?
+    redFlags:
+      - "Suggests switching to acks=all on the producer (it is a consumer-side bug)"
+    tags: [kafka, kafkajs, at-least-once, data-loss]
+    verify: true
+  - id: scenario-migration-020
+    level: medium
+    type: compare
+    q: "Compare Postgres `synchronous_commit` settings `off`, `local`, `on` and `remote_apply` for a system that claims zero data loss. What does each actually guarantee?"
+    hint: |-
+      - `off`: trả OK trước khi WAL flush ra disk local → crash có thể mất vài trăm ms giao dịch gần nhất (khoảng tới 3 × `wal_writer_delay`), nhưng **không corrupt**.
+      - `local`: flush WAL local rồi mới OK, không chờ standby.
+      - `on` (default): flush local; nếu có `synchronous_standby_names` thì chờ standby **flush** WAL → mất primary không mất commit đã ack.
+      - `remote_write`: chờ standby nhận và ghi vào OS (chưa fsync). `remote_apply`: chờ standby **apply** → đọc từ standby thấy ngay (read-your-writes).
+      Trade-off: sync standby thêm 1 network RTT mỗi commit; nếu chỉ có 1 sync standby và nó chết thì **write dừng** → dùng `ANY 1 (s1, s2)` với 2 standby. Có thể đặt per-transaction: log ít quan trọng dùng `SET LOCAL synchronous_commit = off`.
+    followUp: With `synchronous_standby_names = 'FIRST 1 (s1)'`, the standby goes down at peak. What happens to the application?
+    redFlags:
+      - "Thinks synchronous_commit=off can corrupt the database"
+      - "Believes streaming replication is synchronous by default"
+    tags: [postgres, durability, replication]
+    verify: true
+  - id: scenario-migration-021
+    level: medium
+    type: compare
+    q: "Your RDS Postgres has one async read replica, and someone says 'we are covered for data loss because we have a replica'. Compare that with Multi-AZ. What would you change?"
+    hint: |-
+      **Read replica**: replication **async**, mục đích scale read; primary chết → replica có thể thiếu vài giây dữ liệu, promote là thao tác thủ công, endpoint đổi.
+      **Multi-AZ (DB instance)**: standby ở AZ khác nhận **synchronous** replication, không phục vụ read, failover tự động (thường 1–2 phút) qua cùng DNS endpoint. **Multi-AZ DB cluster**: 2 standby đọc được, commit chờ ít nhất 1 standby ack, failover nhanh hơn.
+      Cả hai **không phải backup**: `DELETE` sai được replicate ngay. Cần thêm automated backups + PITR (retention 7–35 ngày), snapshot copy sang region/account khác.
+      App: dùng endpoint DNS, TTL thấp, retry khi failover, pool reconnect.
+    followUp: During a Multi-AZ failover your Node pods keep hitting the old IP for minutes. Why, and how do you fix it?
+    redFlags:
+      - "Treats a read replica as the high-availability and backup strategy"
+    tags: [aws, rds, multi-az, durability]
+    verify: true
+  - id: scenario-migration-022
+    level: medium
+    type: scenario
+    q: "Your team has had nightly backups and WAL archiving for two years. The CTO asks, 'How do you know we can restore?' What do you answer and what do you set up?"
+    hint: |-
+      Câu trả lời thật: "chưa restore thử thì chưa biết". Backup chưa restore = giả thuyết.
+      Thiết lập: **restore drill tự động** định kỳ (tuần/tháng) vào instance tạm, PITR tới một timestamp cụ thể, chạy smoke query (count bảng chính, row mới nhất ≈ timestamp mục tiêu), đo **thời gian restore thật** = RTO thật, alert nếu fail.
+      Kiểm tra chuỗi WAL liên tục (`archive_command` fail sẽ âm thầm tạo lỗ hổng; theo dõi `pg_stat_archiver.failed_count`), retention đủ, backup ở account/region khác + chống xoá (S3 Object Lock / AWS Backup vault lock).
+      Viết runbook: ai được quyết định restore, restore toàn DB hay chỉ bảng bị hỏng (restore sang instance phụ rồi copy).
+    followUp: A developer ran an UPDATE without WHERE 20 minutes ago. Walk through the recovery with PITR without losing the last 20 minutes of other writes.
+    redFlags:
+      - "Says 'AWS handles backups' and stops"
+    tags: [backup, pitr, wal, restore-drill]
+  - id: scenario-migration-023
+    level: medium
+    type: scenario
+    q: "You are moving an endpoint from a legacy PHP service that returns XML to a Node service that returns JSON. 40 partner integrations still parse the XML. How do you migrate without breaking them?"
+    hint: |-
+      Không bắt partner đổi cùng lúc. Node service giữ **core model** chung, thêm **adapter** theo content negotiation (`Accept: application/xml` hoặc route `/v1` giữ XML, `/v2` JSON).
+      Adapter XML phải giống **byte-level ở những điểm partner parse**: tên element, thứ tự, namespace, định dạng số/ngày, cách biểu diễn null (thẻ rỗng vs vắng mặt), encoding.
+      Bảo vệ: **golden file / contract test** từ response thật của PHP; shadow traffic so XML cũ vs mới; canary theo partner.
+      Sau đó: đo ai còn dùng XML (log theo API key), gửi lịch deprecation, `Deprecation` / `Sunset` header, chỉ tắt khi traffic = 0 hoặc hết hạn đã thông báo.
+    example: |-
+      ```ts
+      app.get("/api/orders/:id", async (req, res) => {
+        const order = await orders.get(req.params.id);       // one core model
+        if (req.accepts(["json", "xml"]) === "xml") {
+          res.type("application/xml").send(toLegacyXml(order)); // matches PHP output
+        } else {
+          res.json(toJsonV2(order));
+        }
+      });
+      ```
+    followUp: The XML from Node matches the schema, yet one partner breaks. What kinds of differences would you look for?
+    redFlags:
+      - "Plans to email partners and switch everyone on a date"
+    tags: [legacy, backward-compatibility, xml, api-versioning]
+  - id: scenario-migration-024
+    level: medium
+    type: gotcha
+    q: "To test the new Node service, you mirror 100% of production traffic to it (shadowing). A day later, customers complain about duplicate confirmation emails. What went wrong and how should shadowing be scoped?"
+    hint: |-
+      Shadow traffic cho endpoint **ghi** làm hệ mới thực hiện side effect thật: gửi email, charge thẻ, publish event, ghi DB chung.
+      Quy tắc: mirror **chỉ GET/read** mặc định; nếu cần test write → hệ mới chạy ở **dry-run mode** với sandbox (email/payment stub, DB riêng, topic riêng), hoặc chỉ so sánh output của hàm tính toán mà không commit.
+      Mirror phải **fire-and-forget**: lỗi/latency của hệ mới không được ảnh hưởng response thật; so sánh bỏ qua field động (timestamp, request id, thứ tự mảng không quan trọng).
+      Tooling: Envoy/Istio request mirroring, Nginx `mirror`, hoặc diff service riêng (kiểu Diffy).
+    followUp: The diff tool shows 4% mismatches, mostly on timestamps and array ordering. How do you get a useful signal?
+    redFlags:
+      - "Mirrors write endpoints to a shared production database"
+    tags: [shadow-traffic, parity-testing, legacy]
+  - id: scenario-migration-025
+    level: medium
+    type: design
+    q: "You need to retire `/v1/orders` in favor of `/v2/orders`. Mobile clients from 2 years ago still call v1. Design the deprecation process."
+    hint: |-
+      (1) **Đo trước**: log version theo client/app version/API key → biết ai còn dùng và bao nhiêu %.
+      (2) **Thông báo máy đọc được**: header `Deprecation` (RFC 9745) và `Sunset: <HTTP-date>` (RFC 8594) + `Link` tới tài liệu migrate; changelog, email cho partner.
+      (3) **Mobile**: force-update / min-version check từ config server; không tắt v1 khi còn app cũ ngoài kia mà không có force update.
+      (4) **Giảm dần**: brownout (tắt v1 vài phút theo lịch để lộ client còn phụ thuộc), rồi tắt hẳn, trả `410 Gone` kèm hướng dẫn.
+      (5) v1 nên là **adapter mỏng** gọi logic v2 để không phải bảo trì hai logic.
+    followUp: A top-10 customer says they cannot migrate before the sunset date. What do you do?
+    redFlags:
+      - "Removes v1 on the announced date without measuring remaining traffic"
+    tags: [api-versioning, deprecation, sunset]
+    verify: true
+  - id: scenario-migration-026
+    level: medium
+    type: scenario
+    q: "You deployed v2, which ran a migration adding a column and a new table. Error rate jumps, and you want to roll back. Do you roll back the migration too?"
+    hint: |-
+      Thường **không**. Nếu migration là additive (expand) thì code v1 vẫn chạy được với schema mới → chỉ rollback code, giữ schema. Đây là lý do mọi migration trong release phải additive.
+      `down` migration nguy hiểm: drop cột/bảng vừa nhận dữ liệu thật từ v2 → mất dữ liệu; và nó lấy lock lúc hệ thống đang có sự cố.
+      Chiến lược **forward-only**: sửa bằng migration mới (roll forward). Chỉ chạy down khi chắc chắn chưa có dữ liệu có giá trị và đã review.
+      Kiểm tra: v2 có ghi dữ liệu dạng mới mà v1 hiểu sai không (vd enum value mới) — đây là rủi ro thật của rollback code.
+    followUp: v2 wrote a new enum value `partially_refunded` that v1 does not know. What happens after rollback and how do you prevent it next time?
+    redFlags:
+      - "Always runs the down migration as part of rollback"
+    tags: [rollback, forward-only, migrations]
+  - id: scenario-migration-027
+    level: medium
+    type: compare
+    q: "You must add a column and an index to a 200M-row MySQL table and a similar SQL Server table. How does the approach differ from Postgres?"
+    hint: |-
+      **MySQL 8 (InnoDB)**: `ADD COLUMN` thường `ALGORITHM=INSTANT` (8.0.12+; add ở bất kỳ vị trí từ 8.0.29). Index: `ALGORITHM=INPLACE, LOCK=NONE` (online nhưng vẫn cần metadata lock ngắn đầu/cuối → cũng có lock queue, xem `lock_wait_timeout`). Thay đổi nặng / an toàn hơn: **gh-ost** (triggerless, đọc binlog, throttle theo replica lag, cutover có thể hoãn) hoặc **pt-online-schema-change** (dùng trigger).
+      **SQL Server**: `CREATE INDEX ... WITH (ONLINE = ON)` (Enterprise / Azure SQL), `RESUMABLE = ON` (2017+ cho rebuild, 2019+ cho create). Add NOT NULL column với default hằng là metadata-only (2012+ Enterprise). Đặt `SET LOCK_TIMEOUT` và `WAIT_AT_LOW_PRIORITY` cho online ops.
+      **Postgres**: không có online DDL tool phổ biến kiểu gh-ost; dựa vào `CONCURRENTLY`, `NOT VALID`, fast default, `lock_timeout`, pg_repack cho rewrite.
+      Luôn nêu: chế độ "online" vẫn có đoạn lock ngắn → vẫn cần timeout + retry.
+    followUp: gh-ost's cutover step is postponed until you allow it. Why is that useful during business hours?
+    redFlags:
+      - "Assumes ONLINE=ON works on every SQL Server edition"
+    tags: [mysql, sql-server, gh-ost, online-ddl]
+    verify: true
+  - id: scenario-migration-028
+    level: hard
+    type: scenario
+    q: "A migration runs `ALTER TABLE orders ADD COLUMN channel text` (normally 5 ms). Within seconds every API call touching `orders` times out and the connection pool is exhausted. Walk through diagnosis and the fix."
+    hint: |-
+      (1) Chẩn đoán ngay: `pg_stat_activity` + `pg_blocking_pids()` → thấy `ALTER` chờ `ACCESS EXCLUSIVE` sau một transaction dài (report query, `idle in transaction`), và hàng trăm query app chờ **sau ALTER**.
+      (2) Cơ chế: lock queue FIFO — request đang chờ xung đột với lock `ACCESS SHARE` của SELECT mới → SELECT mới cũng phải chờ.
+      (3) Dập lửa: `pg_cancel_backend` migration (hoặc blocker nếu an toàn) → queue tự tan.
+      (4) Fix lâu dài: migration luôn `SET lock_timeout = '2s'` + retry có jitter (vd 10 lần); giới hạn `idle_in_transaction_session_timeout`; không chạy migration khi có long query (check trước); report chạy trên replica.
+      Con số: API timeout 5s + pool 20 → chỉ cần chờ lock ~5s là cạn pool.
+    example: |-
+      ```sql
+      SELECT pid, pg_blocking_pids(pid) AS blocked_by, state,
+             now() - xact_start AS xact_age, left(query, 60) AS query
+      FROM pg_stat_activity
+      WHERE datname = current_database() AND wait_event_type = 'Lock'
+      ORDER BY xact_start;
+      ```
+    followUp: Write the retry wrapper for DDL. How many attempts, what backoff, and when do you give up and page someone?
+    redFlags:
+      - "Blames the ALTER for being slow"
+      - "Kills random blocked API queries instead of the queue head"
+    tags: [postgres, lock-queue, incident]
+  - id: scenario-migration-029
+    level: hard
+    type: design
+    q: "`orders.id` is an `integer` at 1.9B and growing 20M/day. You have about 12 weeks before overflow. Plan the move to `bigint` with zero downtime, including the foreign keys that reference it."
+    hint: |-
+      `ALTER COLUMN TYPE bigint` rewrite toàn bảng + index dưới ACCESS EXCLUSIVE → không dùng được. Expand–contract:
+      (1) Thêm `id_new bigint`, **trigger** `BEFORE INSERT OR UPDATE` copy `id` → `id_new`; làm tương tự cho `order_items.order_id_new` và các bảng con.
+      (2) Backfill batch theo PK, throttle theo replica lag.
+      (3) `CREATE UNIQUE INDEX CONCURRENTLY` trên `id_new`; NOT NULL qua CHECK NOT VALID → VALIDATE; FK mới `NOT VALID` → VALIDATE.
+      (4) Cutover trong **một transaction ngắn** (lock_timeout + retry): drop PK cũ, `ADD CONSTRAINT pk PRIMARY KEY USING INDEX`, rename cột, chuyển sequence sang `bigint` (`ALTER SEQUENCE ... AS bigint`), đổi default, drop trigger.
+      (5) App/ORM: kiểu TS (`bigint` từ `pg` trả về **string** mặc định), client JS với số > 2^53, API contract.
+      Tạm thời (mua thời gian): sequence có thể dùng số âm nếu app chịu được — chỉ là biện pháp khẩn cấp.
+    followUp: The pg driver returns bigint as string. Which parts of a Node/TS stack break, and how do you handle JSON clients?
+    redFlags:
+      - "Plans a single ALTER COLUMN TYPE during a maintenance window without estimating rewrite time"
+      - "Forgets the referencing foreign key columns"
+    tags: [postgres, bigint, expand-contract, sequence]
+    verify: true
+  - id: scenario-migration-030
+    level: hard
+    type: design
+    q: "You are splitting `customers.name` into `first_name` and `last_name`. Old app versions, a cron job and a partner integration still write `name` only. Design the transition so both representations stay correct."
+    hint: |-
+      Vì không kiểm soát mọi writer, đồng bộ ở **DB** bằng trigger thay vì chỉ trong app:
+      - Trigger `BEFORE INSERT OR UPDATE`: nếu chỉ `name` đổi → tách thành first/last (theo rule đã thống nhất); nếu first/last đổi → ghép lại `name`. So sánh `OLD` vs `NEW` để biết phía nào đổi, tránh vòng lặp.
+      - Backfill row cũ theo batch; row không tách được (1 từ, nhiều họ, tên châu Á thứ tự họ trước) → đánh dấu `needs_review`, không đoán bừa.
+      - Chuyển read sang cột mới qua feature flag; đo writer còn dùng `name` (log / `pg_stat_statements`) rồi mới gỡ trigger và drop `name`.
+      Trade-off: trigger ẩn logic và thêm latency mỗi write; nhưng an toàn hơn khi có writer ngoài tầm kiểm soát. Ghi rõ trong migration docs và có test.
+    followUp: A row is updated by an old writer (name) and a new writer (first_name) in the same second. Which wins, and is that acceptable?
+    redFlags:
+      - "Splits on the first space and assumes all names fit"
+      - "Relies on app dual-writes while external writers exist"
+    tags: [expand-contract, triggers, data-quality]
+  - id: scenario-migration-031
+    level: hard
+    type: scenario
+    q: "Your throttled backfill (5k rows per batch, 200 ms sleep) is running on the primary. Replica lag climbs to 90 s, disk usage grows 150 GB, and read-your-writes bugs appear. What is going on and how do you make the job self-regulating?"
+    hint: |-
+      Mỗi UPDATE trong Postgres = tuple mới + WAL (có thể full-page writes sau checkpoint) → WAL sinh nhanh hơn replica replay; replica lag làm user đọc dữ liệu cũ. Disk: WAL giữ lại (replication slot của CDC/replica chậm, `wal_keep_size`) + **dead tuples** chưa vacuum.
+      Fix: (1) throttle **theo tín hiệu**, không theo sleep cố định: trước mỗi batch đọc `replay_lag` từ `pg_stat_replication` (hoặc CloudWatch `ReplicaLag`), dừng khi > 5s, tiếp khi < 1s; cũng dừng theo CPU/IO và giờ cao điểm.
+      (2) Theo dõi `pg_replication_slots` (`pg_wal_lsn_diff` của `restart_lsn`), đặt `max_slot_wal_keep_size` để slot chết không làm đầy disk.
+      (3) Để autovacuum theo kịp (VACUUM bảng giữa các đợt), tránh update cột có index nếu có thể (giữ HOT update).
+      (4) Tạm route read-after-write về primary cho luồng bị ảnh hưởng.
+    example: |-
+      ```ts
+      async function waitForReplicas(maxLagSec = 5) {
+        for (;;) {
+          const { rows } = await pg.query(
+            `SELECT coalesce(max(extract(epoch FROM replay_lag)), 0) AS lag FROM pg_stat_replication`);
+          if (Number(rows[0].lag) < maxLagSec) return;
+          await sleep(2_000);
+        }
+      }
+      ```
+    followUp: A logical replication slot for a paused Debezium connector is holding 400 GB of WAL. What are your options?
+    redFlags:
+      - "Only increases the sleep between batches"
+    tags: [backfill, replication-lag, wal, vacuum]
+  - id: scenario-migration-032
+    level: hard
+    type: scenario
+    q: "You use Debezium to migrate from SQL Server to Postgres. How does the connector guarantee that the initial snapshot and the change stream line up without gaps or double-applied changes, and what can still go wrong?"
+    hint: |-
+      Cơ chế: yêu cầu bật **CDC trên database + từng bảng** SQL Server. Connector ghi lại **LSN** hiện tại, chụp snapshot nhất quán (isolation snapshot / lock ngắn tùy `snapshot.isolation.mode`), rồi stream thay đổi **từ LSN đó**. Offset (LSN) lưu trong Kafka Connect → restart tiếp tục đúng chỗ.
+      Có thể trùng thay đổi quanh ranh giới / sau restart → sink phải **upsert theo PK** (idempotent), không insert thuần.
+      Rủi ro: CDC retention của SQL Server (cleanup job, mặc định 3 ngày) ngắn hơn thời gian connector dừng → mất change, phải snapshot lại; **DDL** không tự áp (bảng capture instance phải tạo lại khi đổi schema); bảng không có PK; type mapping (`datetimeoffset`, `money`, `uniqueidentifier`, `bit`); log truncation / disk transaction log phình.
+      Incremental snapshot (signal table) cho phép snapshot lại bảng lớn theo chunk mà không dừng stream.
+    followUp: Someone adds a column to a captured SQL Server table during the migration. What happens to the stream?
+    redFlags:
+      - "Assumes Debezium gives exactly-once delivery into the sink without idempotent writes"
+    tags: [debezium, cdc, sql-server, db-migration]
+    verify: true
+  - id: scenario-migration-033
+    level: hard
+    type: debug
+    q: "Right after cutover to the new Postgres cluster, every insert into `orders` fails with `duplicate key value violates unique constraint \"orders_pkey\"`. Data was copied with DMS. What happened and how do you fix it in minutes?"
+    example: |-
+      ```text
+      ERROR: duplicate key value violates unique constraint "orders_pkey"
+      DETAIL: Key (id)=(1) already exists.
+      ```
+
+      ```sql
+      -- fix: move the sequence past the copied data (plus headroom)
+      SELECT setval(pg_get_serial_sequence('orders', 'id'),
+                    (SELECT coalesce(max(id), 0) + 1000 FROM orders), false);
+      ```
+    hint: |-
+      CDC/DMS copy **giá trị** của cột id, nhưng **sequence / identity** ở DB đích vẫn ở giá trị khởi tạo (1). DMS cũng không migrate sequence, default, secondary index, FK theo mặc định.
+      Fix ngay (trong freeze window, trước khi mở write): với mỗi bảng dùng sequence, `setval` = `max(id)` + khoảng đệm.
+      Checklist cutover phải có bước này + test insert một row giả; so sánh `last_value` với `max(id)` cho **mọi** sequence.
+      Nếu còn reverse replication về DB cũ để rollback: dùng **dải id tách biệt** (vd DB mới nhảy lên +1B) hoặc UUID để hai phía không trùng id.
+    followUp: How do you generate the setval statements for 300 tables automatically, including identity columns?
+    redFlags:
+      - "Deletes the conflicting rows"
+    tags: [sequence, identity, cutover, dms]
+    verify: true
+  - id: scenario-migration-034
+    level: hard
+    type: gotcha
+    q: "After migrating from SQL Server to Postgres, signups start creating duplicate accounts like `Alice@x.com` and `alice@x.com`, and some reports are off by a day. Explain both bugs."
+    hint: |-
+      (1) **Collation**: SQL Server mặc định `SQL_Latin1_General_CP1_CI_AS` = **case-insensitive** → unique index trên `email` chặn trùng khác hoa/thường, `WHERE email = @e` cũng không phân biệt. Postgres mặc định **case-sensitive** → unique không còn chặn, lookup login fail.
+      Fix: normalize `lower(email)` + unique index trên `lower(email)`, hoặc `citext`, hoặc nondeterministic ICU collation (PG12+, không dùng được với `LIKE` ở bản cũ). Dọn duplicate đã tạo.
+      (2) **Time zone**: `datetime`/`datetime2` không có offset; nếu migrate sang `timestamptz` mà connector giả định sai zone (server local vs UTC) → lệch vài giờ, nhóm theo ngày lệch 1 ngày. Xác định zone thật của dữ liệu cũ trước khi convert; `datetimeoffset` → `timestamptz`.
+      Khác: `money` → `numeric(19,4)`, `bit` → `boolean`, trailing space khi so sánh (`'a ' = 'a'` đúng trong SQL Server), `NULL` + string concat, `TOP` vs `LIMIT`, empty string vs NULL từ tool.
+    followUp: How would your verification step have caught these before cutover?
+    redFlags:
+      - "Only lists syntax differences like TOP vs LIMIT"
+    tags: [sql-server, postgres, collation, timezone]
+    verify: true
+  - id: scenario-migration-035
+    level: hard
+    type: debug
+    q: "Your outbox relay runs as 3 replicas for throughput. Consumers report events for the same order arriving out of order, and a few events are never published at all. Find both bugs."
+    example: |-
+      ```ts
+      // runs every 200 ms in each of 3 replicas
+      async function relayOnce() {
+        const last = await state.get("last_id");               // shared checkpoint
+        const { rows } = await pg.query(
+          `SELECT * FROM outbox WHERE id > $1 ORDER BY id LIMIT 500
+           FOR UPDATE SKIP LOCKED`, [last]);
+        for (const e of rows) await kafka.send({ topic: e.topic, messages: [{ value: e.payload }] });
+        await pg.query(`UPDATE outbox SET published_at = now() WHERE id = ANY($1)`, [rows.map(r => r.id)]);
+        await state.set("last_id", rows.at(-1)?.id ?? last);
+      }
+      ```
+    hint: |-
+      **Mất event**: `id` lấy từ sequence lúc INSERT, nhưng transaction commit theo thứ tự khác. Tx A lấy id 100 commit chậm, tx B id 101 commit trước → relay thấy 101, set `last_id = 101` → 100 **không bao giờ** được đọc. Checkpoint "id > last" không an toàn; dùng `WHERE published_at IS NULL` (partial index) thay vì high-water mark.
+      **Sai thứ tự**: `SKIP LOCKED` chia các row của **cùng một order** cho nhiều relay → publish song song; và `kafka.send` thiếu **key** → vào partition khác nhau. Fix: key = `aggregate_id`; mỗi relay sở hữu một nhóm aggregate (`hash(aggregate_id) % N`, hoặc advisory lock theo shard), hoặc 1 relay leader.
+      Còn nữa: lock `FOR UPDATE` không giữ qua các statement vì không có transaction; publish rồi mới mark → crash giữa chừng = **duplicate** (at-least-once) → consumer dedupe bằng `event_id`.
+      CDC (Debezium outbox event router) đọc WAL theo **commit order** nên tránh được cả hai bug.
+    followUp: With `published_at IS NULL` polling, how do you keep the outbox table and its index from bloating at 5k events/s?
+    redFlags:
+      - "Says SKIP LOCKED makes the relay exactly-once"
+    tags: [outbox, ordering, skip-locked, at-least-once]
+  - id: scenario-migration-036
+    level: hard
+    type: scenario
+    q: "The outbox table has grown to 80M rows, the relay is 25 minutes behind, and the polling query takes 4 seconds. What happened and how do you fix it without losing events?"
+    hint: |-
+      Nguyên nhân thường gặp: không xoá row đã publish → bảng + index phình; polling `WHERE published_at IS NULL ORDER BY id` không có **partial index** → scan; dead tuples do update `published_at` liên tục mà autovacuum không kịp; relay publish từng message một (không batch, `await` tuần tự).
+      Fix theo ưu tiên: (1) partial index `ON outbox(id) WHERE published_at IS NULL`; (2) publish **batch** (500–1000 message/`send`, idempotent producer) rồi mark một lần; (3) xoá row đã publish theo batch (hoặc **partition theo ngày** và `DROP` partition cũ — O(1)); autovacuum tuning riêng cho bảng; (4) scale relay theo shard aggregate.
+      Trong lúc catch-up: consumer phải chịu được burst; báo downstream "trễ 25 phút"; alert trên **outbox age** (`now() - min(created_at) WHERE published_at IS NULL`).
+    followUp: Would you switch to Debezium here? What operational risks does that bring?
+    redFlags:
+      - "Truncates the outbox to catch up"
+    tags: [outbox, bloat, relay-lag]
+  - id: scenario-migration-037
+    level: hard
+    type: gotcha
+    q: "During a 10M-message backlog, someone increases the `orders` topic from 12 to 48 partitions to drain faster. Afterwards, a downstream service sees 'payment captured' before 'order created' for new orders. Explain."
+    hint: |-
+      Default partitioner: `partition = murmur2(key) % numPartitions`. Đổi 12 → 48 thì **cùng key giờ vào partition khác**. Message cũ của order X vẫn nằm trong partition cũ (backlog đang chờ), message mới của X vào partition mới (trống, được xử lý ngay) → message mới đi **trước** message cũ.
+      Hậu quả khác: partition **không giảm được**; state theo partition (Kafka Streams, compacted topic) bị lệch; consumer mới chỉ đọc từ partition mới theo `auto.offset.reset`.
+      Nếu cần ordering theo key: không tăng partition trong lúc có backlog; tăng song song **bên trong consumer theo key**. Nếu buộc phải tăng: pause producer → drain hết → tăng partition → resume; hoặc tạo topic mới với số partition lớn và migrate consumer có kiểm soát.
+    followUp: How would you get 4x throughput on the same 12 partitions while keeping per-key order?
+    redFlags:
+      - "Says ordering is only lost for old messages, not new ones"
+      - "Plans to reduce partitions afterwards"
+    tags: [kafka, partitions, ordering]
+  - id: scenario-migration-038
+    level: hard
+    type: design
+    q: "Each partition must be processed in key order, but one message takes 50 ms (downstream API call) and you only have 12 partitions. Design a Node consumer that is 20x faster without breaking per-key order or losing messages."
+    hint: |-
+      Ý tưởng: ordering chỉ cần **trong cùng key**, không phải cả partition. Trong mỗi partition, fetch batch → chia message theo key vào **hàng đợi theo key**; chạy tới N key song song (vd 20–50), mỗi key tuần tự.
+      Commit offset: chỉ commit tới **offset liên tục thấp nhất đã xong** (low watermark) trong partition; message sau đã xong nhưng message trước chưa xong thì chưa commit → crash sẽ xử lý lại → sink idempotent.
+      Backpressure: giới hạn số message in-flight, `pause()` partition khi đầy; `heartbeat()` khi batch dài để tránh rebalance; giới hạn concurrency theo capacity downstream (rate limiter).
+      Java có Confluent Parallel Consumer (key-ordering mode) làm sẵn; Node phải tự viết hoặc dùng batch + `Promise.all` theo nhóm key.
+    example: |-
+      ```ts
+      eachBatch: async ({ batch, resolveOffset, heartbeat }) => {
+        const byKey = new Map<string, KafkaMessage[]>();
+        for (const m of batch.messages) {
+          const k = m.key?.toString() ?? "";
+          byKey.set(k, [...(byKey.get(k) ?? []), m]);
+        }
+        await pMap([...byKey.values()], async (msgs) => {
+          for (const m of msgs) await handleIdempotent(m);   // in order per key
+        }, { concurrency: 32 });
+        resolveOffset(batch.lastOffset());                    // whole batch done
+        await heartbeat();
+      }
+      ```
+    followUp: One key has 200k messages in the backlog (hot tenant). How does your design behave and what do you change?
+    redFlags:
+      - "Processes the whole batch with Promise.all and ignores ordering"
+      - "Commits the last offset of the batch before all messages finish"
+    tags: [kafka, parallel-consumer, ordering, backpressure]
+  - id: scenario-migration-039
+    level: hard
+    type: scenario
+    q: "While draining a backlog, one partition's lag stops moving. Logs show the same message failing every 30 seconds with a JSON schema error. Other partitions are fine. What do you do now and what do you change?"
+    hint: |-
+      Đó là **poison message**: retry vô hạn chặn cả partition (head-of-line blocking).
+      Ngay: cấu hình / code "sau N lần retry với lỗi **không retry được** (validation, schema) → gửi sang **DLQ / parking topic** kèm headers (lỗi, offset gốc, partition) → commit và đi tiếp".
+      Nếu ordering theo key quan trọng: park **cả các message sau cùng key** (hoặc chặn key đó) để tránh xử lý event sau khi event trước bị bỏ; các key khác vẫn chạy.
+      Phân loại lỗi: transient (timeout, 503) → retry có backoff hoặc retry topic; permanent → DLQ ngay. Alert trên DLQ size; có tool **replay** DLQ sau khi fix. Nguồn gốc: producer không validate schema → dùng Schema Registry + compatibility check.
+    followUp: After the fix, how do you replay the DLQ without reordering events for those keys?
+    redFlags:
+      - "Suggests skipping the offset manually and forgetting about the message"
+    tags: [kafka, dlq, poison-message]
+  - id: scenario-migration-040
+    level: hard
+    type: scenario
+    q: "Your topic uses RF=3, `min.insync.replicas=2`, `acks=all`. During a rolling broker upgrade, producers throw `NotEnoughReplicasException` and the API returns 500s. Is the config wrong? What do you change?"
+    hint: |-
+      Config đúng cho zero loss: ghi chỉ thành công khi ≥ 2 replica in-sync. Lỗi xuất hiện vì trong lúc upgrade, **1 broker restart + 1 replica khác đang lag** (chưa vào lại ISR) → ISR = 1 < 2 → từ chối ghi (đúng thiết kế: ưu tiên durability hơn availability).
+      Fix vận hành: upgrade từng broker và **chờ URP (under-replicated partitions) = 0** trước khi sang broker tiếp; controlled shutdown; tránh rack/AZ mất 2 replica.
+      App: producer retry có backoff (`delivery.timeout.ms` đủ dài để qua restart), idempotent producer để retry không duplicate; API không trả 500 ngay — nếu business cho phép thì ghi vào **outbox** và ack, relay publish sau.
+      Không hạ `min.insync.replicas` xuống 1 hay bật unclean election để "hết lỗi" — đó là đổi sang có thể mất dữ liệu.
+    followUp: What exactly does `unclean.leader.election.enable=true` risk, and when would anyone accept it?
+    redFlags:
+      - "Lowers min.insync.replicas to 1 to stop the errors"
+    tags: [kafka, durability, isr, operations]
+  - id: scenario-migration-041
+    level: hard
+    type: scenario
+    q: "Blue/green deploy with a shared database: green ran a migration that dropped `orders.legacy_status`, then you switched traffic back to blue because of a bug. Blue now fails on every order page. How do you recover, and what rule was broken?"
+    hint: |-
+      Rule bị phá: trong blue/green, **cả hai màu phải chạy được trên cùng schema** trong suốt thời gian còn khả năng switch back. Drop cột là **contract** → chỉ làm khi blue đã bị huỷ và không còn đường rollback.
+      Recover: không có "undo DROP COLUMN". Hoặc sửa nhanh green và switch lại; hoặc thêm lại cột (nullable) để blue chạy tạm rồi **restore dữ liệu cột** từ PITR vào instance phụ và copy theo PK (dữ liệu ghi sau thời điểm drop phải điền lại từ logic/nguồn khác).
+      Phòng ngừa: migration destructive tách thành release riêng sau 1 chu kỳ; CI lint cấm DROP trong cùng release; checklist "blue còn đọc cột này không?"; bật `pg_stat_statements` / log để kiểm tra không còn query dùng cột trước khi drop.
+    followUp: How do you design background workers and queue consumers in blue/green so that both colors do not process the same jobs twice?
+    redFlags:
+      - "Suggests restoring the whole database to before the migration"
+    tags: [blue-green, shared-db, contract-phase]
+  - id: scenario-migration-042
+    level: hard
+    type: debug
+    q: "You reindexed 40M products into `products_v2` with `_reindex` while the app kept writing to `products_v1`, then swapped the alias. Next day, v2 has 0.3% fewer docs and some prices are stale. Why, and what should the procedure have been?"
+    hint: |-
+      `_reindex` copy snapshot tại thời điểm chạy (scroll) → write/update/**delete** xảy ra trong lúc reindex (vài giờ) **không** có trong v2. Delete sau khi đã copy → doc "ma" còn trong v2; update sau khi copy → giá cũ.
+      Quy trình đúng: (1) tạo v2 với mapping mới; (2) **dual-index**: app (hoặc indexer consumer) ghi vào cả v1 và v2 từ **trước** khi bắt đầu backfill; (3) backfill từ **source of truth** (DB/Kafka), dùng `version_type: external` (version = `updated_at` hoặc số version từ DB) để bản backfill cũ **không đè** bản dual-write mới hơn; (4) verify count + sample so với DB; (5) swap alias atomic; (6) giữ v1 vài ngày để rollback.
+      Nếu indexer đọc từ Kafka: có thể chạy consumer group mới cho v2 từ offset đầu (hoặc snapshot + CDC) rồi swap khi lag = 0.
+    followUp: Why does external versioning make the order of backfill and live writes irrelevant?
+    redFlags:
+      - "Suggests running _reindex again right before the swap and hoping nothing changed"
+    tags: [elasticsearch, reindex, dual-index, versioning]
+  - id: scenario-migration-043
+    level: hard
+    type: scenario
+    q: "You need to move 300 TB and 2B objects from an S3 bucket in one region/account to a bucket in another, while the app keeps uploading and reading. How do you do it with zero loss and prove it?"
+    hint: |-
+      (1) Bật **versioning** cả hai bucket (bắt buộc cho replication). Cấu hình **S3 Replication** (CRR) cho object **mới**; object có sẵn dùng **S3 Batch Replication** (hoặc Batch Operations copy / DataSync).
+      (2) App đọc: **dual-read** — thử bucket mới, miss thì fallback bucket cũ (và log miss) cho tới khi backfill xong.
+      (3) Verify: **S3 Inventory** hai bên (key, size, ETag/checksum, version) → join (Athena) tìm thiếu/lệch; ETag multipart không so trực tiếp được → dùng **additional checksums** (SHA-256/CRC) hoặc so size + checksum do app lưu.
+      (4) Cutover: app ghi vào bucket mới, giữ replication **ngược** hoặc giữ bucket cũ read-only một thời gian; chỉ xoá sau khi inventory khớp 100% và qua retention.
+      Chú ý: chi phí data transfer + request (2B PUT), KMS key giữa account, object ACL/ownership, lifecycle, delete marker không replicate mặc định.
+    followUp: Replication metrics show 12,000 objects in FAILED status. How do you find and fix them?
+    redFlags:
+      - "Plans to run `aws s3 sync` from a laptop and compare object counts"
+    tags: [s3, replication, data-migration]
+    verify: true
+  - id: scenario-migration-044
+    level: hard
+    type: design
+    q: "Orders flow from Postgres through an outbox to Kafka and into a reporting warehouse and a search index. Finance finds totals differ by 0.1% some days. Design a reconciliation system."
+    hint: |-
+      (1) Định nghĩa **invariant** so được: count + sum(amount) + max(updated_at) theo (tenant, giờ) ở nguồn và từng sink. Tính ở nguồn bằng query trên replica, ở sink bằng query tương ứng.
+      (2) Chạy theo **cửa sổ đã đóng** (vd giờ trước + độ trễ an toàn 15 phút) để không báo lệch do lag bình thường.
+      (3) Lệch → drill-down: chia nhỏ cửa sổ, so danh sách id (hoặc hash theo bucket id) để tìm đúng row thiếu/sai.
+      (4) Sửa **tự động**: re-emit event cho các id đó từ nguồn (replay) — an toàn vì sink idempotent (upsert theo `event_id`/version).
+      (5) Metric + alert: mismatch rate, số row tự sửa, tuổi của lệch; dashboard cho finance. Lưu kết quả để audit.
+      Nguyên nhân hay gặp: event bị DLQ, consumer lỗi mapping, update out-of-order ghi đè bản mới, timezone khi group theo ngày.
+    followUp: Why must the sink apply updates only if the incoming version is newer, and how do you store that version?
+    redFlags:
+      - "Proposes a nightly full resync as the only mechanism"
+    tags: [reconciliation, data-quality, idempotency]
+  - id: scenario-migration-045
+    level: hard
+    type: debug
+    q: "The order API returns 202 in 8 ms at peak. After a pod was OOM-killed, 600 orders that customers saw as 'accepted' do not exist anywhere. Find the design bug."
+    example: |-
+      ```ts
+      const queue: Order[] = [];
+      setInterval(async () => {
+        const batch = queue.splice(0, 500);
+        if (batch.length) await producer.send({ topic: "orders", messages: batch.map(toMsg) });
+      }, 1000);
+
+      app.post("/orders", (req, res) => {
+        queue.push(validate(req.body));
+        res.status(202).json({ status: "accepted" }); // acked before durable
+      });
+      ```
+    hint: |-
+      API **ack trước khi durable**: order chỉ nằm trong RAM của pod tối đa 1 giây (và lâu hơn khi Kafka chậm, queue lớn dần → chính nó gây OOM). Pod chết = mất. Lỗi `send` trong `setInterval` còn bị nuốt mất (unhandled rejection).
+      Nguyên tắc: **no ack until durable**. Fix: `await producer.send(...)` với `acks=all` + idempotent producer trước khi trả 202 (thêm vài ms), hoặc ghi vào Postgres (order + outbox) trong 1 transaction rồi trả 202.
+      Client gửi **Idempotency-Key** để retry khi timeout mà không tạo trùng. Giới hạn in-flight / backpressure: Kafka chậm → trả 503 + `Retry-After` thay vì phình RAM.
+      Graceful shutdown (`SIGTERM` → ngừng nhận, flush, rồi thoát) giúp khi deploy, nhưng **không** cứu OOM/kill -9.
+    followUp: With `await producer.send`, what does the client see if Kafka acks but the HTTP response is lost, and how does it recover?
+    redFlags:
+      - "Suggests only adding graceful shutdown"
+    tags: [durability, no-ack-until-durable, kafka, idempotency]
+  - id: scenario-migration-046
+    level: hard
+    type: design
+    q: "A risky data migration (new column semantics plus a backfill) must be applied to a shared-schema SaaS with 2,000 tenants. How do you roll it out per tenant instead of all at once?"
+    hint: |-
+      Tách **schema change** (một lần, additive, cho toàn bảng) khỏi **data migration + behaviour switch** (theo tenant).
+      (1) Expand schema toàn cục (cột/index mới, CONCURRENTLY). (2) Backfill **theo tenant**, bắt đầu từ tenant nội bộ / nhỏ, rồi % tăng dần; lưu trạng thái `tenant_migration(tenant_id, step, status, checked_at)`. (3) Feature flag theo tenant để đọc/ghi đường mới sau khi tenant đã verify. (4) Tenant lớn nhất chạy riêng, ngoài giờ cao điểm của họ (múi giờ khác nhau).
+      Lợi: blast radius nhỏ, rollback theo tenant bằng flag, đo được thời gian để dự đoán tenant lớn. Chi phí: code phải hỗ trợ hai đường trong thời gian dài; flag cleanup.
+      Xem thêm 14-multi-tenancy cho schema-per-tenant.
+    followUp: Tenant 1,437 fails verification after migrating. What does the system do automatically, and what do you do manually?
+    redFlags:
+      - "Runs one global backfill and flips a global flag"
+    tags: [multi-tenancy, feature-flags, backfill]
+  - id: scenario-migration-047
+    level: senior
+    type: design
+    q: "Write the cutover runbook for moving a 2 TB SQL Server database behind a Node API to Aurora PostgreSQL, with a target of under 5 minutes of write unavailability and a rollback path for 7 days."
+    hint: |-
+      **T-weeks**: schema convert (types, collation, identity, triggers/procs rewrite), app hỗ trợ cả hai DB qua config; full load + CDC (DMS / Debezium) chạy liên tục; verify count/checksum theo chunk hàng ngày; shadow read; load test trên Aurora; reverse CDC (Aurora → SQL Server) đã dựng và test.
+      **Go/no-go**: CDC lag < 5s ổn định, mismatch = 0 trên chunk đã đóng, rollback đã diễn tập, người quyết định + kênh liên lạc rõ.
+      **Cutover (≤ 5 phút)**: bật maintenance cho write (flag → 503 + Retry-After, read vẫn chạy) → dừng job/cron → chờ lag = 0 → verify nhanh (count/checksum bảng nóng) → `setval` sequences → dừng CDC xuôi, bật **reverse CDC** → flip connection config → smoke test write → mở write.
+      **Sau**: theo dõi error/latency/lock; reconciliation hai chiều; giữ SQL Server sync 7 ngày; hết hạn → tắt reverse CDC, snapshot cuối, decommission.
+      **Rollback**: flip config lại (dữ liệu mới đã được reverse CDC mang về), id range tách biệt để không trùng.
+    followUp: At minute 3 of cutover, the verification query shows a mismatch on one table. Do you proceed or abort, and who decides?
+    redFlags:
+      - "No rollback path once writes go to the new database"
+      - "No explicit freeze of background jobs"
+    tags: [cutover, runbook, db-migration, aurora]
+    verify: true
+  - id: scenario-migration-048
+    level: senior
+    type: design
+    q: "A 10-year-old PHP monolith serves checkout, catalog and admin for thousands of merchants. Leadership wants it moved to Node over 18 months without breaking users. Lay out your strategy."
+    hint: |-
+      (1) **Hiểu trước khi đụng**: map endpoint theo traffic, lỗi, business criticality, coupling DB; viết **characterization / contract tests** từ traffic thật (golden files).
+      (2) **Edge proxy** cho strangler fig: routing theo route + tenant + %; logging chuẩn hoá request/response để so sánh.
+      (3) Thứ tự: read-only, ít rủi ro (catalog read) → write đơn giản → checkout cuối cùng. Mỗi slice: shadow read → canary 1% → 10% → 100%, rollback bằng route.
+      (4) **Data**: giai đoạn đầu service mới đọc/ghi **cùng DB** qua bảng nó "sở hữu"; tách DB sau bằng CDC khi boundary ổn. Không để hai hệ cùng ghi một bảng mà không có quy tắc owner.
+      (5) Tương thích: adapter XML/JSON, cùng session/auth (JWT hoặc session store chung), cùng format ID, URL cũ redirect.
+      (6) Tổ chức: đo tiến độ bằng % traffic đã chuyển, không bằng % code viết lại; ngừng thêm feature vào PHP ở slice đã chuyển; kế hoạch tắt hẳn.
+      Trade-off: chạy hai hệ thống tốn gấp đôi vận hành; nói rõ điều kiện dừng/không làm (vd module ít đổi có thể để yên).
+    followUp: Halfway through, both systems write the `orders` table. How do you avoid conflicting business rules?
+    redFlags:
+      - "Big-bang rewrite with a launch date"
+      - "No plan for data ownership during coexistence"
+    tags: [strangler-fig, legacy, modernization]
+  - id: scenario-migration-049
+    level: senior
+    type: design
+    q: "Design the durability chain for a payment-events pipeline where the requirement is 'no accepted payment is ever lost': mobile client → API → Kafka → ledger service → Postgres. Name every knob."
+    hint: |-
+      - **Client**: Idempotency-Key per payment, retry có backoff khi timeout, lưu local tới khi nhận ack.
+      - **API**: ghi `payments` + `outbox` trong 1 transaction Postgres rồi mới trả 200/202 (**no ack until durable**); unique index trên idempotency key.
+      - **Relay → Kafka**: `acks=all`, `enable.idempotence=true`, topic RF=3, `min.insync.replicas=2`, `unclean.leader.election.enable=false`, replica trải 3 AZ; key = payment/account id.
+      - **Consumer (ledger)**: commit offset **sau** khi ghi DB; upsert theo `event_id` (hoặc lưu offset trong cùng transaction); poison → DLQ, không bỏ.
+      - **Postgres**: Multi-AZ / sync standby (`synchronous_commit=on` với ≥1 sync standby, `ANY 1 (a,b)` để không dừng khi mất một), WAL archive + PITR, backup cross-region có restore drill.
+      - **Chứng minh**: reconciliation outbox ↔ Kafka ↔ ledger theo giờ; alert outbox age, consumer lag, DLQ size.
+      Trade-off: +vài ms mỗi hop, chi phí 3 AZ; mất 2 broker → producer bị từ chối nhưng outbox giữ dữ liệu.
+    followUp: Where in this chain is 'exactly-once' real, and where is it at-least-once plus idempotency?
+    redFlags:
+      - "Relies on Kafka transactions alone for end-to-end exactly-once including the DB"
+    tags: [durability, kafka, outbox, payments]
+  - id: scenario-migration-050
+    level: senior
+    type: compare
+    q: "You are moving a 3 TB self-managed Postgres 13 cluster to Amazon Aurora PostgreSQL (or RDS) with minimal downtime. Compare native logical replication, AWS DMS and dump/restore, and pick one."
+    hint: |-
+      - **pg_dump/pg_restore**: đơn giản, chính xác, nhưng downtime ≈ thời gian dump + restore (3 TB = nhiều giờ) → chỉ hợp khi được maintenance window.
+      - **Native logical replication** (publication/subscription): PG → PG, commit order, ít thành phần; hạn chế: **không replicate DDL, sequence, large objects**; bảng cần PK / replica identity; initial copy nặng; slot giữ WAL nếu subscriber chậm. Thường là lựa chọn đầu cho PG → Aurora PG.
+      - **AWS DMS**: managed, hỗ trợ khác engine, có validation; nhưng type mapping/LOB mode dễ sai, không tạo secondary index / sequence đầy đủ, throughput và debug khó hơn.
+      Chọn: logical replication (hoặc Aurora/RDS hỗ trợ tính năng migrate riêng tuỳ version) + schema dump trước (`pg_dump --schema-only`), tạo index **sau** initial copy, `setval` sequence ở cutover. Upgrade major version cùng lúc được (logical không yêu cầu cùng major).
+      Rủi ro chung: extension không có trên Aurora, parameter khác, connection limit, PgBouncer config.
+    followUp: Logical replication does not carry sequences. What exactly do you run at cutover, and in what order?
+    redFlags:
+      - "Picks DMS for a PG-to-PG move without discussing its limits"
+    tags: [aurora, rds, logical-replication, dms]
+    verify: true
+  - id: scenario-migration-051
+    level: senior
+    type: compare
+    q: "An order must be saved in Postgres and in MongoDB (read model), consistently. The team debates 2PC, dual writes, transactional outbox and CDC. Give your recommendation and where each option actually fits."
+    hint: |-
+      - **Dual write** (Postgres rồi Mongo trong request): không atomic, thứ tự có thể đảo → loại trừ trừ khi có reconciliation mạnh.
+      - **2PC / XA**: có thật (Postgres `PREPARE TRANSACTION`, XA ở MySQL/SQL Server), cho atomic cross-resource nhưng coordinator là SPOF, giữ lock khi chờ, blocking khi coordinator chết; và **đa số NoSQL (Mongo, Dynamo, ES) không tham gia XA** → thực tế không áp dụng được ở đây. Không phải "không bao giờ", mà là trade-off thường không đáng.
+      - **Outbox**: Postgres là source of truth, event cùng transaction, relay → Kafka/trực tiếp → Mongo upsert có version. At-least-once, ordering theo aggregate key, cần idempotent sink.
+      - **CDC trên bảng business** (Debezium): không cần sửa code ghi, nhưng event mang hình dạng bảng (leak schema) → outbox + CDC (outbox event router) là kết hợp tốt.
+      Chốt: outbox (poll hoặc CDC), sink upsert `WHERE version < incoming`, đo relay lag, UI chịu được read-model trễ (read-your-writes đọc từ Postgres cho chính user đó).
+    followUp: Relay lag reaches 30 seconds. The user who just placed the order opens 'My orders' (served from Mongo). What do they see, and how do you fix the UX?
+    redFlags:
+      - "Says 2PC does not exist or is never used"
+      - "Proposes a distributed transaction with MongoDB and Postgres via the ORM"
+    tags: [outbox, 2pc, cdc, dual-write]
+  - id: scenario-migration-052
+    level: senior
+    type: open
+    q: "You are the new tech lead. In the last quarter, three incidents were caused by schema migrations. How do you make safe migrations the default for a team of 25 engineers?"
+    hint: |-
+      Biến kiến thức thành **guardrail tự động**, không chỉ tài liệu:
+      - **Lint migration trong CI** (squawk cho Postgres; rule: cấm `CREATE INDEX` không CONCURRENTLY, ADD FK không NOT VALID, DROP/RENAME trong cùng release, `ALTER TYPE` rewrite).
+      - **Runner chuẩn**: tự `SET lock_timeout` / `statement_timeout`, retry DDL có jitter, log thời gian lock; không chạy migration trong app startup.
+      - **Test trên dữ liệu cỡ prod** (clone định kỳ, ẩn danh) và đo thời gian trong pipeline.
+      - **Quy trình**: template PR cho migration (expand/contract step, rollback, ước lượng rows), reviewer DB, migration destructive cần approval riêng.
+      - **Học từ incident**: postmortem không đổ lỗi, thêm rule lint cho mỗi loại lỗi.
+      Đo kết quả: số incident do migration, thời gian lock p99 của migration, % migration pass lint lần đầu.
+    followUp: Engineers complain the linter blocks urgent hotfixes. How do you handle exceptions without losing the guardrail?
+    redFlags:
+      - "Only proposes writing a wiki page"
+      - "Proposes a single DBA approving every migration manually"
+    tags: [engineering-practices, guardrails, migrations]
+  - id: scenario-migration-053
+    level: senior
+    type: open
+    q: "When would you deliberately choose a planned downtime window over a zero-downtime migration? Defend the choice to a product manager."
+    hint: |-
+      Zero-downtime có **chi phí**: nhiều release, dual-write/CDC, code hai đường nhiều tuần, rủi ro bug khi dữ liệu ở trạng thái trung gian, người trực.
+      Chọn downtime khi: dữ liệu nhỏ (dump/restore < 15 phút), có khung thấp điểm thật (B2B nội địa lúc 2h sáng), SLA cho phép maintenance đã báo trước, thay đổi khó chia nhỏ (đổi engine với logic trigger phức tạp), team nhỏ không đủ người vận hành CDC.
+      Nói bằng số: "30 phút maintenance vào Chủ nhật, 0.3% traffic tuần, đổi lấy 6 tuần engineering và rủi ro lệch dữ liệu" vs "downtime checkout mất X tiền/phút".
+      Kể cả có downtime: vẫn cần rehearsal, rollback plan, go/no-go, và giao tiếp trước với user.
+    followUp: The PM agrees, but a key customer runs batch jobs at exactly that time. What now?
+    redFlags:
+      - "Insists zero-downtime is always required"
+    tags: [judgment, trade-offs, downtime]
+  - id: scenario-migration-054
+    level: senior
+    type: design
+    q: "A 10M-message backlog built up during a 3-hour outage of a downstream service. Live traffic keeps arriving and users care about fresh events far more than old ones. Design the recovery so fresh traffic is not delayed by the backlog."
+    hint: |-
+      Vấn đề: một consumer group xử lý theo offset → event mới phải chờ sau 10M event cũ.
+      Phương án: (1) **Tách luồng**: ghi lại điểm hiện tại (offset / timestamp T); consumer group chính **nhảy tới T** (reset offset tới latest) để phục vụ traffic mới ngay; một **consumer group backfill** riêng đọc từ offset cũ tới T với rate limit thấp hơn. (2) Hoặc copy backlog sang **overflow topic** rồi xử lý chậm.
+      Điều kiện: event cũ và mới **không cần thứ tự** giữa nhau, hoặc sink dùng **version/timestamp** để event cũ không ghi đè trạng thái mới hơn (upsert `WHERE version < incoming`).
+      Bảo vệ downstream: token bucket chung cho cả hai luồng, ưu tiên luồng live; circuit breaker; downstream vừa hồi phục thường yếu (cold cache) → ramp-up dần.
+      Xem xét bỏ qua: event hết giá trị (notification quá 3 giờ) → drop có log thay vì gửi muộn gây phiền.
+    followUp: How do you know when the backfill group has reached T and should stop?
+    redFlags:
+      - "Scales consumers to the maximum immediately, crushing the recovering downstream"
+    tags: [kafka, backlog, prioritization, backpressure]
+  - id: scenario-migration-055
+    level: senior
+    type: design
+    q: "Canary releases for a service whose release includes a data format change: v2 writes a new JSON shape into a shared `jsonb` column and a Kafka topic that other teams consume. Design a canary that can really be rolled back."
+    hint: |-
+      Canary chỉ rollback được nếu dữ liệu v2 ghi ra **vẫn đọc được bởi v1 và consumer khác**.
+      (1) Tách **reader trước writer**: release A = mọi reader (v1 service, consumer của team khác) hiểu cả shape cũ và mới (tolerant reader); release B = writer bắt đầu ghi shape mới sau flag.
+      (2) Kafka: schema registry với compatibility **BACKWARD/FULL**, thêm field optional, không đổi nghĩa field cũ; hoặc version trong envelope (`schemaVersion`) / topic mới `orders.v2` chạy song song.
+      (3) Canary theo tenant/% với metric **cả phía consumer** (lỗi deserialize, DLQ), không chỉ error rate của service.
+      (4) Rollback: tắt flag writer → dữ liệu shape mới đã ghi vẫn hợp lệ với reader. Không có bước (1) thì rollback không cứu được data đã ghi.
+    followUp: Another team's consumer is owned by a team that will not deploy for a month. How does that change your plan?
+    redFlags:
+      - "Measures only HTTP error rate on the canary pods"
+    tags: [canary, schema-evolution, compatibility]
+  - id: scenario-migration-056
+    level: cv
+    type: behavioral
+    q: "Tell me about a migration (schema, data or system) that went wrong. What happened, what did you do in the moment, and what did you change afterwards?"
+    hint: |-
+      STAR:
+      - **S**: hệ thống, quy mô (rows, QPS, số tenant), migration gì, vì sao cần.
+      - **T**: vai trò của bạn (viết migration, người trực, lead).
+      - **A**: phát hiện thế nào (alert nào, sau bao lâu), bước dập lửa (cancel DDL, rollback code, tắt flag), cách giao tiếp (status update mỗi 15 phút), root cause (lock queue, backfill không throttle, sequence chưa reset…).
+      - **R**: thời gian ảnh hưởng, dữ liệu có mất không, số liệu sau khi sửa.
+      - **Reflection**: guardrail đã thêm (lint CI, lock_timeout mặc định, runbook, restore drill) — nói rõ phần **bạn** làm. Không bịa số; ước lượng thì nói là ước lượng.
+    followUp: What would have caught this before production, and why was it not in place?
+    redFlags:
+      - "Blames another team or the DBA"
+      - "The story has no measurable impact or no lasting change"
+    tags: [behavioral, star, incident]
+  - id: scenario-migration-057
+    level: cv
+    type: behavioral
+    q: "Tell me about a time you had to change an API, payload or data format while old clients kept depending on the old one. How did you keep them working?"
+    hint: |-
+      STAR:
+      - **S**: ai phụ thuộc (mobile app cũ, partner, service khác), format cũ/mới (vd XML → JSON, field đổi tên, schema DB cũ).
+      - **T**: thay đổi mà không break; hạn chót.
+      - **A**: đo ai còn dùng (log theo client/version), adapter hoặc versioning, contract/golden tests, shadow/compare, canary theo client, thông báo deprecation với ngày cụ thể.
+      - **R**: số client đã chuyển, số incident (lý tưởng 0), thời gian giữ format cũ.
+      - **Reflection**: điều sẽ làm sớm hơn (version field ngay từ đầu, tolerant reader, đo usage trước khi thiết kế).
+    followUp: How did you decide when it was finally safe to delete the old format?
+    redFlags:
+      - "Says old clients were told to upgrade and that was it"
+    tags: [behavioral, backward-compatibility, api-versioning]

@@ -706,3 +706,75 @@ questions:
       Reflection: công cụ observability nào bạn ước đã có lúc đó.
     followUp: Which tools did you use to find the root cause, specifically?
     tags: [cv, incident, full-stack]
+  - id: behavioral-046
+    level: easy
+    type: behavioral
+    q: Across the companies you've worked at, which project was the biggest and most important? What was the team size, the domain, and your part in it?
+    hint: |-
+      Chọn **một** dự án, trả lời theo khung 4 ý, tối đa ~2 phút:
+      - **Domain + quy mô**: làm gì, cho ai, bao nhiêu user/tenant/request (số thật).
+      - **Team**: tổng bao nhiêu người, bao nhiêu BE/FE/QA, bạn ở vị trí nào (IC, tech lead, owner module nào).
+      - **Phần của bạn**: 2–3 việc bạn *own* end-to-end ("tôi thiết kế…", không phải "team đã…").
+      - **Kết quả**: 1 con số impact + 1 bài học.
+      Reflection: phân biệt rõ đóng góp của bạn và của team — interviewer sẽ đào đúng chỗ đó.
+    followUp: Which part of that project would you design differently today, and why?
+    redFlags:
+      - "Says 'we' for everything, so the interviewer can't tell what they personally did"
+      - "Cannot give the team size or the scale of the system"
+    tags: [opener, project]
+  - id: behavioral-047
+    level: easy
+    type: behavioral
+    q: What is good about your current company, what is not, and what would you improve if you could?
+    hint: |-
+      Câu hỏi thử **sự chín chắn và lòng trung thành** — không phải mời bạn xả.
+      - **Tốt**: 2 điều cụ thể (con người, domain, quy trình review, cơ hội học).
+      - **Chưa tốt**: 1 điều mang tính hệ thống, nói trung tính ("quy trình release còn thủ công, mất ~2 ngày").
+      - **Cải thiện**: điều *bạn đã làm hoặc đã đề xuất* để cải thiện nó → biến điểm yếu thành câu chuyện ownership.
+      Reflection: không nêu tên người, không kể chuyện nội bộ, không tiết lộ thông tin khách hàng.
+    followUp: Did you try to change that yourself? What happened?
+    redFlags:
+      - "Blames the manager or colleagues by name"
+      - "Says there's nothing bad at all (sounds rehearsed)"
+    tags: [motivation, culture]
+  - id: behavioral-048
+    level: easy
+    type: behavioral
+    q: What are your salary expectations?
+    hint: |-
+      Chuẩn bị số **trước** buổi phỏng vấn (khảo sát thị trường cho level + stack + location).
+      - Đưa **khoảng** (range) mà mức thấp nhất vẫn là mức bạn vui lòng nhận; nói rõ gross hay net, tháng hay năm, có tính bonus/13th month không.
+      - Nếu được hỏi quá sớm: "Tôi muốn hiểu rõ scope vai trò trước; mức tôi đang nhắm cho vai trò senior tương tự là khoảng X–Y."
+      - Neo vào **giá trị** (scope, kinh nghiệm liên quan), không vào nhu cầu cá nhân.
+      Reflection: tổng gói (bảo hiểm, remote, học tập, equity) cũng là thứ để đàm phán.
+    followUp: That's above our budget for this level. What flexibility do you have?
+    redFlags:
+      - "Gives a single number with no preparation, or refuses to answer at all"
+      - "Justifies the number with personal expenses"
+    tags: [hr, negotiation]
+  - id: behavioral-049
+    level: easy
+    type: behavioral
+    q: When could you join us, and how do you spend your free time?
+    hint: |-
+      **Ngày join**: nói đúng notice period theo hợp đồng (vd 30–45 ngày) + kế hoạch bàn giao; đừng hứa join ngay nếu phải bỏ ngang việc — công ty mới sẽ lo bạn cũng làm vậy với họ.
+      **Thời gian rảnh**: 1–2 sở thích thật, nếu có thì 1 cái liên quan tới học hỏi (side project, đọc sách kỹ thuật, thể thao đồng đội); ngắn gọn, thật.
+      Reflection: cả hai câu đều đo **độ tin cậy** — trả lời thật và nhất quán.
+    followUp: Is there anything that could delay that start date, such as other offers you're considering?
+    redFlags:
+      - "Offers to leave the current job immediately without handover"
+      - "Invents hobbies that sound impressive but can't talk about them"
+    tags: [hr, logistics]
+  - id: behavioral-050
+    level: easy
+    type: behavioral
+    q: Describe yourself in three words, and give me an example for each.
+    hint: |-
+      Chọn 3 từ **khớp với vai trò senior** và có bằng chứng: vd *ownership*, *pragmatic*, *curious*.
+      - Mỗi từ = 1 câu ví dụ thật ("Ownership: tôi tự nhận on-call cho service checkout sau sự cố X và viết runbook").
+      - Tránh từ sáo rỗng không chứng minh được (hard-working, passionate) trừ khi có ví dụ mạnh.
+      Reflection: ba từ nên kể cùng một câu chuyện về bạn, và khớp với các câu trả lời khác.
+    followUp: What would your last team lead say is your biggest weakness?
+    redFlags:
+      - "Three generic adjectives with no examples"
+    tags: [hr, self-awareness]

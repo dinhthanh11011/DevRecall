@@ -1,0 +1,1280 @@
+id: 35-scenario-concurrency-reliability
+slug: scenario-reliability
+title: "Scenarios: Concurrency, Idempotency & Reliability"
+tier: 9
+status: drafted
+summary: Mock interview tình huống production — oversell, double charge, rate limit, retry/circuit breaker, graceful shutdown trên K8s, webhook, idempotent consumer, deadlock, distributed lock, cron chạy 2 lần, OTP/MFA, race condition trong Node.
+cvLinked: true
+prerequisites: [13-sql-postgres, 17-messaging-kafka, 18-distributed-systems]
+overview: |-
+  ## TL;DR
+
+  - Mọi scenario trong track này quy về 3 câu hỏi: **(1) hai actor cùng chạm một resource thì ai thắng?** (concurrency), **(2) cùng một việc bị làm hai lần thì sao?** (idempotency), **(3) dependency chậm/chết/đang deploy thì hệ thống cư xử thế nào?** (reliability).
+  - Sửa race condition = **đẩy invariant xuống nơi có atomicity** (một câu `UPDATE ... WHERE`, unique constraint, Lua script), không phải "check trong code rồi ghi".
+  - At-least-once là thực tế của mạng: client retry, provider retry webhook, Kafka redeliver sau rebalance. Mọi handler có side effect phải **idempotent** — dedup bằng key + unique constraint **trong cùng transaction** với side effect.
+  - Retry chỉ an toàn khi: lỗi transient, operation idempotent, có **backoff + full jitter**, có **retry budget** và **deadline**. Nếu không, retry biến một sự cố nhỏ thành retry storm.
+  - Vận hành: graceful shutdown trên K8s là bài toán **race giữa SIGTERM và việc gỡ endpoint** → readiness fail + `preStop` sleep + đóng keep-alive + drain consumer. Liveness **không bao giờ** check DB.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Read-modify-write race | Đọc → quyết định trong app → ghi; khoảng giữa là nơi request khác chen vào | 2 request cùng đọc `stock=1`, cùng trừ |
+  | Atomic conditional UPDATE | Điều kiện nằm trong `WHERE`, DB kiểm và ghi trong 1 lệnh | `UPDATE ... SET stock=stock-1 WHERE id=$1 AND stock>=1` → `rowCount` |
+  | Optimistic lock | Ghi kèm `WHERE version=$old`; 0 row → conflict → retry | `version = version + 1` |
+  | Pessimistic lock | Khoá row khi đọc (`FOR UPDATE`), người khác chờ | `NOWAIT` = lỗi ngay, `SKIP LOCKED` = bỏ qua row đang bị khoá |
+  | Idempotency key | Client gửi 1 key/1 thao tác; server lưu key + fingerprint + response | `Idempotency-Key: 7c3e...` |
+  | Idempotent consumer | Dedup theo `event_id` bằng unique constraint trong cùng transaction với business write | `INSERT INTO processed_events ... ON CONFLICT DO NOTHING` |
+  | Token bucket | Bucket dung lượng B, nạp r token/s; request lấy 1 token | B=20, r=100/60 → burst 20, trung bình 100/phút |
+  | Full jitter | `sleep = random(0, min(cap, base·2^n))` | n=3, base=100ms → random 0..800ms |
+  | Retry budget | Giới hạn tỉ lệ retry / request (vd ≤10%) | 1000 rps → tối đa 100 retry/s |
+  | Circuit breaker | Closed → Open (fail fast) → Half-open (thử) | opossum `errorThresholdPercentage: 50` |
+  | Fencing token | Số tăng dần cấp kèm lock; storage từ chối token cũ | `WHERE last_token < $token` |
+  | Reservation/hold | Giữ tài nguyên có hạn (`expires_at`), hết hạn thì trả lại | Giữ ghế 10 phút khi checkout |
+  | Pivot transaction | Bước trong saga mà sau nó chỉ được đi tiếp (retry), không compensate | Capture payment thành công |
+  | Read-your-writes | User luôn thấy chính thứ mình vừa ghi | Route read về primary 5s sau write |
+
+  ## Cơ chế hoạt động
+
+  ### Chống double charge bằng idempotency key (có xử lý in-flight và crash)
+
+  ```mermaid
+  flowchart TD
+    R["POST /payments + Idempotency-Key"] --> I{"INSERT key, fingerprint,<br/>status=processing,<br/>locked_until=now+30s<br/>ON CONFLICT DO NOTHING"}
+    I -- "inserted (winner)" --> P["Call provider với<br/>CÙNG idempotency key"]
+    P --> S["UPDATE status=done,<br/>response_code, response_body"]
+    S --> OK["Trả response"]
+    I -- "conflict" --> F{"fingerprint khớp?"}
+    F -- no --> E422["422: key reused<br/>with different body"]
+    F -- yes --> ST{"status?"}
+    ST -- done --> RP["Replay response đã lưu"]
+    ST -- "processing, lease còn hạn" --> C409["409 / Retry-After"]
+    ST -- "processing, lease hết hạn" --> RC["Recovery: hỏi provider<br/>theo key rồi hoàn tất"]
+  ```
+
+  ### Graceful shutdown của pod Node trên Kubernetes
+
+  ```mermaid
+  sequenceDiagram
+    participant K as kubelet
+    participant EP as EndpointSlice / kube-proxy / LB
+    participant P as Node process
+    K->>EP: Pod Terminating → gỡ khỏi endpoints (bất đồng bộ)
+    K->>P: preStop (sleep 5-10s)
+    Note over P: Vẫn nhận traffic đến khi LB cập nhật xong
+    K->>P: SIGTERM (sau preStop)
+    P->>P: readiness=503, server.close()
+    P->>P: closeIdleConnections, Connection close cho request đang chạy
+    P->>P: consumer.disconnect() → commit offset
+    P->>P: đóng DB pool, Redis → exit(0)
+    K-->>P: SIGKILL nếu quá terminationGracePeriodSeconds (tính từ lúc bắt đầu preStop)
+  ```
+
+  ### Idempotent consumer + DLQ
+
+  ```mermaid
+  flowchart LR
+    T["Topic partition<br/>(key = orderId)"] --> H["Handler"]
+    H --> TX{"BEGIN<br/>INSERT processed_events(event_id)<br/>ON CONFLICT DO NOTHING"}
+    TX -- "0 row: đã xử lý" --> CM["COMMIT → commit offset"]
+    TX -- "1 row" --> BL["Business write"] --> CM
+    H -- "transient error" --> RT["Retry có backoff<br/>(giới hạn số lần)"]
+    RT --> H
+    H -- "poison / hết retry" --> DLQ["DLQ + alert<br/>(+ park key nếu cần ordering)"]
+    DLQ --> RE["Fix → replay"]
+  ```
+
+  ## Khung trả lời (dùng cho mọi scenario trong track)
+
+  1. **Clarify & đo**: volume (QPS, số item), invariant nghiệp vụ ("không bao giờ bán quá 100 vé", "mỗi order tối đa 1 lần charge"), chấp nhận stale/lỗi đến đâu, hiện có metric/log gì.
+  2. **Gọi tên cơ chế**: race (read-modify-write, check-then-act), duplicate (retry, redelivery), amplification (retry storm), race hạ tầng (SIGTERM vs endpoint removal).
+  3. **Fix theo lớp, rẻ nhất trước**: constraint/atomic op ở storage → idempotency/dedup → lock (DB trước Redis) → thay đổi kiến trúc (queue, reservation, saga).
+  4. **Failure modes của chính cái fix**: lock hết hạn, Redis chết, key "processing" kẹt, DLQ phá ordering, fail-open vs fail-closed.
+  5. **Chứng minh**: test song song (k6/autocannon + assert invariant), metric (conflict rate, 409, DLQ size, retry ratio), reconciliation job định kỳ như lưới an toàn cuối.
+
+  ## Trade-offs
+
+  | Kỹ thuật | Throughput khi contention cao | Độ phức tạp | Khi nào dùng | Rủi ro chính |
+  |---|---|---|---|---|
+  | Atomic conditional UPDATE | Cao nhưng serialize trên 1 row | Thấp | Counter/tồn kho đơn giản | Hot row: mọi request xếp hàng trên 1 row lock |
+  | Optimistic (version) | Kém khi conflict nhiều (retry liên tục) | Trung bình | Logic phức tạp, conflict hiếm | Retry storm, starvation |
+  | `SELECT ... FOR UPDATE` | Trung bình, giữ lock suốt transaction | Trung bình | Nhiều bước đọc/ghi cần nhất quán | Deadlock, pool cạn nếu transaction dài |
+  | `FOR UPDATE SKIP LOCKED` | Cao | Trung bình | Phân phát item bất kỳ (ghế trống bất kỳ, job queue) | Không dùng được khi cần đúng 1 row cụ thể |
+  | Redis Lua pre-decrement | Rất cao (~100k ops/s một node, verify) | Cao | Flash sale | Lệch với DB → cần reconciliation |
+  | Sharded counter | Cao | Trung bình | Counter nóng (view, stock pool) | Đọc tổng tốn hơn; check "≥0" khó hơn |
+  | Redis lock | Cao | Trung bình | Tránh làm trùng việc tốn kém (efficiency) | Không an toàn cho correctness nếu thiếu fencing |
+  | Postgres advisory lock | Trung bình | Thấp | Job/cron singleton, đã có Postgres | Session lock + PgBouncer transaction mode = hỏng |
+
+  | Rate limit fail mode | Hành vi khi Redis chết | Hợp cho |
+  |---|---|---|
+  | Fail-open | Cho qua hết (có thể kèm local limiter) | API đọc thông thường, ưu tiên availability |
+  | Fail-closed | Chặn (429/503) | Login, OTP, gửi SMS, endpoint tốn tiền |
+  | Degraded local | Mỗi pod dùng limit/N in-memory | Hầu hết trường hợp — trung dung |
+
+  ## Pitfalls
+
+  - Kiểm tra trong code (`if (stock > 0)`) rồi mới `UPDATE` — dù dùng transaction ở READ COMMITTED vẫn race.
+  - Idempotency key không có **fingerprint** (cùng key, body khác) và không có **lease** → key kẹt `processing` vĩnh viễn sau crash.
+  - Không truyền idempotency key xuống **payment provider** → timeout ở giữa vẫn double charge.
+  - Retry ở mọi layer (client + gateway + service + SDK) → amplification theo cấp số nhân.
+  - `server.close()` rồi nghĩ là xong: keep-alive connection giữ process sống đến SIGKILL.
+  - `CMD ["npm", "start"]` hoặc shell form → SIGTERM không tới được Node.
+  - Liveness probe gọi DB → DB chậm 30s = restart toàn bộ fleet.
+  - Verify HMAC trên `JSON.stringify(req.body)` thay vì raw body; so sánh bằng `===`; không kiểm timestamp → replay.
+  - Check `exists(event_id)` **ngoài** transaction → hai consumer cùng pass check.
+  - Redis lock release bằng `DEL` trơn; lock hết hạn giữa chừng mà không có fencing token.
+  - OTP tạo bằng `Math.random()`, lưu plaintext, không giới hạn số lần thử, không throttle resend.
+
+  ## Cheat sheet
+
+  - Oversell: `UPDATE ... WHERE stock >= $qty` + check `rowCount`; ghế cụ thể → unique `(show_id, seat_id)`; flash sale → Redis Lua + queue + reconcile; hot row → sharded counter.
+  - Postgres errors: `40001` serialization_failure, `40P01` deadlock_detected, `55P03` lock_not_available (NOWAIT), `23505` unique_violation. SQL Server: deadlock = error 1205; `WITH (UPDLOCK, ROWLOCK)`, `READPAST` ≈ SKIP LOCKED.
+  - Idempotency record: `key, scope(user/tenant), fingerprint(sha256 body), status, locked_until, response_code, response_body, created_at` + TTL ~24h (Stripe giữ 24h, verify).
+  - Rate limit: 429 + `Retry-After`; IETF `RateLimit-Policy` / `RateLimit` headers (draft, verify). Tính toán trong **Lua** để atomic.
+  - Retry: chỉ transient (timeout, 502/503/504, 429 có `Retry-After`, ECONNRESET) + idempotent; full jitter; tối đa 3 attempt; retry ở **một** layer; budget 10%.
+  - Shutdown: preStop sleep 5–10s → SIGTERM → readiness 503 → `server.close()` + `closeIdleConnections()` → drain → commit offset → exit. `terminationGracePeriodSeconds` mặc định 30s và **bao gồm** preStop.
+  - Webhook: raw body HMAC-SHA256 + timestamp ±5 phút + `timingSafeEqual` → insert event (unique event_id) → 200 nhanh → worker → reconcile theo API.
+  - Lock: `SET k token NX PX ttl` + Lua compare-and-delete + fencing token cho correctness; hoặc `pg_try_advisory_xact_lock`.
+  - Cron: K8s `concurrencyPolicy: Forbid` + job idempotent (CronJob có thể tạo 2 job hoặc 0 job trong vài trường hợp — docs K8s).
+  - OTP: `crypto.randomInt`, hash + TTL 5 phút, ≤5 lần thử, resend cooldown 30–60s, single-use, bind `user + purpose`, `timingSafeEqual`; ưu tiên TOTP/WebAuthn.
+notionRefs:
+  - title: Mock Questions — Technical Page 3 (Concurrency & Reliability)
+    url: https://app.notion.com/p/381ef77f8ab2813aa6f6d88fab1b272f
+  - title: Mock Questions — Technical Page 4 (Distributed Systems & Messaging)
+    url: https://app.notion.com/p/381ef77f8ab28104b342fd40e69d5be0
+  - title: Mock Questions — Technical Page 5 (Database & Performance)
+    url: https://app.notion.com/p/381ef77f8ab281b29a62ec72658d0405
+  - title: Mock Questions — Topic (MFA / OTP)
+    url: https://app.notion.com/p/2ddef77f8ab28030a76fcbaaa3dde966
+references:
+  - title: PostgreSQL — Transaction Isolation
+    url: https://www.postgresql.org/docs/current/transaction-iso.html
+  - title: PostgreSQL — Explicit Locking (row locks, advisory locks, deadlocks)
+    url: https://www.postgresql.org/docs/current/explicit-locking.html
+  - title: PostgreSQL — SELECT (FOR UPDATE, NOWAIT, SKIP LOCKED)
+    url: https://www.postgresql.org/docs/current/sql-select.html
+  - title: PostgreSQL — Error codes (Appendix A)
+    url: https://www.postgresql.org/docs/current/errcodes-appendix.html
+  - title: PostgreSQL — Monitoring replication (pg_stat_replication)
+    url: https://www.postgresql.org/docs/current/monitoring-stats.html
+  - title: Node.js — http.Server close / closeIdleConnections / closeAllConnections
+    url: https://nodejs.org/api/http.html
+  - title: Node.js — crypto.timingSafeEqual / randomInt
+    url: https://nodejs.org/api/crypto.html
+  - title: Kubernetes — Pod termination lifecycle
+    url: https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination
+  - title: Kubernetes — Container lifecycle hooks (preStop)
+    url: https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/
+  - title: Kubernetes — Configure liveness, readiness and startup probes
+    url: https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/
+  - title: Kubernetes — CronJob (concurrencyPolicy, job idempotency)
+    url: https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/
+  - title: Apache Kafka — Producer configs (enable.idempotence, max.in.flight.requests.per.connection)
+    url: https://kafka.apache.org/documentation/#producerconfigs
+  - title: Redis — Distributed locks
+    url: https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/
+  - title: Redis — Scripting with Lua (EVAL)
+    url: https://redis.io/docs/latest/develop/programmability/eval-intro/
+  - title: AWS Architecture Blog — Exponential Backoff and Jitter
+    url: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+  - title: AWS Builders' Library — Timeouts, retries, and backoff with jitter
+    url: https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/
+  - title: AWS Builders' Library — Making retries safe with idempotent APIs
+    url: https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/
+  - title: AWS Builders' Library — Using load shedding to avoid overload
+    url: https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/
+  - title: RFC 9110 — HTTP Semantics (Retry-After, idempotent methods)
+    url: https://www.rfc-editor.org/rfc/rfc9110
+  - title: RFC 6585 — 429 Too Many Requests
+    url: https://www.rfc-editor.org/rfc/rfc6585
+  - title: IETF draft — RateLimit header fields for HTTP
+    url: https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/
+  - title: IETF draft — The Idempotency-Key HTTP header field
+    url: https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/
+  - title: RFC 6238 — TOTP
+    url: https://www.rfc-editor.org/rfc/rfc6238
+  - title: NIST SP 800-63B — Authentication and Lifecycle Management
+    url: https://pages.nist.gov/800-63-4/sp800-63b.html
+  - title: OWASP — Multifactor Authentication Cheat Sheet
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Multifactor_Authentication_Cheat_Sheet.html
+  - title: Martin Kleppmann — How to do distributed locking
+    url: https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html
+  - title: opossum — Node.js circuit breaker
+    url: https://nodeshift.dev/opossum/
+questions:
+  - id: scenario-reliability-001
+    level: easy
+    type: scenario
+    q: Your ticketing API sold 105 seats for a 100-seat show during the on-sale. What class of bug is this, and what is the smallest correct fix?
+    hint: |-
+      (1) Hỏi: code đang đọc `remaining` rồi ghi lại trong app đúng không? Nếu có → **read-modify-write race**: N request cùng đọc `remaining=1`, cùng pass check, cùng ghi.
+      (2) Fix nhỏ nhất: đẩy điều kiện vào **một câu UPDATE atomic** và đọc `rowCount`: `UPDATE shows SET remaining = remaining - $qty WHERE id = $1 AND remaining >= $qty`. `rowCount = 0` → hết vé → 409.
+      (3) Postgres READ COMMITTED: UPDATE thứ hai **chờ row lock**, rồi **re-evaluate WHERE trên bản mới nhất** → không oversell. Thêm `CHECK (remaining >= 0)` làm lưới an toàn cuối.
+      (4) Đánh đổi: mọi request serialize trên 1 row → hot row khi on-sale lớn (xem các card flash sale / sharded counter).
+    example: |-
+      ```ts
+      const { rowCount } = await pool.query(
+        `UPDATE shows SET remaining = remaining - $2
+         WHERE id = $1 AND remaining >= $2`,
+        [showId, qty],
+      );
+      if (rowCount === 0) throw new SoldOutError(); // MySQL: affectedRows; SQL Server: @@ROWCOUNT
+      ```
+    followUp: Why doesn't wrapping the original read-then-write code in a transaction fix it under READ COMMITTED?
+    redFlags:
+      - "Suggests a Redis lock or a mutex in Node as the first fix"
+      - "Says 'use a transaction' without saying which isolation level or lock"
+    tags: [oversell, race-condition, postgres]
+  - id: scenario-reliability-002
+    level: easy
+    type: gotcha
+    q: Product says the double-charge bug is fixed because the frontend now disables the Pay button after the first click. Why is that not enough?
+    hint: |-
+      (1) Disable button chỉ chặn **một** nguồn trùng (double-click trong 1 tab). Còn: client/SDK auto-retry khi timeout, mobile mạng chập chờn gửi lại, user mở 2 tab, reload trang, proxy/LB retry, attacker gọi thẳng API.
+      (2) Timeout phía client **không có nghĩa** server chưa xử lý — request có thể đã charge xong nhưng response bị mất.
+      (3) Fix đúng ở server: **Idempotency-Key** (client sinh 1 UUID cho 1 thao tác, giữ nguyên khi retry) + **business unique constraint** (vd `UNIQUE (order_id) WHERE status='succeeded'`) + truyền key xuống payment provider.
+      (4) Disable button vẫn nên giữ — nó là UX, không phải correctness.
+    followUp: Where should the idempotency key be generated — when the page loads, when the user clicks, or on each HTTP attempt?
+    redFlags:
+      - "Accepts the frontend fix as sufficient"
+      - "Generates a new idempotency key on every retry attempt"
+    tags: [idempotency, payments]
+  - id: scenario-reliability-003
+    level: easy
+    type: concept
+    q: A partner complains their integration keeps hammering you after receiving 429s. What should your 429 response contain so that well-behaved clients back off correctly?
+    hint: |-
+      (1) Status **429 Too Many Requests** (RFC 6585) + header **`Retry-After`** (giây hoặc HTTP-date, RFC 9110) — đây là tín hiệu chuẩn nhất mà client/SDK hiểu.
+      (2) Thêm header quota để client tự điều tiết trước khi bị chặn: kiểu cũ `X-RateLimit-Limit/Remaining/Reset`, hoặc chuẩn IETF đang draft `RateLimit-Policy` + `RateLimit` (verify tên trường theo draft mới nhất).
+      (3) Body JSON có `code`, `message`, limit bị vượt (per key/tenant/IP) để debug.
+      (4) Phía client: tôn trọng `Retry-After`, backoff + jitter, không retry song song. Nếu partner vẫn không tuân thủ → limit chặt hơn ở gateway hoặc tạm khoá key.
+    followUp: Should a rate-limited request count against the quota itself?
+    redFlags:
+      - "Returns 503 or 500 for rate limiting"
+      - "Returns 429 with no indication of when to retry"
+    verify: true
+    tags: [rate-limiting, http]
+  - id: scenario-reliability-004
+    level: easy
+    type: concept
+    q: "Your HTTP client wrapper retries on every error. Which of these should it actually retry: 400, 401, 404, 409, 429, 500, 502, 503, 504, ECONNRESET, and a timeout on POST /payments?"
+    hint: |-
+      (1) **Không retry**: 400/401/404/409 — lỗi của request, retry vẫn fail (401 thì refresh token 1 lần rồi gọi lại, không phải backoff loop).
+      (2) **Retry có backoff**: 502/503/504, ECONNRESET/ECONNREFUSED, 429 (theo `Retry-After`). 500 thì tuỳ — thường chỉ retry nếu operation idempotent.
+      (3) **Timeout trên POST /payments**: kết quả **không xác định** (có thể đã charge). Chỉ retry nếu có **idempotency key** được server/provider tôn trọng; không thì phải query trạng thái trước.
+      (4) Quy tắc: retry = transient **và** idempotent **và** còn deadline/budget.
+    followUp: How do you make a timeout on a non-idempotent POST safe to retry?
+    redFlags:
+      - "Retries 4xx errors"
+      - "Treats a timeout as 'the request failed, so it is safe to resend'"
+    tags: [retry, http]
+  - id: scenario-reliability-005
+    level: easy
+    type: scenario
+    q: A pod has lost its database connection but the process itself is healthy. Should Kubernetes restart it or stop sending it traffic? Which probe expresses that?
+    hint: |-
+      (1) **Readiness** fail → pod bị rút khỏi Service endpoints (không nhận traffic), **không restart**. Đây là phản ứng đúng với dependency lỗi.
+      (2) **Liveness** fail → kubelet **restart container**. Chỉ dùng cho trạng thái mà restart thực sự sửa được: deadlock, event loop treo, process zombie.
+      (3) **Startup** probe: che liveness/readiness trong lúc app khởi động chậm (migrate, warm cache).
+      (4) Cẩn thận: nếu **tất cả** pod cùng mất DB và readiness đều fail → Service không còn endpoint → 503 toàn bộ. Có khi tốt hơn là vẫn ready và trả lỗi degrade cho endpoint cần DB.
+    followUp: If every replica's readiness checks the same database and the database blips, what does the user see?
+    redFlags:
+      - "Puts the DB check in the liveness probe"
+    tags: [kubernetes, health-checks]
+  - id: scenario-reliability-006
+    level: easy
+    type: scenario
+    q: Your consumer commits the Kafka offset as soon as it receives a message, then processes it. A pod crashes mid-processing. What happened to that message, and what delivery semantics is this?
+    hint: |-
+      (1) Offset đã commit → sau khi restart/rebalance, consumer đọc tiếp từ offset **sau** message đó → message bị **mất** → **at-most-once**.
+      (2) Đổi thứ tự (xử lý xong mới commit) → crash giữa "xử lý xong" và "commit" sẽ đọc lại → **at-least-once** → phải có consumer idempotent.
+      (3) Exactly-once của Kafka (idempotent producer + transactions) chỉ bao phủ **Kafka → Kafka**; side effect ra DB/HTTP vẫn cần dedup.
+      (4) Lưu ý auto-commit: KafkaJS `eachMessage` và Java client `enable.auto.commit` commit theo chu kỳ — hiểu rõ nó commit **cái gì, khi nào** (verify theo client).
+    followUp: Which one would you choose for an email-sending consumer, and which for a payment consumer?
+    redFlags:
+      - "Claims Kafka guarantees exactly-once by default"
+    verify: true
+    tags: [kafka, delivery-semantics]
+  - id: scenario-reliability-007
+    level: easy
+    type: scenario
+    q: A user updates their display name, gets 200 OK, refreshes the page and sees the old name. Reads are served from a read replica. What is happening?
+    hint: |-
+      (1) **Replica lag**: streaming replication mặc định **bất đồng bộ** — write commit trên primary, replica apply WAL sau vài ms đến vài giây (hoặc phút khi write spike/long query trên replica).
+      (2) Vi phạm **read-your-writes** consistency.
+      (3) Fix nhanh: response của PUT trả luôn object mới (client không cần đọc lại); route read của **chính user đó** về primary trong N giây sau write (cookie/flag); hoặc chờ replica tới LSN của write (card hard).
+      (4) Đo: `pg_stat_replication.replay_lag` trên primary; alert khi vượt ngưỡng và tự chuyển read về primary.
+    followUp: How would you route only that user's reads to the primary without sending all traffic there?
+    redFlags:
+      - "Suggests switching to synchronous replication for everything as the first fix"
+    tags: [replication, consistency]
+  - id: scenario-reliability-008
+    level: easy
+    type: concept
+    q: You're asked to add a 6-digit SMS/email OTP for login. What properties must the OTP and its verification have?
+    hint: |-
+      (1) Sinh bằng **CSPRNG**: `crypto.randomInt(0, 1_000_000)` rồi pad 6 số — không dùng `Math.random()`.
+      (2) Lưu **hash** (vd HMAC-SHA256 với server secret) + **TTL ngắn** (~5 phút), **single-use** (xoá/đánh dấu used ngay khi verify đúng), bind với `user_id + purpose` (login ≠ đổi email ≠ reset password).
+      (3) **Giới hạn số lần thử** (vd 5) rồi vô hiệu OTP; **throttle resend** (cooldown 30–60s, tối đa N/giờ); so sánh **constant-time**.
+      (4) 6 số = 1e6 khả năng; với 5 lần thử, xác suất đoán trúng mỗi OTP = 5e-6 — an toàn chỉ khi có attempt limit. SMS là factor yếu (SIM swap) → ưu tiên TOTP/WebAuthn.
+    followUp: Why must the attempt counter be per OTP and also per account, not only per IP?
+    redFlags:
+      - "Stores the OTP in plaintext with no expiry"
+      - "Only rate-limits by IP"
+    tags: [otp, mfa, security]
+  - id: scenario-reliability-009
+    level: medium
+    type: design
+    q: Seat booking lets users pick a specific seat (row F, seat 12), not just a count. How does that change your concurrency design compared to a plain stock counter?
+    hint: |-
+      (1) Không còn là counter mà là **claim một row cụ thể** → invariant là "mỗi `(show_id, seat_id)` tối đa 1 booking active".
+      (2) Cách gọn nhất: **unique constraint** — `UNIQUE (show_id, seat_id)` trên bảng `seat_holds`/`bookings` (partial `WHERE status IN ('held','booked')`). Request thua nhận `23505` → trả 409 "seat taken". Hoặc conditional UPDATE: `UPDATE seats SET status='held', held_by=$u, expires_at=now()+interval '10 min' WHERE id=$1 AND (status='free' OR (status='held' AND expires_at < now()))`.
+      (3) Đặt nhiều ghế trong 1 lần: claim trong **một transaction**, khoá theo **thứ tự seat_id tăng dần** để tránh deadlock; 1 ghế fail → rollback cả nhóm.
+      (4) "Ghế bất kỳ trong khu B" → `SELECT ... FOR UPDATE SKIP LOCKED LIMIT n` thay vì tranh nhau cùng 1 row.
+    example: |-
+      ```sql
+      CREATE UNIQUE INDEX uq_active_seat ON seat_holds (show_id, seat_id)
+        WHERE status IN ('held', 'booked');
+      -- SQL Server: filtered index cũng hỗ trợ WHERE; MySQL không có partial index → dùng generated column
+      ```
+    followUp: Two users hold overlapping seat sets {F10,F11} and {F11,F10} at the same instant. What can go wrong and how do you order the locks?
+    redFlags:
+      - "Uses one global lock for the whole show"
+    tags: [oversell, booking, postgres]
+  - id: scenario-reliability-010
+    level: medium
+    type: gotcha
+    q: A teammate "fixes" the oversell by running the read-then-write checkout code at REPEATABLE READ in Postgres. Does it work? What does the application now have to handle?
+    hint: |-
+      (1) Postgres REPEATABLE READ (snapshot isolation) phát hiện **lost update**: khi transaction B cố UPDATE row mà A đã sửa và commit sau snapshot của B → B nhận `ERROR: could not serialize access due to concurrent update` (**SQLSTATE 40001**). Nên đúng là không oversell nữa.
+      (2) Nhưng app **phải retry toàn bộ transaction** khi gặp 40001 (không phải chỉ câu lỗi). Không có retry → user thấy 500.
+      (3) Write skew (hai transaction đọc chung, ghi row **khác nhau**) vẫn lọt ở RR → cần SERIALIZABLE (SSI) hoặc lock tường minh.
+      (4) Khác DB: MySQL InnoDB REPEATABLE READ **không** báo lỗi lost update với plain SELECT (cần `FOR UPDATE`); SQL Server default READ COMMITTED dùng lock (hoặc RCSI nếu bật). Atomic UPDATE vẫn đơn giản và nhanh hơn.
+    example: |-
+      ```ts
+      async function withSerializableRetry<T>(fn: () => Promise<T>, max = 5): Promise<T> {
+        for (let attempt = 1; ; attempt++) {
+          try { return await fn(); }
+          catch (e: any) {
+            if (!['40001', '40P01'].includes(e.code) || attempt === max) throw e;
+            await sleep(Math.random() * 20 * 2 ** attempt); // full jitter
+          }
+        }
+      }
+      ```
+    followUp: What is write skew, and give a booking example that REPEATABLE READ allows?
+    redFlags:
+      - "Believes a higher isolation level fixes races without any retry logic"
+    verify: true
+    tags: [isolation, postgres, sql-server]
+  - id: scenario-reliability-011
+    level: medium
+    type: compare
+    q: You assign one-time promo codes from a pool table to users at 2,000 requests per second. FOR UPDATE, FOR UPDATE NOWAIT, or FOR UPDATE SKIP LOCKED?
+    hint: |-
+      (1) Bài toán "lấy **bất kỳ** row free nào" → **SKIP LOCKED**: mỗi transaction bỏ qua row đang bị khoá và lấy row kế tiếp → không ai chờ ai.
+      (2) Plain `FOR UPDATE` với `LIMIT 1`: mọi request cùng nhắm row đầu tiên → xếp hàng chờ → throughput ≈ 1 transaction tại 1 thời điểm.
+      (3) `NOWAIT` → lỗi ngay **55P03 lock_not_available** nếu row đang bị khoá — hợp cho "một row cụ thể, fail fast thay vì chờ" (vd admin sửa order đang được xử lý).
+      (4) Trade-off SKIP LOCKED: kết quả không nhất quán (view bỏ qua row), không dùng cho báo cáo. SQL Server tương đương `WITH (UPDLOCK, READPAST, ROWLOCK)`; MySQL 8.0+ có `SKIP LOCKED`.
+    example: |-
+      ```sql
+      UPDATE promo_codes SET user_id = $1, claimed_at = now()
+      WHERE id = (
+        SELECT id FROM promo_codes
+        WHERE user_id IS NULL AND campaign_id = $2
+        ORDER BY id
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+      )
+      RETURNING code;
+      ```
+    followUp: What stops one user from claiming two codes if they fire two requests concurrently?
+    redFlags:
+      - "Selects a free code without a lock, then updates it"
+    tags: [locking, postgres, skip-locked]
+  - id: scenario-reliability-012
+    level: medium
+    type: design
+    q: "Checkout must hold a seat for 10 minutes while the user pays. Design the hold: schema, how it expires, and what happens if payment succeeds at minute 11."
+    hint: |-
+      (1) Bảng `seat_holds(show_id, seat_id, user_id, status, expires_at)` + partial unique như card 009. Hold = INSERT/UPDATE conditional.
+      (2) Hết hạn **lazy** trong chính điều kiện claim (`OR expires_at < now()`) → không phụ thuộc cron để đúng; cron/sweeper chỉ dọn và trả số liệu. Redis `SET hold:... NX EX 600` cũng được nhưng DB vẫn là source of truth.
+      (3) Payment về trễ (minute 11): khi confirm, `UPDATE ... SET status='booked' WHERE id=$hold AND status='held' AND expires_at > now()` → 0 row → ghế đã bị người khác lấy → **refund tự động** (compensation) + thông báo. Hoặc giữ hold thêm "grace" khi user đã vào trang provider.
+      (4) Numbers: hold quá dài → giảm tỉ lệ bán khi on-sale; quá ngắn → nhiều refund. Đo conversion theo thời gian thanh toán để chọn (thường 5–15 phút).
+    followUp: How do you show the remaining hold time to the user without trusting the client clock?
+    redFlags:
+      - "Relies only on a cron job to release expired holds"
+      - "Ignores the late-payment race"
+    tags: [reservation, booking, expiry]
+  - id: scenario-reliability-013
+    level: medium
+    type: scenario
+    q: A client reuses the same Idempotency-Key for a second payment with a different amount. What should your API do, and why do you store a request fingerprint?
+    hint: |-
+      (1) Key xác định **một thao tác**; cùng key + body khác = lỗi của client (bug sinh key, hoặc dùng lại key cố định). Nếu chỉ lookup theo key → server **replay response cũ** (charge 100) trong khi client tưởng đã charge 250 → dữ liệu sai lệch âm thầm.
+      (2) Lưu **fingerprint** = hash các trường quan trọng (method, path, body chuẩn hoá) cùng key; khi conflict mà fingerprint khác → **422** (Stripe trả lỗi tương tự; IETF draft Idempotency-Key gợi ý 422, verify).
+      (3) Scope key theo `tenant/user` (key của user A không đụng user B), TTL ~24h.
+      (4) Đừng hash cả field biến động (timestamp, trace id) → retry hợp lệ bị coi là khác body.
+    followUp: Which parts of the request go into the fingerprint, and which must be excluded?
+    redFlags:
+      - "Scopes idempotency keys globally instead of per client/tenant"
+    verify: true
+    tags: [idempotency, payments, api]
+  - id: scenario-reliability-014
+    level: medium
+    type: scenario
+    q: Your server calls the payment provider's charge API and gets a socket timeout after 10 seconds. Did the customer get charged? What do you do next?
+    hint: |-
+      (1) **Không biết** — timeout là kết quả thứ ba ngoài success/fail. Đừng đánh dấu failed rồi cho user thử lại.
+      (2) Nếu đã gửi **provider idempotency key** (vd derive từ `payment_id` nội bộ): retry **cùng key** → provider trả kết quả của lần đầu, không charge 2 lần. Đây là lý do phải truyền key xuống provider, không chỉ ở API của mình.
+      (3) Nếu provider không hỗ trợ key: query trạng thái theo reference của mình (`GET /charges?metadata.order_id=`), rồi mới quyết định. Đặt payment ở trạng thái `unknown/pending` → background job reconcile.
+      (4) Lưu trạng thái trước khi gọi (`pending` + key) để crash giữa chừng vẫn recover được; webhook của provider + reconciliation là lưới an toàn cuối.
+    followUp: Your idempotency record says 'processing' and the provider says it has never seen that key. What now?
+    redFlags:
+      - "Marks the payment failed on timeout and lets the user retry"
+      - "Retries with a new provider idempotency key"
+    tags: [payments, idempotency, timeouts]
+  - id: scenario-reliability-015
+    level: medium
+    type: compare
+    q: "Pick a rate-limit algorithm for each: (a) public API, 100 requests/minute per API key with bursts up to 20; (b) login, 5 failed attempts per account per 15 minutes; (c) outbound calls to a partner that allows exactly 10 rps."
+    hint: |-
+      (a) **Token bucket** capacity 20, refill 100/60 token/s → cho burst ngắn, trung bình đúng 100/phút. Memory O(1)/key.
+      (b) **Sliding window log** hoặc counter theo account (và thêm theo IP) — số nhỏ, cần chính xác, chỉ đếm **failed** attempts; reset khi login thành công. Fixed window cho phép 10 lần quanh ranh giới.
+      (c) **Leaky bucket / queue** phía client với tốc độ ra đều 10 rps (vd Bottleneck/p-limit + interval) → không vượt limit partner, request dư chờ trong queue có giới hạn.
+      Sliding window **counter** (ước lượng từ 2 window) là mặc định rẻ cho quota lớn khi chấp nhận sai số nhỏ.
+    followUp: Where would you enforce each one — API gateway, application, or the outbound client?
+    redFlags:
+      - "Uses the same algorithm and key for everything"
+    tags: [rate-limiting, algorithms]
+  - id: scenario-reliability-016
+    level: medium
+    type: output
+    q: With a fixed-window limit of 100 requests per minute, what is the maximum number of requests a client can get through in a 2-second span, and when?
+    hint: |-
+      **200**: 100 request ở giây 00:59 (cuối window 1) + 100 request ở giây 01:00 (đầu window 2) → trong ~2 giây vượt gấp đôi limit.
+      Nguyên nhân: counter reset theo mốc đồng hồ, không theo "60 giây gần nhất".
+      Fix: sliding window log (chính xác, tốn memory O(n)/key) hoặc sliding window counter (ước lượng, O(1)) hoặc token bucket.
+      Fixed window vẫn ổn cho quota lớn/không nhạy burst (vd 10k/ngày).
+    example: |-
+      ```text
+      window [00:00–01:00)  count=100  (all at 00:59.5)
+      window [01:00–02:00)  count=100  (all at 01:00.2)
+      => 200 requests within ~0.7 s
+      ```
+    followUp: How does the sliding window counter estimate the count, and what is its error?
+    tags: [rate-limiting, fixed-window]
+  - id: scenario-reliability-017
+    level: medium
+    type: output
+    q: "A sliding-window-counter limiter allows 100 requests/minute. The previous minute had 80 requests, the current minute has 30 so far, and we are 15 seconds into the current minute. Is the next request allowed?"
+    hint: |-
+      Công thức: `estimate = prev × (1 − elapsed/window) + curr` = 80 × (1 − 15/60) + 30 = 80 × 0.75 + 30 = **90** → < 100 → **cho phép** (count mới = 91 theo ước lượng).
+      Giả định: request của window trước **phân bố đều** — nếu 80 request dồn vào giây cuối thì ước lượng thấp hơn thực tế.
+      Ưu: chỉ 2 counter/key (O(1)), mượt hơn fixed window nhiều. Cloudflare báo sai số rất nhỏ trên traffic thật (verify).
+      Cần atomic: đọc 2 counter + INCR phải nằm trong 1 Lua script.
+    example: |-
+      ```text
+      prev window  [00:00-01:00) = 80
+      curr window  [01:00-02:00) = 30, now = 01:15
+      weight = 1 - 15/60 = 0.75
+      estimate = 80*0.75 + 30 = 90  -> allow
+      ```
+    followUp: Construct a traffic pattern where the sliding window counter lets through more than the true 60-second limit.
+    verify: true
+    tags: [rate-limiting, sliding-window]
+  - id: scenario-reliability-018
+    level: medium
+    type: debug
+    q: This retry helper is in the notes as the standard way to call third-party APIs. What would you change before using it in production?
+    example: |-
+      ```ts
+      async function callWithRetry<T>(fn: () => Promise<T>, max = 4): Promise<T> {
+        for (let i = 0; i < max; i++) {
+          try { return await fn(); }
+          catch (e) {
+            if (!isRetryable(e) || i === max - 1) throw e;
+            const base = 2 ** i * 100;          // 100, 200, 400, 800ms
+            const jitter = Math.random() * 100;
+            await sleep(base + jitter);
+          }
+        }
+        throw new Error('unreachable');
+      }
+      ```
+    hint: |-
+      (1) Jitter **cộng thêm 0–100ms** quá nhỏ so với base ở attempt sau → client vẫn retry gần đồng bộ. Dùng **full jitter**: `sleep(random(0, min(cap, base·2^i)))` (AWS Architecture Blog) — tổng work ít nhất, phân tán tốt nhất.
+      (2) Không có **cap** và **deadline tổng**: attempt kèm timeout riêng; dừng khi vượt deadline của request gốc (truyền `AbortSignal`).
+      (3) Không tôn trọng **`Retry-After`** khi 429/503.
+      (4) Không có **retry budget** / circuit breaker → khi downstream sập, mọi request nhân 4 tải. Và `fn` phải idempotent (hoặc có idempotency key) mới retry được.
+    followUp: Why does full jitter complete less total work than equal jitter or no jitter under contention?
+    redFlags:
+      - "Thinks exponential backoff alone prevents a thundering herd"
+    tags: [retry, backoff, jitter, notion-correction]
+  - id: scenario-reliability-019
+    level: medium
+    type: design
+    q: A downstream pricing service has p99 latency of 800 ms and sometimes goes down for minutes. Configure a circuit breaker (e.g., opossum) and a fallback for it.
+    hint: |-
+      (1) `timeout` ~ trên p99 một chút (vd 1000–1200ms), không để default (opossum 10s, verify) — timeout quá dài = thread/socket bị giữ, event loop phình promise.
+      (2) `errorThresholdPercentage: 50`, `rollingCountTimeout: 10000`, **`volumeThreshold`** (vd 20) để 2 lỗi trên 3 request lúc traffic thấp không mở mạch; `resetTimeout: 30000` → half-open thử 1 request.
+      (3) **Fallback**: giá cache gần nhất (stale có TTL), hoặc ẩn khuyến mãi, hoặc lỗi rõ ràng — tuỳ nghiệp vụ; không bao giờ "giá 0".
+      (4) Breaker **theo từng downstream/endpoint**, không chung cho cả client; emit metric sự kiện `open/halfOpen/close` + alert. Kết hợp bulkhead (giới hạn concurrent calls) để service chậm không ăn hết socket.
+    example: |-
+      ```ts
+      import CircuitBreaker from 'opossum';
+      const breaker = new CircuitBreaker(fetchPrice, {
+        timeout: 1200, errorThresholdPercentage: 50,
+        rollingCountTimeout: 10_000, volumeThreshold: 20, resetTimeout: 30_000,
+      });
+      breaker.fallback((sku: string) => priceCache.getStale(sku));
+      breaker.on('open', () => metrics.increment('cb.pricing.open'));
+      ```
+    followUp: Should 4xx responses from the pricing service count as failures for the breaker?
+    redFlags:
+      - "Uses one breaker for every call to a multi-endpoint client"
+      - "Fallback returns a default price of 0"
+    verify: true
+    tags: [circuit-breaker, opossum, fallback]
+  - id: scenario-reliability-020
+    level: medium
+    type: scenario
+    q: During every rolling deploy you see a burst of 502s at the load balancer, even though your SIGTERM handler calls server.close(). Explain the sequence of events on Kubernetes.
+    hint: |-
+      (1) Khi pod chuyển Terminating, **hai việc chạy song song**: kubelet chạy preStop rồi gửi SIGTERM; control plane gỡ pod khỏi EndpointSlice → kube-proxy/ingress/cloud LB cập nhật **sau vài giây**.
+      (2) App nhận SIGTERM, `server.close()` ngừng accept ngay → trong khoảng LB chưa cập nhật, connection mới tới bị refuse/reset → **502**.
+      (3) Fix: **`preStop` sleep 5–15s** (K8s 1.29+ có `sleep` action, trước đó dùng `exec: sleep` cần binary sleep trong image, verify) để trễ SIGTERM tới khi endpoints được gỡ; trong lúc đó vẫn phục vụ bình thường.
+      (4) Rồi mới close + drain. Tổng preStop + drain phải < `terminationGracePeriodSeconds` (mặc định 30s, **đếm từ lúc preStop bắt đầu**).
+    example: |-
+      ```yaml
+      spec:
+        terminationGracePeriodSeconds: 45
+        containers:
+          - name: api
+            lifecycle:
+              preStop:
+                sleep: { seconds: 10 }   # older clusters: exec: { command: ["sleep", "10"] }
+      ```
+    followUp: With a 30-second grace period, a 10-second preStop, and requests that can take 25 seconds, what happens?
+    redFlags:
+      - "Assumes the pod is removed from the load balancer before SIGTERM is delivered"
+    verify: true
+    tags: [graceful-shutdown, kubernetes]
+  - id: scenario-reliability-021
+    level: medium
+    type: debug
+    q: Every pod takes exactly 30 seconds to terminate and in-flight requests are cut off, even though the app has a SIGTERM handler. Here is the Dockerfile. What is wrong?
+    example: |-
+      ```dockerfile
+      FROM node:22-alpine
+      WORKDIR /app
+      COPY . .
+      RUN npm ci --omit=dev
+      CMD npm start
+      ```
+    hint: |-
+      (1) `CMD npm start` (shell form) → PID 1 là `/bin/sh -c`, sh **không forward SIGTERM** cho con → Node không bao giờ nhận signal → sau 30s bị SIGKILL (đúng `terminationGracePeriodSeconds`).
+      (2) Kể cả exec form `CMD ["npm", "start"]`: npm là process trung gian, forward signal không đáng tin cậy và thêm một lớp process (verify theo version npm).
+      (3) Fix: `CMD ["node", "dist/server.js"]` (exec form, Node là PID 1) **và** tự handle SIGTERM/SIGINT — PID 1 không có default handler, signal không có handler sẽ bị kernel bỏ qua. Hoặc dùng init nhỏ: `tini` / `docker run --init` / `shareProcessNamespace` để reap zombie và forward signal.
+      (4) Kiểm chứng: `kubectl exec ... -- ps -o pid,comm` xem PID 1 là gì.
+    followUp: Why does a Node process running as PID 1 without a SIGTERM handler ignore `docker stop`?
+    redFlags:
+      - "Blames Kubernetes and just increases terminationGracePeriodSeconds"
+    verify: true
+    tags: [docker, graceful-shutdown, signals]
+  - id: scenario-reliability-022
+    level: medium
+    type: scenario
+    q: A payment provider's webhook times out after 10 seconds. Your handler updates the order, sends an email and calls the ERP, taking about 15 seconds. You see each event processed 3–4 times. Fix it.
+    hint: |-
+      (1) Provider coi timeout là fail → **retry** → xử lý lặp. Đây là at-least-once do chính mình gây ra.
+      (2) **Ack nhanh**: verify signature → INSERT raw event (`UNIQUE(provider, event_id)`) → trả **2xx trong < 1–2s** → worker xử lý async từ bảng/queue.
+      (3) Worker **idempotent**: dedup theo `event_id`, và side effect từng bước cũng idempotent (email theo `event_id`, ERP call có key).
+      (4) Insert event và enqueue phải atomic: dùng chính bảng `webhook_events(status)` làm outbox (worker poll `SKIP LOCKED`) — nếu insert xong rồi `queue.add` fail, event bị kẹt; nếu enqueue trước insert, event bị xử lý mà không có record.
+    followUp: The worker is down for an hour. How do you make sure no event is lost and the backlog drains safely?
+    redFlags:
+      - "Increases the provider timeout instead of acking fast"
+      - "Dedups in memory"
+    tags: [webhooks, idempotency, async]
+  - id: scenario-reliability-023
+    level: medium
+    type: scenario
+    q: Consumer lag on one partition is growing without bound, while the other partitions are fine. Logs show the same JSON parse error repeating every few seconds. What is happening and how do you fix it without losing data?
+    hint: |-
+      (1) **Poison message**: một message không bao giờ xử lý được (payload hỏng, schema mới) → consumer retry mãi → partition đó **bị chặn** (head-of-line), các partition khác vẫn chạy.
+      (2) Phân loại lỗi: **non-retryable** (parse/validation) → đẩy thẳng sang **DLQ** kèm metadata (topic, partition, offset, error, stack, attempt, original headers) rồi commit offset; **transient** → retry có giới hạn + backoff.
+      (3) DLQ phải có **alert** (size > 0) và công cụ **replay** sau khi fix.
+      (4) Nếu nghiệp vụ cần ordering theo key: bỏ qua message lỗi có thể làm message sau của cùng key sai (card 024) → park cả key.
+    followUp: What metadata must a DLQ record carry so that replay is safe and debuggable?
+    redFlags:
+      - "Skips the message by resetting the offset manually without saving it anywhere"
+    tags: [kafka, dlq, poison-message]
+  - id: scenario-reliability-024
+    level: medium
+    type: gotcha
+    q: "Events for the same order are keyed by orderId, yet after a change you see OrderShipped processed before OrderPaid. The change: the consumer now processes each batch with Promise.all for throughput. Explain, and how else can retries break ordering?"
+    hint: |-
+      (1) Kafka chỉ đảm bảo thứ tự **trong partition**, và chỉ khi consumer xử lý **tuần tự**. `Promise.all` trên cả batch → 2 event cùng key chạy song song → hoàn thành sai thứ tự.
+      (2) Fix giữ throughput: song song **giữa các key**, tuần tự **trong một key** (group batch theo key, mỗi group một chuỗi promise); hoặc tăng số partition.
+      (3) Retry phá ordering: (a) **retry topic / DLQ** — message lỗi rời đi, message sau cùng key được xử lý trước; (b) **producer** retry với `max.in.flight.requests.per.connection > 1` khi **không** bật idempotence có thể đảo thứ tự. Idempotent producer (`enable.idempotence=true`, mặc định từ Kafka 3.0 Java client) giữ thứ tự với in-flight ≤ 5 (verify theo client; KafkaJS có ràng buộc riêng).
+      (4) Phòng thủ: consumer kiểm `version`/state machine (bỏ event cũ hơn state hiện tại).
+    followUp: How would you make the consumer tolerant of out-of-order events instead of preventing them?
+    redFlags:
+      - "Thinks keying by orderId alone guarantees processing order"
+    verify: true
+    tags: [kafka, ordering, retries, notion-correction]
+  - id: scenario-reliability-025
+    level: medium
+    type: debug
+    q: You find this in the Postgres log after checkout errors spiked. Explain exactly what happened and what code pattern causes it.
+    example: |-
+      ```text
+      ERROR:  deadlock detected
+      DETAIL:  Process 4211 waits for ShareLock on transaction 918273; blocked by process 4302.
+               Process 4302 waits for ShareLock on transaction 918270; blocked by process 4211.
+               Process 4211: UPDATE inventory SET qty = qty - 1 WHERE sku = 'B-2'
+               Process 4302: UPDATE inventory SET qty = qty - 1 WHERE sku = 'A-1'
+      HINT:  See server log for query details.
+      CONTEXT:  while updating tuple (12,7) in relation "inventory"
+      ```
+    hint: |-
+      (1) "ShareLock on transaction X" = chờ transaction X kết thúc vì X đang giữ **row lock** trên tuple cần update. 4211 đã khoá `A-1` và chờ `B-2`; 4302 đã khoá `B-2` và chờ `A-1` → vòng chờ.
+      (2) Pattern: hai cart chứa cùng SKU nhưng **update theo thứ tự item trong cart** (A,B vs B,A).
+      (3) Postgres phát hiện sau `deadlock_timeout` (mặc định 1s), huỷ **một** transaction với `40P01`. Fix: **sort theo sku** trước khi update (hoặc 1 câu `UPDATE ... FROM (VALUES ...) ORDER BY` / `SELECT ... ORDER BY sku FOR UPDATE`), giữ transaction ngắn, **retry 40P01**.
+      (4) Bật `log_lock_waits = on` để thấy chờ lock > deadlock_timeout. SQL Server: error 1205, xem deadlock graph trong `system_health` Extended Events.
+    followUp: Why is sorting in JavaScript with `[a, b].sort()` fine here for string SKUs but a trap for numeric ids used elsewhere with ORDER BY id?
+    redFlags:
+      - "Suggests lowering isolation level to fix row-lock deadlocks"
+    tags: [deadlock, postgres, sql-server]
+  - id: scenario-reliability-026
+    level: medium
+    type: scenario
+    q: A nightly Kubernetes CronJob that bills customers ran twice last night and charged some customers twice. How can that happen and how do you prevent it?
+    hint: |-
+      (1) Nguyên nhân có thể: `concurrencyPolicy: Allow` (mặc định) và lần chạy trước **chưa xong** khi lịch mới tới; pod fail → Job retry (`backoffLimit` mặc định 6) chạy lại **từ đầu**; controller có thể tạo 2 Job trong vài trường hợp — docs K8s nói rõ job phải **idempotent**.
+      (2) Chống chạy song song: `concurrencyPolicy: Forbid` + `startingDeadlineSeconds`; hoặc lock `pg_try_advisory_lock(hashtext('billing'))`.
+      (3) Chống **chạy lại** (quan trọng hơn): idempotent theo business key — `UNIQUE (customer_id, billing_period)` trên invoice, charge với idempotency key `bill:{customer}:{period}`; job đánh dấu tiến độ theo từng customer để resume.
+      (4) Lock chỉ ngăn chạy **đồng thời**, không ngăn chạy **hai lần tuần tự** → idempotency mới là fix gốc.
+    example: |-
+      ```yaml
+      apiVersion: batch/v1
+      kind: CronJob
+      spec:
+        schedule: "0 2 * * *"
+        timeZone: "Asia/Ho_Chi_Minh"
+        concurrencyPolicy: Forbid
+        startingDeadlineSeconds: 600
+        jobTemplate:
+          spec:
+            backoffLimit: 2
+      ```
+    followUp: Your job crashes halfway through 50,000 customers. How does the retry avoid double-billing the first 25,000?
+    redFlags:
+      - "Relies only on concurrencyPolicy: Forbid"
+    tags: [cron, kubernetes, idempotency]
+  - id: scenario-reliability-027
+    level: medium
+    type: debug
+    q: "\"Node is single-threaded, so this can't race.\" Two concurrent requests for the same user redeem the same voucher twice. Why?"
+    example: |-
+      ```ts
+      app.post('/vouchers/:code/redeem', async (req, res) => {
+        const v = await db.voucher.findUnique({ where: { code: req.params.code } });
+        if (!v || v.redeemedAt) return res.status(409).end();
+        await paymentService.applyCredit(req.user.id, v.amount); // await → yields
+        await db.voucher.update({ where: { code: v.code }, data: { redeemedAt: new Date() } });
+        res.json({ ok: true });
+      });
+      ```
+    hint: |-
+      (1) Single-threaded chỉ đảm bảo **không có 2 dòng JS chạy cùng lúc**; mỗi `await` là điểm **nhường event loop** → request B chạy `findUnique` trong khi A đang chờ `applyCredit` → cả hai thấy `redeemedAt = null` (**check-then-act across awaits**). Và app chạy nhiều pod thì càng chắc chắn race.
+      (2) Fix: claim atomic **trước** side effect: `UPDATE vouchers SET redeemed_at = now(), redeemed_by = $u WHERE code = $1 AND redeemed_at IS NULL RETURNING amount` → 0 row = 409.
+      (3) Side effect sau đó phải idempotent (`applyCredit` với key `voucher:{code}`); nếu nó fail → compensate hoặc retry, không để voucher "đã dùng" mà không có credit.
+      (4) Mutex in-process (async-mutex) chỉ sửa được trong 1 process — sai khi scale ngang.
+    followUp: Give another check-then-act race in Node that has nothing to do with a database (e.g., an in-memory cache or file).
+    redFlags:
+      - "Says Node cannot have race conditions"
+      - "Fixes it with an in-process mutex"
+    tags: [nodejs, race-condition, async]
+  - id: scenario-reliability-028
+    level: medium
+    type: scenario
+    q: After placing an order, the user is redirected to "My orders" and the new order is missing for 2–3 seconds, because the list is served from a projection updated by Kafka. Product calls it a bug. What are your options?
+    hint: |-
+      (1) Đây là **eventual consistency** có chủ đích (CQRS/projection), không phải bug hệ thống — nhưng là bug UX. Đo lag projection thực tế (p99) trước.
+      (2) Options theo độ rẻ: trả luôn order vừa tạo trong response → client **optimistic insert** vào list (TanStack Query `setQueryData`); client giữ "pending order" đến khi list có nó.
+      (3) Server: **read-your-writes** — request đọc kèm `minVersion`/`lastWriteAt` của user; nếu projection chưa tới, đọc từ write model hoặc chờ ngắn (≤ 500ms) rồi fallback.
+      (4) Nếu lag tăng tới phút (consumer chậm) thì đó là incident thật → alert theo consumer lag, không che bằng UI.
+    followUp: How do you do read-your-writes across devices (the user places the order on mobile and opens the web)?
+    redFlags:
+      - "Proposes making the projection synchronous in the write path without discussing the cost"
+    tags: [eventual-consistency, cqrs, ux]
+  - id: scenario-reliability-029
+    level: hard
+    type: debug
+    q: This Redis token-bucket limiter (10 tokens, 1 token/second) lets some users through unlimited and blocks others forever. Find every bug.
+    example: |-
+      ```ts
+      async function allow(userId: string): Promise<boolean> {
+        const now = Date.now();
+        const key = `rl:${userId}`;
+        const { tokens, ts } = await redis.hgetall(key);
+        const refill = Math.floor((now - ts) / 1000);
+        const current = Math.min(10, (tokens ?? 10) + refill);
+        if (current < 1) return false;
+        await redis.hset(key, { tokens: current - 1, ts: now });
+        return true;
+      }
+      ```
+    hint: |-
+      (1) `hgetall` trả **string** (và `{}` khi key chưa có, không phải null): `"9" + 1 = "91"` → `Math.min(10, "91")` = 10 → bucket luôn đầy (unlimited). Lần đầu `ts` undefined → `now - undefined = NaN` → `current = NaN` → `NaN < 1` false nhưng `hset tokens: NaN` → lần sau hỏng tiếp.
+      (2) Refill `Math.floor` theo giây nhưng luôn ghi `ts = now` → request mỗi 900ms **không bao giờ** được refill (phần lẻ bị vứt) → user đều đặn bị chặn mãi. Phải refill **fractional**: `tokens += elapsedMs * rate / 1000`, lưu tokens dạng float.
+      (3) Read-then-write qua 2 round-trip, không atomic → N pod cùng đọc `tokens=1` và cùng cho qua. Fix: toàn bộ logic trong **một Lua script** (EVALSHA), dùng thời gian của Redis (`TIME`) hoặc truyền `now` từ app nhất quán.
+      (4) Không có TTL → key rác cho mọi user từng gọi; đặt `PEXPIRE` ≈ thời gian refill đầy.
+    followUp: Write the Lua version. Whose clock should `now` come from, and why?
+    redFlags:
+      - "Only spots the missing atomicity"
+    tags: [rate-limiting, redis, token-bucket, notion-correction]
+  - id: scenario-reliability-030
+    level: hard
+    type: design
+    q: Implement an atomic distributed token bucket in Redis that 40 API pods share. Show the script and explain the return value your middleware needs.
+    hint: |-
+      (1) Một Lua script: đọc `tokens, ts`, tính refill fractional, trừ `cost`, ghi lại + `PEXPIRE`; Redis chạy script **đơn luồng, atomic** → không race giữa pod.
+      (2) Trả về `{allowed, remaining, retryAfterMs}` để set `RateLimit`/`Retry-After` headers.
+      (3) Redis Cluster: script chỉ đụng **một key** → luôn cùng slot. Latency thêm ~0.3–1ms/request trong cùng AZ (verify).
+      (4) Thời gian: dùng `redis.call('TIME')` để mọi pod chung một clock (Redis ≥5 cho phép write sau TIME nhờ effects replication — verify); hoặc truyền `now` từ app nếu clock NTP ổn.
+    example: |-
+      ```lua
+      -- KEYS[1]=bucket  ARGV: capacity, refill_per_ms, cost
+      local cap, rate, cost = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+      local t = redis.call('TIME'); local now = t[1] * 1000 + math.floor(t[2] / 1000)
+      local h = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+      local tokens = tonumber(h[1]) or cap
+      local ts = tonumber(h[2]) or now
+      tokens = math.min(cap, tokens + (now - ts) * rate)
+      local allowed = 0
+      if tokens >= cost then tokens = tokens - cost; allowed = 1 end
+      redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+      redis.call('PEXPIRE', KEYS[1], math.ceil(cap / rate))
+      local retry = allowed == 1 and 0 or math.ceil((cost - tokens) / rate)
+      return { allowed, math.floor(tokens), retry }
+      ```
+    followUp: At 50k requests/second, Redis becomes the bottleneck. How do you reduce round-trips while keeping limits roughly correct?
+    redFlags:
+      - "Uses MULTI/EXEC with a read inside and thinks it is atomic read-modify-write"
+    verify: true
+    tags: [rate-limiting, redis, lua]
+  - id: scenario-reliability-031
+    level: hard
+    type: debug
+    q: "Customers are still occasionally double-charged with this idempotency middleware, and some payments stay stuck forever. Find the flaws."
+    example: |-
+      ```ts
+      async function pay(req: Request) {
+        const key = req.headers['idempotency-key'] as string;
+        const existing = await db.idempotency.findByKey(key);
+        if (existing) return existing.response;            // replay
+
+        const inserted = await db.idempotency.insertIfAbsent(key, 'processing');
+        if (!inserted) throw new ConflictError('in progress');
+
+        const result = await chargeGateway(req.body);
+        await db.idempotency.update(key, 'done', result);
+        return result;
+      }
+      ```
+    hint: |-
+      (1) `existing` ở trạng thái `processing` → `existing.response` là **null** → trả 200 rỗng; client tưởng thành công hoặc lỗi lạ. Phải phân nhánh theo `status` (done → replay status code + body; processing → 409 + `Retry-After`).
+      (2) Không có **fingerprint** → cùng key, body khác vẫn replay/charge sai (card 013). Không scope theo user/tenant.
+      (3) `chargeGateway` throw hoặc process crash → key kẹt `processing` **mãi mãi** (mọi retry nhận 409). Cần `locked_until` (lease) + recovery; lỗi **chắc chắn** (4xx từ provider) thì lưu response lỗi, lỗi **không chắc** (timeout) thì giữ để reconcile.
+      (4) Không truyền key xuống `chargeGateway` → nếu gateway timeout nhưng đã charge, retry sau recovery sẽ **charge lần 2**. Và thiếu business unique constraint `payments(order_id)` làm lớp phòng thủ cuối.
+    followUp: Design the recovery path for a record stuck in 'processing' with an expired lease.
+    redFlags:
+      - "Says the unique insert alone makes it safe"
+    tags: [idempotency, payments, debug, notion-correction]
+  - id: scenario-reliability-032
+    level: hard
+    type: scenario
+    q: "An idempotency record has been in 'processing' for 20 minutes because the pod was OOM-killed mid-request. The client keeps retrying and getting 409. Design the recovery."
+    hint: |-
+      (1) Record cần `locked_until` (vd now + 30–60s, dài hơn timeout tối đa của request) và `recovery_point` (`created → provider_called → charged → done`) — mô hình "atomic phases" của Stripe.
+      (2) Retry tới khi lease **hết hạn** → request đó giành lại lease bằng conditional UPDATE (`WHERE key=$1 AND status='processing' AND locked_until < now()`) — chỉ 1 người thắng.
+      (3) Tiếp tục **từ recovery point**: đã gọi provider → hỏi provider bằng **cùng provider idempotency key**/reference → có charge thì hoàn tất record, không có thì charge (vẫn cùng key, an toàn).
+      (4) Background sweeper xử lý record kẹt mà client không quay lại; metric "idempotency records processing > 5 phút" + alert.
+    example: |-
+      ```sql
+      UPDATE idempotency_keys
+      SET locked_until = now() + interval '60 seconds', attempt = attempt + 1
+      WHERE scope = $1 AND key = $2 AND status = 'processing' AND locked_until < now()
+      RETURNING recovery_point, provider_ref;
+      ```
+    followUp: What if the provider has no lookup-by-reference API and no idempotency key support?
+    redFlags:
+      - "Deletes stuck keys with a cron so the client can retry from scratch"
+    tags: [idempotency, recovery, payments]
+  - id: scenario-reliability-033
+    level: hard
+    type: design
+    q: "Flash sale: 500 units, 20,000 requests/second at 10:00:00. The single inventory row in Postgres becomes the bottleneck. Design the purchase path."
+    hint: |-
+      (1) Chặn trước DB: **Redis Lua pre-decrement** (`if GET stock >= qty then DECRBY` + ghi `SADD buyers user` để 1 user 1 lần) → 99% request bị từ chối ngay trong Redis, không chạm DB.
+      (2) Request thắng → tạo **reservation** (token) và đẩy vào **queue**; worker tạo order trong DB với atomic UPDATE như lưới an toàn (`stock >= qty`) + unique `(sale_id, user_id)`.
+      (3) Redis và DB **lệch** được (Redis mất data, worker fail, user không thanh toán) → reservation có TTL, hết hạn thì `INCRBY` trả lại; **reconciliation job** so `redis stock + reserved + sold == initial`.
+      (4) Phía trước: CDN cho trang tĩnh, **waiting room**/token để làm mượt, rate limit per user, chống bot. Số: 20k rps × 1 Lua call ≈ trong khả năng 1 Redis node (~100k ops/s, verify), DB chỉ nhận ~500 write.
+    example: |-
+      ```lua
+      -- KEYS[1]=stock KEYS[2]=buyers  ARGV[1]=user ARGV[2]=qty
+      if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1 then return -1 end
+      local s = tonumber(redis.call('GET', KEYS[1]) or '0')
+      if s < tonumber(ARGV[2]) then return 0 end
+      redis.call('DECRBY', KEYS[1], ARGV[2])
+      redis.call('SADD', KEYS[2], ARGV[1])
+      return 1
+      ```
+    followUp: Redis fails over to a replica that missed the last 200 decrements. What happens and how do you detect it?
+    redFlags:
+      - "Puts all 20k rps directly on SELECT FOR UPDATE"
+      - "Treats Redis as the source of truth with no reconciliation"
+    verify: true
+    tags: [flash-sale, redis, oversell, hot-row]
+  - id: scenario-reliability-034
+    level: hard
+    type: scenario
+    q: "A counter row (`campaign_budget.spent`) receives 2,000 updates per second. p99 latency of the endpoint jumps to 3 seconds and pg_stat_activity shows many sessions waiting on `Lock: transactionid`. What do you do?"
+    hint: |-
+      (1) **Hot row contention**: mỗi UPDATE giữ row lock tới **commit** → các update khác xếp hàng; transaction chứa thêm việc (HTTP call, nhiều query) làm thời gian giữ lock dài → throughput ≈ 1 / (thời gian giữ lock).
+      (2) Nhanh: rút ngắn transaction (update counter **cuối cùng**, ngay trước commit, không gọi I/O ngoài trong txn), atomic `SET spent = spent + $x`.
+      (3) Cấu trúc: **sharded counter** — N row `(campaign_id, shard)`; mỗi write chọn shard ngẫu nhiên; đọc = `SUM`. Budget limit: chia quota cho từng shard, hoặc cộng dồn trong Redis `INCRBYFLOAT` và flush định kỳ (chấp nhận vượt nhẹ).
+      (4) Trade-off: check "không vượt budget" chính xác tuyệt đối khó hơn → hỏi business được phép vượt bao nhiêu (vd 0.1%).
+    example: |-
+      ```sql
+      -- 16 shards
+      UPDATE campaign_budget_shards
+      SET spent = spent + $2
+      WHERE campaign_id = $1 AND shard = floor(random() * 16)::int
+        AND spent + $2 <= shard_cap;
+      SELECT sum(spent) FROM campaign_budget_shards WHERE campaign_id = $1;
+      ```
+    followUp: One shard hits its cap while others still have budget. How do you rebalance?
+    redFlags:
+      - "Adds more DB replicas to fix write contention"
+    tags: [hot-row, postgres, sharded-counter]
+  - id: scenario-reliability-035
+    level: hard
+    type: debug
+    q: This cache rebuild lock is meant to prevent a stampede. Under load, the DB still gets hammered and requests sometimes hang. What is wrong?
+    example: |-
+      ```ts
+      async function getWithLock(key: string): Promise<string> {
+        const val = await redis.get(key);
+        if (val) return val;
+        const lock = await redis.set(`lock:${key}`, '1', 'NX', 'EX', 10);
+        if (!lock) { await sleep(50); return getWithLock(key); }
+        const fresh = await queryDB(key);
+        await redis.set(key, fresh, 'EX', 300);
+        await redis.del(`lock:${key}`);
+        return fresh;
+      }
+      ```
+    hint: |-
+      (1) `redis.del` trơn: nếu `queryDB` chạy > 10s, lock hết hạn, request khác lấy lock, rồi request cũ **xoá lock của người khác** → nhiều người rebuild cùng lúc. Fix: value = **token ngẫu nhiên** + release bằng Lua compare-and-delete.
+      (2) **Đệ quy không giới hạn** mỗi 50ms: 5,000 waiter × 20 lần/s = 100k GET/s vào Redis; không có max wait → request treo tới timeout. Giới hạn (vd 10 lần/≈500ms) rồi **fallback**.
+      (3) Không có **stale fallback**: nên giữ bản stale (key phụ TTL dài hoặc SWR) để waiter trả stale ngay thay vì chờ.
+      (4) `queryDB` throw → lock không được release (thiếu `finally`) → mọi người chờ 10s. Thêm **singleflight in-process** để 1 pod chỉ gửi 1 request lock/rebuild.
+    followUp: Write the Lua compare-and-delete and explain why GET-then-DEL from Node is not enough.
+    redFlags:
+      - "Only increases the lock TTL"
+    tags: [cache-stampede, redis, lock, notion-correction]
+  - id: scenario-reliability-036
+    level: hard
+    type: scenario
+    q: A 30-second database blip turned into a 20-minute outage. Traces show each user request produced up to 64 calls to the database. Explain the mechanism and the guardrails you'd add.
+    hint: |-
+      (1) **Retry amplification**: 3 layer (BFF → service → data service), mỗi layer 1 lần gọi + 3 retry = 4 attempts → 4³ = **64** lần gọi xuống DB/1 request. DB vừa hồi đã bị đánh sập lại (metastable failure).
+      (2) Guardrails: retry ở **một layer** (gần lỗi nhất), layer khác fail fast; **retry budget** (vd retry ≤ 10% số request thành công, token bucket cho retry); full jitter.
+      (3) **Deadline propagation**: truyền deadline còn lại (header/`AbortSignal`) → layer dưới không retry khi caller đã bỏ cuộc.
+      (4) Circuit breaker mở khi lỗi cao; **load shedding** (trả 503 sớm khi queue/pool đầy); client tôn trọng 503 + `Retry-After`. Đo: retry ratio, attempts per request.
+    followUp: How would you implement a retry budget in a Node HTTP client shared by 30 pods?
+    redFlags:
+      - "Proposes increasing retry counts to ride out the blip"
+    tags: [retry, amplification, resilience]
+  - id: scenario-reliability-037
+    level: hard
+    type: design
+    q: "Your API has a 2-second SLO. It calls service A, then B and C in parallel. Implement deadline propagation in Node so that downstream calls never outlive the caller."
+    hint: |-
+      (1) Tạo deadline lúc nhận request: `AbortSignal.timeout(1900)`; kết hợp với signal khi client ngắt (`req.on('close')`) bằng `AbortSignal.any([...])` (Node ≥ 20.3, verify).
+      (2) Mỗi call downstream nhận **timeout = min(per-call timeout, thời gian còn lại)**; truyền `signal` vào `fetch`/undici, DB driver (`statement_timeout` / query cancel).
+      (3) Truyền deadline qua mạng: header (vd `x-request-deadline: <epoch ms>` hoặc gRPC `grpc-timeout`) để service dưới dùng tiếp; bỏ qua retry nếu còn < ngưỡng.
+      (4) Abort không huỷ được work đã gửi tới server khác → downstream cũng phải check deadline. Budget thời gian: A 800ms, B‖C 900ms, dư 200ms cho serialize.
+    example: |-
+      ```ts
+      const deadline = Date.now() + 1900;
+      const signal = AbortSignal.any([AbortSignal.timeout(1900), clientAbort.signal]);
+      const left = () => Math.max(0, deadline - Date.now());
+      const a = await callA({ signal, timeoutMs: Math.min(800, left()) });
+      const [b, c] = await Promise.all([
+        callB(a, { signal: AbortSignal.any([signal, AbortSignal.timeout(Math.min(900, left()))]) }),
+        callC(a, { signal: AbortSignal.any([signal, AbortSignal.timeout(Math.min(900, left()))]) }),
+      ]);
+      ```
+    followUp: C is optional. How do you return a partial response when C misses its budget?
+    redFlags:
+      - "Sets the same fixed timeout on every layer"
+    verify: true
+    tags: [timeouts, deadlines, nodejs]
+  - id: scenario-reliability-038
+    level: hard
+    type: debug
+    q: This shutdown handler hangs until SIGKILL on every deploy behind a keep-alive load balancer. Explain why and fix it.
+    example: |-
+      ```ts
+      process.on('SIGTERM', async () => {
+        server.close();                 // stop accepting
+        await drainInflightRequests(30_000);
+        await db.end();
+        await consumer.disconnect();
+        process.exit(0);
+      });
+      ```
+    hint: |-
+      (1) `server.close()` chỉ ngừng **accept connection mới**; callback chỉ chạy khi mọi connection đóng. LB giữ **keep-alive** connection idle → không bao giờ đóng. Node 19+ `close()` tự đóng connection idle (verify), nhưng connection đang có request vẫn giữ keep-alive sau response.
+      (2) Fix: `server.close()` + `server.closeIdleConnections()` (Node ≥ 18.2), set header `Connection: close` cho response trong lúc draining, và sau timeout thì `server.closeAllConnections()`.
+      (3) `drainInflightRequests` không phải API có sẵn — phải tự đếm in-flight (middleware tăng/giảm) hoặc chờ callback của `close`. Thứ tự: readiness 503 → (preStop đã sleep) → close HTTP → **ngừng consumer trước khi đóng DB** (consumer đang xử lý cần DB) → đóng DB/Redis.
+      (4) Hard timeout `setTimeout(() => process.exit(1), 25_000).unref()` < grace period; handler chỉ chạy **một lần** (SIGTERM có thể tới 2 lần).
+    followUp: How do you drain long-lived connections such as WebSockets or SSE?
+    redFlags:
+      - "Calls process.exit(0) immediately on SIGTERM"
+    verify: true
+    tags: [graceful-shutdown, nodejs, keep-alive, notion-correction]
+  - id: scenario-reliability-039
+    level: hard
+    type: scenario
+    q: One pod runs both the HTTP API and a Kafka consumer. Every deploy produces a wave of duplicate processing and a consumer-group rebalance storm. How do you shut this pod down correctly?
+    hint: |-
+      (1) Duplicate vì pod bị kill khi message đã xử lý mà **offset chưa commit** → consumer mới đọc lại. Rebalance storm vì rolling update: mỗi pod rời/vào group → nhiều lần rebalance (eager protocol dừng cả group).
+      (2) Shutdown: ngừng fetch (`consumer.stop()`/`pause`) → **chờ message đang xử lý xong** → commit offset → `disconnect()` (gửi LeaveGroup → rebalance ngay thay vì chờ `session.timeout`).
+      (3) Giảm rebalance: **cooperative-sticky** assignor (Java/librdkafka) hoặc **static membership** (`group.instance.id`) để pod restart trong session timeout không gây rebalance (verify hỗ trợ theo client; KafkaJS hạn chế).
+      (4) Dù vậy vẫn có duplicate (crash, OOM) → consumer idempotent là bắt buộc. Cân nhắc tách consumer ra Deployment riêng để scale/deploy độc lập.
+    followUp: What is the difference between the eager and cooperative rebalance protocols from the consumer's point of view?
+    redFlags:
+      - "Thinks graceful shutdown alone guarantees no duplicates"
+    verify: true
+    tags: [kafka, graceful-shutdown, rebalance]
+  - id: scenario-reliability-040
+    level: hard
+    type: debug
+    q: "Pods restart in a loop during the nightly report export. The liveness endpoint pings the DB and Redis. Review the config and fix it."
+    example: |-
+      ```yaml
+      livenessProbe:
+        httpGet: { path: /health, port: 3000 }   # checks DB + Redis
+        periodSeconds: 5
+        timeoutSeconds: 1
+        failureThreshold: 2
+      readinessProbe:
+        httpGet: { path: /health, port: 3000 }
+      ```
+    hint: |-
+      (1) Report export chặn event loop / DB bận → `/health` trả chậm > **1s** × 2 lần = 10s → liveness fail → restart → export chạy lại → loop. DB chậm thì **mọi** pod restart cùng lúc (cascading).
+      (2) Liveness chỉ check **bản thân process** (`/livez` trả 200 từ memory, không I/O); ngưỡng rộng (`timeoutSeconds: 3–5`, `failureThreshold: 3–6`). Readiness (`/readyz`) mới check dependency, và cẩn thận khi mọi pod cùng fail.
+      (3) Thêm **startupProbe** cho cold start. Đưa export nặng ra worker/job riêng hoặc stream + chunk để không block event loop.
+      (4) Nếu muốn liveness bắt event loop treo: đo event-loop lag (`perf_hooks.monitorEventLoopDelay`) với ngưỡng lớn (vd > 10s), không phải 1s.
+    followUp: When is it actually correct for liveness to fail?
+    redFlags:
+      - "Uses the same endpoint for liveness and readiness"
+    tags: [kubernetes, health-checks, debug]
+  - id: scenario-reliability-041
+    level: hard
+    type: debug
+    q: A security review flags this webhook receiver. List the vulnerabilities and fix them.
+    example: |-
+      ```ts
+      app.use(express.json());
+      app.post('/webhooks/payments', async (req, res) => {
+        const sig = req.header('x-signature');
+        const expected = crypto.createHmac('sha256', SECRET)
+          .update(JSON.stringify(req.body)).digest('hex');
+        if (sig !== expected) return res.status(401).end();
+        await handleEvent(req.body);       // 5–15 s of work
+        res.sendStatus(200);
+      });
+      ```
+    hint: |-
+      (1) HMAC trên `JSON.stringify(req.body)` ≠ **raw bytes** provider đã ký (thứ tự key, khoảng trắng, unicode) → fail ngẫu nhiên. Dùng `express.raw({ type: 'application/json' })` cho route này (hoặc `verify` callback lưu `rawBody`).
+      (2) `!==` so string → timing attack; dùng `crypto.timingSafeEqual` trên Buffer **cùng độ dài** (check length trước, không throw).
+      (3) Không có **timestamp** trong chuỗi ký + tolerance (vd ±5 phút) → **replay** event cũ hợp lệ; không dedup event id → replay trong cửa sổ vẫn lọt.
+      (4) Xử lý đồng bộ 15s → provider timeout + retry → trùng. Fix: verify → insert `UNIQUE(event_id)` → 200 → worker; worker re-fetch trạng thái từ API provider cho event quan trọng (không tin payload tuyệt đối). Hỗ trợ **2 secret** khi rotate.
+    followUp: How do you rotate the webhook secret without dropping events?
+    redFlags:
+      - "Only mentions HTTPS"
+    tags: [webhooks, hmac, security]
+  - id: scenario-reliability-042
+    level: hard
+    type: debug
+    q: This "exactly-once" consumer still applies some events twice after rebalances. Why, and what is the correct version?
+    example: |-
+      ```ts
+      async function handle(message: KafkaMessage) {
+        const eventId = message.headers!.eventId!.toString();
+        const seen = await db.processedEvents.exists(eventId);   // check outside tx
+        if (seen) return;
+        await db.transaction(async (tx) => {
+          await applyBusinessLogic(tx, message);
+          await tx.processedEvents.insert(eventId);
+        });
+        await consumer.commitOffsets([...]);
+      }
+      ```
+    hint: |-
+      (1) `exists` chạy **ngoài** transaction → check-then-act: trong rebalance, consumer cũ (chưa biết mình mất partition) và consumer mới cùng xử lý message → cả hai thấy `seen=false`. Nếu bảng thiếu **unique constraint** trên `event_id` → cả hai commit → áp dụng 2 lần.
+      (2) Fix: bỏ check riêng; **INSERT processed_events ... ON CONFLICT DO NOTHING** làm câu **đầu tiên** trong transaction, `rowCount = 0` → return (commit rỗng). Unique constraint làm người thứ hai chờ rồi thấy conflict → atomic.
+      (3) Business write và dedup **cùng DB, cùng transaction**; nếu side effect là HTTP call ra ngoài thì dedup không bao phủ → cần idempotency key ở phía đó hoặc outbox.
+      (4) Offset commit sau DB commit vẫn đúng (at-least-once); dọn `processed_events` theo TTL > thời gian retention/replay tối đa.
+    followUp: The business write goes to Postgres but the side effect is publishing to another Kafka topic. How do you keep them consistent?
+    redFlags:
+      - "Keeps the exists() pre-check as the primary guard"
+    tags: [kafka, idempotent-consumer, notion-correction]
+  - id: scenario-reliability-043
+    level: hard
+    type: scenario
+    q: A worker takes a Redis lock (`SET lock:invoice:42 token NX PX 30000`) and then generates and uploads an invoice. A 40-second stop-the-world pause happened, and two invoices were sent. How do you make the lock safe, and would a Postgres advisory lock be better?
+    hint: |-
+      (1) Lock **hết hạn trong lúc work vẫn chạy** (GC pause, event loop block, network partition) → worker B lấy lock → cả hai làm. Không có lock dựa trên TTL nào an toàn nếu chỉ dựa vào chính lock.
+      (2) **Fencing token**: mỗi lần cấp lock kèm số tăng dần (`INCR lock:invoice:42:fence`); mọi write vào storage mang token, storage **từ chối token cũ**: `UPDATE invoices SET ... , fence = $t WHERE id = 42 AND fence < $t`. Side effect ngoài (email) → idempotency key theo invoice.
+      (3) Postgres advisory lock (`pg_try_advisory_xact_lock(42)`) gắn với **transaction/session**: session chết → lock tự nhả; không có TTL nên không "hết hạn giữa chừng", nhưng giữ connection suốt thời gian work, và **session-level lock hỏng với PgBouncer transaction mode**.
+      (4) Nếu dữ liệu đã ở Postgres, thường tốt hơn là **row lock / conditional UPDATE trạng thái** (`status='generating' WHERE status='pending'`) + idempotent side effect, không cần lock ngoài.
+    followUp: Why does Redlock across 5 Redis nodes not solve the GC-pause problem?
+    redFlags:
+      - "Fixes it by increasing the TTL to 5 minutes"
+      - "Calls Redlock safe for correctness without fencing"
+    tags: [distributed-lock, fencing, advisory-lock, notion-correction]
+  - id: scenario-reliability-044
+    level: hard
+    type: debug
+    q: "This money-transfer code deadlocks under load and the retry wrapper makes it worse. Find the problems."
+    example: |-
+      ```ts
+      async function transfer(from: number, to: number, amount: number) {
+        return retry(() => db.tx(async (tx) => {
+          await tx.query('SELECT * FROM accounts WHERE id = $1 FOR UPDATE', [from]);
+          await fraudService.check(from, to, amount);          // HTTP, 200-2000 ms
+          await tx.query('SELECT * FROM accounts WHERE id = $1 FOR UPDATE', [to]);
+          await tx.query('UPDATE accounts SET balance = balance - $2 WHERE id = $1', [from, amount]);
+          await tx.query('UPDATE accounts SET balance = balance + $2 WHERE id = $1', [to, amount]);
+        }), { retries: 5, retryOn: () => true });
+      }
+      ```
+    hint: |-
+      (1) Khoá theo thứ tự `from → to`: A→B và B→A cùng lúc = deadlock kinh điển. Fix: khoá cả hai trong **một câu** theo thứ tự id: `SELECT ... WHERE id = ANY($1) ORDER BY id FOR UPDATE`.
+      (2) HTTP call **trong** transaction giữ row lock 2s → contention, pool cạn, deadlock window lớn. Gọi fraud check **trước** transaction.
+      (3) `retryOn: () => true`: retry cả lỗi nghiệp vụ (số dư không đủ), không backoff/jitter → deadlock lặp lại đồng bộ. Chỉ retry `40P01`/`40001`, 3 lần, full jitter.
+      (4) Thiếu check số dư (`WHERE balance >= $2` + `rowCount`) và thiếu idempotency key cho transfer → retry sau commit-but-lost-ack sẽ chuyển 2 lần.
+    followUp: How would the same pattern look in SQL Server, and which error number do you retry?
+    redFlags:
+      - "Only suggests adding more retries"
+    tags: [deadlock, postgres, transactions]
+  - id: scenario-reliability-045
+    level: hard
+    type: design
+    q: Design read-your-writes on top of Postgres async replicas without routing all reads to the primary.
+    hint: |-
+      (1) Sau write, lấy **LSN** của commit: `SELECT pg_current_wal_lsn()` (hoặc `pg_current_wal_insert_lsn`) và trả về client dưới dạng token (cookie/header), vd `x-min-lsn`.
+      (2) Khi đọc: chọn replica có `pg_last_wal_replay_lsn() >= token` (poll/cached per replica mỗi ~100ms); không có → chờ ngắn (≤ 200ms) hoặc đọc primary.
+      (3) Rẻ hơn: "sticky primary" N giây theo user sau write (N > p99 lag); hoặc chỉ các endpoint "của tôi" đọc primary.
+      (4) Monitor `pg_stat_replication.replay_lag`; lag > ngưỡng → circuit tự chuyển read về primary (cẩn thận primary quá tải). Aurora/RDS có metric riêng (`AuroraReplicaLag`, `ReplicaLag`, verify).
+    example: |-
+      ```sql
+      -- on primary, after the write commits
+      SELECT pg_current_wal_lsn();            -- e.g. 3/A1B2C3D0
+      -- on a replica, before serving the read
+      SELECT pg_last_wal_replay_lsn() >= '3/A1B2C3D0'::pg_lsn AS caught_up;
+      ```
+    followUp: How does this work when the user's session spans multiple devices?
+    redFlags:
+      - "Uses synchronous_commit = remote_apply for every write"
+    verify: true
+    tags: [replication, read-your-writes, postgres]
+  - id: scenario-reliability-046
+    level: hard
+    type: scenario
+    q: Your Redis-backed rate limiter's Redis cluster goes down. Should the API fail open or fail closed? Walk through different endpoints.
+    hint: |-
+      (1) Không có câu trả lời chung — quyết định **theo endpoint** dựa trên rủi ro: bị lạm dụng tốn bao nhiêu vs mất availability tốn bao nhiêu.
+      (2) **Fail-closed**: login, OTP send/verify, reset password, gửi SMS/email, endpoint tốn tiền (LLM, payment) — không có limit = brute force / SMS pumping / hoá đơn.
+      (3) **Fail-open** (kèm **local in-memory limiter** ≈ limit/số pod): API đọc thông thường — thà cho qua hơi nhiều còn hơn sập toàn bộ.
+      (4) Luôn: timeout Redis ngắn (vd 20–50ms), circuit breaker quanh limiter để không cộng latency, metric + alert "limiter degraded"; gateway/WAF limit thô làm lớp ngoài.
+    followUp: How do you pick the local fallback limit when the number of pods changes with autoscaling?
+    redFlags:
+      - "Picks one policy for all endpoints"
+    tags: [rate-limiting, redis, failure-modes]
+  - id: scenario-reliability-047
+    level: hard
+    type: debug
+    q: Review this OTP implementation for a login second factor. What would an attacker exploit?
+    example: |-
+      ```ts
+      async function sendOtp(userId: string, phone: string) {
+        const code = Math.floor(100000 + Math.random() * 900000).toString();
+        await redis.set(`otp:${phone}`, code);
+        await sms.send(phone, `Your code is ${code}`);
+      }
+      async function verifyOtp(phone: string, code: string) {
+        return (await redis.get(`otp:${phone}`)) === code;
+      }
+      ```
+    hint: |-
+      (1) `Math.random()` không phải CSPRNG → dùng `crypto.randomInt(0, 1_000_000)` + `padStart(6,'0')`. Lưu **plaintext**, **không TTL**, không xoá sau khi dùng (reuse).
+      (2) Key theo **phone**, không bind `user_id + purpose` → OTP cho "đổi số điện thoại" dùng được cho login; `phone` đến từ client → gửi OTP tới số bất kỳ.
+      (3) **Không giới hạn số lần thử** → 1e6 khả năng, brute force vài phút; không throttle resend → SMS bombing + **SMS pumping** (toll fraud). So sánh `===` không constant-time.
+      (4) Fix: `otp:{userId}:{purpose}` = HMAC(code) + `EX 300`, `attempts` counter (≤5 rồi xoá + lock tạm), resend cooldown 60s + tối đa/giờ/account/IP/số, `timingSafeEqual`, xoá ngay khi đúng, log & alert.
+    followUp: Why hash a 6-digit OTP at all if it can be brute-forced offline in milliseconds?
+    redFlags:
+      - "Only points out Math.random"
+    tags: [otp, mfa, security, debug]
+  - id: scenario-reliability-048
+    level: hard
+    type: scenario
+    q: Your SMS bill jumps 40x overnight. Most OTP requests target premium-rate numbers in a few countries and none of them complete verification. What is happening and what do you do?
+    hint: |-
+      (1) **SMS pumping / toll fraud (IRSF)**: bot gọi endpoint gửi OTP tới dải số premium mà kẻ gian chia doanh thu với nhà mạng. Dấu hiệu: conversion (verify/sent) ≈ 0, số liên tiếp, quốc gia lạ.
+      (2) Ngay: fail-closed/tắt gửi SMS tới các country code bất thường (allowlist quốc gia bạn phục vụ), rate limit chặt theo IP/device/prefix, CAPTCHA/Turnstile trước khi gửi.
+      (3) Lâu dài: giới hạn theo **conversion rate** per country/prefix, budget cảnh báo chi phí theo giờ, dùng tính năng fraud guard của SMS provider (verify tên tính năng), chỉ gửi OTP khi đã qua bước 1 (password), ưu tiên **TOTP/WebAuthn/email**.
+      (4) Postmortem: endpoint gửi OTP là **endpoint tốn tiền** → cần quota và alert như payment.
+    followUp: How would you detect this automatically within 15 minutes instead of on the monthly bill?
+    redFlags:
+      - "Only blocks the attacker's IPs"
+    verify: true
+    tags: [otp, fraud, rate-limiting]
+  - id: scenario-reliability-049
+    level: senior
+    type: design
+    q: Design ticket sales for a stadium concert — 50,000 seats, 1 million users arriving at on-sale time, seat selection allowed, payment within 10 minutes. Walk through the architecture and its failure modes.
+    hint: |-
+      (1) Clarify: seat map hay general admission, giới hạn vé/user, chống bot/scalper, SLA thanh toán, chấp nhận hàng đợi không.
+      (2) **Virtual waiting room**: token có chữ ký, cho vào theo tốc độ hệ thống chịu được (vd 2k user/phút) → biến spike 1M thành dòng đều. Trang tĩnh qua CDN.
+      (3) Seat map đọc từ cache (vài giây stale OK); **hold** ghế bằng conditional UPDATE/unique partial index (card 009/012), shard theo section để giảm contention; hết hạn lazy + sweeper.
+      (4) Thanh toán: idempotency key theo hold, provider key, webhook + reconcile; payment về trễ sau hết hold → refund tự động.
+      (5) Failure modes: DB primary chết (hold mất?), Redis waiting room chết (fail-closed: dừng cho vào), bot mua sạch (per-account limit, CAPTCHA, verified fan). Load test với số liệu thật trước on-sale.
+    followUp: Where exactly is the single most contended resource in your design, and how does it behave at 10x the expected load?
+    redFlags:
+      - "Scales the API horizontally and assumes the database will keep up"
+    tags: [system-design, booking, oversell]
+  - id: scenario-reliability-050
+    level: senior
+    type: design
+    q: "Checkout spans three services: reserve inventory, capture payment, create shipment. Design it as a saga. Where is the pivot transaction and what are the compensations?"
+    hint: |-
+      (1) Thứ tự theo **khả năng hoàn tác**: bước compensatable trước (reserve inventory → compensate: release), **pivot** = capture payment (sau nó chỉ đi tiếp), bước **retriable** sau (create shipment — phải retry đến khi thành công, không rollback tiền).
+      (2) Orchestration (Temporal/state machine trong DB) cho flow tiền: trạng thái rõ, timeout, retry per step, dễ audit. Choreography ổn cho flow ít bước, ít coupling.
+      (3) Mỗi step + compensation **idempotent** (key = `saga_id:step`); gửi command qua **outbox** để state saga và message nhất quán.
+      (4) Compensation có thể fail (refund lỗi) → retry vô hạn có backoff + alert + manual queue. UX: order `PENDING` → `CONFIRMED`/`CANCELLED`; semantic lock (reserved, chưa bán) chống dirty read giữa các saga.
+    followUp: The shipment service is down for 6 hours after payment capture. What does the customer see and what does the saga do?
+    redFlags:
+      - "Proposes 2PC across the three services"
+      - "Puts payment capture first"
+    tags: [saga, distributed-transactions, payments]
+  - id: scenario-reliability-051
+    level: senior
+    type: design
+    q: Finance reports that your payment records and the provider's settlement report disagree for about 0.1% of transactions every month. Design a reconciliation system.
+    hint: |-
+      (1) Clarify: nguồn sự thật (provider settlement là tiền thật), độ trễ settlement (T+1..T+3), các loại lệch: có ở provider không có ở mình (webhook mất, crash sau charge), có ở mình không có ở provider (đánh dấu success sai), lệch số tiền/currency, refund/chargeback.
+      (2) Job định kỳ: kéo report/API provider theo ngày → normalize → match theo **reference nội bộ** (idempotency key/metadata) → phân loại → auto-fix loại an toàn (cập nhật trạng thái, refund charge mồ côi), còn lại vào queue cho người.
+      (3) Ledger **append-only** (double-entry) thay vì update trạng thái tại chỗ → audit được.
+      (4) Metric: tỉ lệ lệch theo loại, tuổi item chưa xử lý; mục tiêu kéo 0.1% về gần 0 bằng cách sửa nguyên nhân gốc (provider key, lease recovery, webhook dedup), reconcile chỉ là lưới an toàn.
+    followUp: A charge exists at the provider but no order exists in your DB. Do you refund automatically or create the order?
+    redFlags:
+      - "Treats reconciliation as a one-off SQL script"
+    tags: [reconciliation, payments, reliability]
+  - id: scenario-reliability-052
+    level: senior
+    type: open
+    q: A team proposes a shared Redlock-based "distributed lock service" that every microservice must use for any concurrent update. How do you respond?
+    hint: |-
+      (1) Hỏi mục đích lock: **efficiency** (tránh làm trùng việc tốn kém — lỗi thỉnh thoảng chấp nhận được) hay **correctness** (không bao giờ được trùng). Redis lock ổn cho cái đầu.
+      (2) Cho correctness, Redlock dựa vào giả định thời gian (clock drift, GC pause, network delay có giới hạn) — Kleppmann chỉ ra không có fencing token thì không an toàn; antirez phản biện. Kết luận thực dụng: cần **fencing ở storage** hoặc dùng hệ đồng thuận (etcd/ZooKeeper lease có revision).
+      (3) Phần lớn case "concurrent update" giải quyết tốt hơn **ngay tại data store**: conditional UPDATE, optimistic version, unique constraint, `SKIP LOCKED`, advisory lock — không thêm dependency, không thêm failure mode.
+      (4) Service lock chung = single point of failure + coupling mọi team; đề xuất guideline + thư viện nhỏ thay vì platform bắt buộc.
+    followUp: Give one case where you would genuinely need a lock outside the database.
+    redFlags:
+      - "Accepts the proposal without asking what correctness is required"
+    tags: [distributed-lock, redlock, architecture]
+  - id: scenario-reliability-053
+    level: senior
+    type: design
+    q: Black Friday traffic is expected at 3x your tested capacity. Autoscaling takes 4 minutes to add pods. Design load shedding, bulkheads and graceful degradation for a Node checkout API.
+    hint: |-
+      (1) Ưu tiên traffic: checkout/payment > cart > browse/recommendation > analytics. Degrade tính năng không cốt lõi trước (feature flag tắt recommendations, reviews).
+      (2) **Load shedding**: trả 503 + `Retry-After` **sớm** khi vượt concurrency limit (in-flight > N) hoặc event loop lag > ngưỡng (vd 200ms) — thà từ chối nhanh còn hơn timeout tất cả. Shed traffic ưu tiên thấp trước (header/route priority).
+      (3) **Bulkhead**: pool/semaphore riêng cho từng downstream (payment 50 concurrent, recommendation 10) → service chậm không ăn hết socket/DB connection. Timeout + breaker per downstream.
+      (4) Pre-scale trước sự kiện (không trông vào autoscale 4 phút), waiting room cho peak, load test ở 3–4x với dependency thật. Metric: shed rate theo priority, goodput.
+    followUp: How do you prevent clients' retries from undoing your load shedding?
+    redFlags:
+      - "Relies only on autoscaling"
+    tags: [load-shedding, bulkhead, resilience]
+  - id: scenario-reliability-054
+    level: senior
+    type: design
+    q: Design MFA for a B2B SaaS app used by finance teams. Which factors do you support, how do you handle recovery, and where do you require step-up?
+    hint: |-
+      (1) Factor: **WebAuthn/passkeys** (phishing-resistant, ưu tiên), **TOTP** (RFC 6238, 30s, cho phép ±1 step, chống reuse cùng step), SMS/email OTP chỉ fallback (NIST xếp SMS là "restricted" — verify phiên bản 800-63B). Tenant admin có thể **bắt buộc** MFA/cấm SMS.
+      (2) Recovery: **recovery codes** (10 mã, hash, single-use), nhiều factor đăng ký, reset qua admin tenant + xác minh; recovery là nơi bị tấn công nhiều nhất → throttle, notify, cooldown.
+      (3) **Step-up** cho hành động nhạy cảm: đổi bank account, xuất dữ liệu, tạo API key, đổi MFA — yêu cầu xác thực lại trong 5 phút gần nhất (`acr`/`amr` claim nếu dùng OIDC).
+      (4) OTP rules như card 008/047; remember-device có hạn (30 ngày) bind cookie + device; audit log mọi thay đổi factor.
+    followUp: A user loses their phone and all recovery codes. What is your support process, and how do you stop social engineering?
+    redFlags:
+      - "Uses SMS OTP as the only second factor for finance users"
+    verify: true
+    tags: [mfa, security, auth]
+  - id: scenario-reliability-055
+    level: senior
+    type: open
+    q: You are leading the postmortem for an outage where a slow dependency triggered a retry storm that took down three services. How do you run it and what systemic guardrails come out of it?
+    hint: |-
+      (1) Blameless, timeline từ dữ liệu (metric, trace, deploy log): khi nào dependency chậm, khi nào retry ratio tăng, vì sao alert muộn.
+      (2) Tìm **cơ chế** chứ không tìm người: retry ở mọi layer, timeout dài hơn caller, không có budget/breaker, autoscale thêm pod càng tăng tải lên dependency.
+      (3) Guardrails có chủ sở hữu và deadline: thư viện HTTP client chung (timeout mặc định, full jitter, max 3 attempts, retry budget, breaker), lint/review checklist, dashboard "retry ratio / attempts per request", game day / chaos test (inject latency).
+      (4) Đo hiệu quả: lần inject latency tiếp theo hệ thống degrade thay vì sập. Chia sẻ learning cross-team.
+    followUp: Two teams disagree on who owns the shared HTTP client defaults. How do you resolve it?
+    redFlags:
+      - "Action items are only 'be more careful' or 'add more monitoring'"
+    tags: [postmortem, retry, leadership]
+  - id: scenario-reliability-056
+    level: senior
+    type: open
+    q: How do you catch concurrency and idempotency bugs before they reach production?
+    hint: |-
+      (1) **Test song song có assert invariant**: bắn 50–200 request đồng thời cùng resource (Promise.all/autocannon/k6) vào DB thật (Testcontainers), assert `sold <= capacity`, `charges per order <= 1`.
+      (2) **Inject lỗi ở điểm giữa**: fake provider timeout sau khi đã "charge", kill process giữa transaction, duplicate delivery (gửi message 2 lần, out-of-order) → kiểm idempotency và recovery.
+      (3) Làm race **tái hiện được**: hook/barrier trong test để ép interleaving (2 transaction cùng đọc trước khi ghi), hoặc `pg_sleep` trong test; property-based testing cho state machine.
+      (4) Review checklist: có read-modify-write không? side effect có key không? retry ở layer nào? Và production: reconcile + invariant check định kỳ (query phát hiện oversell/double charge) như canary.
+    followUp: Which of these would have caught the voucher double-redeem bug, and which would not?
+    redFlags:
+      - "Relies on unit tests with mocked database calls"
+    tags: [testing, concurrency, idempotency]
+  - id: scenario-reliability-057
+    level: cv
+    type: behavioral
+    q: Tell me about a time you found and fixed a duplicate-processing or race-condition bug in production. How did you prove it was fixed?
+    hint: |-
+      STAR: **S** — triệu chứng đo được (vd x% order bị trùng, số khiếu nại, chi phí). **T** — vai trò của bạn (owner/on-call).
+      **A** — cách tái hiện (log correlation id, test song song), root cause (check-then-act, retry không idempotent, consumer rebalance), fix theo lớp (constraint/atomic update → idempotency key → dọn dữ liệu lỗi cũ).
+      **R** — số liệu sau fix (trùng về 0 trong N tuần), test/alert thêm vào để không tái diễn.
+      Reflection: vì sao lỗi lọt review/test và bạn đã đổi quy trình gì (checklist, test concurrency).
+    followUp: What data did you have to clean up, and how did you communicate it to affected users or finance?
+    redFlags:
+      - "Cannot explain the exact interleaving that caused the bug"
+    tags: [behavioral, race-condition]
+  - id: scenario-reliability-058
+    level: cv
+    type: behavioral
+    q: Tell me about a time a timeout, retry or health-check configuration caused or prevented an incident.
+    hint: |-
+      STAR: bối cảnh (service, traffic, dependency), cấu hình ban đầu (timeout mặc định, retry mọi layer, liveness check DB, shutdown không drain).
+      Sự cố hoặc near-miss: chuỗi sự kiện cụ thể có số (latency p99, error rate, thời gian downtime).
+      Hành động: đổi cấu hình (timeout theo p99, full jitter, retry budget, readiness vs liveness, preStop), cách test (inject latency, rolling deploy dưới tải).
+      Kết quả + reflection: 502 khi deploy về 0, MTTR giảm; bài học "mặc định của framework hiếm khi đúng cho production".
+    followUp: What default in your current stack do you think is still wrong?
+    tags: [behavioral, resilience]
