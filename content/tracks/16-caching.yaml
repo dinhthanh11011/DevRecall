@@ -200,7 +200,7 @@ questions:
     type: concept
     q: What is cache hit ratio, how do you measure it in Redis, and what else would you monitor on a cache?
     hint: |-
-      Hit ratio = hits / (hits + misses). Redis: `INFO stats` → `keyspace_hits`, `keyspace_misses` (toàn instance, không theo key pattern) → nên đo thêm ở app layer theo từng loại key.
+      Hit ratio = hits / (hits + misses). Redis: `INFO stats` → `keyspace_hits`, `keyspace_misses` (toàn instance, không theo key pattern, và tính mọi lệnh tra key như `TTL`, `EXISTS`, lock, rate limiter) → nên đo ở app layer theo từng loại key.
       Theo dõi thêm: latency p99 của lệnh cache, `evicted_keys`, `expired_keys`, `used_memory` vs `maxmemory`, `mem_fragmentation_ratio`, `connected_clients`, `instantaneous_ops_per_sec`, `latency` spikes, và **DB QPS** (mục tiêu thật của cache).
       Hit ratio cao nhưng DB vẫn nặng → có thể đang cache nhầm chỗ.
     followUp: Hit ratio is 95% but DB load barely dropped. What could explain that?
@@ -439,7 +439,7 @@ questions:
     type: compare
     q: Compare Redis eviction policies. LRU vs LFU, `allkeys-*` vs `volatile-*` — which do you pick and why?
     hint: |-
-      Policies: `noeviction` (default), `allkeys-lru`, `allkeys-lfu`, `allkeys-random`, `volatile-lru`, `volatile-lfu`, `volatile-random`, `volatile-ttl`.
+      Policies: `noeviction` (default), `allkeys-lru`, `allkeys-lfu`, `allkeys-random`, `volatile-lru`, `volatile-lfu`, `volatile-random`, `volatile-ttl`; Redis 8.x thêm `allkeys-lrm`/`volatile-lrm` (least recently modified).
       - `allkeys-*`: đuổi bất kỳ key nào → hợp **cache thuần**.
       - `volatile-*`: chỉ đuổi key có TTL → key không TTL (lock, config) an toàn; nhưng nếu không còn key có TTL thì hành xử như noeviction (lỗi OOM).
       - LRU xấp xỉ (sampling `maxmemory-samples`); LFU (từ 4.0) giữ key phổ biến lâu dài tốt hơn khi có scan một lần làm "bẩn" LRU.
@@ -619,7 +619,7 @@ questions:
       - **Client-side caching** (RESP3 tracking) cho key ít đổi.
       - Thêm **read replicas** và đọc từ replica (chấp nhận lag).
       - Giảm payload (nén, chỉ field cần), hoặc đẩy lên CDN nếu là public content.
-      Phát hiện: `redis-cli --hotkeys` (cần policy LFU), metrics theo prefix ở client, `MONITOR` chỉ ngắn hạn (rất tốn).
+      Phát hiện: metrics theo prefix ở client, `redis-cli --hotkeys` (cần policy LFU), lệnh `HOTKEYS START/GET` (Redis 8.6+, top-K theo CPU/network), `MONITOR` chỉ ngắn hạn (rất tốn).
     followUp: How do you invalidate N replicated copies consistently?
     verify: true
     tags: [hot-key, redis]
@@ -757,7 +757,7 @@ questions:
     q: You implemented write-behind for view counters. After a Redis failover, a day of counts partly disappears. Explain and redesign.
     hint: |-
       Write-behind giữ dữ liệu chỉ trong Redis tới khi flush; Redis replication **async** → failover promote replica thiếu các write gần nhất; nếu instance chết trước flush thì mất phần chưa flush.
-      Redesign: chấp nhận xấp xỉ và nói rõ SLA; hoặc ghi event bền (Kafka/Stream với ack) rồi aggregate; flush thường xuyên với `GETDEL`/`INCRBY` âm atomic; idempotent flush (ghi theo cửa sổ thời gian + key cửa sổ) để retry không đếm đôi. `WAIT` chỉ tăng xác suất, không đảm bảo.
+      Redesign: chấp nhận xấp xỉ và nói rõ SLA; hoặc ghi event bền (Kafka/Stream với ack) rồi aggregate; flush thường xuyên theo **key cửa sổ thời gian** (chỉ flush cửa sổ đã đóng), ghi DB bằng **upsert giá trị tuyệt đối** theo (key, window) rồi mới xoá key Redis, để retry không đếm đôi. Tránh `GETDEL` trước khi ghi DB: crash ở giữa là mất luôn cửa sổ đó. `WAIT` chỉ tăng xác suất, không đảm bảo.
     followUp: How do you make the flush idempotent so a retry does not double-count?
     tags: [write-behind, durability]
   - id: caching-045

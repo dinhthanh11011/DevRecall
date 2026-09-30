@@ -336,7 +336,7 @@ questions:
     hint: |-
       `Cache-Control: max-age=60, stale-while-revalidate=600`: trong 60s response là fresh; từ 60s tới 660s cache được **trả bản stale ngay** và **revalidate nền**; sau đó phải chờ network.
       Hiệu quả: user gần như không chờ, dữ liệu cập nhật trong lần sau. Định nghĩa ở RFC 5861.
-      Hỗ trợ: phần lớn CDN và các browser hiện đại (mức hỗ trợ từng browser nên kiểm tra lại). Cùng ý tưởng ở tầng app: SWR/React Query, Next.js ISR.
+      Hỗ trợ: phần lớn CDN; browser theo MDN compat data: Chrome 75+, Firefox 68+, Safari 14+. Cùng ý tưởng ở tầng app: SWR/React Query, Next.js ISR.
       Không hợp cho dữ liệu phải mới tuyệt đối (giá lúc checkout, số dư).
     followUp: How is this different from `stale-if-error`?
     tags: [http-caching, swr]
@@ -415,9 +415,10 @@ questions:
       - Luôn có `width`/`height` (chống CLS).
       - Ảnh LCP: `fetchpriority="high"`.
       - CDN resize/nén theo thiết bị; placeholder (blur/màu chủ đạo).
-      Next.js `next/image` tự làm nhiều việc này (cần hiểu cấu hình `sizes`, `priority`/preload).
+      Next.js `next/image` tự làm nhiều việc này (cần hiểu cấu hình `sizes`; từ Next.js 16 prop `priority` bị deprecate, thay bằng `preload`, docs khuyên dùng `loading="eager"`/`fetchPriority="high"` cho ảnh LCP).
     followUp: What is wrong with `sizes="100vw"` on a 4-column product grid?
     tags: [images, lcp, cls]
+    verify: true
   - id: browser-web-perf-020
     level: medium
     type: compare
@@ -682,7 +683,7 @@ questions:
     q: What is the back/forward cache (bfcache), and what commonly makes a page ineligible?
     hint: |-
       bfcache giữ **snapshot toàn bộ trang trong memory** khi user rời đi → Back/Forward hiển thị tức thì (LCP ~0, không chạy lại JS).
-      Thường làm mất eligibility: handler `unload` (đang bị Chrome deprecate — dùng `pagehide`/`visibilitychange`), kết nối đang mở (WebSocket/WebRTC/IndexedDB transaction dở), `window.opener` references; `Cache-Control: no-store` trên HTML trong lịch sử chặn bfcache (Chrome đang thay đổi hành vi này cho một số trường hợp — kiểm tra hiện tại).
+      Thường làm mất eligibility: handler `unload` (đang bị Chrome deprecate — dùng `pagehide`/`visibilitychange`), kết nối đang mở (WebSocket/WebRTC/IndexedDB transaction dở), `window.opener` references. `Cache-Control: no-store` trên HTML: lịch sử chặn bfcache; Chrome hiện cho trang `no-store` vào bfcache **trừ khi cookie (HttpOnly) thay đổi** (đo trên Chrome 154: lý do `CacheControlNoStoreHTTPOnlyCookieModified`); Firefox/Safari có thể khác → không dựa vào `no-store` để chặn hiển thị dữ liệu nhạy cảm.
       Code phải xử lý `pageshow` với `event.persisted === true` để làm mới dữ liệu nhạy cảm (giỏ hàng, số dư).
       Kiểm tra: DevTools → Application → Back/forward cache.
     followUp: For a banking app, is bfcache a security concern? How do you handle it?
@@ -705,7 +706,7 @@ questions:
     q: How do you break up a long task on the main thread, and why does `setTimeout(0)` chunking hurt some interactions?
     hint: |-
       Long task > 50ms chặn input → INP tệ. Chia việc thành nhiều phần và **yield** về main thread giữa các phần để browser xử lý input/render.
-      Cách yield: `await new Promise(r => setTimeout(r, 0))` (continuation xếp **cuối hàng đợi**, có thể bị task khác chen, và browser kẹp delay tối thiểu ~4ms khi lồng nhiều cấp); `scheduler.yield()` (Chromium mới) giữ **ưu tiên** cho continuation; `requestIdleCallback` cho việc không gấp; `isInputPending` (cũ).
+      Cách yield: `await new Promise(r => setTimeout(r, 0))` (continuation xếp **cuối hàng đợi**, có thể bị task khác chen, và browser kẹp delay tối thiểu ~4ms khi lồng nhiều cấp); `scheduler.yield()` (Chrome 129+, Firefox 142+, chưa có Safari — cần fallback) giữ **ưu tiên** cho continuation; `requestIdleCallback` cho việc không gấp; `isInputPending` (cũ).
       Ưu tiên việc hiển thị trước (update UI), đẩy việc phụ (analytics, log) sau.
       Nặng thật (parse, crypto, CSV lớn) → Web Worker.
     example: |-
@@ -847,7 +848,7 @@ questions:
     hint: |-
       Nội dung mạnh:
       - Hiện tượng: `ChunkLoadError`/màn hình trắng khi chuyển route; nguyên nhân mạng yếu vs deploy xoá chunk cũ (điền trường hợp thật của bạn).
-      - Xử lý client: Error Boundary quanh `Suspense` route, retry `import()` có backoff, reload một lần có guard (sessionStorage flag) chống vòng lặp, thông báo thân thiện.
+      - Xử lý client: Error Boundary quanh `Suspense` route, reload một lần có guard (sessionStorage flag) chống vòng lặp, thông báo thân thiện. Retry có backoff chỉ hữu ích với runtime tải chunk của webpack; với ESM native (Vite), `import()` lỗi được nhớ trong module map nên retry cùng URL không gửi lại request (đã kiểm chứng trên Chrome).
       - Xử lý hạ tầng: `index.html` `no-cache`, asset hashed `immutable`, giữ chunk cũ sau deploy.
       - Giám sát: error tracking nhóm theo loại lỗi chunk, tỉ lệ trước/sau fix (điền số liệu thật của bạn).
       - Với app ngân hàng: không mất dữ liệu form giao dịch khi reload (lưu nháp an toàn, không lưu dữ liệu nhạy cảm).

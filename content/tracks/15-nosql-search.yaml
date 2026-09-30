@@ -212,7 +212,7 @@ questions:
     q: What are primary shards and replicas in Elasticsearch, and what can you change after index creation?
     hint: |-
       Primary shard: mảnh dữ liệu (mỗi cái là một Lucene index); document được route theo `hash(_routing) % num_primary_shards` (thực tế có thêm `routing_num_shards`). Replica: bản sao của primary trên node khác → HA + tăng throughput đọc.
-      Sau khi tạo: **replica đổi bất cứ lúc nào**; số primary **không đổi trực tiếp** — phải reindex, hoặc dùng `_split` (tăng theo bội số) / `_shrink` (giảm theo ước số) với điều kiện index read-only tạm thời.
+      Sau khi tạo: **replica đổi bất cứ lúc nào**; số primary **không đổi trực tiếp** — phải reindex, hoặc dùng `_split` (số đích phải là bội số của số hiện tại **và** chia hết `index.number_of_routing_shards`; mặc định chỉ nhân theo luỹ thừa của 2, ví dụ 2 → 8 được nhưng 2 → 6 lỗi) / `_shrink` (giảm theo ước số), cả hai cần chặn ghi (`index.blocks.write`) trước.
       Thêm replica **không** giúp khi một shard quá lớn/chậm ghi.
     followUp: Why is adding replicas not a fix for slow indexing?
     tags: [elasticsearch, shards]
@@ -587,7 +587,7 @@ questions:
       - **Yellow**: mọi primary đã assign, một số **replica** chưa (ví dụ cluster 1 node, hoặc node đang recover) → vẫn search/ghi được, nhưng giảm HA.
       - **Red**: ít nhất một **primary** chưa assign → dữ liệu shard đó không truy cập được; search trả partial/lỗi.
       Điều tra: `GET _cluster/health`, `GET _cat/shards?v&h=index,shard,prirep,state,unassigned.reason`, `GET _cluster/allocation/explain` (lý do: disk watermark vượt ngưỡng, node thiếu, allocation filter, shard corrupt).
-      Khắc phục theo nguyên nhân: giải phóng disk (watermark mặc định high 90%, flood stage 95% → index read-only), đưa node về, `_cluster/reroute?retry_failed=true`; cuối cùng mới restore snapshot hoặc chấp nhận mất shard.
+      Khắc phục theo nguyên nhân: giải phóng disk (watermark mặc định low 85%, high 90%, flood stage 95% → index bị block `read_only_allow_delete`; disk lớn còn có `max_headroom`, ví dụ flood stage chỉ đòi trống tối đa 100GB; block tự gỡ khi disk xuống dưới high watermark), đưa node về, `_cluster/reroute?retry_failed=true`; cuối cùng mới restore snapshot hoặc chấp nhận mất shard.
     followUp: Why can a disk filling to 95% make every index read-only, and how do you undo it?
     tags: [elasticsearch, cluster-health, operations, scenario]
     verify: true

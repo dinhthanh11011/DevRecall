@@ -276,15 +276,16 @@ questions:
     hint: |-
       `USING`: điều kiện row **hiện có** phải thoả để được thấy/UPDATE/DELETE.
       `WITH CHECK`: điều kiện row **mới** (INSERT, hoặc giá trị sau UPDATE) phải thoả → chặn ghi row sang tenant khác hoặc đổi `tenant_id`.
-      Nếu `FOR ALL` chỉ có `USING`, Postgres dùng nó cho cả check. Dùng `current_setting('app.tenant_id', true)` (missing_ok) → khi chưa set trả NULL → so sánh NULL → không thấy row nào (fail closed).
+      Nếu `FOR ALL` chỉ có `USING`, Postgres dùng nó cho cả check. Dùng `current_setting('app.tenant_id', true)` (missing_ok) → khi chưa từng set trong session trả NULL → không thấy row nào (fail closed).
+      Bẫy với pool: sau khi một transaction trước đã `set_config(..., true)`, setting vẫn tồn tại trong session với giá trị `''` → `''::bigint` báo lỗi. Viết `nullif(current_setting('app.tenant_id', true), '')::bigint` để luôn ra NULL.
     example: |-
       ```sql
       ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
       ALTER TABLE orders FORCE ROW LEVEL SECURITY;
 
       CREATE POLICY tenant_isolation ON orders
-        USING (tenant_id = current_setting('app.tenant_id', true)::bigint)
-        WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::bigint);
+        USING (tenant_id = nullif(current_setting('app.tenant_id', true), '')::bigint)
+        WITH CHECK (tenant_id = nullif(current_setting('app.tenant_id', true), '')::bigint);
 
       -- per request, inside a transaction:
       BEGIN;
@@ -416,9 +417,9 @@ questions:
     q: How does SQL Server implement row-level security, and how would you pass the tenant from a Node.js app?
     hint: |-
       SQL Server 2016+: tạo **inline table-valued function** làm predicate, rồi `CREATE SECURITY POLICY` với **FILTER PREDICATE** (lọc đọc) và **BLOCK PREDICATE** (chặn ghi sai tenant: AFTER INSERT/UPDATE...).
-      Tenant truyền qua `sp_set_session_context @key = N'TenantId', @value = @tid, @read_only = 1`; predicate đọc `SESSION_CONTEXT(N'TenantId')`.
-      Với connection pool (tedious/mssql): session context tồn tại theo connection → phải set lại mỗi lần mượn connection; connection reset (`sp_reset_connection`) khi trả về pool xoá session context.
-      Giống Postgres: user có quyền cao (db_owner, sysadmin) và cách predicate viết ảnh hưởng hiệu năng.
+      Tenant truyền qua `sp_set_session_context @key = N'TenantId', @value = @tid`; predicate đọc `SESSION_CONTEXT(N'TenantId')`. `@read_only = 1` khoá key tới hết session.
+      Connection pool: ADO.NET reset connection (`sp_reset_connection`) khi tái sử dụng nên xoá session context. node-mssql (tarn + tedious) **không** reset khi trả connection về pool (chạy thật với mssql 12.7 / tedious 20): context rò sang request sau, và `@read_only = 1` làm request của tenant khác lỗi "Cannot set key ... read_only". Trong Node: set trong cùng batch/transaction với query, không dùng read_only trên pool chung, reset về NULL khi xong.
+      Khác Postgres: RLS của SQL Server lọc cả sysadmin/db_owner (không tự bypass); muốn admin thấy hết phải viết vào predicate. Nhưng người có quyền ALTER SECURITY POLICY tắt được policy. Predicate phải inline được và dùng index.
     example: |-
       ```sql
       CREATE FUNCTION sec.fn_tenant(@TenantId int)
@@ -516,7 +517,7 @@ questions:
     hint: |-
       - Service kết nối bằng **table owner** → owner bypass RLS vì chưa `FORCE ROW LEVEL SECURITY`.
       - View tạo bởi owner mặc định chạy với quyền owner → kể cả role app thường truy vấn view cũng bypass. PG 15+: `CREATE VIEW ... WITH (security_invoker = true)`.
-      - `current_setting('app.tenant_id')` không có `missing_ok` → khi chưa set sẽ **lỗi** (fail closed nhưng gây 500); với `true` → NULL → không row nào. Chọn có chủ đích.
+      - `current_setting('app.tenant_id')` không có `missing_ok` → khi chưa set sẽ **lỗi** (fail closed nhưng gây 500); với `true` → NULL → không row nào, nhưng chỉ khi setting chưa từng được set trong session; connection đã dùng trả `''` và `::bigint` lại lỗi → dùng `nullif(..., '')`. Chọn có chủ đích.
       Fix: role riêng cho app (NOLOGIN owner, LOGIN app không phải owner, không `BYPASSRLS`), `FORCE RLS`, view `security_invoker`, test tự động bằng đúng role của app.
     followUp: Reporting legitimately needs cross-tenant aggregates for the platform team. How do you allow that safely?
     tags: [rls, postgres, debug]
@@ -608,7 +609,7 @@ questions:
       Tiền đề: mọi table có `tenant_id`, ID global (không trùng khi tách), routing tenant → DB qua **tenant catalog** (control plane).
       Các bước:
       1. Provision DB mới cùng schema version.
-      2. Copy snapshot dữ liệu tenant (`COPY ... WHERE tenant_id = X`) + CDC (logical replication với row filter — PG 15+ — hoặc Debezium) để bắt thay đổi.
+      2. Copy snapshot dữ liệu tenant (`COPY ... WHERE tenant_id = X`) + CDC (logical replication với row filter — PG 15+ — hoặc Debezium) để bắt thay đổi. Bẫy: row filter theo `tenant_id` đòi `tenant_id` nằm trong replica identity, nếu không mọi UPDATE/DELETE trên bảng nguồn lỗi ("Column used in the publication WHERE expression is not part of the replica identity") → PK `(tenant_id, id)` hoặc `REPLICA IDENTITY USING INDEX`.
       3. Kiểm tra đối chiếu (count, checksum theo table).
       4. Cutover: tạm dừng ghi tenant đó vài giây (maintenance flag), chờ CDC bắt kịp, đổi routing trong catalog, invalidate cache routing.
       5. Giữ dữ liệu cũ read-only một thời gian để rollback, rồi xoá.
