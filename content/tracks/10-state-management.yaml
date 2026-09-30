@@ -263,6 +263,7 @@ questions:
       - `onSettled`: `invalidateQueries({ queryKey })` để **reconcile** với server.
       - Cập nhật **mọi** query chứa item (list + detail) hoặc chấp nhận invalidate cả hai.
       - v5 có cách đơn giản hơn: render optimistic từ `mutation.variables` khi `isPending`, không đụng cache.
+      - Toggle dồn dập: các request có thể tới server **sai thứ tự** (request đầu chậm nhất thắng) → dùng `scope: { id }` (v5, mutation cùng scope chạy tuần tự), debounce, hoặc gửi giá trị tuyệt đối (`favourite: true`) kèm version thay vì "toggle".
     example: |-
       ```ts
       useMutation({
@@ -287,7 +288,8 @@ questions:
     type: concept
     q: How does RTK Query cache invalidation with tags work? Show `providesTags` and `invalidatesTags` for a list and a detail.
     hint: |-
-      - Query khai báo `providesTags` (dữ liệu này "thuộc" tag nào); mutation khai báo `invalidatesTags`; khi mutation xong, mọi query đang có subscription với tag trùng sẽ **refetch**.
+      - Query khai báo `providesTags` (dữ liệu này "thuộc" tag nào); mutation khai báo `invalidatesTags`; khi mutation xong, mọi query đang có subscription với tag trùng sẽ **refetch**; entry không còn subscriber thì bị xoá thay vì refetch.
+      - Mutation lỗi có response từ server (VD `PATCH 500`) **vẫn** invalidate tag (RTK 2.x khớp cả fulfilled lẫn rejected-with-value) — muốn chỉ invalidate khi thành công thì dùng callback `(result, error) => error ? [] : [...]`.
       - Pattern chuẩn: list cung cấp `{ type: 'Order', id: 'LIST' }` + từng `{ type: 'Order', id }`; tạo mới invalidate `LIST`; sửa một item invalidate `{ type: 'Order', id }`.
       - Cache entry không còn subscriber bị xoá sau `keepUnusedDataFor` (default 60 giây).
       - Invalidate quá rộng (`['Order']`) → refetch nhiều query không cần.
@@ -317,6 +319,7 @@ questions:
       - Không dùng Redux / chỉ cần server state → **TanStack Query**: API linh hoạt theo từng query, infinite query mạnh, devtools riêng, SSR hydration, framework-agnostic.
       - Khác biệt mô hình: RTK Query định nghĩa **API slice tập trung**; TanStack Query định nghĩa **tại chỗ** (hoặc qua `queryOptions`).
       - Invalidation: tags (RTK Query) vs query key prefix (TanStack).
+      - Default khác nhau: RTK Query **không** refetch khi mount nếu đã có cache (`refetchOnMountOrArgChange: false`), focus refetch cần `refetchOnFocus` + `setupListeners`; TanStack Query mặc định `staleTime: 0`, refetch khi mount và focus.
       - Đừng dùng cả hai cho cùng dữ liệu.
     followUp: How would you migrate a codebase from `createAsyncThunk` + slices storing API data to RTK Query incrementally?
     tags: [rtk-query, tanstack-query, compare]
@@ -328,7 +331,7 @@ questions:
       - `useSelector` chạy lại selector sau **mọi** action và so sánh kết quả bằng `===`; `.filter` trả **array mới** mỗi lần → component render sau mọi action, kể cả không liên quan.
       - React-Redux (v8+) còn cảnh báo dev khi selector trả reference khác cho cùng input.
       - Fix: memoized selector `createSelector([selectOrders], orders => orders.filter(o => o.paid))` — chỉ tính lại khi `orders` đổi reference; hoặc select primitive/id; hoặc `shallowEqual` làm tham số thứ hai.
-      - Selector có tham số (theo `status`) → tạo selector instance per component (`useMemo(makeSelect, [])`) nếu cache size nhỏ.
+      - Selector có tham số (theo `status`): Reselect 5 (đi kèm RTK 2) mặc định dùng `weakMapMemoize`, nhớ nhiều bộ tham số → thường không cần factory. Reselect 4 / `lruMemoize` chỉ nhớ 1 bộ (cache size 1) → khi đó mới cần selector instance per component (`useMemo(makeSelect, [])`).
     followUp: What is the cache size of a Reselect selector, and how does that matter for parameterized selectors?
     verify: true
     tags: [redux, selectors, performance]
@@ -338,10 +341,10 @@ questions:
     q: "`invalidateQueries` vs `refetchQueries` vs `setQueryData` vs `resetQueries` — when do you use each after a mutation?"
     hint: |-
       - `invalidateQueries`: đánh dấu stale; query **đang active** refetch ngay, inactive refetch khi được dùng lại → lựa chọn mặc định an toàn.
-      - `refetchQueries`: fetch ngay theo filter (kể cả không stale) — ít dùng.
+      - `refetchQueries`: fetch ngay theo filter (kể cả không stale), mặc định `type: 'all'` nên refetch **cả query inactive** — ít dùng.
       - `setQueryData`: ghi tay vào cache (dùng response của mutation, tránh round-trip) — cần đúng shape; hợp khi server trả entity đã cập nhật.
       - `resetQueries`: về `initialData`/xoá data rồi refetch — dùng khi logout/đổi tenant.
-      - `removeQueries`: xoá khỏi cache không refetch.
+      - `removeQueries`: xoá khỏi cache không refetch — xoá cả khi component vẫn đang subscribe.
       - Thường: `setQueryData` cho detail từ response + `invalidateQueries` cho list.
     followUp: After logout, what must happen to the query cache and why?
     tags: [tanstack-query, caching]
@@ -461,7 +464,7 @@ questions:
     type: concept
     q: What are the default retry and refetch behaviours of TanStack Query, and when should you override them?
     hint: |-
-      - Client: query lỗi **retry 3 lần** với exponential backoff; mutation mặc định **không retry**. Trên server (SSR) retry mặc định 0.
+      - Client: query lỗi **retry 3 lần** với exponential backoff (tổng 4 lần gọi, cách nhau 1 s, 2 s, 4 s → user chờ ~7 s mới thấy lỗi); mutation mặc định **không retry**. Trên server (SSR) retry mặc định 0.
       - Refetch khi query stale và: component mới mount (`refetchOnMount`), window focus (`refetchOnWindowFocus`), mạng reconnect (`refetchOnReconnect`).
       - Override: không retry lỗi 4xx (401/403/404/422) — `retry: (count, err) => err.status >= 500 && count < 3`; tắt focus refetch cho form/màn hình nặng; bật `refetchInterval` cho dashboard.
       - Test: tắt retry trong QueryClient của test để lỗi hiện ngay.
@@ -511,7 +514,7 @@ questions:
       }
       ```
     hint: |-
-      - Selector trả **object mới** mỗi lần gọi → so sánh `Object.is` luôn khác → component render mỗi lần store đổi; ở Zustand v5 (dựa `useSyncExternalStore`), selector không ổn định có thể gây **"Maximum update depth exceeded"**.
+      - Selector trả **object mới** mỗi lần gọi → so sánh `Object.is` luôn khác → component render mỗi lần store đổi; ở Zustand v5 (dựa `useSyncExternalStore`), selector không ổn định **throw ngay khi mount**: "getSnapshot should be cached" rồi **"Maximum update depth exceeded"** (render lại mỗi lần store đổi là hành vi v4).
       - Fix: `useCart(useShallow((s) => ({ count: s.items.length, hasCoupon: s.coupon !== null })))`, hoặc hai selector primitive riêng (`useCart(s => s.items.length)`).
       - Tương tự Redux: selector phải trả primitive hoặc reference ổn định.
     followUp: How would you write a unit test that proves `CartBadge` does not re-render when an unrelated field changes?
@@ -535,7 +538,7 @@ questions:
       - Thiếu `await queryClient.cancelQueries({ queryKey: ['project', id] })` trong `onMutate`: một refetch đang bay (do focus/mount) trả về **tên cũ** sau khi đã set optimistic → ghi đè → flash tên cũ → `onSettled` refetch lại mới đúng.
       - Thiếu snapshot + rollback trong `onError` → lỗi thì UI kẹt tên sai tới khi refetch.
       - List query (`['projects']`) không được cập nhật → nơi khác vẫn hiện tên cũ.
-      - Nếu mutation dồn dập: chỉ invalidate khi không còn mutation cùng key đang chạy (`isMutating`) để tránh nhảy qua lại.
+      - Nếu mutation dồn dập: chỉ invalidate khi không còn mutation cùng key đang chạy (`isMutating`) để giảm nhảy qua lại — nhưng cách này **không** sửa thứ tự server nhận ghi; cần `scope: { id }` (v5, chạy tuần tự) hoặc gửi giá trị tuyệt đối kèm version.
     followUp: How do you handle two optimistic mutations on the same item where the first fails and the second succeeds?
     tags: [tanstack-query, optimistic-ui, debug]
   - id: state-management-028
@@ -560,7 +563,7 @@ questions:
       - **Redux/Zustand store** → root reducer reset khi `loggedOut` (trả `undefined` cho slice) hoặc reload trang.
       - **Persisted state**: localStorage/sessionStorage/IndexedDB (redux-persist, query persister) → xoá hoặc key theo user id.
       - **Service worker / HTTP cache** cho response cá nhân → `Cache-Control: private, no-store`.
-      - **Framework cache**: Next.js client router cache → `router.refresh()` hoặc hard navigation sau logout.
+      - **Framework cache**: Next.js client router cache → `router.refresh()` hoặc hard navigation sau logout; với Next 16, `cookies().set/delete` trong Server Action logout cũng invalidate router cache.
       - Socket vẫn kết nối với token cũ → disconnect.
       - Cách an toàn nhất cho app nhạy cảm (banking): full page reload sau logout.
     followUp: How do you test this automatically?

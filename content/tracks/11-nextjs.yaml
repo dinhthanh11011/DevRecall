@@ -215,7 +215,7 @@ questions:
       - `not-found`: UI khi gọi `notFound()` hoặc route không match.
       - `template`: như layout nhưng **remount** mỗi navigation (reset state, chạy lại effect).
       - `route`: Route Handler (GET/POST…) — không cùng cấp với `page`.
-      - `default`: fallback cho parallel route slot; Next 16 **bắt buộc** cho mọi slot (thiếu → build fail).
+      - `default`: fallback cho parallel route slot; Next 16 **bắt buộc** cho mọi slot. Thiếu → `next build --webpack` fail; với Turbopack (mặc định) build **vẫn pass** nhưng route trả 404 lúc runtime (16.3.7).
     followUp: In what order are these nested for one segment, and why does it matter for error boundaries around layouts?
     verify: true
     tags: [app-router, file-conventions]
@@ -240,7 +240,7 @@ questions:
       - `<Suspense>` thủ công chi tiết hơn: phần ngoài boundary hiển thị ngay, từng phần chậm stream riêng.
       - Không đủ khi: **layout** của chính segment đó đọc runtime/uncached data → nó nằm **ngoài** boundary của `loading` → chặn navigation. Fix: Suspense riêng quanh phần dynamic trong layout hoặc chuyển fetch xuống page.
       - Streaming cần hạ tầng không buffer (nginx, LB).
-    followUp: Why do bots and crawlers receive a fully rendered page instead of a streamed shell?
+    followUp: Which bots get a blocking (non-streamed) metadata response, and how does Next.js decide?
     tags: [streaming, suspense]
   - id: nextjs-007
     level: easy
@@ -309,7 +309,7 @@ questions:
     type: concept
     q: What do `next/image` and `next/font` do for you, and what changed in Next 16 image defaults?
     hint: |-
-      - `next/image`: resize/convert (WebP/AVIF) theo thiết bị, lazy loading, `srcset`, chống CLS bằng `width/height` hoặc `fill`; `priority`/preload cho ảnh LCP; remote image phải khai báo `remotePatterns`.
+      - `next/image`: resize/convert (WebP/AVIF) theo thiết bị, lazy loading, `srcset`, chống CLS bằng `width/height` hoặc `fill`; ảnh LCP dùng `preload` (hoặc `loading="eager"`/`fetchPriority="high"`) — `priority` deprecated từ Next 16; remote image phải khai báo `remotePatterns`.
       - `next/font`: self-host font lúc build (không gọi Google Fonts lúc runtime), `size-adjust` chống layout shift, preload.
       - Next 16: `minimumCacheTTL` mặc định 4 giờ (trước 60s), `qualities` mặc định chỉ `[75]`, bỏ `16` khỏi `imageSizes`, chặn optimize IP local mặc định, tối đa 3 redirect, `images.domains` deprecated → `remotePatterns`, local image có query string cần `localPatterns.search`.
     followUp: Your LCP image is lazy-loaded and LCP is 4 s. What do you change?
@@ -378,7 +378,7 @@ questions:
     type: compare
     q: "`revalidateTag` vs `updateTag` vs `revalidatePath` vs `refresh` in Next.js 16 — when do you use each?"
     hint: |-
-      - `revalidateTag(tag, 'max')`: **stale-while-revalidate** — người sau vẫn thấy dữ liệu cũ trong lúc refresh nền; dùng trong Server Action **và** Route Handler (webhook CMS). Response của action **không** kèm re-render ngay. Next 16: dạng một argument deprecated.
+      - `revalidateTag(tag, 'max')`: **stale-while-revalidate** — người sau vẫn thấy dữ liệu cũ trong lúc refresh nền; dùng trong Server Action **và** Route Handler (webhook CMS). Response của action **không** kèm re-render ngay. Next 16: dạng một argument deprecated (hành vi như `{ expire: 0 }`); từ Route Handler muốn hết hạn ngay thì dùng `revalidateTag(tag, { expire: 0 })`.
       - `updateTag(tag)`: **hết hạn ngay**, read-your-own-writes — user thấy thay đổi của mình trong chính response; **chỉ trong Server Action**.
       - `revalidatePath('/orders')`: invalidate theo path (dựa trên soft tag của route); tiện khi không biết tag, dễ over-invalidate.
       - `refresh()` (`next/cache`): refetch RSC của route hiện tại **không xoá cache** — khi view phụ thuộc state ngoài cache (VD đếm notification).
@@ -501,7 +501,7 @@ questions:
     q: How does error handling work in the App Router — `error.tsx`, `global-error.tsx`, `not-found`, and component-level boundaries?
     hint: |-
       - Lỗi **mong đợi** → return value (Server Action + `useActionState`) hoặc render có điều kiện; `notFound()` → `not-found.tsx`.
-      - Lỗi **bất ngờ** → throw → `error.tsx` gần nhất (phải `'use client'`), nhận `error` và cách retry.
+      - Lỗi **bất ngờ** → throw → `error.tsx` gần nhất (phải `'use client'`), nhận `error` và `retry` (16.3: prop `retry` stable, re-fetch và render lại segment; `reset` chỉ xoá error state, không fetch lại).
       - `error.tsx` của segment **không bắt lỗi của `layout` cùng segment** (layout nằm ngoài boundary) → lỗi layout lên boundary cha; lỗi root layout → `global-error.tsx` (tự khai báo `<html><body>`).
       - Component-level: `catchError` (`next/error`, stable từ 16.3) tạo boundary bọc bất kỳ phần nào, xử lý đúng `redirect()`/`notFound()` và reset khi navigate.
       - Không bắt lỗi trong event handler → tự `try/catch` + state.
@@ -518,7 +518,7 @@ questions:
       - **Intercepting route**: `@modal/(.)photo/[id]/page.tsx` bắt navigation client-side tới `/photo/123` và render trong slot modal, trong khi trang feed vẫn ở dưới.
       - Truy cập trực tiếp/refresh `/photo/123` → không intercept → render trang `photo/[id]` đầy đủ.
       - Back đóng modal (URL thay đổi); share link hoạt động.
-      - Next 16: mọi slot cần `default.tsx` (trả `null` hoặc `notFound()`), thiếu thì build fail.
+      - Next 16: mọi slot cần `default.tsx` (trả `null` hoặc `notFound()`). Thiếu thì `--webpack` build fail; Turbopack (mặc định) build pass nhưng route 404 lúc runtime.
     followUp: After closing the modal and navigating elsewhere, the modal reappears. Which file is missing or wrong?
     verify: true
     tags: [routing, parallel-routes, intercepting-routes]
@@ -531,7 +531,7 @@ questions:
       - Dynamic: `export async function generateMetadata({ params })` — fetch dữ liệu (dedupe với page nhờ fetch memoization/`React.cache`).
       - Truy cập dữ liệu không cache/runtime trong `generateMetadata` cũng tính là dynamic như page (với Cache Components cũng bị validate).
       - File-based: `opengraph-image.tsx`, `sitemap.ts`, `robots.ts`, `icon`; Next 16: `params`/`id` của image function là Promise, `id` của sitemap là Promise.
-      - Bot nhận trang render đầy đủ (không stream) nên metadata luôn có trong HTML.
+      - Bot **HTML-limited** (`facebookexternalhit`, Bingbot, Slackbot…) chờ `generateMetadata` xong để metadata nằm trong `<head>`, phần thân vẫn stream sau. Googlebot được coi là bot chạy JS → nhận shell + metadata stream như browser (16.3.7; docs `caching.md` và `streaming.md` mâu thuẫn, chạy thực tế khớp `streaming.md`).
     followUp: Your product page fetches the product twice (metadata + page). How do you verify and fix it?
     verify: true
     tags: [seo, metadata]
@@ -595,7 +595,7 @@ questions:
       - Không có `matcher` → proxy chạy trên **mọi request**, kể cả `_next/static`, `_next/image`, file `public/` → auth redirect làm hỏng CSS/JS/ảnh, tốn CPU.
       - Dùng negative lookahead để loại tài nguyên tĩnh: `'/((?!api|_next/static|_next/image|favicon.ico).*)'`.
       - Giá trị `matcher` phải là **hằng số** phân tích tĩnh lúc build — biến bị bỏ qua.
-      - Proxy chạy cả với **prefetch** → logic nặng/DB làm prefetch chậm; có thể dùng `missing: [{ type: 'header', key: 'next-router-prefetch' }]` để bỏ qua prefetch.
+      - Proxy chạy cả với **prefetch** → logic nặng/DB làm prefetch chậm; có thể dùng `missing: [{ type: 'header', key: 'next-router-prefetch' }]` để bỏ qua prefetch — nhưng client tự gửi header `Next-Router-Prefetch: 1` là **bypass được proxy** và lấy RSC payload của trang được bảo vệ → chỉ an toàn khi chính page/DAL tự kiểm tra auth.
       - **Server Functions** là POST tới route nơi chúng dùng → matcher loại route đó thì action cũng không qua proxy; refactor chuyển action sang route khác có thể **âm thầm** mất coverage.
     followUp: How do you unit test proxy logic?
     verify: true
@@ -777,7 +777,7 @@ questions:
     hint: |-
       - **Version skew**: browser đang chạy JS của build cũ gọi action id của build cũ; server mới không nhận ra (ID đổi theo build, và rotate tối đa mỗi 14 ngày).
       - Nhiều instance mà **encryption key khác nhau** (mỗi build tự sinh) → instance này không giải mã được closure/reference của instance kia → cùng lỗi ngay cả khi không deploy.
-      - Mitigate: `deploymentId` → client gửi `x-deployment-id`, mismatch thì **hard navigation** tải build mới; `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY` (base64, 16/24/32 byte) **giống nhau** trên mọi instance; build một lần, promote image qua môi trường; rolling deploy, giữ asset build cũ trên CDN một thời gian; UI bắt lỗi và mời reload thay vì lỗi cứng.
+      - Mitigate: `deploymentId` → client gửi `x-deployment-id`, mismatch thì **hard navigation** tải build mới; `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY` (base64, 16/24/32 byte) **giống nhau** trên mọi instance và phải có **lúc `next build`** (key được nhúng vào build); build một lần, promote image qua môi trường; rolling deploy, giữ asset build cũ trên CDN một thời gian; UI bắt lỗi và mời reload thay vì lỗi cứng.
     followUp: Why must the same build (not a rebuild per environment) be promoted from staging to production?
     verify: true
     tags: [server-actions, deployment, version-skew, scenario]
@@ -800,7 +800,7 @@ questions:
       - Proxy/LB **buffer** response: nginx mặc định `proxy_buffering on` → giữ chunk tới khi đủ/xong → mất streaming (Suspense fallback không bao giờ hiện, TTFB = thời gian render toàn bộ).
       - Fix: header `X-Accel-Buffering: no` (có thể set qua `headers()` trong `next.config`) hoặc `proxy_buffering off` cho location đó; bảo đảm LB hỗ trợ chunked/HTTP2 streaming (một số tích hợp như ALB + Lambda buffer mặc định); tắt compression buffer ở tầng trung gian nếu nó gom chunk.
       - Kiểm tra bằng `curl -N` xem chunk đến dần hay không.
-      - Nhắc thêm: bot/crawler luôn nhận trang render xong (không stream) — đừng nhầm khi test bằng user-agent bot.
+      - Nhắc thêm: bot HTML-limited (`facebookexternalhit`, Slackbot…) chờ metadata trước khi gửi → đừng nhầm khi test bằng user-agent bot.
     followUp: Without streaming, what happens to PPR's static shell advantage?
     verify: true
     tags: [streaming, self-hosting, nginx, scenario]
@@ -832,7 +832,7 @@ questions:
     type: gotcha
     q: After enabling Cache Components, a dropdown stays open and a form keeps old input when the user navigates away and back. Why?
     hint: |-
-      - Với Cache Components, Next **giữ route cũ bằng React `<Activity mode="hidden">`** thay vì unmount → `useState`, input, scroll **được giữ** khi quay lại; effect vẫn cleanup/re-run.
+      - Với Cache Components, Next **giữ route cũ bằng React `<Activity mode="hidden">`** thay vì unmount → `useState`, input, scroll **được giữ** khi quay lại; effect vẫn cleanup/re-run. Giữ tối đa 3 route.
       - Code cũ ngầm dựa vào unmount để reset (popover đóng, form trống) → hành vi đổi.
       - Fix: reset tường minh — đóng popover trong cleanup của `useLayoutEffect`, reset form sau submit thành công, dùng `key` theo entity để remount khi cần; state thuộc URL thì đưa lên URL.
       - Đây là thay đổi UX có chủ đích (back navigation nhanh, giữ state) — nhưng cần QA lại các flow.
@@ -907,9 +907,9 @@ questions:
   - id: nextjs-049
     level: hard
     type: gotcha
-    q: Why can a page render fine for users but fail for Googlebot under Cache Components/PPR?
+    q: Why can a page render fine for users but fail for some crawlers under Cache Components/PPR?
     hint: |-
-      - Browser nhận **static shell** (đã prerender lúc build) rồi stream phần động. Bot/crawler (nhận diện theo user-agent) thì **không** dùng shell: Next render **toàn trang lúc request** rồi gửi HTML hoàn chỉnh.
+      - Browser nhận **static shell** (đã prerender lúc build) rồi stream phần động. Bot **HTML-limited** (nhận diện theo user-agent: `facebookexternalhit`, Bingbot, Slackbot…) thì **không** dùng shell: Next render lúc request (vẫn stream phần thân). Googlebot được coi là bot chạy JS và nhận shell như browser (16.3.7, verify).
       - Công việc "đã xong lúc build" cho user sẽ **chạy lại lúc request** cho bot → nếu shell dựa vào input chỉ có lúc build (file build-time, secret chỉ có ở CI, API nội bộ không truy cập được từ runtime), bot nhận lỗi.
       - Fix: bảo đảm mọi dữ liệu shell cũng truy cập được lúc runtime; test bằng user-agent bot; theo dõi lỗi render theo UA.
       - Hệ quả hiệu năng: bot không được hưởng tốc độ shell; cache cho bot nếu crawl nặng.

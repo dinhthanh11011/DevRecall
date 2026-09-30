@@ -313,6 +313,7 @@ questions:
     hint: |-
       - Sort key **unique và ổn định**: `(created_at DESC, id DESC)`; index composite đúng thứ tự.
       - Cursor = base64(JSON của giá trị sort key của item cuối) — **opaque** với client; có thể ký HMAC để chống sửa tay.
+      - Timestamp trong cursor: encode dạng text của DB (`created_at::text`) hoặc epoch **micro**giây. JS `Date` chỉ giữ millisecond trong khi Postgres lưu microsecond → các row cùng millisecond bị **bỏ sót** ở trang sau.
       - Query dùng **row value comparison** (PostgreSQL) hoặc mở rộng `OR` (SQL Server không hỗ trợ row value).
       - Trả `nextCursor: null` khi hết; lấy `limit + 1` row để biết còn trang không (không cần `COUNT(*)`).
       - Filter phải được **gắn vào cursor** (hoặc validate lại) để client không đổi filter giữa chừng mà dùng cursor cũ.
@@ -477,6 +478,7 @@ questions:
     hint: |-
       - Multipart qua server: đơn giản, validate được ngay; nhưng tốn băng thông/CPU/RAM của API, dễ bị DoS bằng file lớn, giữ connection lâu.
       - **Presigned URL** (S3/GCS): `POST /uploads` → server kiểm tra quyền, trả URL ký có hạn (vài phút), giới hạn `Content-Type`/size (presigned POST policy) → client upload thẳng → server nhận event/confirm (`POST /uploads/{id}/complete`) rồi mới gắn vào entity.
+      - Presigned **PUT** mặc định chỉ ký `host` (`X-Amz-SignedHeaders=host`) → không ép được Content-Type/size; cần ép thì dùng presigned POST policy (`content-length-range`). SDK v3 còn tự thêm `x-amz-checksum-crc32` (checksum của body rỗng) trừ khi đặt `requestChecksumCalculation: "WHEN_REQUIRED"` (verify).
       - Sau upload: scan virus, kiểm tra magic bytes (không tin `Content-Type`), tạo thumbnail async.
       - File lớn: multipart upload + resume.
       - Key object chứa tenant prefix, không cho client tự chọn key.
@@ -512,7 +514,7 @@ questions:
       - `Cache-Control`: `max-age` (browser), `s-maxage` (shared/CDN), `stale-while-revalidate`, `no-store` (không lưu), `no-cache` (lưu nhưng phải revalidate), `private` (chỉ browser).
       - Validator: `ETag`/`Last-Modified` → `304`.
       - `Vary`: response phụ thuộc header nào (`Accept-Language`, `Authorization`…) — thiếu `Vary` → CDN trả nhầm biến thể.
-      - Không bao giờ cache ở shared cache: response theo user/tenant (profile, cart, giá riêng tenant) → `private` hoặc `no-store`. Response có `Set-Cookie`.
+      - Không bao giờ cache ở shared cache: response theo user/tenant (profile, cart, giá riêng tenant) → `private` hoặc `no-store`. Response có `Set-Cookie`: RFC 9111 không cấm cache, nhưng thực tế phải đánh dấu `private`/`no-store` để CDN không phát cookie của người này cho người khác.
       - Public catalog giống nhau cho mọi người → `public, s-maxage=60, stale-while-revalidate=300`.
     followUp: A CDN served user A's cart to user B. What header was wrong, and how do you audit for it?
     tags: [http, caching, cdn]

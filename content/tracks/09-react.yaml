@@ -267,7 +267,7 @@ questions:
       - Component bắt lỗi JS xảy ra **khi render, trong lifecycle, trong constructor** của cây con, hiển thị fallback thay vì unmount cả app.
       - Phải là **class** với `static getDerivedStateFromError` (render fallback) và/hoặc `componentDidCatch` (log). Chưa có hook tương đương; thường dùng thư viện `react-error-boundary`.
       - Không bắt: lỗi trong **event handler**, code async (`setTimeout`, promise sau await trong handler), lỗi của chính boundary, lỗi server rendering ở một số môi trường.
-      - Lỗi trong `startTransition`/Action có thể được ném lên boundary gần nhất.
+      - Lỗi ném trong Action của `startTransition` lấy từ `useTransition` (kể cả async) được đưa lên boundary gần nhất. Với `startTransition` import thẳng từ `react`, lỗi trong callback async **không** tới boundary (React 19.2: thành window `error` event) (verify).
       - Đặt nhiều boundary theo vùng (widget, route) thay vì một cái cho cả app.
     followUp: How do you report errors caught by boundaries to your monitoring tool in React 19?
     tags: [errors, error-boundary]
@@ -429,6 +429,7 @@ questions:
       - `action(prevState, formData)` — có thể async; giá trị trả về thành `state` mới. Chạy trong transition nên có `isPending`.
       - Truyền `formAction` vào `<form action={formAction}>` (hoặc `formAction` của button); gọi nhiều lần được **xếp hàng tuần tự**.
       - Lỗi **mong đợi** (validation) nên trả về trong state, không `throw` (throw → error boundary).
+      - Sau khi action xong, React **reset field uncontrolled** của form, kể cả khi trả về lỗi validation → user mất dữ liệu vừa gõ. Fix: trả lại giá trị đã submit trong state và dùng làm `defaultValue`.
       - Trước đây là `useFormState` của react-dom (canary) — đã đổi tên.
     example: |-
       ```tsx
@@ -496,7 +497,7 @@ questions:
       - `use(resource)` đọc giá trị của **Promise** hoặc **Context**.
       - Với Promise: component **suspend** tới khi resolve (cần `<Suspense>` bên trên), reject → error boundary gần nhất.
       - Khác hook thường: gọi được **trong `if`/loop** (vẫn phải trong component/hook).
-      - Promise phải **ổn định** giữa các render: tạo ở Server Component rồi truyền xuống, hoặc từ cache/data library. Tạo promise mới trong render của Client Component → suspend vô hạn/refetch mỗi render (React cảnh báo uncached promise).
+      - Promise phải **ổn định** giữa các render: tạo ở Server Component rồi truyền xuống, hoặc từ cache/data library. Tạo promise mới trong render của Client Component → suspend mãi ở fallback/refetch mỗi render (React **có thể** cảnh báo uncached promise; 19.2 không phải lúc nào cũng log).
       - Không dùng trong `try/catch` để bắt lỗi — dùng error boundary.
     followUp: In Next.js, why would you pass an un-awaited promise from a Server Component to a Client Component and call `use()` there?
     verify: true
@@ -582,7 +583,7 @@ questions:
     q: What is the React Compiler, what does it require from your code, and how do you adopt it incrementally?
     hint: |-
       - Build-time compiler (Babel plugin `babel-plugin-react-compiler`; 1.0 stable 10/2025) tự **memoize** component, hook, value và JSX ở mức chi tiết — thay phần lớn `useMemo`/`useCallback`/`memo`.
-      - Yêu cầu code tuân **Rules of React**: render thuần, không mutate props/state/value đã render, hooks đúng rule. Compiler **bỏ qua (bail out)** component vi phạm thay vì làm sai.
+      - Yêu cầu code tuân **Rules of React**: render thuần, không mutate props/state/value đã render, hooks đúng rule. Compiler **bỏ qua (bail out)** component vi phạm mà nó phát hiện được (mutate props, đọc ref trong render, hook có điều kiện) thay vì làm sai — nhưng không phải mọi vi phạm đều bị bắt (VD `items.push()` trên prop vẫn được compile), nên lint + test vẫn cần.
       - Adopt dần: bật lint rules (eslint-plugin-react-hooks có các rule của compiler), chạy trên một thư mục (`sources`) hoặc opt-in theo file (`"use memo"`), opt-out với `"use no memo"`.
       - Next.js 16: `reactCompiler: true` (stable, không bật mặc định; build chậm hơn vì dùng Babel).
       - Vẫn cần đo; compiler không sửa thuật toán O(n²) hay list 10k dòng (cần virtualization).
@@ -664,6 +665,7 @@ questions:
       - RTL đã bọc `render`, `userEvent`, `fireEvent` trong `act`; warning thường có nghĩa **test không chờ** hiệu ứng async.
       - Fix đúng: `await screen.findBy…`, `await waitFor(() => …)`, `await userEvent…`; với fake timers dùng `vi/jest.advanceTimersByTime` trong `act` hoặc cấu hình `userEvent.setup({ advanceTimers })`.
       - Không "fix" bằng bọc lung tung `act(() => {})` hoặc tắt warning.
+      - Vitest không bật `globals: true` → RTL không set `IS_REACT_ACT_ENVIRONMENT` và không auto-cleanup → warning act **im lặng biến mất** (không phải test đã đúng).
       - React 19: import `act` từ `react` (không còn `react-dom/test-utils`).
     followUp: A test passes locally and flakes in CI with this warning. What is your debugging approach?
     verify: true
@@ -752,7 +754,7 @@ questions:
       - **HTML lồng sai** (`<div>` trong `<p>`, `<a>` trong `<a>`, `<tr>` ngoài `<tbody>`) → browser tự sửa DOM → mismatch.
       - Extension trình duyệt chèn attribute/node; CDN/proxy chỉnh HTML.
       - Tìm: React 19 báo **diff** chi tiết trong console (dev); bisect bằng cách comment component; kiểm tra "view source" vs DOM.
-      - Fix: render giá trị client-only sau mount (`useEffect` set state → render lần 2), `suppressHydrationWarning` **chỉ** cho text không tránh được (timestamp), truyền giá trị từ server xuống (timezone), `useSyncExternalStore` với `getServerSnapshot`.
+      - Fix: render giá trị client-only sau mount (`useEffect` set state → render lần 2), `suppressHydrationWarning` **chỉ** cho text không tránh được (timestamp; chỉ có tác dụng một cấp và **giữ nguyên text của server**, không patch), truyền giá trị từ server xuống (timezone), `useSyncExternalStore` với `getServerSnapshot`.
     followUp: Why is "just add `suppressHydrationWarning` on `<body>`" a bad fix?
     tags: [hydration, ssr, debug]
   - id: react-039
@@ -969,6 +971,7 @@ questions:
       - Rollout theo thư mục/feature (`sources`/opt-in), feature flag hoặc canary; theo dõi lỗi và bug "UI không cập nhật".
       - Không xoá `useMemo`/`useCallback` hàng loạt ngay — compiler làm việc cùng chúng; dọn dần sau khi ổn định.
       - Class components không được compile — chấp nhận hoặc chuyển dần.
+      - Đừng coi "compile được" là "đúng Rules of React": compiler không bắt mọi vi phạm (VD mutate prop bằng `push`).
       - Chấp nhận trade-off build time (Babel).
     followUp: How do you prove to management that it was worth it?
     verify: true
