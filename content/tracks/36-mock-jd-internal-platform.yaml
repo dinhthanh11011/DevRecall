@@ -1,0 +1,1002 @@
+id: 36-mock-jd-internal-platform
+slug: mock-internal-platform
+title: "Mock: Internal Business Platform on Next.js + Supabase/Vercel"
+tier: 9
+status: drafted
+summary: Bộ mock theo một JD thật — build internal business platform từ đầu trên Next.js + Node/TS + PostgreSQL, auth/RBAC/multi-tenant, Supabase (RLS, Auth, pooler) + Vercel là bắt buộc, agentic coding (Claude Code/Cursor), và ownership chất lượng end-to-end (schema, security, test, CI/CD, observability).
+cvLinked: true
+prerequisites: [11-nextjs, 13-sql-postgres, 14-multi-tenancy, 23-auth-identity, 27-testing, 28-ai-assisted-engineering]
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - mock-internal-platform-001
+  - mock-internal-platform-007
+  - mock-internal-platform-012
+  - mock-internal-platform-021
+  - mock-internal-platform-016
+  - mock-internal-platform-030
+  - mock-internal-platform-038
+  - mock-internal-platform-044
+overview: |-
+  ## TL;DR
+
+  - JD này chấm 4 thứ: **(1)** dựng internal platform từ đầu (data model + auth + permissions), **(2)** Supabase/Vercel là *firm requirement*, **(3)** dùng agent (Claude Code/Cursor) có kiểm soát, **(4)** tự chịu trách nhiệm chất lượng: schema integrity, security, test, CI/CD, observability, production readiness.
+  - Trục xuyên suốt là **tenant isolation nhiều lớp**: tenant lấy từ token đã verify → app check permission → **Postgres RLS** chặn ở DB → cache key/Storage path/Realtime cũng scoped theo tenant.
+  - Supabase = Postgres + Auth (GoTrue, JWT) + PostgREST + Realtime + Storage. Client gọi thẳng DB qua PostgREST bằng anon/publishable key → **RLS là ranh giới bảo mật thật**, không phải "defense in depth tùy chọn".
+  - Vercel = serverless/Fluid functions + preview deployment theo PR. Hệ quả: dùng **connection pooler**, không giữ state trong memory, job dài đưa ra queue/cron.
+  - Agentic coding: nói được **workflow + guardrails** (context file, plan trước, task nhỏ, test/validator làm gate, human review cho auth/migration/tiền).
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Row Level Security (RLS) | Postgres tự thêm điều kiện vào mọi query theo policy của role hiện tại | `USING (tenant_id = (select private.current_tenant()))` |
+  | `USING` vs `WITH CHECK` | `USING` lọc row được thấy/sửa/xoá; `WITH CHECK` chặn row mới/sau update không hợp lệ | Chặn user đổi `tenant_id` của row sang tenant khác |
+  | `auth.uid()` / `auth.jwt()` | Hàm Supabase đọc claim `sub` / toàn bộ claims của JWT request hiện tại | `auth.jwt() -> 'app_metadata' ->> 'tenant_id'` |
+  | anon/publishable vs service_role/secret key | Key public cho client (bị RLS) vs key server (**bypass RLS**) | service_role chỉ ở server, không bao giờ `NEXT_PUBLIC_` |
+  | `app_metadata` vs `user_metadata` | `app_metadata` chỉ server sửa; `user_metadata` user tự sửa được | Role/tenant **không** đặt trong `user_metadata` |
+  | Custom Access Token Hook | Postgres function chạy khi phát JWT, thêm claim (tenant, role) | Claim `active_tenant_id` (verify API hiện tại) |
+  | Membership table | Bảng nối user ↔ tenant ↔ role, nguồn sự thật cho RBAC | `memberships(user_id, tenant_id, role)` PK kép |
+  | Security definer function | Function chạy với quyền owner → bỏ qua RLS | Helper `is_member(tenant)` để tránh policy đệ quy; đặt ở schema private |
+  | `security_invoker` view | View (PG15+) áp RLS theo người gọi thay vì owner | `create view ... with (security_invoker = true)` |
+  | Supavisor pooler | Pooler Postgres của Supabase; transaction mode cho serverless | Port 6543 transaction mode (verify) |
+  | Preview deployment | Mỗi PR có URL deploy riêng với env Preview | QA test PR trước khi merge |
+  | Expand → contract | Đổi schema qua nhiều release tương thích ngược | Add column → dual-write → backfill → switch read → drop |
+
+  ## Cơ chế hoạt động
+
+  ### Một request từ Next.js tới Supabase, qua các lớp kiểm soát
+
+  ```mermaid
+  sequenceDiagram
+    participant B as Browser
+    participant P as Next.js proxy.ts
+    participant S as Server Component / Action
+    participant A as Supabase Auth
+    participant DB as Postgres + RLS
+    B->>P: Request + auth cookies
+    P->>A: Refresh session nếu access token hết hạn
+    P-->>B: Set-Cookie mới (nếu refresh)
+    B->>S: Render page / gọi Server Action
+    S->>A: getUser() hoặc getClaims() verify JWT
+    S->>S: Check permission ở app (role, resource)
+    S->>DB: Query bằng client mang JWT của user
+    DB->>DB: RLS thêm điều kiện tenant và role vào query
+    DB-->>S: Chỉ các row thuộc tenant hợp lệ
+    S-->>B: HTML / kết quả action
+  ```
+
+  Điểm mấu chốt: proxy (middleware cũ) chỉ **refresh session và redirect sớm**; quyết định bảo mật nằm ở **Server Component/Action** và ở **RLS**. Nếu app check sót, RLS vẫn chặn. Nếu dùng `service_role`, RLS bị tắt, nên toàn bộ trách nhiệm quay về code.
+
+  ### Mô hình dữ liệu tenant + RBAC tối thiểu
+
+  ```mermaid
+  flowchart LR
+    U["auth.users"] --> M["memberships<br/>user_id, tenant_id, role"]
+    T["tenants"] --> M
+    R["role_permissions<br/>role, permission"] -.-> M
+    T --> D["business tables<br/>tenant_id NOT NULL + FK"]
+    M -. "RLS: is_member(tenant_id)" .-> D
+  ```
+
+  ### Pipeline chất lượng cho một PR
+
+  ```mermaid
+  flowchart LR
+    PR["Pull request"] --> CI["lint + typecheck + unit"]
+    CI --> IT["integration test với Postgres thật<br/>+ RLS test matrix"]
+    IT --> MIG["migration check trên DB tạm / Supabase branch"]
+    MIG --> PV["Vercel preview deployment"]
+    PV --> RV["code review + QA trên preview"]
+    RV --> PROD["merge main → deploy prod<br/>→ theo dõi error rate, p95"]
+    PROD -- "lỗi" --> RB["instant rollback<br/>+ migration expand-only nên an toàn"]
+  ```
+
+  ## Trade-offs
+
+  | Quyết định | Lựa chọn A | Lựa chọn B | Khi nào chọn |
+  |---|---|---|---|
+  | Truy cập DB | Client gọi Supabase trực tiếp (PostgREST + RLS) | Mọi thứ qua API server (Route Handler/Server Action) | A: CRUD đơn giản, realtime. B: logic nghiệp vụ phức tạp, nhiều bước, cần transaction |
+  | Chỗ enforce tenant | Chỉ app layer | App layer + RLS | Supabase gần như luôn B, vì client có thể gọi DB trực tiếp |
+  | Tenant trong JWT claim | Nhanh (không query), nhưng stale đến khi token refresh | Tra bảng membership mỗi query | Claim cho tenant đang active; membership table cho quyền nhạy cảm/cần revoke ngay |
+  | Tenancy model | Shared schema + `tenant_id` | Schema/DB riêng mỗi tenant | Internal platform nhiều tenant nhỏ: shared + RLS. Tenant lớn/compliance: tách |
+  | RBAC | Role cố định (enum) | Permission-based (role → permissions) | Bắt đầu enum đơn giản, chuyển permission khi có >3–4 role hoặc custom role |
+  | Chạy logic server | Server Action | Route Handler | Action: mutation từ form UI. Handler: webhook, API cho client ngoài, public contract |
+  | Function runtime | Node.js runtime | Edge runtime | Node: mặc định, đầy đủ lib, DB driver. Edge: logic nhẹ gần user (verify khuyến nghị hiện tại) |
+
+  ## Pitfalls
+
+  - ❌ Tạo bảng mới mà quên `enable row level security` → bảng mở toàn bộ cho anon key. ✅ Migration template luôn có RLS + policy; CI chạy query kiểm tra bảng `public` nào chưa bật RLS.
+  - ❌ Đặt role/tenant trong `user_metadata`. ✅ `app_metadata`, membership table, hoặc access token hook.
+  - ❌ Dùng `service_role` trong Server Component "cho tiện" → bypass RLS. ✅ Client theo user cho request của user; admin client chỉ cho job hệ thống, luôn filter tenant tường minh.
+  - ❌ Chỉ check auth trong `proxy.ts`/middleware. ✅ Check lại trong từng Server Action/Route Handler (Server Action là POST endpoint public).
+  - ❌ Tin `getSession()` ở server. ✅ `getUser()`/`getClaims()` để verify token (verify theo docs Supabase hiện tại).
+  - ❌ Policy gọi `auth.uid()` trên từng row, không index `tenant_id`. ✅ `(select auth.uid())` và index cột trong policy.
+  - ❌ View thường trên bảng có RLS → view chạy quyền owner, lộ data. ✅ `security_invoker = true` hoặc revoke quyền view.
+  - ❌ Kết nối Postgres trực tiếp từ mỗi serverless invocation. ✅ Pooler transaction mode, pool nhỏ mỗi instance.
+  - ❌ Để agent sinh migration/RLS rồi merge vì test pass. ✅ Đọc từng dòng, chạy test matrix cross-tenant.
+
+  ## Cheat sheet
+
+  - Tenant isolation = token verify → app permission → **RLS** → cache key/Storage path/Realtime channel có tenant.
+  - Mọi bảng `public`: `tenant_id NOT NULL` + FK + index + RLS bật + policy SELECT/INSERT/UPDATE/DELETE rõ ràng.
+  - Policy INSERT/UPDATE cần `WITH CHECK`; UPDATE còn cần row nhìn thấy được qua SELECT policy.
+  - Helper `security definer` đặt ở schema **không expose** qua API, `set search_path = ''`.
+  - Next.js: Server Action = public endpoint; proxy chỉ refresh session; `NEXT_PUBLIC_*` lộ ra browser.
+  - Vercel: env theo Production/Preview/Development; preview dùng DB riêng, **không** dùng DB prod; instant rollback chỉ an toàn khi migration là expand-only.
+  - Migration Postgres an toàn: `lock_timeout`, `CREATE INDEX CONCURRENTLY`, constraint `NOT VALID` → `VALIDATE`, backfill theo batch.
+  - Test: RLS test matrix (role × action × same/other tenant) chạy trên Postgres thật trong CI.
+  - Observability: log có `request_id`, `tenant_id`, `user_id`; alert theo error rate + p95 + slow query.
+  - Agent: context file → plan → task nhỏ → test/validator gate → human review cho auth/migration/tiền.
+notionRefs: []
+references:
+  - { title: "Supabase docs: Row Level Security", url: "https://supabase.com/docs/guides/database/postgres/row-level-security" }
+  - { title: "Supabase docs: Server-side Auth for Next.js", url: "https://supabase.com/docs/guides/auth/server-side/nextjs" }
+  - { title: "Supabase docs: Custom Access Token Hook", url: "https://supabase.com/docs/guides/auth/auth-hooks/custom-access-token-hook" }
+  - { title: "Supabase docs: Connecting to Postgres (pooler)", url: "https://supabase.com/docs/guides/database/connecting-to-postgres" }
+  - { title: "PostgreSQL docs: Row Security Policies", url: "https://www.postgresql.org/docs/current/ddl-rowsecurity.html" }
+  - { title: "Next.js docs: Data Security", url: "https://nextjs.org/docs/app/guides/data-security" }
+  - { title: "Vercel docs: Environments", url: "https://vercel.com/docs/deployments/environments" }
+  - { title: "Anthropic: Claude Code best practices", url: "https://www.anthropic.com/engineering/claude-code-best-practices" }
+questions:
+  - id: mock-internal-platform-001
+    level: easy
+    type: concept
+    q: Our frontend talks to Supabase directly with the anon key. Why is Row Level Security not optional in that setup, and what happens to a table in the public schema that has RLS disabled?
+    hint: |-
+      (1) Anon/publishable key được nhúng trong bundle, nên **ai cũng có**. Client gọi PostgREST trực tiếp, không qua server của mình → ranh giới bảo mật duy nhất giữa user và data là **quyền Postgres + RLS policy**.
+      (2) Bảng `public` không bật RLS: role `anon`/`authenticated` có quyền mặc định → **đọc/ghi toàn bộ bảng** qua REST API. Đây là lỗi lộ data phổ biến nhất trên Supabase.
+      (3) Bật RLS mà **chưa có policy** → deny all với các role thường (an toàn mặc định), còn `service_role` và table owner vẫn bypass.
+      (4) Thực hành: migration template luôn `enable row level security`, CI có query kiểm tra bảng nào chưa bật RLS; Supabase Security Advisor cũng cảnh báo (verify tên tính năng).
+    example: |-
+      ```sql
+      -- CI check: bảng public nào chưa bật RLS?
+      select relname from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+      where n.nspname = 'public' and c.relkind = 'r' and not c.relrowsecurity;
+      ```
+    followUp: If RLS is enabled with no policies, the app returns empty lists instead of errors. How would you notice that in development before a user reports it?
+    redFlags:
+      - "Thinks the anon key is a secret"
+      - "Says the API server protects the data, forgetting the client calls PostgREST directly"
+    tags: [supabase, rls, security]
+    verify: true
+  - id: mock-internal-platform-002
+    level: easy
+    type: compare
+    q: What is the difference between the anon/publishable key and the service_role/secret key in Supabase? Where is each allowed to live in a Next.js app on Vercel?
+    hint: |-
+      (1) **anon/publishable**: public, request chạy với role `anon` (chưa login) hoặc `authenticated` (kèm JWT user) → **bị RLS áp**. Được đặt ở `NEXT_PUBLIC_SUPABASE_...`.
+      (2) **service_role/secret**: role có `BYPASSRLS` → **bỏ qua mọi policy**. Chỉ ở server: env var **không** có prefix `NEXT_PUBLIC_`, dùng trong Route Handler/Server Action/cron cho việc hệ thống (admin, backfill, webhook).
+      (3) Rủi ro: dùng service_role trong code xử lý request của user → mọi query phải tự filter tenant, sót một chỗ là leak. Prefix `NEXT_PUBLIC_` nhầm là key bị đưa vào JS bundle.
+      (4) Supabase đang chuyển sang key kiểu mới (publishable/secret) thay cho anon/service_role JWT cũ (verify trạng thái hiện tại).
+    followUp: A teammate needs to read across all tenants for a nightly report. How do you give them that power without handing the service_role key to more code than necessary?
+    redFlags:
+      - "Puts the service_role key in a NEXT_PUBLIC_ variable"
+      - "Uses the service_role client everywhere to avoid writing policies"
+    tags: [supabase, secrets, vercel]
+    verify: true
+  - id: mock-internal-platform-003
+    level: easy
+    type: concept
+    q: Explain USING versus WITH CHECK in a Postgres RLS policy. Which one stops a user from moving a row into another tenant?
+    hint: |-
+      (1) **`USING`**: điều kiện áp lên **row đang tồn tại**, quyết định row nào được SELECT, và row nào là mục tiêu của UPDATE/DELETE.
+      (2) **`WITH CHECK`**: điều kiện áp lên **row mới** (INSERT) hoặc **row sau khi update**. Nếu false thì lỗi `new row violates row-level security policy`.
+      (3) User update `tenant_id` của row sang tenant B: `USING` cho phép (row ban đầu thuộc tenant A), nhưng **`WITH CHECK` chặn** vì row mới không thuộc tenant của user.
+      (4) Policy UPDATE không ghi `WITH CHECK` thì Postgres dùng lại biểu thức `USING` cho check. Viết tường minh vẫn dễ đọc hơn. Tốt hơn nữa là không cho update cột `tenant_id` (column privilege hoặc trigger).
+    example: |-
+      ```sql
+      create policy "members update own tenant rows" on projects
+        for update to authenticated
+        using (private.is_member(tenant_id))
+        with check (private.is_member(tenant_id));
+      ```
+    followUp: Why does an UPDATE sometimes affect 0 rows silently under RLS instead of raising an error?
+    redFlags:
+      - "Thinks USING alone is enough for INSERT"
+      - "Cannot explain what happens when WITH CHECK is omitted"
+    tags: [rls, postgres]
+  - id: mock-internal-platform-004
+    level: easy
+    type: gotcha
+    q: Why must you never use user_metadata to decide a user's role or tenant in Supabase? Where should that information live instead?
+    hint: |-
+      (1) `user_metadata` (raw_user_meta_data) **user tự sửa được** qua `supabase.auth.updateUser({ data })` từ client → user tự nâng mình lên `admin`.
+      (2) `app_metadata` chỉ server (service_role/admin API) sửa được → an toàn cho claim do hệ thống cấp.
+      (3) Với internal platform nhiều tenant, nguồn sự thật tốt nhất là **bảng `memberships(user_id, tenant_id, role)`**. JWT claim (qua Custom Access Token Hook) chỉ là cache để policy đọc nhanh.
+      (4) Nhớ: claim trong JWT **stale** đến khi token refresh. Đổi role cần refresh session hoặc policy tra bảng trực tiếp cho quyền nhạy cảm.
+    followUp: An admin removes a user from a tenant. The user still has a valid access token for 50 more minutes. What can they still do, and how do you close that window?
+    redFlags:
+      - "Reads role from auth.jwt() -> 'user_metadata'"
+    tags: [supabase, auth, rbac]
+    verify: true
+  - id: mock-internal-platform-005
+    level: easy
+    type: concept
+    q: In an internal platform where one person can belong to several companies (tenants) with different roles, what tables would you create for tenancy and RBAC?
+    hint: |-
+      (1) `tenants(id, name, ...)`, `memberships(user_id → auth.users, tenant_id → tenants, role, created_at)` với **PK (user_id, tenant_id)**. Một user nhiều tenant, mỗi tenant một role.
+      (2) Role đơn giản: enum `('owner','admin','member','viewer')`. Cần custom role: `roles(tenant_id, name)` + `role_permissions(role_id, permission)`.
+      (3) Mọi bảng nghiệp vụ: `tenant_id uuid not null references tenants` + index (thường composite `(tenant_id, ...)`).
+      (4) FK giữa bảng nghiệp vụ nên **gồm cả tenant_id** (`foreign key (tenant_id, project_id) references projects(tenant_id, id)`) để DB chặn việc task của tenant A trỏ vào project của tenant B.
+      (5) "Active tenant" của session: claim trong JWT hoặc tham số tường minh, luôn được **kiểm lại** với membership.
+    followUp: Why would you put tenant_id into the foreign key of child tables, and what does it cost you?
+    redFlags:
+      - "Puts a single role column on the users table"
+      - "Stores tenant_id only on the top-level table and joins to find it"
+    tags: [data-modelling, rbac, multi-tenancy]
+  - id: mock-internal-platform-006
+    level: easy
+    type: concept
+    q: What is a Vercel preview deployment, and what must be true about its environment variables and database for it to be safe?
+    hint: |-
+      (1) Mỗi push/PR được build và deploy lên **URL riêng**, dùng env scope **Preview**. QA/PO test trên đó trước khi merge.
+      (2) Env Preview phải trỏ **DB riêng** (Supabase project staging hoặc branch), **không** trỏ prod. Nếu không, một PR chạy thử migration/seed có thể phá prod.
+      (3) Secret Preview khác Production (key thanh toán test, email sandbox) để preview không gửi email thật cho khách.
+      (4) Bảo vệ URL preview (Deployment Protection/password) nếu app có data nội bộ. Nhớ thêm URL preview vào redirect allow-list của Supabase Auth (wildcard) để OAuth login hoạt động (verify cú pháp).
+    followUp: OAuth login works on production but fails on every preview URL. What is the likely cause?
+    redFlags:
+      - "Uses production database for previews"
+    tags: [vercel, ci-cd, environments]
+    verify: true
+  - id: mock-internal-platform-007
+    level: medium
+    type: design
+    q: Write the RLS policies for a projects table in a multi-tenant app where members can read, admins can write, and nobody can see another tenant's rows. How do you avoid infinite recursion when the policy needs to read the memberships table?
+    hint: |-
+      (1) Tạo helper **`security definer`** trong schema **private** (không expose qua API): `private.is_member(tenant uuid)` và `private.has_role(tenant, roles[])`, dùng `(select auth.uid())`, `set search_path = ''`.
+      (2) Vì sao: policy trên `memberships` mà lại query `memberships` → **infinite recursion**. Security definer chạy quyền owner nên bỏ qua RLS của memberships.
+      (3) Tách policy theo command: SELECT dùng `is_member`, INSERT/UPDATE/DELETE dùng `has_role(tenant_id, '{owner,admin}')`, và INSERT/UPDATE có `WITH CHECK`.
+      (4) Index `memberships(user_id, tenant_id)` và `projects(tenant_id)`. Hàm đánh dấu `stable`.
+      (5) Test: user tenant A, user tenant B, viewer, admin × select/insert/update/delete.
+    example: |-
+      ```sql
+      create function private.has_role(t uuid, roles text[])
+      returns boolean language sql stable security definer set search_path = '' as $$
+        select exists (
+          select 1 from public.memberships m
+          where m.user_id = (select auth.uid()) and m.tenant_id = t and m.role = any(roles)
+        );
+      $$;
+
+      alter table projects enable row level security;
+      create policy "read" on projects for select to authenticated
+        using (private.has_role(tenant_id, '{owner,admin,member,viewer}'));
+      create policy "write" on projects for insert to authenticated
+        with check (private.has_role(tenant_id, '{owner,admin}'));
+      create policy "update" on projects for update to authenticated
+        using (private.has_role(tenant_id, '{owner,admin}'))
+        with check (private.has_role(tenant_id, '{owner,admin}'));
+      ```
+    followUp: Your helper is security definer in the public schema. Why is that a problem, and how would an attacker abuse it?
+    redFlags:
+      - "Writes one FOR ALL policy with no WITH CHECK"
+      - "Queries memberships inside a memberships policy without a definer helper"
+    tags: [rls, rbac, supabase]
+  - id: mock-internal-platform-008
+    level: medium
+    type: debug
+    q: This RLS setup works but the orders list page takes 4 seconds for a tenant with 2 million rows. What is wrong and how do you fix it?
+    example: |-
+      ```sql
+      create policy "tenant read" on orders for select to authenticated
+        using (
+          tenant_id in (
+            select tenant_id from memberships where user_id = auth.uid()
+          )
+        );
+      -- orders has no index on tenant_id
+      -- app query: select * from orders order by created_at desc limit 50;
+      ```
+    hint: |-
+      (1) **Không có index `tenant_id`**: policy biến thành filter trên toàn bảng → seq scan 2M row. Thêm `create index on orders (tenant_id, created_at desc)` khớp với query phổ biến.
+      (2) `auth.uid()` gọi trực tiếp có thể bị evaluate **mỗi row**. Bọc `(select auth.uid())` → Postgres chạy **initPlan một lần** mỗi query.
+      (3) App query không có `where tenant_id = ...` → planner chỉ biết điều kiện qua policy. Thêm filter tường minh ở app giúp planner dùng index tốt hơn (Supabase docs khuyến nghị).
+      (4) Kiểm chứng bằng `explain analyze` **dưới đúng role**: `set local role authenticated; set local request.jwt.claims = '...'`.
+      (5) Subquery `in (select ...)` có thể thay bằng security definer helper, vì membership thường ít row.
+    followUp: How do you run EXPLAIN ANALYZE as the end user so you see the plan with the RLS policy applied?
+    redFlags:
+      - "Suggests disabling RLS for performance"
+      - "Adds caching before looking at the query plan"
+    tags: [rls, performance, indexing]
+    verify: true
+  - id: mock-internal-platform-009
+    level: medium
+    type: gotcha
+    q: You created a reporting view over an RLS-protected table and exposed it through the API. A user suddenly sees every tenant's data in the view. Why, and what is the fix?
+    hint: |-
+      (1) View trong Postgres mặc định chạy với **quyền của owner** (thường là `postgres`, có bypass RLS) → RLS của bảng gốc **không áp** cho người gọi view.
+      (2) Fix PG15+: `create view ... with (security_invoker = true)` → RLS được đánh giá theo người gọi.
+      (3) Hoặc không expose view: `revoke select on view from anon, authenticated`, đặt ở schema private, chỉ server dùng.
+      (4) Tương tự với **security definer function** gọi qua RPC và **materialized view** (materialized view không có RLS). Chỉ expose qua function có check quyền tường minh.
+    example: |-
+      ```sql
+      create view public.order_totals with (security_invoker = true) as
+        select tenant_id, date_trunc('day', created_at) d, sum(total) s
+        from orders group by 1, 2;
+      ```
+    followUp: Materialized views don't support RLS. How would you serve a per-tenant dashboard from a materialized view safely?
+    redFlags:
+      - "Assumes views inherit the caller's RLS automatically"
+    tags: [rls, views, security]
+  - id: mock-internal-platform-010
+    level: medium
+    type: design
+    q: How would you put the user's active tenant and role into the Supabase JWT, and what are the trade-offs versus looking them up in the database inside each policy?
+    hint: |-
+      (1) **Custom Access Token Hook**: Postgres function nhận event (user_id, claims) khi phát token, đọc `memberships`, thêm claim (ví dụ `active_tenant_id`, `tenant_role`). Grant execute cho `supabase_auth_admin` và revoke khỏi anon/authenticated (verify API hiện tại).
+      (2) Policy đọc claim: `(select auth.jwt() ->> 'active_tenant_id')::uuid`, không cần query bảng nên nhanh.
+      (3) Trade-off: claim **stale** tới khi token refresh (access token thường ~1h). Revoke membership không có hiệu lực ngay.
+      (4) Cách trung hoà: claim cho việc lọc tenant (đọc nhiều), còn thao tác nhạy cảm (xoá, đổi quyền, tiền) thì policy/app tra `memberships` trực tiếp. Hoặc access token ngắn + ép refresh khi đổi quyền.
+      (5) Đổi tenant active: gọi API cập nhật lựa chọn, rồi `refreshSession()` để lấy token mới.
+    followUp: A user switches tenants in the UI but for a few seconds still sees the previous tenant's data. Walk me through where that could come from.
+    redFlags:
+      - "Trusts a tenant_id sent in the request body"
+      - "Unaware that JWT claims don't change until the token is refreshed"
+    tags: [supabase, jwt, multi-tenancy]
+    verify: true
+  - id: mock-internal-platform-011
+    level: medium
+    type: compare
+    q: In a Next.js App Router app with Supabase, why is calling supabase.auth.getSession() in a Server Component considered unsafe for authorization, and what should you call instead?
+    hint: |-
+      (1) Ở server, `getSession()` đọc session **từ cookie** và không bắt buộc verify lại với Auth server hay kiểm chữ ký. Cookie do client gửi nên có thể bị giả mạo.
+      (2) `getUser()`: gọi Supabase Auth để lấy user thật, chắc chắn nhưng tốn một network round-trip.
+      (3) `getClaims()`: verify chữ ký JWT (với asymmetric signing key có thể verify local qua JWKS) nên nhanh hơn `getUser()` (verify API/tên hàm theo docs mới nhất).
+      (4) Pattern: `proxy.ts` (Next 16, trước đây là middleware) refresh token và set cookie. Server Component/Action gọi `getUser()`/`getClaims()` trước khi đọc data. Dù vậy RLS vẫn là lớp chặn cuối.
+    followUp: What breaks if the proxy/middleware that refreshes the session cookie is removed or its matcher excludes some routes?
+    redFlags:
+      - "Relies on the session object from cookies for authorization decisions"
+    tags: [nextjs, supabase, auth]
+    verify: true
+  - id: mock-internal-platform-012
+    level: medium
+    type: gotcha
+    q: Our only authentication check is in the Next.js middleware (proxy). A reviewer says Server Actions are still unprotected. Explain why, and show where the checks should go.
+    hint: |-
+      (1) Server Action được compile thành **POST endpoint**. Ai biết action ID đều gọi thẳng được, không cần đi qua UI. Next docs: "treat Server Actions like public API endpoints".
+      (2) Middleware/proxy có thể bị **matcher bỏ sót**, và từng có lỗ hổng bypass (CVE-2025-29927, header `x-middleware-subrequest`). Không nên là lớp duy nhất.
+      (3) Pattern: một **Data Access Layer** (`server-only`) mà mọi hàm đều `verifySession()` rồi `authorize(user, action, resource)`. Server Action validate input bằng Zod, gọi DAL, không query DB trực tiếp.
+      (4) Với Supabase: client theo user, nên RLS là lớp thứ ba.
+    example: |-
+      ```ts
+      'use server'
+      import { z } from 'zod'
+      import { requireMember } from '@/server/auth'
+
+      const Input = z.object({ projectId: z.uuid(), name: z.string().min(1).max(120) })
+
+      export async function renameProject(raw: unknown) {
+        const input = Input.parse(raw)
+        const { supabase } = await requireMember({ permission: 'project:update' })
+        const { error } = await supabase.from('projects')
+          .update({ name: input.name }).eq('id', input.projectId)
+        if (error) throw error
+      }
+      ```
+    followUp: How would you make it impossible for a new developer to add a Server Action that skips the authorization check?
+    redFlags:
+      - "Believes hiding the button in the UI protects the action"
+    tags: [nextjs, server-actions, security]
+    verify: true
+  - id: mock-internal-platform-013
+    level: medium
+    type: concept
+    q: Your Next.js app on Vercel connects to Supabase Postgres with a Node driver. After a traffic spike you get "too many connections". Why does this happen with serverless, and how do you connect correctly?
+    hint: |-
+      (1) Mỗi function instance mở pool riêng. Khi scale lên N instance × pool size thì vượt `max_connections` của Postgres (instance nhỏ chỉ vài chục đến vài trăm).
+      (2) Dùng **Supavisor transaction mode** (connection string port 6543): kết nối server chỉ giữ trong một transaction nên nhiều client dùng chung ít kết nối Postgres (verify port/tên).
+      (3) Transaction mode hạn chế: **prepared statements** (tắt trong driver/ORM), `SET` session, advisory lock session, `LISTEN` không dùng được qua pooler.
+      (4) Pool mỗi instance nhỏ (1–5), đặt client ở module scope để reuse giữa các invocation. Việc cần session (migration) dùng direct/session mode.
+      (5) CRUD đơn giản có thể dùng `supabase-js` (HTTP qua PostgREST), không tốn kết nối DB từ function.
+    followUp: Your ORM starts throwing "prepared statement already exists" after switching to the pooler. Why?
+    redFlags:
+      - "Suggests raising max_connections as the main fix"
+    tags: [supabase, vercel, postgres, serverless]
+    verify: true
+  - id: mock-internal-platform-014
+    level: medium
+    type: design
+    q: Files in our internal platform (contracts, invoices) are stored in Supabase Storage. How do you make sure a user can only download files from their own tenant?
+    hint: |-
+      (1) Bucket **private** (không public). Đường dẫn object có tenant làm prefix: `{tenant_id}/{entity}/{file_id}.pdf`.
+      (2) RLS policy trên `storage.objects`: `bucket_id = 'docs' and private.is_member(((storage.foldername(name))[1])::uuid)` cho SELECT và INSERT (verify helper `storage.foldername`).
+      (3) Tải xuống: server tạo **signed URL ngắn hạn** (vài phút) sau khi check quyền nghiệp vụ, hoặc client download bằng JWT của user (policy áp).
+      (4) Không lấy tenant từ tên file client gửi lên. Server tự build path từ tenant đã verify.
+      (5) Metadata file lưu trong bảng riêng (`documents`, có `tenant_id` và RLS) để truy vấn, audit, xoá theo tenant.
+    followUp: A signed URL leaked in a Slack message. What is your exposure, and how would you reduce it next time?
+    redFlags:
+      - "Uses a public bucket with unguessable file names as the protection"
+    tags: [supabase, storage, multi-tenancy]
+    verify: true
+  - id: mock-internal-platform-015
+    level: hard
+    type: scenario
+    q: A customer reports they can see another company's invoices in the new admin page, which shipped yesterday. You're on call. Walk me through the first hour.
+    hint: |-
+      (1) **Contain trước**: tắt feature (flag) hoặc rollback deployment trên Vercel ngay. Không debug khi data vẫn đang lộ.
+      (2) Xác định nguyên nhân khả dĩ theo thứ tự: code mới dùng **service_role/admin client**? bảng/view mới **thiếu RLS** hoặc view không `security_invoker`? cache key thiếu `tenant_id`? tenant lấy từ query string?
+      (3) **Đánh giá phạm vi**: log truy cập (request log có `tenant_id`, `user_id`), Supabase API/Postgres logs xem ai đã đọc gì, trong khoảng thời gian nào.
+      (4) Fix + test tái hiện (user tenant A đọc invoice tenant B phải nhận 0 row/403), rồi thêm vào test matrix CI.
+      (5) Thông báo: báo lead/security, theo quy trình incident và nghĩa vụ báo khách/pháp lý (GDPR 72h nếu có dữ liệu cá nhân EU, verify áp dụng). Postmortem không đổ lỗi, gồm guardrail mới (CI check RLS, lint cấm service_role trong request path).
+    followUp: The root cause was a new view without security_invoker. What automated check would have caught it before merge?
+    redFlags:
+      - "Starts by reading code for an hour while the leak continues"
+      - "Doesn't think about who was affected or notification"
+    tags: [incident, multi-tenancy, security]
+  - id: mock-internal-platform-016
+    level: hard
+    type: design
+    q: How do you test RLS policies so that a regression that leaks data across tenants fails CI? Describe the test setup and one concrete test.
+    hint: |-
+      (1) Chạy **Postgres thật** trong CI: `supabase start` (Docker local stack) hoặc container Postgres + apply migrations. Không mock DB cho test quyền.
+      (2) Seed: 2 tenant, mỗi tenant có owner/admin/member/viewer, cộng một user không thuộc tenant nào.
+      (3) Giả lập user: trong transaction `set local role authenticated; select set_config('request.jwt.claims', '{"sub":"<uid>", ...}', true)`, hoặc dùng **pgTAP** (`supabase test db`), hoặc sign JWT test rồi gọi qua supabase-js.
+      (4) **Test matrix**: role × (select/insert/update/delete) × (same tenant/other tenant), generate test tự động từ bảng mong đợi.
+      (5) Thêm meta-test: mọi bảng `public` phải bật RLS và có ít nhất 1 policy. Bảng mới không có test thì fail.
+    example: |-
+      ```sql
+      begin;
+      select plan(2);
+      set local role authenticated;
+      select set_config('request.jwt.claims', '{"sub":"11111111-1111-1111-1111-111111111111","role":"authenticated"}', true);
+      select is_empty($$ select * from invoices where tenant_id = 'tenant-b-uuid' $$, 'A cannot read B');
+      select throws_ok($$ insert into invoices(tenant_id, total) values ('tenant-b-uuid', 10) $$, '42501');
+      select * from finish();
+      rollback;
+      ```
+    followUp: How do you keep this matrix from becoming a maintenance burden as tables and roles grow?
+    redFlags:
+      - "Only tests with the service_role key"
+      - "Relies on manual QA to check tenant isolation"
+    tags: [testing, rls, ci]
+    verify: true
+  - id: mock-internal-platform-017
+    level: hard
+    type: debug
+    q: This migration ran on production during business hours and the whole app froze for several minutes, even though the table "only" has 8 million rows. Explain what locked what, and rewrite it safely.
+    example: |-
+      ```sql
+      -- 20261001_add_external_ref.sql
+      alter table tasks add column external_ref uuid not null default gen_random_uuid();
+      create index tasks_external_ref_idx on tasks (external_ref);
+      alter table tasks add constraint tasks_project_fk
+        foreign key (tenant_id, project_id) references projects (tenant_id, id);
+      ```
+    hint: |-
+      (1) Default **volatile** (`gen_random_uuid()`) → Postgres **rewrite cả bảng** dưới `ACCESS EXCLUSIVE` lock, chặn cả SELECT. (Default hằng số thì PG11+ chỉ sửa metadata, rất nhanh.)
+      (2) `create index` thường giữ lock `SHARE` → **chặn mọi ghi** tới khi build xong.
+      (3) Thêm FK sẽ **validate toàn bảng** khi giữ lock trên cả hai bảng.
+      (4) **Lock queue**: ALTER chờ sau một transaction dài, và mọi query đến sau lại xếp hàng sau ALTER → app "đứng" dù ALTER chưa chạy.
+      (5) Safe: `set lock_timeout = '3s'` + retry. Add column nullable không default → backfill theo batch → `set not null` (PG12+: có `CHECK ... NOT VALID` + validate trước thì nhanh). `create index concurrently` (không chạy được trong transaction block). FK `not valid` rồi `validate constraint` ở bước riêng.
+    followUp: Supabase CLI wraps each migration file in a transaction. How do you run CREATE INDEX CONCURRENTLY then?
+    redFlags:
+      - "Says 8M rows is small so locks don't matter"
+      - "Doesn't know about lock_timeout or the lock queue effect"
+    tags: [postgres, migrations, locking]
+    verify: true
+  - id: mock-internal-platform-018
+    level: medium
+    type: design
+    q: Internal platforms always get the request "we need to know who changed what and when". How would you build an audit log in Postgres/Supabase, and where do you capture the actor?
+    hint: |-
+      (1) Bảng `audit_log(id, tenant_id, actor_id, action, table_name, record_id, before jsonb, after jsonb, at timestamptz default now(), request_id)`, append-only (revoke UPDATE/DELETE, RLS chỉ cho admin tenant đọc).
+      (2) Cách ghi: **trigger** `after insert/update/delete` → không sót dù ghi từ đâu. Actor lấy từ `auth.uid()` (request qua PostgREST) hoặc `current_setting('app.actor_id', true)` do server set trong transaction.
+      (3) Hoặc ghi ở **app layer** khi cần ngữ nghĩa nghiệp vụ ("approved invoice") thay vì diff row. Thường dùng cả hai: trigger cho data change, app event cho business action.
+      (4) Job của `service_role` không có `auth.uid()` → bắt buộc set actor = system/job name.
+      (5) Khối lượng: partition theo tháng, retention policy, index `(tenant_id, table_name, record_id, at)`.
+    followUp: A background job updates 100k rows. Your trigger writes 100k audit rows with full before/after JSON. What do you do?
+    redFlags:
+      - "Logs only to application logs (not queryable, not tenant-scoped)"
+    tags: [audit, postgres, data-modelling]
+  - id: mock-internal-platform-019
+    level: hard
+    type: gotcha
+    q: You use soft delete (deleted_at) on customers, with a unique constraint on (tenant_id, email). A user deletes a customer and tries to re-create it with the same email, and gets a unique violation. Fix it, and list the other traps soft delete brings with RLS.
+    hint: |-
+      (1) Đổi sang **partial unique index**: `create unique index on customers (tenant_id, lower(email)) where deleted_at is null`.
+      (2) RLS: policy SELECT thêm `deleted_at is null` cho user thường. Nhưng UPDATE set `deleted_at` có thể bị chặn nếu SELECT policy lọc mất row sau update (row mới phải "nhìn thấy được"), nên dùng function/RPC `soft_delete()` hoặc policy riêng cho admin.
+      (3) FK không biết soft delete: order vẫn trỏ customer đã xoá. Cần quyết định hiển thị, cascade soft delete.
+      (4) Mọi query/report phải nhớ `deleted_at is null`. Có thể dùng view `security_invoker` `active_customers`.
+      (5) GDPR "right to erasure": soft delete **không** phải xoá. Cần job hard delete/anonymize sau retention.
+    followUp: When would you pick an archive table (move row on delete) over a deleted_at column?
+    redFlags:
+      - "Drops the unique constraint entirely"
+    tags: [postgres, soft-delete, rls]
+    verify: true
+  - id: mock-internal-platform-020
+    level: medium
+    type: design
+    q: In a shift scheduling module, an employee must never have two overlapping shifts. Where do you enforce that, and how in Postgres?
+    hint: |-
+      (1) Check ở app (query overlap rồi insert) có **race**: hai request song song đều thấy "không trùng".
+      (2) Enforce ở DB bằng **exclusion constraint**: `exclude using gist (tenant_id with =, employee_id with =, tstzrange(starts_at, ends_at, '[)') with &&)`, cần extension `btree_gist`.
+      (3) Lưu thời gian `timestamptz` (UTC). Timezone của tenant/location chỉ dùng khi hiển thị và nhập liệu. DST làm "8 giờ" có thể dài 7h hoặc 9h.
+      (4) Thêm `check (ends_at > starts_at)`. App bắt lỗi `23P01` (exclusion_violation) → trả message thân thiện.
+      (5) Đây là ví dụ **schema integrity**: rule quan trọng nằm ở DB, app chỉ để UX.
+    example: |-
+      ```sql
+      create extension if not exists btree_gist;
+      alter table shifts add constraint no_overlap exclude using gist (
+        tenant_id with =, employee_id with =,
+        tstzrange(starts_at, ends_at, '[)') with &&
+      );
+      ```
+    followUp: Why use the half-open range '[)' rather than '[]'?
+    redFlags:
+      - "Only checks overlap in application code"
+      - "Stores local time without a time zone"
+    tags: [postgres, constraints, data-integrity]
+  - id: mock-internal-platform-021
+    level: senior
+    type: design
+    q: You're the first engineer on a new internal business platform (Next.js, Supabase, Vercel). What do you set up in the first two weeks before building features, and what do you deliberately postpone?
+    hint: |-
+      (1) **Nền móng khó đổi sau này, làm ngay**: tenancy model (shared schema + `tenant_id` + RLS), bảng `tenants/memberships`, auth (Supabase Auth, SSO nếu nội bộ cần), pattern DAL + permission check, convention migration (CLI, review), audit log.
+      (2) **Pipeline**: repo + TS strict + lint, CI (typecheck, unit, integration với `supabase start`, RLS tests), preview deploy, 3 môi trường (local/staging/prod) với project Supabase riêng, secret management.
+      (3) **Vận hành tối thiểu**: error tracking, structured logging có `tenant_id`/`request_id`, backup/PITR, uptime check.
+      (4) **Hoãn**: microservices, event bus, caching layer, custom role builder, multi-region. Chưa cần, và thêm vào sau không khó như tenancy.
+      (5) Ship **một vertical slice** end-to-end (login → list → create → audit) để kiểm chứng mọi lớp, và viết ADR ngắn cho các quyết định chính.
+    followUp: The business asks for a feature demo in week one. How do you balance that against the foundation work?
+    redFlags:
+      - "Starts with microservices or Kubernetes"
+      - "Postpones tenancy and auth as 'we'll add it later'"
+    tags: [architecture, greenfield, platform]
+  - id: mock-internal-platform-022
+    level: medium
+    type: compare
+    q: For a mutation in a Next.js + Supabase app you can use the Supabase client from the browser, a Server Action, or a Route Handler. How do you decide?
+    hint: |-
+      (1) **Browser → Supabase trực tiếp**: CRUD đơn giản trên 1 bảng, realtime. Bảo mật hoàn toàn dựa vào RLS, và logic nghiệp vụ bị lộ ra client.
+      (2) **Server Action**: mutation từ UI của chính app (form, button). Có type-safety end-to-end, revalidate cache dễ, validate input + business rule + nhiều bước trong một transaction (qua RPC/SQL).
+      (3) **Route Handler**: contract HTTP công khai/ổn định cho webhook (Stripe, Slack), mobile app, service khác, hoặc cần kiểm soát status/header/streaming.
+      (4) Rule thực tế: logic nghiệp vụ nhiều bước hoặc cần atomicity → Postgres function (RPC) hoặc server code với transaction. Đừng để client gọi 3 update riêng lẻ.
+    followUp: A "create order" needs to insert an order, its lines, and decrement stock atomically. Where does that logic live in a Supabase stack?
+    redFlags:
+      - "Chains several supabase-js calls from the browser for one business operation"
+    tags: [nextjs, supabase, architecture]
+  - id: mock-internal-platform-023
+    level: hard
+    type: debug
+    q: After a refactor, users of tenant A occasionally see tenant B's dashboard numbers in production, but never locally. What's wrong with this code?
+    example: |-
+      ```ts
+      // lib/stats.ts (server)
+      let cached: { at: number; data: Stats } | null = null
+
+      export async function getStats(tenantId: string) {
+        if (cached && Date.now() - cached.at < 60_000) return cached.data
+        const data = await db.query('select ... where tenant_id = $1', [tenantId])
+        cached = { at: Date.now(), data }
+        return data
+      }
+      ```
+    hint: |-
+      (1) Biến **module-scope** sống qua nhiều request trong cùng instance (Vercel Fluid/Node reuse instance, một instance xử lý request của nhiều user). Cache **không có tenant trong key** → request B đọc cache của A.
+      (2) Local ít gặp vì chỉ có một mình bạn là một tenant.
+      (3) Fix: key theo tenant (`Map<tenantId, ...>`), hoặc bỏ cache module-level. Dùng cache có key rõ ràng (Redis/Next cache với tag `stats:${tenantId}`) và có invalidation.
+      (4) Tương tự: `unstable_cache`/`"use cache"` mà hàm đọc cookies/tenant **bên trong** thay vì nhận qua tham số → key không chứa tenant (verify hành vi theo version Next).
+      (5) Guardrail: lint rule/review checklist "mọi cache key có tenant". Có test hai tenant song song.
+    followUp: How would you design the cache key and invalidation for per-tenant dashboard stats that change on every new order?
+    redFlags:
+      - "Blames the database or replication lag"
+    tags: [caching, multi-tenancy, nextjs, serverless]
+    verify: true
+  - id: mock-internal-platform-024
+    level: medium
+    type: design
+    q: How do you share types and validation between the Next.js frontend, server code, and Postgres so that a schema change doesn't silently break things?
+    hint: |-
+      (1) **DB là nguồn gốc**: generate type từ schema (`supabase gen types typescript`) chạy trong CI. Migration đổi cột mà code chưa đổi → typecheck fail.
+      (2) **Zod ở biên**: validate mọi input không tin cậy (form, Server Action, webhook, env var). `z.infer` cho type, dùng chung schema cho form client và server.
+      (3) Không `as SomeType` với dữ liệu từ ngoài. Parse xong mới có type.
+      (4) Constraint trong DB (NOT NULL, CHECK, FK) là lớp cuối. Zod là UX + fail sớm, DB là đảm bảo.
+      (5) CI: `tsc --noEmit` + kiểm tra generated types không lệch (`git diff --exit-code` sau khi gen).
+    followUp: Your Zod schema says email is required but the DB column is nullable and old rows have NULL. What breaks and where?
+    redFlags:
+      - "Hand-writes DB types and keeps them in sync manually"
+    tags: [typescript, zod, type-safety]
+    verify: true
+  - id: mock-internal-platform-025
+    level: hard
+    type: scenario
+    q: Admins upload a CSV of 50,000 employees to import. It works for 500 rows, but in production the Vercel function times out halfway and leaves half the data imported. Redesign it.
+    hint: |-
+      (1) Vấn đề: function có **giới hạn thời gian** (tuỳ plan/cấu hình, verify), import đồng bộ trong request, không transaction/không idempotent → dừng giữa chừng để lại data dở dang.
+      (2) Thiết kế: upload file lên **Storage** → tạo record `import_jobs(status, tenant_id, file_path, total, processed, errors)` → trả 202 + job id.
+      (3) Xử lý nền: queue (Supabase Queues/pgmq, hoặc dịch vụ như Inngest/QStash) hoặc cron worker. Xử lý **theo batch** (500–1000 row), mỗi batch một transaction, lưu checkpoint.
+      (4) **Idempotent**: upsert theo khoá tự nhiên `(tenant_id, employee_code)` → chạy lại không nhân đôi. Row lỗi ghi vào `import_errors` thay vì fail cả job.
+      (5) UI poll/Realtime hiển thị tiến độ. Validate header/format sớm (dry-run). Giới hạn kích thước file.
+    followUp: The business wants all-or-nothing semantics for the import. How does that change the design?
+    redFlags:
+      - "Just raises the function timeout"
+    tags: [vercel, background-jobs, idempotency]
+    verify: true
+  - id: mock-internal-platform-026
+    level: medium
+    type: design
+    q: Describe how database migrations flow from a developer's laptop to production in a Supabase + Vercel setup. Who applies them, and when relative to the app deploy?
+    hint: |-
+      (1) Local: `supabase start` → sửa schema → `supabase migration new <name>` (viết SQL tay) hoặc `supabase db diff` để sinh → `supabase db reset` để chạy lại từ đầu + seed.
+      (2) PR: CI apply migrations lên DB tạm, chạy test/RLS test. Preview dùng staging hoặc Supabase Branching (verify tính năng/plan).
+      (3) Merge: pipeline chạy `supabase db push` (hoặc migration job) lên prod **trước** khi app mới nhận traffic. Chỉ cho phép vì migration là **expand-only**, tương thích với code cũ.
+      (4) Không sửa schema prod bằng dashboard → drift. Chỉ đi qua migration có review.
+      (5) Rollback = **roll forward** (migration mới). Xoá cột (contract) để ở release sau khi code cũ không còn chạy.
+    followUp: Someone changed a column type directly in the production dashboard last month. How do you detect and reconcile the drift?
+    redFlags:
+      - "Applies migrations manually from a laptop to production"
+      - "Deploys app and destructive migration in the same step"
+    tags: [migrations, ci-cd, supabase]
+    verify: true
+  - id: mock-internal-platform-027
+    level: hard
+    type: scenario
+    q: You deploy a release that renames a column. Errors spike, you click "instant rollback" in Vercel, and errors get worse. What happened, and how should the change have been shipped?
+    hint: |-
+      (1) Rollback Vercel chỉ quay lại **code**, còn **DB đã migrate** (cột đã đổi tên). Code cũ query tên cột cũ nên lỗi toàn bộ.
+      (2) Nguyên tắc: mỗi release phải **tương thích với cả code trước và sau nó**. Rename = **expand → migrate → contract**: thêm cột mới → dual-write (trigger hoặc app) → backfill theo batch → đọc cột mới → release sau mới xoá cột cũ.
+      (3) Bây giờ: fix forward nhanh nhất là migration thêm lại cột/view tương thích, hoặc deploy lại bản mới kèm hotfix. Không restore backup nếu không có mất dữ liệu.
+      (4) Guardrail: CI lint migration cấm `rename column`/`drop column` trong cùng release với code dùng nó (ví dụ squawk, strong_migrations-style checks).
+    followUp: How long do you keep the old column before the contract step, and what signal tells you it's safe to drop?
+    redFlags:
+      - "Assumes rollback also reverts the database"
+    tags: [migrations, deployment, rollback]
+  - id: mock-internal-platform-028
+    level: medium
+    type: design
+    q: What observability would you set up for a Next.js on Vercel + Supabase platform so that you can answer "why is tenant X slow/broken" within minutes?
+    hint: |-
+      (1) **Structured logs** (JSON) mỗi request có `request_id`, `tenant_id`, `user_id`, route, duration, status. Đẩy qua log drain/OTel tới nơi query được (Datadog, Axiom, Grafana, ...), vì log mặc định của nền tảng có retention ngắn (verify).
+      (2) **Error tracking** (Sentry hoặc tương đương) cho cả client, server, Server Action, gắn tag tenant/release.
+      (3) **Metrics/alert**: error rate, p95/p99 theo route, số 5xx. Alert theo SLO chứ không theo mỗi lỗi.
+      (4) **DB**: `pg_stat_statements` (Supabase Query Performance), slow query log, số kết nối pooler, CPU/IO của instance.
+      (5) **Tracing** (OpenTelemetry, Next hỗ trợ `instrumentation.ts`) nối request → DB call. Dashboard theo tenant để thấy noisy neighbor.
+    followUp: One tenant generates 60% of the DB load. How do you find out which queries, and what do you do about it?
+    redFlags:
+      - "Relies on console.log and user reports"
+    tags: [observability, vercel, supabase]
+    verify: true
+  - id: mock-internal-platform-029
+    level: hard
+    type: scenario
+    q: Right after a deploy, p95 latency on the main list page goes from 300 ms to 2.5 s, but only for large tenants. Walk me through your investigation.
+    hint: |-
+      (1) So sánh release: diff PR, đặc biệt query mới, thay đổi RLS policy, bỏ index, N+1 trong Server Component (mỗi row một query), bỏ pagination.
+      (2) "Chỉ tenant lớn" → nghi **query phụ thuộc số row**: seq scan, sort không index, policy RLS gọi hàm mỗi row, `count(*)` chính xác trên bảng lớn.
+      (3) Dữ liệu: `pg_stat_statements` sắp theo total/mean time trước và sau deploy. `explain (analyze, buffers)` dưới role `authenticated` với claims của tenant lớn.
+      (4) Giảm tác động: rollback nếu migration không chặn, hoặc feature flag. Rồi mới fix gốc (index composite `(tenant_id, sort_col)`, keyset pagination, bọc `(select auth.uid())`, gộp query).
+      (5) Phòng ngừa: seed tenant lớn trong staging/perf test, và alert p95 theo route.
+    followUp: The plan looks fine in staging but bad in production for the same query. What could differ?
+    redFlags:
+      - "Immediately adds Redis without finding the cause"
+    tags: [performance, postgres, incident]
+  - id: mock-internal-platform-030
+    level: medium
+    type: design
+    q: What is your test strategy for a multi-tenant internal platform on Next.js + Supabase? What do you test at each level, and what do you deliberately not test?
+    hint: |-
+      (1) **Unit** (Vitest/Jest): business rule thuần (tính lương ca, trạng thái workflow, permission map). Nhanh, nhiều.
+      (2) **Integration với Postgres thật**: RLS test matrix, RPC/SQL function, constraint (overlap, unique), migration apply từ đầu. Đây là tầng quan trọng nhất với Supabase vì logic bảo mật nằm trong DB.
+      (3) **Server Action/Route Handler**: gọi với user giả lập của nhiều role, kiểm tra 403/validation.
+      (4) **E2E** (Playwright): ít, cho luồng sống còn: login/SSO, tạo và duyệt một request, đổi tenant. Chạy trên preview deployment.
+      (5) **Không** test implementation detail của UI hay mock supabase-js cho logic quyền (test giả, pass mà không chứng minh gì). Snapshot test tràn lan thì dễ vỡ.
+      (6) CI gate: typecheck, lint, unit, integration bắt buộc; E2E chạy trên preview; coverage là tín hiệu, không phải mục tiêu.
+    followUp: Integration tests with a real database are slow. How do you keep the CI under 10 minutes?
+    redFlags:
+      - "Mocks the database for permission tests"
+      - "Aims for 100% coverage as the goal"
+    tags: [testing, strategy, rls]
+  - id: mock-internal-platform-031
+    level: medium
+    type: debug
+    q: What is wrong with this Route Handler from a type-safety and security point of view?
+    example: |-
+      ```ts
+      export async function POST(req: Request) {
+        const body = (await req.json()) as { tenantId: string; role: 'member' | 'admin'; email: string }
+        const admin = createAdminClient() // service_role
+        await admin.from('memberships').insert({
+          tenant_id: body.tenantId, role: body.role, email: body.email,
+        })
+        return Response.json({ ok: true })
+      }
+      ```
+    hint: |-
+      (1) `as` **không validate** gì cả. Body có thể thiếu field, sai kiểu, `role: 'owner'`. TypeScript chỉ là compile time.
+      (2) **Không authentication/authorization**: ai cũng mời được người vào bất kỳ tenant nào, tự cấp role admin.
+      (3) `tenantId` lấy từ body → phải lấy từ session/active tenant đã verify, rồi check người gọi có quyền `member:invite` trong tenant đó.
+      (4) Dùng **service_role** → RLS không bảo vệ gì. Nên dùng client theo user (RLS kiểm) hoặc chỉ dùng admin sau khi check quyền tường minh.
+      (5) Fix: Zod parse, `requireMember({ permission: 'member:invite' })`, giới hạn role được cấp ≤ role người mời, trả 400/403 đúng, audit log.
+    followUp: An admin should be able to invite members and admins, but never owners. Where do you enforce that rule, and how do you test it?
+    redFlags:
+      - "Only points out the missing try/catch"
+    tags: [typescript, security, zod, rbac]
+  - id: mock-internal-platform-032
+    level: hard
+    type: debug
+    q: Two managers click "Approve" on the same expense request at the same time and the employee gets reimbursed twice. Find the bug and fix it.
+    example: |-
+      ```ts
+      export async function approve(requestId: string) {
+        const { data: req } = await supabase.from('expense_requests')
+          .select('*').eq('id', requestId).single()
+        if (req.status !== 'pending') throw new Error('Already processed')
+        await supabase.from('expense_requests').update({ status: 'approved' }).eq('id', requestId)
+        await createPayout(req) // inserts into payouts
+      }
+      ```
+    hint: |-
+      (1) **Read-check-write race**: cả hai request đọc `pending`, cả hai qua check, cả hai tạo payout.
+      (2) Fix atomic: `update ... set status='approved', approved_by=... where id=$1 and status='pending' returning *`. Không có row trả về → đã xử lý → 409.
+      (3) Payout chỉ tạo **nếu update thắng**, và trong **cùng transaction** (Postgres function/RPC), vì supabase-js không có multi-statement transaction từ client.
+      (4) Lưới an toàn ở DB: `unique (expense_request_id)` trên `payouts`. Nếu gọi hệ thống thanh toán ngoài thì dùng idempotency key = request id.
+      (5) Có thể dùng `select ... for update` trong function. Nhưng conditional update đơn giản và không giữ lock lâu.
+    followUp: The payout goes to an external payment API that can time out after charging. How do you make the whole approval flow safe to retry?
+    redFlags:
+      - "Suggests disabling the button in the UI as the fix"
+      - "Uses an in-memory mutex in the Node process"
+    tags: [concurrency, idempotency, postgres]
+  - id: mock-internal-platform-033
+    level: easy
+    type: compare
+    q: What do you mean by an "agentic coding workflow", and how is it different from using Copilot-style autocomplete?
+    hint: |-
+      (1) **Autocomplete**: gợi ý vài dòng tại con trỏ, bạn vẫn điều khiển từng bước.
+      (2) **Agentic**: agent (Claude Code, Cursor agent, Codex) nhận **mục tiêu**, tự đọc repo, chạy lệnh (test, lint, grep), sửa nhiều file, lặp lại tới khi đạt tiêu chí. Bạn đóng vai **người giao việc + reviewer**.
+      (3) Vì agent tự hành động nên cần **guardrails**: context file (CLAUDE.md/rules), plan trước khi code, task nhỏ, quyền hạn giới hạn (lệnh nào được chạy), test/lint/validator làm tiêu chí "done", và human review.
+      (4) Nêu ví dụ thật của bạn: loại việc giao cho agent (khám phá codebase, refactor, viết test) và loại việc bạn giữ (auth, migration, tiền).
+    followUp: Give me a task you would never hand to an agent end to end, and explain why.
+    redFlags:
+      - "Describes it as 'I describe the feature and accept what it generates'"
+    tags: [ai, agentic-coding]
+  - id: mock-internal-platform-034
+    level: medium
+    type: open
+    q: Walk me through how you would set up a repository so that Claude Code or Cursor produces code that matches the team's conventions and doesn't break things.
+    hint: |-
+      (1) **Context file** ở root (`CLAUDE.md`, `.cursor/rules`, `AGENTS.md`): stack, lệnh (dev/test/lint), cấu trúc thư mục, convention, "definition of done", và các điều **cấm** (không dùng service_role trong request path, migration phải expand-only).
+      (2) **Ví dụ mẫu**: trỏ agent tới một module chuẩn để bắt chước thay vì mô tả dài.
+      (3) **Feedback loop tự động**: typecheck, lint, test, validator. Agent phải chạy và đạt xanh trước khi báo xong.
+      (4) **State ngoài chat**: file progress/plan để phiên mới tiếp tục được, và task lớn chia nhỏ.
+      (5) **Quyền hạn**: allow-list lệnh, không cho push/deploy/migrate prod. Secret không nằm trong repo hay prompt.
+      (6) Ví dụ thật: repo side project với content guide + validator script làm gate + sub-agent song song mỗi agent sở hữu một thư mục.
+    followUp: The agent keeps ignoring one rule in your context file. What do you do?
+    redFlags:
+      - "No automated checks — relies on reading every line by eye as the only control"
+    tags: [ai, developer-experience]
+  - id: mock-internal-platform-035
+    level: hard
+    type: scenario
+    q: A teammate opens a 1,800-line PR generated mostly by an agent. It adds a new permissions module and touches three migrations. The tests are green. How do you review it?
+    hint: |-
+      (1) Không review 1,800 dòng một lượt: yêu cầu **tách PR** (migration riêng, permission core riêng, UI riêng) và mô tả rõ intent + plan.
+      (2) Ưu tiên theo rủi ro: **migration** (lock, expand/contract, reversible?), **RLS/permission** (có đường nào bypass? service_role? tenant từ input?), rồi mới tới UI.
+      (3) **Kiểm tra test có thật sự test không**: đảo logic hoặc xoá check quyền xem test có fail không (mutation-style). Agent hay viết test khớp với code thay vì khớp với yêu cầu.
+      (4) Chạy local với nhiều role/tenant. Đọc diff migration như DBA.
+      (5) Đặt chuẩn team: PR do agent sinh vẫn là trách nhiệm của người mở PR, và họ phải giải thích được từng dòng.
+    followUp: How do you give this feedback without discouraging the teammate from using AI?
+    redFlags:
+      - "Approves because CI is green"
+    tags: [ai, code-review, security]
+  - id: mock-internal-platform-036
+    level: medium
+    type: gotcha
+    q: Name the typical ways AI-generated code goes subtly wrong in a TypeScript/Next.js/Supabase codebase, and how you catch each one.
+    hint: |-
+      (1) **API lỗi thời**: dùng pattern của version cũ (middleware thay vì proxy ở Next 16, `@supabase/auth-helpers` thay vì `@supabase/ssr`, caching default cũ). Bắt bằng docs trong context, pin version, review.
+      (2) **Bảo mật**: quên filter tenant, dùng admin client, tin input, `as` cast. Bắt bằng RLS + test matrix + lint rule.
+      (3) **"Sửa test cho pass"** hoặc test chỉ assert mock được gọi. Bắt bằng review test trước code, mutation check.
+      (4) **Hallucinated API/package** (hàm không tồn tại, package giả, rủi ro typosquatting). Bắt bằng typecheck, lockfile review, chỉ thêm dependency có chủ đích.
+      (5) **Over-engineering**: abstraction thừa, thay đổi ngoài phạm vi task. Bắt bằng task nhỏ, diff nhỏ.
+      (6) **Migration nguy hiểm** (không CONCURRENTLY, rename trực tiếp). Bắt bằng migration linter.
+    followUp: Tell me about a specific time an AI tool gave you code that looked right but wasn't.
+    redFlags:
+      - "Claims AI output is usually correct so review is light"
+    tags: [ai, pitfalls]
+    verify: true
+  - id: mock-internal-platform-037
+    level: senior
+    type: open
+    q: You're asked to write the team's policy for using coding agents on a platform that holds sensitive internal business data. What goes in it?
+    hint: |-
+      (1) **Dữ liệu**: không đưa secret, data khách hàng/PII, dump prod vào prompt. Dùng tài khoản/plan có cam kết không train trên data (verify điều khoản vendor).
+      (2) **Phạm vi hành động**: agent chạy local/sandbox, allow-list lệnh, không có credential prod, không tự merge/deploy/migrate prod.
+      (3) **Vùng cần review sâu** (two-person review): auth, RLS/permission, migration, tiền/payout, crypto, dependency mới.
+      (4) **Trách nhiệm**: người mở PR sở hữu code như tự viết, và phải giải thích được.
+      (5) **Chất lượng**: CI gate giống nhau cho mọi code. Context file của repo được maintain như code.
+      (6) **Đo lường**: lead time, tỉ lệ revert/bug sau release, để biết AI có thực sự giúp không, thay vì cảm giác.
+    followUp: Six months later, bug rates went up after adopting agents. How do you figure out whether AI is the cause?
+    redFlags:
+      - "Either 'ban it' or 'no rules needed'"
+    tags: [ai, governance, leadership]
+  - id: mock-internal-platform-038
+    level: cv
+    type: behavioral
+    q: On your last platform you designed tenant-aware data access and authorization. Walk me through a single request from the token to the SQL query. Where exactly is the tenant enforced, and what happens if a developer forgets the filter?
+    hint: |-
+      (1) Kể theo luồng: login (JWT/OAuth, Google) → middleware verify token → **request context** `{userId, tenantId, roles, permissions}` → permission check (role + resource-level) → **repository bắt buộc nhận tenant** → query có `tenant_id`.
+      (2) "Nếu quên filter": ở stack cũ (SQL Server, app-layer) thì chặn bằng **thiết kế API của data layer** + code review + test cross-tenant. Nói thật lớp nào có, lớp nào không.
+      (3) Cầu nối JD: trên Postgres/Supabase, bạn sẽ thêm **RLS** để quên filter vẫn không lộ. Đó là cải tiến bạn mong muốn.
+      (4) Cache key có tenant. Tenant **không bao giờ** lấy từ body/query string.
+      (5) Số liệu nên có: số tenant, số endpoint, có sự cố leak không.
+    followUp: Can one user have different roles in two tenants in your old design? Show me the tables.
+    redFlags:
+      - "Says 'we' throughout without a clear personal contribution"
+      - "Describes only role checks, no resource-level or tenant-level enforcement"
+    tags: [cv, multi-tenancy, auth]
+  - id: mock-internal-platform-039
+    level: cv
+    type: behavioral
+    q: Your CV says you designed zero-downtime, zero-data-loss migrations. Pick one real example and walk me through it step by step, then tell me what you would do differently on Postgres.
+    hint: |-
+      (1) STAR: bảng nào, bao nhiêu row, vì sao đổi schema.
+      (2) Các bước expand → dual-write → backfill theo batch → verify (count/checksum) → switch read (flag) → contract ở release sau. Kèm rollback plan mỗi bước.
+      (3) Rủi ro lớn nhất bạn gặp (lock, replication lag, backfill chậm) và cách xử lý.
+      (4) **Postgres khác SQL Server**: `CREATE INDEX CONCURRENTLY` (SQL Server dùng `ONLINE = ON` ở edition hỗ trợ), `NOT VALID` + `VALIDATE CONSTRAINT`, `lock_timeout`, add column với default hằng số là metadata-only từ PG11.
+      (5) Kết quả: downtime 0, mất dữ liệu 0, thời gian backfill [số thật].
+    followUp: During the backfill, new writes keep coming in. How did you make sure no row was missed?
+    redFlags:
+      - "Describes a single ALTER TABLE as the migration"
+    tags: [cv, migrations, postgres]
+    verify: true
+  - id: mock-internal-platform-040
+    level: cv
+    type: behavioral
+    q: You introduced Redis caching for high-traffic APIs before. On a Vercel + Supabase stack, would you cache the same way? What changes?
+    hint: |-
+      (1) Kể lại bản cũ: endpoint nào, cache-aside, key design (có tenant), TTL, invalidation khi ghi, fallback khi Redis chết, số liệu hit rate/p95.
+      (2) Trên Vercel: không có process sống lâu để giữ cache in-memory đáng tin. Lựa chọn là Next.js Data Cache/`"use cache"` với tag, CDN cache cho data không nhạy cảm, hoặc Redis serverless (HTTP-based) (verify tên sản phẩm/tích hợp).
+      (3) Internal platform thường **ít cần cache**: số user ít, data phải tươi. Ưu tiên index + query tốt trước.
+      (4) Data theo tenant/user **không** được cache ở CDN public. Key luôn có tenant, invalidate theo tag `tenant:<id>:<entity>`.
+    followUp: How do you invalidate a cached per-tenant report when a row changes through the Supabase client directly, bypassing your server?
+    redFlags:
+      - "Would add Redis by default to every endpoint"
+    tags: [cv, caching, vercel]
+    verify: true
+  - id: mock-internal-platform-041
+    level: cv
+    type: open
+    q: You worked on migrating an enterprise back-office monolith into microservices with Kafka. For a new internal platform built from scratch, would you start with microservices? Why or why not?
+    hint: |-
+      (1) Không: bắt đầu với **modular monolith** (một Next.js app + Postgres, module tách rõ theo domain, boundaries qua interface). Microservices mang chi phí vận hành (deploy, tracing, consistency phân tán, outbox, version contract) mà team nhỏ chưa cần.
+      (2) Rút từ kinh nghiệm migration: phần khó là **chứng minh tương đương** và **consistency qua Kafka** (outbox, idempotent consumer), không phải viết service.
+      (3) Khi nào tách: một phần có tải/scale khác hẳn, team riêng, hoặc cần công nghệ khác. Tách theo **seam đã rõ** trong monolith.
+      (4) Với Supabase: job nền/event có thể dùng queue/cron/webhook trong Postgres trước khi cần Kafka.
+    followUp: What was the hardest consistency problem in your migration, and how did you solve it?
+    redFlags:
+      - "Recommends microservices because 'they scale better'"
+    tags: [cv, architecture, microservices]
+  - id: mock-internal-platform-042
+    level: cv
+    type: behavioral
+    q: Vercel and Supabase are a firm requirement for us, and I don't see them on your CV. How would you convince me you'll be productive on our stack?
+    hint: |-
+      (1) **Thành thật trước**: "Chưa dùng trong dự án khách hàng" (nếu đúng). Không nói vòng vo.
+      (2) **Bằng chứng thật**: demo đã dựng (Next.js trên Vercel + Supabase Auth + RLS theo tenant + migration CLI + preview deploy). Nói được 2–3 điều học được hoặc bất ngờ (ví dụ policy đệ quy, pooler/prepared statements, `getSession` vs `getUser`).
+      (3) **Map kinh nghiệm**: nền tảng bên dưới là thứ đã làm production: Postgres, JWT/OAuth, RBAC, tenant isolation, Next.js. Supabase đưa tenant isolation từ app layer xuống DB, đúng mô hình bạn muốn.
+      (4) Kế hoạch 30 ngày: đọc codebase với agent, sửa bug nhỏ tuần 1, ship feature có migration + RLS tuần 2–3.
+    followUp: Tell me one thing about Supabase that surprised you or that you think is a trap.
+    redFlags:
+      - "Overclaims production experience that isn't there"
+      - "Says 'it's just Postgres' without showing any platform-specific knowledge"
+    tags: [cv, supabase, vercel, behavioral]
+  - id: mock-internal-platform-043
+    level: medium
+    type: behavioral
+    q: Tell me about a production issue you owned end to end, from the first alert to the prevention work afterwards.
+    hint: |-
+      STAR:
+      (1) **S**: user thấy gì, ảnh hưởng bao nhiêu người/tenant, lúc nào.
+      (2) **T**: vai trò của **bạn** (on-call, người phát hiện, owner feature).
+      (3) **A**: phát hiện (alert/log/report) → khoanh vùng (log có request id, metric, tái hiện) → giảm thiểu (rollback/flag/hotfix) → root cause (BE/DB/FE) → fix triệt để.
+      (4) **R**: thời gian khắc phục, tác động, số liệu.
+      (5) **Phòng ngừa**: test thêm, alert thêm, checklist, postmortem. Nói "tôi sẽ làm khác gì".
+    followUp: What signal would have told you about this issue before the users did?
+    redFlags:
+      - "No prevention step"
+      - "Blames another team"
+    tags: [behavioral, incident, ownership]
+  - id: mock-internal-platform-044
+    level: senior
+    type: design
+    q: Design an approval workflow module for the internal platform (purchase requests, expenses, leave) that multiple tenants use, where each tenant configures its own approval rules.
+    hint: |-
+      (1) **Yêu cầu**: rule theo tenant (ngưỡng tiền → cấp duyệt), nhiều bước, delegate khi vắng, audit đầy đủ, thông báo, SLA/nhắc.
+      (2) **Data model**: `workflow_definitions(tenant_id, type, version, steps jsonb)` (**versioned**, request giữ version lúc tạo), `requests(tenant_id, type, status, current_step, definition_version, payload)`, `approvals(request_id, step, approver_id, decision, at)` unique `(request_id, step, approver_id)`.
+      (3) **State machine** rõ ràng (draft → pending → approved/rejected/cancelled). Chuyển trạng thái bằng conditional update/RPC trong transaction, chống double-approve.
+      (4) **Quyền**: ai được duyệt bước nào = role + rule, check ở server/RPC. RLS cho đọc: người tạo, người duyệt, admin tenant.
+      (5) **Side effects** (email, Slack, payout) qua **outbox/queue**, idempotent. Không gọi trực tiếp trong transaction.
+      (6) **Audit** append-only. Test: unit cho engine rule, integration cho transition + RLS.
+    followUp: A tenant changes its approval rules while 200 requests are in flight. What happens to those requests?
+    redFlags:
+      - "Hard-codes the approval chain in code"
+      - "Sends notifications inside the DB transaction"
+    tags: [system-design, workflow, multi-tenancy]
+  - id: mock-internal-platform-045
+    level: senior
+    type: design
+    q: Tenants start asking for custom roles ("Finance viewer can see invoices but not salaries"). How do you evolve a simple role enum into a permission model without rewriting every check?
+    hint: |-
+      (1) Tách **permission** khỏi **role**: code chỉ check permission (`invoice:read`, `salary:read`), không check role trực tiếp. Làm từ đầu thì migration sau rẻ.
+      (2) Model: `permissions` (danh mục cố định trong code), `roles(tenant_id, name)`, `role_permissions`, `memberships.role_id`. Role hệ thống seed sẵn.
+      (3) Enforce: server `can(user, 'salary:read', resource)`. RLS dùng helper `private.has_permission(tenant, 'salary:read')` (security definer, cache hợp lý). JWT claim chỉ khi danh sách ngắn, vì claim phình to và stale.
+      (4) Mức cột/field (lương): RLS là theo row. Cần view/RPC riêng, bảng tách cột nhạy cảm, hoặc column privilege.
+      (5) UI dùng cùng permission để ẩn/hiện, nhưng server mới là nơi quyết định.
+      (6) Khi nào cần ABAC (theo thuộc tính: phòng ban, chủ sở hữu): thêm điều kiện trong policy/function, đừng nhồi hết vào role.
+    followUp: RLS works per row, but salary is a column. Give me two ways to hide that column from Finance viewers in Supabase.
+    redFlags:
+      - "Adds a new if (role === ...) branch for every custom role"
+    tags: [rbac, authorization, design]
+  - id: mock-internal-platform-046
+    level: hard
+    type: gotcha
+    q: We use Supabase Realtime so managers see new requests live. How do you make sure a manager of tenant A never receives tenant B's events?
+    hint: |-
+      (1) **Postgres Changes** (subscribe thay đổi bảng): Realtime kiểm tra RLS SELECT của user trước khi gửi từng change. Nhưng chỉ khi client dùng JWT của user, và bảng có RLS đúng (verify hành vi hiện tại).
+      (2) **Broadcast/Presence**: không tự áp RLS bảng nghiệp vụ. Phải dùng **private channel** + RLS policy trên `realtime.messages` (ví dụ topic `tenant:<id>` và kiểm membership) (verify API).
+      (3) Tên channel là **public string**: đừng coi "channel khó đoán" là bảo mật.
+      (4) Payload tối thiểu (id + loại event), client tự fetch chi tiết qua API có RLS. Nhờ đó khi cấu hình channel sai cũng lộ ít.
+      (5) Test: subscribe bằng user tenant B và assert không nhận event.
+    followUp: Postgres Changes with RLS gets slow when many users subscribe to a busy table. What alternatives do you have?
+    redFlags:
+      - "Assumes channel names are secret"
+    tags: [supabase, realtime, multi-tenancy]
+    verify: true
+  - id: mock-internal-platform-047
+    level: easy
+    type: open
+    q: What does "production ready" mean to you for a new feature in an internal platform? Give me your checklist.
+    hint: |-
+      (1) **Đúng**: acceptance criteria đạt, test (unit + integration + E2E luồng chính), đã chạy trên preview/staging với data giống thật.
+      (2) **An toàn**: authz + RLS + test cross-tenant, validate input, không lộ secret, audit log cho thao tác quan trọng.
+      (3) **Data**: migration expand-only, reversible/roll-forward, backfill đã thử, backup/PITR có sẵn.
+      (4) **Vận hành**: log/metric/alert, feature flag để tắt nhanh, runbook ngắn nếu phức tạp.
+      (5) **Hiệu năng**: query có index, đã thử với tenant lớn nhất.
+      (6) **Con người**: docs/ADR, stakeholder biết thay đổi, support biết cách xử lý.
+    followUp: Which of these items do you drop first under deadline pressure, and which never?
+    redFlags:
+      - "'Tests pass and QA signed off' is the whole answer"
+    tags: [production-readiness, quality]
+  - id: mock-internal-platform-048
+    level: easy
+    type: compare
+    q: For primary keys in a multi-tenant Postgres schema exposed through an API, would you use bigint identity or UUID? And timestamp or timestamptz?
+    hint: |-
+      (1) **UUID**: không đoán được (không lộ số lượng, khó enumerate), sinh được ở client, merge/tách tenant dễ. Nhược điểm: 16 byte, UUIDv4 ngẫu nhiên làm index B-tree phân mảnh. **UUIDv7** (sắp theo thời gian) giảm vấn đề này (Postgres 18 có `uuidv7()`, verify).
+      (2) **bigint identity**: nhỏ, nhanh, tuần tự. Nhưng lộ qua URL (`/invoices/1043`), và chỉ an toàn nếu authz chặt.
+      (3) Supabase `auth.users.id` là UUID, nên FK thường UUID cho đồng nhất.
+      (4) **Luôn `timestamptz`**: lưu thời điểm tuyệt đối (UTC). `timestamp` không có tz gây lỗi khi user ở nhiều múi giờ và DST.
+    followUp: Does using UUIDs remove the need for authorization checks on /invoices/:id? Why not?
+    redFlags:
+      - "Says UUIDs make IDOR impossible"
+    tags: [postgres, data-modelling]
+    verify: true
+  - id: mock-internal-platform-049
+    level: medium
+    type: behavioral
+    q: Tell me about a time you pushed back on a product or business request because of security, data integrity, or quality concerns. How did it end?
+    hint: |-
+      STAR:
+      (1) Yêu cầu là gì, vì sao hợp lý với business (deadline, khách lớn).
+      (2) Rủi ro bạn thấy, **cụ thể** (lộ data tenant, mất dữ liệu khi migrate, không rollback được).
+      (3) Cách bạn trình bày: nói bằng **ngôn ngữ business** (rủi ro, chi phí, xác suất), kèm **phương án thay thế** (làm phần an toàn trước, feature flag, phase 2), không chỉ nói "không".
+      (4) Kết quả + quan hệ sau đó. Nếu bạn sai một phần thì nói thật.
+      (5) Bài học: giờ bạn nêu rủi ro sớm hơn ở bước nào.
+    followUp: What would you have done if the product owner had insisted on shipping anyway?
+    redFlags:
+      - "Story where the candidate simply refused without offering an alternative"
+    tags: [behavioral, communication, quality]
+  - id: mock-internal-platform-050
+    level: easy
+    type: concept
+    q: Our internal platform uses "Sign in with Google" through Supabase Auth in a Next.js App Router app. Describe the flow and the settings that usually break it.
+    hint: |-
+      (1) Flow: client gọi `signInWithOAuth({ provider: 'google', options: { redirectTo } })` → Google → callback Supabase → redirect về app route (ví dụ `/auth/callback?code=...`) → server `exchangeCodeForSession(code)` (**PKCE**) → set cookie → redirect vào app.
+      (2) Hay hỏng: **Redirect URL allow-list** trong Supabase thiếu domain (preview URL, localhost), Authorized redirect URI ở Google Cloud Console sai, `redirectTo` không khớp.
+      (3) Cookie không set vì route callback không dùng server client `@supabase/ssr` đúng cách, hoặc proxy không refresh session.
+      (4) Internal platform: giới hạn domain công ty (kiểm `hd`/email domain ở hook hoặc server). Liên kết tài khoản Google với email/password có sẵn phải cẩn thận (email đã verify).
+    followUp: Only employees of the client's Google Workspace domain should be able to sign in. Where do you enforce that?
+    redFlags:
+      - "Trusts the email domain check done only in the browser"
+    tags: [auth, oauth, supabase, nextjs]
+    verify: true

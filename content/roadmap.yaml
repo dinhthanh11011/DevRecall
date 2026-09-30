@@ -40,4 +40,4 @@ tiers:
   - id: 9
     title: "Mock Interview: Production Scenarios"
     description: Câu hỏi tình huống production thực tế — scale & memory leak, pagination/export dữ liệu lớn, upload & streaming, migration zero-downtime/zero data loss, concurrency & reliability. Học sau khi đã vững các tier trước.
-    tracks: [31-scenario-performance-scale, 32-scenario-large-data, 33-scenario-files-streaming, 34-scenario-migration-zero-loss, 35-scenario-concurrency-reliability]
+    tracks: [31-scenario-performance-scale, 32-scenario-large-data, 33-scenario-files-streaming, 34-scenario-migration-zero-loss, 35-scenario-concurrency-reliability, 36-mock-jd-internal-platform]
