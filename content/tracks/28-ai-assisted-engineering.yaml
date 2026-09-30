@@ -73,6 +73,19 @@ overview: |-
 
   Phòng thủ: **least privilege** (allowlist lệnh, deny đọc `.env`), **sandbox/container**, **không auto-approve** network/write ngoài repo, **tách secrets** khỏi môi trường agent, **review mọi action có side-effect**.
 
+  ## Playbook theo giai đoạn
+
+  | Giai đoạn | Làm gì với Claude Code | Điểm dừng của bạn |
+  |---|---|---|
+  | **Bắt đầu dự án** | Nhờ agent phỏng vấn bạn → `docs/SPEC.md`; đề xuất 2–3 kiến trúc kèm trade-off; dựng walking skeleton (1 endpoint + test + lint + CI); `/init` rồi sửa CLAUDE.md; `.claude/settings.json` allow/deny + hook format | Bạn chốt stack/boundary, ghi ADR; CI xanh trước feature đầu tiên |
+  | **Làm feature** | Ticket → acceptance criteria → plan mode (explore, chưa sửa) → test trước → implement từng bước → `/code-review` ở session sạch → PR nhỏ | Duyệt plan; đọc diff; giải thích được từng dòng |
+  | **Requirement đổi giữa chừng** | Dừng, cập nhật spec + test trước; impact analysis read-only; `/rewind` hoặc bỏ branch làm lại; session mới | Quyết định sửa tiếp hay làm lại |
+  | **Requirement đổi sau release** | Map blast radius; expand → migrate → contract; feature flag; nhiều PR nhỏ; script migration dry-run | Không để agent chạm DB/prod; review migration |
+  | **Join dự án mới** | Chạy được local; hỏi agent kiến trúc, entrypoint, trace 1 request; `git log` vùng nóng; characterization test; ghi notes | Kiểm chứng mọi tóm tắt bằng code; hỏi người về "vì sao" |
+  | **Việc song song** | Mỗi task một git worktree/session; một session viết, một session review | Số PR bạn review nổi mới là giới hạn |
+
+  Chi tiết từng bước nằm trong các lesson của track (Bắt đầu dự án, Feature workflow, Requirement change, Onboarding).
+
   ## Trade-offs
 
   | Tình huống | AI giúp nhiều | AI dễ gây hại |
@@ -397,6 +410,7 @@ questions:
       - Cấu hình commit vào repo (project settings) để team dùng chung; cấu hình cá nhân tách riêng.
       - Việc rủi ro/ tự động dài → chạy trong **container/devcontainer/sandbox** không có credentials prod.
       - Không dùng chế độ bỏ qua mọi permission trên máy có credentials thật.
+      - Rule `Bash(...)` **không phải security boundary** (`sh -c 'curl …'` lách được `Bash(curl *)`); hook chặn phải **exit 2** (exit khác vẫn cho tool chạy) → ranh giới thật là sandbox/container.
       Chi tiết cú pháp settings/permission thay đổi theo version → đọc docs hiện hành.
     followUp: A teammate enabled "skip all permission prompts" because approvals were slowing them down. How do you respond?
     redFlags:
@@ -649,6 +663,7 @@ questions:
       - Agent chỉ tạo **commit đề xuất/PR riêng**, người review merge; cấm sửa file `.github/workflows`, lockfile, config bảo mật.
       - Giới hạn thời gian/token/cost; log toàn bộ action.
       - Rule: không được skip/xoá test; diff lớn → dừng, comment thay vì commit.
+      - Trigger `pull_request` (không phải `pull_request_target`) cho PR từ fork, để code/nội dung untrusted không chạy với secrets của repo.
     followUp: A malicious contributor puts instructions in a PR description targeting your CI agent. What's your defense in depth?
     tags: [ci, security, design]
     verify: true
@@ -821,3 +836,121 @@ questions:
       Numbers: (điền số liệu thật của bạn) — kích thước module, thời gian refactor, MTTR của incident.
     followUp: What did you deliberately NOT use AI for during that incident?
     tags: [cv, legacy, incident]
+  - id: ai-assisted-engineering-047
+    level: medium
+    type: scenario
+    q: You are starting a brand-new service with Claude Code. What do you do in the first day so the agent stays useful for months instead of producing a mess?
+    hint: |-
+      - **Spec trước, code sau**: viết `docs/SPEC.md` ngắn (mục tiêu, non-goals, user flow, data model, NFR) và nhờ agent **phỏng vấn ngược** bạn để lấp chỗ mơ hồ.
+      - **Quyết định kiến trúc do bạn chốt** (stack, boundary, auth, DB) → ghi ADR; agent đề xuất phương án + trade-off, không tự chọn.
+      - **Walking skeleton**: 1 endpoint end-to-end + test + lint + typecheck + CI chạy xanh trước khi thêm feature → agent luôn có feedback loop.
+      - **CLAUDE.md ngay từ đầu** (`/init` rồi sửa tay): lệnh build/test, cấu trúc thư mục, quy ước; `.claude/settings.json` với allow/deny; hook format/lint.
+      - Commit nhỏ, thường xuyên; mỗi bước là một checkpoint để quay lại.
+    followUp: The agent proposes a microservices architecture with Kafka for a 3-person MVP. How do you respond?
+    redFlags:
+      - "Asks the agent to 'build the whole app' from a one-paragraph prompt"
+      - "Adds CLAUDE.md and tests later, once the code exists"
+    tags: [workflow, greenfield, claude-md]
+  - id: ai-assisted-engineering-048
+    level: medium
+    type: concept
+    q: Describe the explore → plan → implement → verify loop. Why is skipping the plan step the most common cause of bad agent output?
+    hint: |-
+      - **Explore**: agent đọc file liên quan, *chưa sửa gì* (plan mode / "đừng viết code").
+      - **Plan**: agent viết kế hoạch (file sẽ đổi, bước, rủi ro, test) → **bạn duyệt/sửa** — rẻ nhất để sửa hướng.
+      - **Implement**: từng bước nhỏ, chạy test/typecheck sau mỗi bước.
+      - **Verify**: test, lint, chạy thật, bạn đọc diff; rồi commit/PR.
+      Bỏ plan → agent **đoán yêu cầu**, chọn nhầm chỗ sửa, diff to; phát hiện sai hướng lúc review thì đắt gấp nhiều lần so với lúc plan.
+      Task nhỏ, rõ (sửa typo, rename) → có thể bỏ plan.
+    followUp: When is it fine to skip the plan and let the agent go straight to code?
+    tags: [workflow, claude-code]
+  - id: ai-assisted-engineering-049
+    level: medium
+    type: scenario
+    q: Halfway through implementing a feature with an agent, the product owner changes the requirement. How do you handle it?
+    hint: |-
+      - **Dừng agent**, đừng "vá thêm" trong cùng session dài — context còn đầy giả định cũ.
+      - Cập nhật **nguồn sự thật trước**: spec/ticket/acceptance criteria + test (sửa/viết test cho hành vi mới, đánh dấu test cũ bị thay thế).
+      - Nhờ agent làm **impact analysis** (read-only): file, API, migration, UI, test bị ảnh hưởng; bạn duyệt.
+      - Quyết định: sửa tiếp trên branch, hay **rewind/checkpoint** về trước điểm rẽ, hay bỏ branch và làm lại với spec mới (code AI rẻ, đừng tiếc).
+      - Session mới với spec mới; ghi lại quyết định (ADR/changelog) để người sau biết vì sao.
+    followUp: Part of the old behaviour is already in production and has data written under the old rules. What changes in your plan?
+    redFlags:
+      - "Just tells the agent 'actually, make it do Y instead' and keeps going"
+    tags: [workflow, requirement-change]
+  - id: ai-assisted-engineering-050
+    level: hard
+    type: scenario
+    q: A requirement change arrives for a feature that has been live for three months. It touches the API contract, the database schema and two frontends. How do you use an agent to deliver it safely?
+    hint: |-
+      - **Map blast radius trước**: agent grep call site, consumer của API, query dùng cột; bạn kiểm chứng; liệt kê thành checklist.
+      - **Expand → migrate → contract**: thêm cột/field mới song song, dual-write/backfill, chuyển consumer, rồi mới xoá cái cũ; API version hoặc field optional để không break client cũ.
+      - **Characterization test** cho hành vi hiện tại trước khi đổi; test mới cho hành vi mới.
+      - Chia **nhiều PR nhỏ** theo bước; feature flag cho hành vi mới; mỗi PR agent làm trong session riêng với plan riêng.
+      - Migration dữ liệu: agent viết script, **bạn** review + chạy dry-run trên bản sao; không cho agent chạm DB prod.
+    followUp: The agent suggests renaming the column in one migration because "it's cleaner". What goes wrong?
+    tags: [requirement-change, migration, workflow]
+  - id: ai-assisted-engineering-051
+    level: medium
+    type: scenario
+    q: You join a new project on Monday and must ship a small fix by Friday. How do you use an AI agent to catch up fast without being misled?
+    hint: |-
+      - **Ngày 1**: chạy được project local (agent giúp đọc README, Dockerfile, CI config, sửa lỗi setup); hỏi agent "vẽ kiến trúc, entrypoint, module chính, luồng dữ liệu" → **ghi vào notes của bạn**.
+      - **Trace một request thật** end-to-end (route → service → DB → response) cùng agent, mở code kiểm chứng từng bước.
+      - Đọc **git history**: `git log` file hay đổi, PR gần đây, ai là owner → biết vùng nóng và người để hỏi.
+      - Hỏi agent câu cụ thể có thể kiểm chứng ("ai gọi X", "config Y đọc ở đâu"), không hỏi câu mơ hồ.
+      - Fix nhỏ theo loop explore → plan → test; nhờ reviewer là người trong team.
+      - Cuối tuần: đề xuất cập nhật CLAUDE.md/README từ những gì bạn học (đã kiểm chứng).
+    followUp: What questions do you still ask humans rather than the agent, and why?
+    redFlags:
+      - "Trusts the agent's architecture summary without opening the code"
+    tags: [onboarding, legacy]
+  - id: ai-assisted-engineering-052
+    level: hard
+    type: design
+    q: How do you run several agent sessions in parallel on the same repository without them stepping on each other?
+    hint: |-
+      - **Git worktree** mỗi task (thư mục + branch riêng) → không đụng file của nhau; mỗi session một task độc lập.
+      - Chọn task **ít chồng file** (feature A frontend, bug B backend); task phụ thuộc thì tuần tự.
+      - Một session viết code, một session khác (context sạch) **review** diff → giảm bias "tự chấm bài mình".
+      - Giới hạn bởi **khả năng review của bạn**, không phải số agent: 5 PR chưa review = 5 rủi ro.
+      - Tài nguyên dùng chung (DB local, port, migration) cần tách (DB/schema riêng mỗi worktree) hoặc tuần tự.
+    followUp: Two parallel branches both added a database migration with the same sequence number. How do you prevent that?
+    tags: [workflow, parallel, claude-code]
+    verify: true
+  - id: ai-assisted-engineering-053
+    level: medium
+    type: compare
+    q: Compare CLAUDE.md, skills/custom commands, subagents and hooks in Claude Code. What belongs in each?
+    hint: |-
+      - **CLAUDE.md**: context nạp mỗi session — lệnh build/test, quy ước, "đừng làm". Ngắn, luôn đúng.
+      - **Skill / slash command**: quy trình lặp lại, nạp **khi cần** (thêm endpoint, viết migration, release checklist) → không làm phình context mặc định.
+      - **Subagent**: task phụ có context riêng (tìm kiếm rộng, review, research) → giữ context chính gọn; có thể giới hạn tool.
+      - **Hook**: lệnh **deterministic** chạy tại sự kiện (sau khi sửa file → format/lint; trước tool call → chặn lệnh nguy hiểm). Đây là chỗ cho luật **bắt buộc**.
+      Quy tắc: gợi ý → CLAUDE.md/skill; bắt buộc → hook/lint/CI.
+    followUp: Your CLAUDE.md has a 60-line section on how to write database migrations. Where should it live instead?
+    tags: [claude-code, context, claude-md]
+    verify: true
+  - id: ai-assisted-engineering-054
+    level: hard
+    type: debug
+    q: The team's shared Claude Code settings file is below. What is risky about it, and how would you fix it?
+    example: |-
+      ```json
+      // .claude/settings.json (committed)
+      {
+        "permissions": {
+          "allow": ["Bash(*)", "Read(**)", "Edit(**)", "WebFetch"],
+          "deny": []
+        },
+        "env": { "DATABASE_URL": "postgres://admin:S3cret@prod-db:5432/app" }
+      }
+      ```
+    hint: |-
+      - `Bash(*)` = agent chạy **mọi lệnh** không hỏi (rm, curl, git push, psql) → kết hợp prompt injection từ `WebFetch` là tổ hợp nguy hiểm nhất.
+      - `Read(**)` không deny `.env`, `~/.aws`, key file → secret vào context.
+      - **Secret prod commit trong repo** qua `env` → leak cho mọi người clone; phải rotate ngay.
+      - Fix: allowlist hẹp (`Bash(npm run test:*)`, `Bash(npm run lint)`, `Bash(git status)`, `Bash(git diff:*)`), `deny` cho `Read(./.env)`, `Read(./.env.*)` (deny `Read` không chặn `Bash(cat .env)` → cần hook/sandbox), `Read(./secrets/**)`, `Bash(curl:*)`, `Bash(git push:*)`; lệnh còn lại để **ask**; DB local/staging cho dev; setting cá nhân để ở `settings.local.json` (gitignored).
+    followUp: How would you enforce a minimum safe configuration for everyone in the company, even if a repo's settings file is permissive?
+    tags: [security, permissions, claude-code]
+    verify: true
