@@ -260,7 +260,7 @@ questions:
     q: You add read replicas and users complain "I updated my profile but still see the old value". Explain and fix.
     hint: |-
       **Replication lag** (async): ghi vào primary, đọc ngay từ replica chưa kịp apply.
-      Fix: **read-your-writes** — đọc từ primary trong N giây sau khi user ghi (flag trong session/cookie), hoặc route theo LSN/GTID (chờ replica đạt vị trí), hoặc trả luôn dữ liệu mới từ response của write rồi cập nhật client state.
+      Fix: **read-your-writes** — đọc từ primary trong N giây sau khi user ghi (flag trong session/cookie), hoặc route theo LSN/GTID (chờ replica đạt vị trí; Postgres: lấy `pg_current_wal_lsn()` **sau** COMMIT — `RETURNING pg_current_wal_lsn()` là LSN trước commit), hoặc trả luôn dữ liệu mới từ response của write rồi cập nhật client state.
       Chỉ đọc replica cho dữ liệu chịu được stale (list, report). Monitor replication lag, cắt replica chậm khỏi pool.
     followUp: How would you implement "read from primary for 5 seconds after a write" in a Node API behind a load balancer?
     tags: [replication, consistency]
@@ -381,7 +381,7 @@ questions:
     type: concept
     q: How do you serve user-uploaded images and files at scale without routing the bytes through your API servers?
     hint: |-
-      - Upload: API cấp **presigned URL** (S3 PUT/POST, có giới hạn content-type, size, TTL ngắn) → client upload thẳng lên object storage; multipart upload cho file lớn.
+      - Upload: API cấp **presigned URL** (TTL ngắn) → client upload thẳng lên object storage; multipart upload cho file lớn. Presigned **PUT không giới hạn được max size** → dùng presigned **POST** với policy `content-length-range`. SDK v3 không ký `Content-Type` trừ khi thêm vào `signableHeaders` → client đổi được content-type.
       - Sau upload: event (S3 notification → queue) → worker scan virus, validate magic bytes, tạo thumbnail, cập nhật trạng thái `pending → ready`.
       - Download: CDN trước bucket (private bucket + origin access), signed URL/cookie cho file riêng tư.
       - Key đặt theo `tenant/…/uuid`, không dùng tên file của user.
@@ -404,7 +404,7 @@ questions:
     hint: |-
       - **Auto-increment**: đơn giản, sắp theo thời gian, nhưng cần round trip DB, lộ số lượng (`/orders/1042`), khó merge nhiều shard.
       - **UUIDv4**: random, sinh ở đâu cũng được; random insert làm **B-tree index phân mảnh**, 16 byte.
-      - **UUIDv7** (RFC 9562): timestamp ms ở đầu + random → gần như tăng dần, index-friendly, vẫn phân tán.
+      - **UUIDv7** (RFC 9562): timestamp ms ở đầu + random → gần như tăng dần, index-friendly, vẫn phân tán. Tự viết không có **monotonic counter** thì trong cùng ms thứ tự random → page split, index phình hơn; PG 18 có sẵn `uuidv7()` (monotonic trong một backend).
       - **Snowflake**: 64-bit = timestamp + machine id + sequence → gọn, sắp theo thời gian; cần gán machine id và xử lý clock đi lùi.
       Ghi chú: ID public không nên đoán được nếu thiếu authorization check (IDOR).
     followUp: What happens to a Snowflake generator if the server clock jumps backwards?
@@ -467,7 +467,7 @@ questions:
   - id: system-design-026
     level: medium
     type: debug
-    q: A weekly recurring shift "Monday 09:00–17:00" stored as below shows up as 08:00–16:00 for half the year for staff in Sydney. Why?
+    q: A weekly recurring shift "Monday 09:00–17:00" stored as below shows up as 10:00–18:00 for half the year for staff in Sydney. Why?
     example: |-
       ```ts
       // stored when the shift template was created in May (AEST, UTC+10)
@@ -478,7 +478,7 @@ questions:
       }
       ```
     hint: |-
-      Lịch lặp được lưu bằng **giờ UTC cố định** tính từ offset tại thời điểm tạo (+10). Sydney có **DST** (AEDT, UTC+11 từ đầu tháng 10 tới đầu tháng 4) → cùng giờ UTC giờ hiển thị lệch 1 tiếng.
+      Lịch lặp được lưu bằng **giờ UTC cố định** tính từ offset tại thời điểm tạo (+10). Sydney có **DST** (AEDT, UTC+11 từ đầu tháng 10 tới đầu tháng 4) → cùng giờ UTC `23:00` hiển thị **10:00–18:00** (muộn 1 tiếng) suốt mùa hè. (Nếu template được tạo trong AEDT, ví dụ tháng 1, thì ngược lại: mùa đông thành 08:00–16:00.)
       Fix: lưu **wall-clock local time + IANA zone** (`09:00`, `Australia/Sydney`) cho template; khi sinh occurrence mới chuyển sang UTC instant cho ngày cụ thể (Temporal / Luxon / date-fns-tz).
       Xử lý thêm: giờ **không tồn tại** (gap khi vặn đồng hồ tới) và giờ **lặp** (overlap khi vặn lùi) — chính sách rõ ràng; shift qua đêm; lương tính theo giờ thực làm (7h hay 9h trong đêm đổi giờ).
     followUp: Staff work across two locations in different time zones. Whose time zone does the shift belong to?
@@ -527,7 +527,7 @@ questions:
     hint: |-
       - **Req**: cập nhật điểm realtime, top-N, rank của tôi + người xung quanh, leaderboard theo ngày/tuần/tenant, tie-break.
       - **Core**: Redis **sorted set** — `ZINCRBY lb:week:2026-39 delta userId`, top: `ZREVRANGE 0 99 WITHSCORES`, rank: `ZREVRANK` — O(log N).
-      - Tie-break: encode score = `points * 10^k + (MAX_TS - ts)` hoặc dùng score kép.
+      - Tie-break: encode score = `points * 10^k + (MAX_TS - ts)` hoặc dùng score kép. Score là **double** → chỉ chính xác tới 2^53: `ts` tính bằng ms (~41 bit) chừa quá ít bit cho points → dùng **giây** hoặc offset từ đầu kỳ (per-period epoch).
       - Durability: event điểm lưu DB/Kafka là source of truth; Redis rebuild được.
       - **Trade-offs**: một sorted set 10M member vẫn ổn về RAM (~ vài trăm MB–1 GB, cần đo) nhưng là **hot key** một shard → shard theo bucket điểm hoặc tính top-N gần đúng; approximate rank cho người ngoài top.
       - **Failure**: replay event trùng → idempotent theo event id; reset kỳ bằng key mới + TTL.
@@ -683,7 +683,6 @@ questions:
       2. **Không có adapter**: `io.to(room).emit` chỉ gửi tới socket trên **instance hiện tại**. Fix: `@socket.io/redis-adapter` (Redis pub/sub) hoặc Redis Streams adapter để broadcast qua các node.
       Thêm: message phải được **lưu** trước khi emit (persistence + sequence), client resync khi reconnect — adapter không đảm bảo delivery.
     followUp: Redis pub/sub is fire-and-forget. What happens to messages during a Redis failover, and how does the client recover?
-    verify: true
     tags: [websocket, socket-io, scaling]
   - id: system-design-042
     level: hard
@@ -932,7 +931,7 @@ questions:
       Câu trả lời mạnh có:
       - Scaling: sticky session hay websocket-only; adapter (Redis) hay cơ chế khác.
       - Auth handshake và re-auth khi token hết hạn; authorization khi join room.
-      - Reconnect: snapshot + delta theo `seq`/timestamp; hoặc Socket.IO connection state recovery (nếu dùng — nêu giới hạn).
+      - Reconnect: snapshot + delta theo `seq`/timestamp; hoặc Socket.IO connection state recovery (nếu dùng — nêu giới hạn: **không chạy với Redis pub/sub adapter cổ điển**, cần Redis Streams/MongoDB adapter — verify).
       - Throttle/conflation cho client chậm.
       - Đo gì: số connection đồng thời, latency end-to-end.
       (điền số liệu thật của bạn)

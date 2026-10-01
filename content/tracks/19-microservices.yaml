@@ -219,7 +219,7 @@ questions:
     hint: |-
       Service discovery = tìm địa chỉ instance đang sống của service khi IP thay đổi liên tục (autoscale, redeploy).
       Client-side (client hỏi registry như Consul/Eureka rồi tự load balance) vs server-side (gọi qua LB/DNS).
-      K8s: `Service` có DNS ổn định (`billing.payments.svc.cluster.local`) → kube-proxy/IPVS (hoặc eBPF) cân bằng tới Pod **ready** (theo readiness probe). Headless service trả trực tiếp IP pod.
+      K8s: `Service` có DNS ổn định (`billing.payments.svc.cluster.local`) → kube-proxy (iptables/IPVS/nftables mode — verify) hoặc eBPF (Cilium) cân bằng tới Pod **ready** (theo readiness probe). Headless service trả trực tiếp IP pod.
     followUp: Why do long-lived gRPC connections defeat Kubernetes Service load balancing?
     tags: [discovery, kubernetes]
   - id: microservices-009
@@ -260,7 +260,7 @@ questions:
     type: concept
     q: What rules keep an HTTP or event API backward compatible?
     hint: |-
-      An toàn: **thêm** field optional/endpoint mới, thêm giá trị enum (nếu consumer chịu được giá trị lạ), nới lỏng validation đầu vào.
+      An toàn: **thêm** field optional/endpoint mới, thêm giá trị enum (nếu consumer chịu được giá trị lạ — tool như `oasdiff` coi enum mới ở **response** là breaking; đánh dấu `x-extensible-enum` để báo consumer phải chịu giá trị lạ), nới lỏng validation đầu vào.
       Breaking: xoá/đổi tên field, đổi kiểu, đổi nghĩa, thêm field **bắt buộc** ở request, siết validation, đổi status code/format lỗi, đổi thứ tự/pagination mặc định.
       Consumer phải là **tolerant reader** (bỏ qua field lạ, không phụ thuộc thứ tự). Breaking bắt buộc → version mới (`/v2`, event `v2`) chạy song song + deprecate có hạn + đo ai còn dùng.
     followUp: Is adding a new enum value a breaking change? When?
@@ -281,7 +281,7 @@ questions:
     q: How does distributed tracing work across services, including through Kafka?
     hint: |-
       Mỗi request có **trace id**; mỗi đơn vị công việc là **span** (id, parent id, thời gian, attributes). Context truyền qua header **W3C `traceparent`** (`00-<trace-id>-<span-id>-<flags>`) ở HTTP/gRPC; qua Kafka bằng **record headers**.
-      OpenTelemetry SDK tự instrument HTTP/Express/DB/Kafka client, export tới collector → backend (Jaeger, Tempo, X-Ray...). Sampling (head vs tail) để kiểm soát chi phí.
+      OpenTelemetry SDK tự instrument HTTP/Express/DB/Kafka client (Node `fetch` chạy trên undici → cần **`@opentelemetry/instrumentation-undici`**, instrumentation `http` không bắt được; consumer tự viết phải `propagation.extract()` từ message headers để nối trace), export tới collector → backend (Jaeger, Tempo, X-Ray...). Sampling (head vs tail) để kiểm soát chi phí.
       Node: context giữ bằng AsyncLocalStorage — code tự tạo promise ngoài context có thể làm đứt trace.
     followUp: Head-based vs tail-based sampling — which catches rare errors better and at what cost?
     tags: [tracing, observability]
@@ -292,7 +292,7 @@ questions:
     hint: |-
       Mesh = data plane (proxy sidecar như Envoy, hoặc mô hình không sidecar/ambient) + control plane → lo **mTLS**, retry/timeout, circuit breaking, traffic shifting (canary), telemetry đồng nhất mà không sửa code.
       Đáng khi: nhiều service, nhiều ngôn ngữ, yêu cầu zero-trust/mTLS, cần canary tinh vi. Không đáng khi: vài service một ngôn ngữ — library + gateway là đủ.
-      Chi phí: thêm latency/tài nguyên, độ phức tạp vận hành, debug thêm một tầng; retry ở mesh **cộng** với retry ở code.
+      Chi phí: thêm latency/tài nguyên, độ phức tạp vận hành, debug thêm một tầng; retry ở mesh **nhân** với retry ở code (3 tầng × 3 lần = **27** request xuống service cuối khi outage) → retry ở **một tầng** + retry budget.
     followUp: Your app already retries and so does the mesh. What happens during an outage?
     tags: [service-mesh]
   - id: microservices-015
@@ -387,7 +387,7 @@ questions:
       - **Config** qua environment (không hard-code theo môi trường), secret từ secret manager.
       - **Stateless processes**: không lưu session/file/upload cục bộ — dùng Redis/S3/DB → scale ngang và restart tự do.
       - **Logs** là stream ra stdout (JSON có correlation/trace id), platform thu thập.
-      - **Disposability**: khởi động nhanh, shutdown gracefully khi SIGTERM (ngừng nhận, xử lý nốt, đóng pool).
+      - **Disposability**: khởi động nhanh, shutdown gracefully khi SIGTERM: readiness trả **503** + `preStop` sleep vài giây (chờ endpoint bị gỡ) **trước** `server.close()`, đóng keep-alive connection (`closeIdleConnections()`), xử lý nốt, đóng pool.
       - Dev/prod parity, backing services là tài nguyên gắn qua config.
     followUp: What does graceful shutdown look like for an Express service behind Kubernetes?
     tags: [twelve-factor, nodejs]
@@ -400,7 +400,7 @@ questions:
       - **CDC** từ legacy DB (Debezium/SQL Server CDC) → event → service mới dựng dữ liệu của nó (không cần sửa legacy code).
       - Legacy phát event qua **outbox** (cần sửa legacy).
       - **Dual write** từ app — tránh (không atomic).
-      - Batch sync định kỳ cho dữ liệu ít thay đổi.
+      - Batch sync định kỳ cho dữ liệu ít thay đổi — dựa trên `updated_at` của legacy dễ **sót thay đổi** (delete, update không chạm `updated_at`, transaction commit muộn hơn mốc đã quét) → ưu tiên CDC.
       Quan trọng: xác định **source of truth** từng giai đoạn (legacy → cả hai với một bên chính → service mới), reconciliation job so sánh hai bên, và kế hoạch đảo chiều sync khi service mới trở thành owner.
     followUp: After cutover, legacy screens still read the old tables. How do you keep them working?
     tags: [migration, data, cdc]

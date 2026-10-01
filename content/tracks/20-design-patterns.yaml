@@ -357,7 +357,6 @@ questions:
       }
       ```
     followUp: Is a method parameter type in TypeScript checked covariantly or contravariantly? What does `strictFunctionTypes` change?
-    verify: true
     tags: [solid, lsp, typescript]
   - id: design-patterns-012
     level: medium
@@ -422,7 +421,7 @@ questions:
     q: TypeScript has object literals and optional properties. Is the Builder pattern still useful? Show a case where it is.
     hint: |-
       Với config đơn giản, object literal + default (`{ ...defaults, ...opts }`) là đủ → Builder thừa.
-      Builder có giá trị khi: (1) xây dựng **nhiều bước có ràng buộc thứ tự/validation**, (2) object **immutable** sau khi build, (3) fluent API cho query/request (Knex, Prisma query, test data builder), (4) **type-state builder** bắt lỗi thiếu field lúc compile.
+      Builder có giá trị khi: (1) xây dựng **nhiều bước có ràng buộc thứ tự/validation**, (2) object **immutable** sau khi build, (3) fluent API cho query/request (Knex, Prisma query, test data builder), (4) **type-state builder** bắt lỗi thiếu field lúc compile (cần phantom field `declare readonly __state: S` — type param không dùng thì structural typing coi `Builder<A>` = `Builder<B>`).
       Test Data Builder (`anOrder().withStatus('paid').build()`) là use case phổ biến nhất.
     example: |-
       ```ts
@@ -446,10 +445,9 @@ questions:
     hint: |-
       - GoF Decorator: **object wrapper** cùng interface, thêm hành vi lúc runtime (`new LoggingRepo(new SqlRepo())`), ghép được nhiều lớp.
       - TS `@decorator`: **metaprogramming** trên class/method/field lúc định nghĩa — có thể dùng để hiện thực ý tưởng decorator (`@Cacheable`), nhưng áp lên class, không phải per-instance.
-      - TS 5.0 hỗ trợ **ECMAScript (Stage 3) decorators** chuẩn; `experimentalDecorators` là phiên bản legacy mà NestJS/TypeORM/class-validator vẫn dựa vào, và `emitDecoratorMetadata` chỉ chạy với legacy mode.
+      - TS 5.0 hỗ trợ **ECMAScript (Stage 3) decorators** chuẩn; `experimentalDecorators` là phiên bản legacy mà NestJS/TypeORM/class-validator vẫn dựa vào, và `emitDecoratorMetadata` chỉ chạy với legacy mode (thiếu `experimentalDecorators` → lỗi **TS5052**). Standard decorators **không có parameter decorator** → `constructor(@Inject(X) x)` kiểu NestJS không làm được.
       Chọn wrapper object khi muốn bật/tắt theo config hoặc test riêng.
     followUp: Why can't NestJS just switch to standard decorators today?
-    verify: true
     tags: [decorator, typescript, structural]
   - id: design-patterns-017
     level: medium
@@ -459,11 +457,16 @@ questions:
       Proxy cùng interface với subject, **kiểm soát truy cập** tới nó; Decorator **bổ sung hành vi**. Cấu trúc gần như giống nhau — khác ở **intent**.
       Use cases: **virtual proxy** (lazy load client nặng), **caching proxy**, **protection proxy** (check permission trước khi gọi), **remote proxy** (gRPC stub, HTTP client sinh từ OpenAPI).
       JS có built-in `Proxy` object (traps `get/set/apply`) — dùng cho Vue reactivity, MobX, Immer; nhưng có chi phí performance và khó debug.
+      Gotcha: method gọi qua proxy có `this` = proxy → truy cập **`#private` field ném TypeError** → `Reflect.get(i, k, i)` và `bind(i)` cho function.
     example: |-
       ```ts
       const lazy = <T extends object>(factory: () => T): T => {
         let inst: T | undefined;
-        return new Proxy({} as T, { get: (_t, k) => Reflect.get((inst ??= factory()), k) });
+        return new Proxy({} as T, { get: (_t, k) => {
+          const i = (inst ??= factory());
+          const v = Reflect.get(i, k, i);
+          return typeof v === 'function' ? v.bind(i) : v; // giữ `this` = instance thật (#private OK)
+        } });
       };
       const s3 = lazy(() => new S3Client({ region: 'ap-southeast-1' })); // chỉ khởi tạo khi dùng lần đầu
       ```
@@ -499,10 +502,9 @@ questions:
     q: Where is Chain of Responsibility used in Node.js web frameworks? What are its failure modes?
     hint: |-
       Express/Koa middleware, NestJS guards → interceptors → pipes, Axios interceptors: mỗi handler xử lý hoặc chuyển tiếp qua `next()`.
-      Failure modes: **thứ tự sai** (rate limit sau auth nặng; body parser sau handler), quên gọi `next()` → request treo, gọi `next()` hai lần, error trong async middleware không được forward (Express 4 cần `next(err)`; Express 5 tự bắt rejected promise).
+      Failure modes: **thứ tự sai** (rate limit sau auth nặng; body parser sau handler), quên gọi `next()` → request treo, gọi `next()` hai lần, error trong async middleware không được forward (Express 4 cần `next(err)`; Express 5 tự bắt rejected promise). Express 4 + async throw → **unhandled rejection** → từ Node 15 mặc định **crash process** (không chỉ request treo).
       Tốt cho cross-cutting concern; tệ khi logic nghiệp vụ bị rải trong 12 middleware khó trace.
     followUp: In Express 4, what happens if an async middleware throws and you don't call `next(err)`?
-    verify: true
     tags: [chain-of-responsibility, express, middleware]
   - id: design-patterns-020
     level: medium
@@ -657,7 +659,7 @@ questions:
     hint: |-
       Core (domain + use cases) ở trung tâm, **không import** framework/DB/HTTP. Core định nghĩa **port** (interface); adapter ngoài (Express controller, SQL repo, Kafka publisher) implement/gọi port. Source dependency luôn hướng vào trong.
       Được: test use case không cần DB (nhanh), đổi framework/provider cục bộ, business logic đọc được.
-      Mất: nhiều file/lớp, **mapping** DTO ↔ domain ↔ persistence model, dễ over-engineer cho CRUD, team cần kỷ luật (lint rule `no-restricted-imports`, dependency-cruiser).
+      Mất: nhiều file/lớp, **mapping** DTO ↔ domain ↔ persistence model, dễ over-engineer cho CRUD, team cần kỷ luật (lint rule `no-restricted-imports`, dependency-cruiser — bản 16.10 chưa hỗ trợ TypeScript 7.x, **cruise 0 module mà không báo lỗi** → pin `typescript@5` cho tool, verify).
       Khi KHÔNG dùng: prototype, admin CRUD, Lambda đơn nhiệm, domain logic mỏng.
     followUp: How do you enforce the dependency rule automatically in a TypeScript monorepo?
     redFlags:
@@ -732,10 +734,9 @@ questions:
     q: In NestJS you make one provider request-scoped to read the tenant ID. Suddenly latency goes up and a singleton behaves strangely. Explain.
     hint: |-
       Nest DI scope **lan ngược lên chuỗi inject**: provider nào inject một REQUEST-scoped provider cũng thành request-scoped → controller, service... bị **khởi tạo lại mỗi request** → tốn CPU/GC, cache in-memory trong service mất tác dụng.
-      Singleton inject request-scoped không được như mong đợi (hoặc chính nó bị chuyển scope).
+      Singleton inject request-scoped thì **chính nó bị chuyển thành request-scoped** (state in-memory reset mỗi request). Provider **không phụ thuộc** (trực tiếp/gián tiếp) vào request-scoped vẫn là singleton.
       Cách khác: truyền `tenantId` qua `AsyncLocalStorage` (nestjs-cls), đọc trong guard/interceptor; hoặc **durable providers** (`ContextIdStrategy`) để chia sẻ instance theo tenant thay vì theo request.
     followUp: How would you implement per-tenant database connections in NestJS without request-scoping the whole graph?
-    verify: true
     tags: [nestjs, di, scopes, multi-tenancy]
   - id: design-patterns-033
     level: hard
@@ -744,9 +745,12 @@ questions:
     example: |-
       ```ts
       // order.service.ts
-      import { userService } from './user.service';
-      export class OrderService { owner(id: string) { return userService.find(id); } }
-      export const orderService = new OrderService();
+      import { userService, UserService } from './user.service';
+      export class OrderService {
+        constructor(private users: UserService) {}
+        owner(id: string) { return this.users.find(id); }
+      }
+      export const orderService = new OrderService(userService); // reads the binding at load time
 
       // user.service.ts
       import { orderService } from './order.service';
@@ -755,9 +759,12 @@ questions:
         orders(id: string) { return orderService.owner(id); }
       }
       export const userService = new UserService();
+
+      // main.ts (CommonJS build)
+      import { userService } from './user.service'; // user.service loads first
       ```
     hint: |-
-      **Circular import**: `order.service` import `user.service`, `user.service` import `order.service`. Tuỳ entry point, một module được evaluate khi module kia **chưa chạy xong** → binding còn trong TDZ (ESM: `ReferenceError`) hoặc `undefined` (CJS partial exports).
+      **Circular import**: `order.service` import `user.service`, `user.service` import `order.service`. Tuỳ entry point, một module được evaluate khi module kia **chưa chạy xong** → binding còn trong TDZ (ESM: `ReferenceError`) hoặc `undefined` (CJS partial exports). Chỉ lỗi khi binding được đọc **lúc load** (ở đây: `new OrderService(userService)`); nếu chỉ đọc trong method thì lúc gọi cả hai module đã xong → thường không lỗi. Module nào hỏng phụ thuộc **entry point** import cái nào trước.
       Đây là dấu hiệu **coupling hai chiều** giữa module. Fix theo thứ tự ưu tiên: tách phần dùng chung thành module thứ ba; đảo phụ thuộc qua interface/event; lazy access (hàm trả dependency); NestJS `forwardRef()` chỉ là băng keo.
       Phát hiện sớm: `madge --circular`, eslint `import/no-cycle`, dependency-cruiser.
     followUp: Why does NestJS's `forwardRef()` fix the symptom but not the design problem?
@@ -890,7 +897,7 @@ questions:
     hint: |-
       - `domain/` (entity, VO, event — không import gì ngoài std), `application/` (use case + port interfaces), `adapters/in/http`, `adapters/in/kafka`, `adapters/out/sql`, `adapters/out/payment`, `main.ts` (**composition root** — nơi duy nhất `new` adapter).
       - Test: domain = unit thuần; use case = unit với in-memory adapter; adapter out = integration test với DB thật (Testcontainers); adapter in = HTTP test mỏng; vài E2E.
-      - Enforce: dependency-cruiser/eslint boundaries.
+      - Enforce: dependency-cruiser/eslint boundaries (kiểm tra số module được cruise > 0 — dependency-cruiser 16.10 + TS 7.x im lặng cruise 0 module, verify).
       - Thực dụng: có thể gộp application + domain cho module đơn giản; organize **theo feature** trước (`orders/`, `catalog/`) rồi mới theo layer bên trong.
     example: |-
       ```text

@@ -36,7 +36,7 @@ overview: |-
   | Consumer group | Mỗi partition gán cho **đúng 1** consumer trong group | 12 partition, 4 consumer → mỗi con 3 |
   | Replication / ISR | Mỗi partition có leader + follower; ISR = replica bắt kịp leader | RF=3, ISR={1,2,3} |
   | `acks` | Producer chờ bao nhiêu replica xác nhận: `0`, `1`, `all` | `acks=all` + `min.insync.replicas=2` |
-  | Idempotent producer | Broker dedupe retry bằng producer id + sequence number | Mặc định bật từ Kafka 3.0 |
+  | Idempotent producer | Broker dedupe retry bằng producer id + sequence number | Mặc định bật từ Kafka 3.0 (Java client); KafkaJS/confluent-js mặc định tắt → bật tường minh |
   | Transactions | Ghi nhiều partition + commit offset **atomic** | read-process-write exactly-once |
   | Consumer lag | Log-end offset − committed offset | Lag 2M trên p7 → consumer chậm/kẹt |
   | Log compaction | Giữ bản ghi **mới nhất theo key**; value null = tombstone | Topic `customer-state` |
@@ -112,7 +112,7 @@ overview: |-
 
   ## Cheat sheet
 
-  - Producer bền: `acks=all`, `enable.idempotence=true` (default từ 3.0), topic RF=3, `min.insync.replicas=2`, `unclean.leader.election.enable=false` (default).
+  - Producer bền: `acks=all`, `enable.idempotence=true` (default từ 3.0 ở Java client; Node: bật tường minh), topic RF=3, `min.insync.replicas=2`, `unclean.leader.election.enable=false` (default).
   - Consumer: commit sau xử lý; handler idempotent (unique `event_id`, upsert, version check); `max.poll.records` nhỏ khi xử lý chậm.
   - Ordering: 1 key = 1 partition; idempotent producer giữ thứ tự với `max.in.flight.requests.per.connection ≤ 5`.
   - Rebalance: cooperative-sticky hoặc KIP-848; static membership `group.instance.id` cho rolling deploy.
@@ -299,7 +299,7 @@ questions:
     type: concept
     q: How does the idempotent producer work, and what does it not protect against?
     hint: |-
-      Broker gán **producer id (PID)**; producer đánh **sequence number** theo từng partition. Retry mang cùng seq → broker bỏ bản trùng, giữ đúng thứ tự (với `max.in.flight.requests.per.connection ≤ 5`). Mặc định bật từ Kafka 3.0.
+      Broker gán **producer id (PID)**; producer đánh **sequence number** theo từng partition. Retry mang cùng seq → broker bỏ bản trùng, giữ đúng thứ tự (với `max.in.flight.requests.per.connection ≤ 5`). Mặc định bật từ Kafka 3.0 **ở Java client**; KafkaJS (`idempotent: false`) và confluent-js mặc định tắt → Node phải bật tường minh.
       Không bảo vệ: app gọi `send()` hai lần cho cùng dữ liệu (ví dụ retry ở tầng app, restart process → PID mới), trùng ở phía consumer, hay trùng do dual write. Phạm vi chỉ là một producer session trên từng partition.
     followUp: How do transactions extend idempotence across restarts?
     verify: true
@@ -476,7 +476,7 @@ questions:
     type: gotcha
     q: "What does the consumer setting `isolation.level` do, and what is the default?"
     hint: |-
-      `read_uncommitted` (**default**): đọc mọi record kể cả thuộc transaction chưa commit/đã abort.
+      `read_uncommitted` (**default ở Java client**; KafkaJS `readUncommitted: false` và librdkafka mặc định là `read_committed`): đọc mọi record kể cả thuộc transaction chưa commit/đã abort.
       `read_committed`: chỉ đọc tới **LSO** (last stable offset) — record của transaction đã commit; record bị abort bị lọc. Transaction treo lâu → LSO đứng yên → consumer "đứng" dù có dữ liệu mới (bị giới hạn bởi `transaction.timeout.ms`).
       Dùng transaction ở producer mà consumer để default → exactly-once không có ý nghĩa.
     followUp: Why can a long-running transaction increase lag for read_committed consumers?
@@ -496,7 +496,7 @@ questions:
     type: compare
     q: "In KafkaJS, what is the difference between `eachMessage` and `eachBatch`, and when do you need to call `heartbeat()` yourself?"
     hint: |-
-      `eachMessage`: KafkaJS gọi handler từng message (tuần tự trong partition; `partitionsConsumedConcurrently` cho song song giữa partition), tự resolve offset và auto-commit theo `autoCommitInterval`/`autoCommitThreshold`.
+      `eachMessage`: KafkaJS gọi handler từng message (tuần tự trong partition; `partitionsConsumedConcurrently` cho song song giữa partition), tự resolve offset và auto-commit theo `autoCommitInterval`/`autoCommitThreshold` (không đặt cả hai → commit sau mỗi batch đã fetch; crash giữa batch → xử lý lại cả batch).
       `eachBatch`: nhận cả batch → tự `resolveOffset()`, `commitOffsetsIfNecessary()`, và **gọi `heartbeat()`** trong vòng lặp dài vì heartbeat của KafkaJS chạy cùng event loop — xử lý batch lâu hơn `sessionTimeout` (mặc định 30s) mà không heartbeat → bị đá khỏi group.
       Lưu ý: KafkaJS không còn được maintain tích cực (release cuối 2023) — cân nhắc client được hỗ trợ.
     followUp: What happens to offsets if your eachBatch handler throws halfway through?
@@ -571,7 +571,7 @@ questions:
       - **Key null** → record của cùng account rải ra nhiều partition → không có ordering nào. Key phải = `accountId`.
       - Không idempotence + `max.in.flight > 1` + retry → batch 1 lỗi, batch 2 thành công, batch 1 retry thành công → **đảo thứ tự** (và có thể trùng).
       - `acks=1` → mất dữ liệu khi leader chết.
-      Fix: key = accountId, `enable.idempotence=true` (giữ thứ tự với in-flight ≤ 5), `acks=all`. (Idempotence mặc định bật từ 3.0 nhưng config tường minh `false` sẽ tắt nó.)
+      Fix: key = accountId, `enable.idempotence=true` (giữ thứ tự với in-flight ≤ 5), `acks=all`. (Idempotence mặc định bật từ 3.0 ở Java client nhưng config tường minh `false` sẽ tắt nó; client Node mặc định tắt.)
     followUp: Does the consumer side need anything to keep this ordering?
     verify: true
     tags: [debug, ordering, producer]
@@ -719,7 +719,7 @@ questions:
       await consumer.run({ eachMessage: handle });
       ```
     hint: |-
-      - `SIGTERM` là **tín hiệu của process**, phải là `process.on("SIGTERM", ...)`; `consumer.on` không nhận signal (KafkaJS `on` dùng cho instrumentation events) → handler không bao giờ chạy → pod bị kill sau grace period, offset chưa commit.
+      - `SIGTERM` là **tín hiệu của process**, phải là `process.on("SIGTERM", ...)`; `consumer.on` chỉ nhận instrumentation events (`consumer.events.*`): KafkaJS **throw `KafkaJSNonRetriableError`** ngay lúc đăng ký (TypeScript cũng báo lỗi) → không có shutdown handler nào → pod bị kill sau grace period, offset chưa commit.
       - Nên: dừng nhận message, chờ handler đang chạy xong, commit, `disconnect()` (KafkaJS commit offset đã resolve khi disconnect/stop), rồi `process.exit`. Đặt `terminationGracePeriodSeconds` > thời gian xử lý tối đa.
       - Vẫn cần consumer idempotent: shutdown sạch giảm trùng, không loại bỏ.
     followUp: How long should terminationGracePeriodSeconds be, and what bounds it?

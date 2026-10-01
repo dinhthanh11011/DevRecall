@@ -80,6 +80,8 @@ overview: |-
     F -- "có" --> ALLOW
   ```
 
+  > **(simplified)** Nhánh "Resource-based policy Allow → ALLOW" chỉ bỏ qua identity policy khi resource policy **nêu đích danh role session principal** (ARN `assumed-role/...`); grant cho role ARN vẫn cần identity policy cho phép.
+
   > Cross-account: cần **cả hai phía** cho phép — identity policy ở account gọi **và** resource policy (hoặc trust policy của role) ở account đích. Chi tiết edge case (resource policy grant trực tiếp cho role session, permission boundary) xem docs "Policy evaluation logic".
 
   ## Trade-offs
@@ -119,7 +121,7 @@ overview: |-
   - S3: strong read-after-write consistency (từ 12/2020). Upload lớn → presigned URL + multipart.
   - CloudFront → S3: **OAC** (OAI là legacy).
   - Lambda + RDS → **RDS Proxy**; tạo client **ngoài** handler.
-  - SQS: visibility timeout ≥ ~6× function timeout khi dùng Lambda event source (khuyến nghị của AWS); DLQ với `maxReceiveCount`; consumer phải **idempotent** (at-least-once).
+  - SQS: visibility timeout ≥ ~6× function timeout khi dùng Lambda event source (khuyến nghị của AWS); DLQ với `maxReceiveCount` (≥ 5 với Lambda); consumer phải **idempotent** (at-least-once). Message tối đa **1 MiB** (trước đây 256 KiB) — lớn hơn thì lưu S3, gửi pointer.
   - Multi-AZ = HA; read replica = scale đọc; Aurora Global Database / cross-region replica = DR.
   - DR theo chi phí tăng dần: backup & restore → pilot light → warm standby → multi-site active/active.
   - Well-Architected: 6 pillars — Operational Excellence, Security, Reliability, Performance Efficiency, Cost Optimization, Sustainability.
@@ -224,6 +226,7 @@ questions:
       Lợi ích: browser upload **thẳng lên S3** → API server không phải stream file (không tốn bandwidth/memory, không vướng giới hạn payload của API Gateway/Lambda).
       Quyền thực tế = quyền của credential đã ký; nếu ký bằng temporary credentials (role) thì URL hết hạn **sớm hơn** khi session hết hạn.
       Nên: server validate (auth, tenant, content-type, size) trước khi ký; key do server sinh (không nhận path từ client); thời hạn ngắn.
+      Gotcha SDK v3 (verify): presigned PUT **không ký `Content-Type`** trừ khi thêm vào `signableHeaders`; default checksum mới làm presigned upload từ browser lỗi → `requestChecksumCalculation: "WHEN_REQUIRED"`.
     example: |-
       ```ts
       import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
@@ -276,6 +279,7 @@ questions:
       Consumer xử lý xong phải `DeleteMessage`. Nếu hết timeout mà chưa delete (crash, chậm), message hiện lại → xử lý **lần nữa**.
       Có thể kéo dài bằng `ChangeMessageVisibility` (heartbeat cho job dài).
       Đây là lý do SQS standard là **at-least-once** → consumer phải idempotent.
+      Với Lambda event source mapping: DLQ `maxReceiveCount` nên **≥ 5** (tránh message bị đẩy DLQ oan khi throttle).
     followUp: What is `maxReceiveCount` and how does it relate to a dead-letter queue?
     verify: true
     tags: [sqs, messaging]
@@ -408,7 +412,7 @@ questions:
     q: Your NAT Gateway bill is suddenly the biggest line in the AWS invoice. How do you investigate and reduce it?
     hint: |-
       NAT GW tính **theo giờ (mỗi AZ)** + **mỗi GB xử lý**; traffic cross-AZ tới NAT còn thêm phí data transfer.
-      Điều tra: **VPC Flow Logs** (hoặc CloudWatch metric `BytesOutToDestination` của NAT) + Cost Explorer theo usage type → xem ai đang đẩy GB nào tới đâu.
+      Điều tra: **VPC Flow Logs** (hoặc CloudWatch metric `BytesOutToDestination` của NAT) + Cost Explorer theo usage type (NAT nằm dưới service **EC2** / "EC2-Other", usage type `NatGateway-Bytes`, `NatGateway-Hours`) → xem ai đang đẩy GB nào tới đâu.
       Thủ phạm hay gặp: kéo **image ECR**, upload/download **S3**, gửi log/metric ra ngoài, gọi DynamoDB — tất cả qua NAT.
       Giảm: **S3/DynamoDB gateway endpoint** (miễn phí), **interface endpoint** cho ECR (api + dkr), CloudWatch Logs, STS, Secrets Manager (so sánh giá endpoint/giờ vs GB tiết kiệm); NAT GW mỗi AZ và route theo AZ để tránh cross-AZ; cache image.
     followUp: What's the trade-off of adding 6 interface endpoints across 3 AZs versus paying NAT processing?
@@ -444,7 +448,7 @@ questions:
     q: How does Lambda concurrency work, and what are reserved and provisioned concurrency?
     hint: |-
       Concurrency = số execution environment đang xử lý đồng thời ≈ `RPS × average duration (s)`.
-      Account có quota concurrency **mỗi region** (mặc định 1,000, xin tăng được) chia chung cho mọi function; vượt → **throttle** (429 với sync, retry với async/SQS).
+      Account có quota concurrency **mỗi region** (mặc định 1,000, xin tăng được; **account mới** có thể nhận quota thấp hơn nhiều, được nâng dần theo usage) chia chung cho mọi function; vượt → **throttle** (429 với sync, retry với async/SQS).
       - **Reserved concurrency**: dành riêng *và* đặt **trần** cho một function (bảo vệ DB downstream; đặt 0 để "tắt" function).
       - **Provisioned concurrency**: giữ sẵn N môi trường đã init → không cold start cho N đó; tính phí kể cả khi không dùng; có thể auto-scale theo lịch.
       Tốc độ scale-out cũng có giới hạn riêng theo từng function.
@@ -499,7 +503,7 @@ questions:
     hint: |-
       - Visibility timeout (30s) **< function timeout (60s)**: batch đang xử lý chưa xong thì message đã hiện lại → Lambda khác nhận → **charge lần 2**. AWS khuyến nghị visibility timeout ≥ khoảng **6× function timeout** cho SQS event source.
       - Batch 10: một message lỗi → cả batch retry → 9 message đã thành công bị xử lý lại. Bật **`ReportBatchItemFailures`** và trả `batchItemFailures`.
-      - Không có **DLQ** (`RedrivePolicy` + `maxReceiveCount`) → poison message lặp mãi.
+      - Không có **DLQ** (`RedrivePolicy` + `maxReceiveCount`, AWS khuyến nghị **≥ 5** cho Lambda ESM) → poison message lặp mãi. ESM scale tới ~**1,250** concurrent invocation → đặt maximum concurrency để bảo vệ downstream.
       - Quan trọng nhất: SQS là at-least-once → **idempotency key** (ví dụ `paymentIntentId` + unique constraint / idempotency table, và idempotency key của payment provider).
     followUp: How would you implement idempotency for this worker — what's the key and where is it stored?
     redFlags:
@@ -757,8 +761,8 @@ questions:
     q: Your Next.js server on ECS behind an ALB drops a fraction of requests with 502 during every deploy. What are the likely causes?
     hint: |-
       - **Graceful shutdown**: ECS gửi SIGTERM → app phải ngừng nhận request mới, xử lý xong request đang chạy rồi thoát trước `stopTimeout`. Node chạy PID 1 không bắt SIGTERM, hoặc `npm start` không forward signal → bị SIGKILL giữa chừng.
-      - **Deregistration delay** của target group ngắn hơn thời gian request dài; hoặc app tắt **trước** khi ALB ngừng gửi traffic.
-      - **Keep-alive mismatch**: ALB idle timeout (mặc định 60s) **lớn hơn** keep-alive timeout của Node (`server.keepAliveTimeout` mặc định 5s) → ALB tái dùng connection Node đã đóng → 502. Đặt `keepAliveTimeout` > ALB idle timeout (và `headersTimeout` lớn hơn nữa).
+      - ECS **deregister + drain** target (theo deregistration delay) **rồi mới** gửi SIGTERM → 502 khi request dài hơn deregistration delay, hoặc bị SIGKILL sau `stopTimeout`.
+      - **Keep-alive mismatch**: ALB idle timeout (mặc định 60s) **lớn hơn** keep-alive timeout của Node (`server.keepAliveTimeout` mặc định 5s) → ALB tái dùng connection Node đã đóng → 502. Đặt `keepAliveTimeout` > ALB idle timeout (và `headersTimeout` lớn hơn nữa; Node 24 thêm `keepAliveTimeoutBuffer` ~1s — verify).
       - Health check grace period ngắn → task mới bị đánh dấu unhealthy.
     example: |-
       ```ts
@@ -802,7 +806,7 @@ questions:
     q: What are the main Lambda limits that bite a Node/Next.js app, and how do you design around them?
     hint: |-
       - **Timeout tối đa 15 phút** → job dài chuyển sang Step Functions / ECS task.
-      - **Payload**: sync invoke khoảng 6 MB request/response (qua API Gateway còn bị giới hạn của API Gateway và timeout ~29s) → upload/download qua S3 presigned URL, response lớn dùng streaming.
+      - **Payload**: sync invoke khoảng 6 MB request/response (qua API Gateway còn bị giới hạn của API Gateway và timeout ~29s) → upload/download qua S3 presigned URL, response lớn dùng streaming (response streaming tới ~200 MB). **Async invoke** payload tới 1 MB (trước đây 256 KB).
       - **Memory 128 MB – 10,240 MB** (CPU tỉ lệ theo), `/tmp` ephemeral có thể cấu hình tới 10 GB.
       - **Deployment package** (zip unzipped ~250 MB; container image tới 10 GB) → Next.js bundle phải gọn.
       - **Concurrency** quota per region; không giữ WebSocket lâu (dùng API Gateway WebSocket).
@@ -877,9 +881,9 @@ questions:
     q: How does Aurora differ architecturally from standard RDS PostgreSQL, and when is it worth the price?
     hint: |-
       - Aurora tách **compute và storage**: storage phân tán, tự mở rộng, **6 bản copy trên 3 AZ**; writer chỉ gửi log record xuống storage → replica đọc cùng volume (replica lag thường rất thấp, ms), tối đa **15 Aurora Replicas**, failover nhanh hơn RDS Multi-AZ instance.
-      - Tính năng: Global Database (cross-region, RPO khoảng giây), fast clone, backtrack (MySQL), **Aurora Serverless v2** (scale ACU theo tải), I/O-Optimized pricing.
+      - Tính năng: Global Database (cross-region, RPO khoảng giây), fast clone, backtrack (MySQL), **Aurora Serverless v2** (scale **0–256 ACU** theo tải), I/O-Optimized pricing.
       - Đáng giá khi: cần nhiều replica đọc, failover nhanh, storage lớn tăng dần, DR cross-region. RDS thường rẻ hơn cho DB nhỏ, tải ổn định, hoặc khi cần extension/version Aurora chưa hỗ trợ.
-      - Serverless v2 không phải "free when idle" như Lambda — kiểm tra min ACU hiện tại.
+      - Serverless v2 hỗ trợ **min 0 ACU + auto-pause** khi idle, nhưng resume mất vài giây (cold start DB) và storage/I/O vẫn tính tiền — kiểm tra docs hiện tại.
     followUp: When does Aurora I/O-Optimized become cheaper than Standard?
     verify: true
     tags: [aurora, rds, database]

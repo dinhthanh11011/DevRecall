@@ -184,7 +184,7 @@ questions:
     q: What does idempotent mean for an API, and which HTTP methods are idempotent by definition?
     hint: |-
       Idempotent: gọi N lần có **cùng tác động lên trạng thái server** như gọi 1 lần (response có thể khác, vd 201 rồi 200/409).
-      Theo HTTP semantics: GET, HEAD, OPTIONS, PUT, DELETE là idempotent; **POST, PATCH không** (PATCH có thể idempotent tuỳ cách thiết kế).
+      Theo HTTP semantics (RFC 9110): GET, HEAD, OPTIONS, TRACE, PUT, DELETE là idempotent (GET/HEAD/OPTIONS/TRACE còn là **safe**); **POST, PATCH không** (PATCH có thể idempotent tuỳ cách thiết kế).
       Vì mạng có thể mất response, client không phân biệt được "server chưa làm" và "làm rồi nhưng mất trả lời" → idempotency là điều kiện để retry an toàn.
     followUp: How do you make a POST /payments endpoint safe to retry?
     tags: [idempotency]
@@ -282,6 +282,7 @@ questions:
       Phase 1 (prepare): coordinator hỏi mọi participant "sẵn sàng commit?"; participant ghi durable, khoá tài nguyên, trả yes/no.
       Phase 2 (commit/abort): tất cả yes → commit; bất kỳ no → abort.
       Blocking: participant đã vote yes **không được tự quyết**; nếu coordinator chết sau prepare, participant giữ lock chờ vô hạn tới khi coordinator hồi phục. Thêm: latency nhiều round-trip, availability = tích availability của mọi bên, hầu hết broker/API hiện đại không hỗ trợ XA.
+      Postgres: `PREPARE TRANSACTION` cần `max_prepared_transactions > 0` (default **0**); prepared tx mồ côi **sống qua restart**, giữ lock và chặn VACUUM (giữ xmin horizon) tới khi `COMMIT/ROLLBACK PREPARED` — monitor `pg_prepared_xacts`.
     followUp: Why do microservice architectures prefer sagas over 2PC?
     tags: [2pc, transactions]
   - id: distributed-systems-014
@@ -376,11 +377,11 @@ questions:
     q: What is deadline propagation, and how would you implement it across Node.js services?
     hint: |-
       Request người dùng có ngân sách thời gian (vd 2s). Mỗi hop truyền **thời điểm hết hạn** (hoặc thời gian còn lại) xuống dưới; service con dùng `min(own timeout, remaining)`, và **không bắt đầu/không retry** nếu thời gian còn lại quá ít.
-      Node: header `x-request-deadline` (gRPC có deadline sẵn), `AbortSignal.timeout(remaining)` cho `fetch`, truyền `AbortSignal` xuống DB/HTTP client; lưu trong AsyncLocalStorage.
+      Node: header `x-request-deadline` (gRPC có deadline sẵn), `AbortSignal.timeout(remaining)` cho `fetch` (Node ném `RangeError` nếu giá trị không phải số nguyên không âm → `Math.floor`), truyền `AbortSignal` xuống DB/HTTP client; lưu trong AsyncLocalStorage.
       Lợi ích: không làm việc vô ích cho request mà caller đã bỏ.
     example: |-
       ```ts
-      const remaining = Number(req.header("x-deadline")) - Date.now(); // ms, epoch-based header
+      const remaining = Math.floor(Number(req.header("x-deadline")) - Date.now()); // ms, epoch-based header
       if (remaining < 50) return res.status(504).end();
       const r = await fetch(url, { signal: AbortSignal.timeout(remaining - 20),
         headers: { "x-deadline": req.header("x-deadline")! } });
@@ -427,7 +428,7 @@ questions:
     type: compare
     q: How do you provide read-your-writes consistency when reads go to asynchronous replicas?
     hint: |-
-      Lựa chọn: (1) đọc từ **primary** trong một khoảng sau khi user ghi (cookie/session ghi "last write at"), (2) lưu **LSN/position** của write, chỉ đọc replica đã replay tới LSN đó (Postgres `pg_last_wal_replay_lsn()`), (3) sticky routing user tới replica cố định + chờ, (4) trả dữ liệu vừa ghi từ response của write cho UI (optimistic UI).
+      Lựa chọn: (1) đọc từ **primary** trong một khoảng sau khi user ghi (cookie/session ghi "last write at"), (2) lưu **LSN/position** của write, chỉ đọc replica đã replay tới LSN đó (Postgres `pg_last_wal_replay_lsn()`) — lấy LSN bằng `SELECT pg_current_wal_lsn()` **sau khi COMMIT trả về** (`RETURNING pg_current_wal_lsn()` trong transaction là LSN *trước* commit record → replica có thể chưa thấy write), (3) sticky routing user tới replica cố định + chờ, (4) trả dữ liệu vừa ghi từ response của write cho UI (optimistic UI).
       Chỉ áp dụng cho **chính user đó** — người khác vẫn eventual.
     followUp: How does this interact with caching in front of the replica?
     tags: [consistency, replication]
@@ -578,7 +579,7 @@ questions:
     q: During a network partition between AZs, your Redis Sentinel setup promotes a new master while the old master keeps accepting writes from clients in its AZ. What happens, and how do you limit it?
     hint: |-
       Split brain tạm thời: client ở phía thiểu số ghi vào master cũ; khi partition hết, master cũ bị hạ xuống replica và **resync từ master mới → write đó mất**.
-      Giới hạn: `min-replicas-to-write` + `min-replicas-max-lag` để master cũ ngừng nhận write khi mất liên lạc replica; Sentinel quorum đặt ở ≥3 vị trí; chấp nhận Redis là AP-ish, không dùng cho dữ liệu không được phép mất.
+      Giới hạn: `min-replicas-to-write` + `min-replicas-max-lag` để master cũ ngừng nhận write khi mất liên lạc replica — chỉ **thu hẹp cửa sổ mất dữ liệu** (write trong ~`max-lag` giây đầu vẫn mất), không loại bỏ; Sentinel quorum đặt ở ≥3 vị trí; chấp nhận Redis là AP-ish, không dùng cho dữ liệu không được phép mất.
     followUp: Which data in your system is acceptable to lose this way, and which is not?
     verify: true
     tags: [split-brain, redis, partition]
@@ -648,7 +649,7 @@ questions:
     type: design
     q: A scheduled job must run exactly once per minute across 10 replicas of a Node service. Design it.
     hint: |-
-      Lựa chọn: (1) tách job ra **một** scheduler riêng (K8s CronJob với `concurrencyPolicy: Forbid`, EventBridge Scheduler) — đơn giản nhất; (2) leader election (K8s Lease, etcd) và chỉ leader chạy; (3) claim theo **slot thời gian** trong DB: `INSERT INTO job_runs(job, minute) ... ON CONFLICT DO NOTHING` → chỉ một replica thắng mỗi phút.
+      Lựa chọn: (1) tách job ra **một** scheduler riêng (K8s CronJob với `concurrencyPolicy: Forbid`, EventBridge Scheduler) — đơn giản nhất, nhưng CronJob chỉ "approximately once": có thể tạo **hai Job hoặc không Job nào** cho một lần → job vẫn phải idempotent; (2) leader election (K8s Lease, etcd) và chỉ leader chạy; (3) claim theo **slot thời gian** trong DB: `INSERT INTO job_runs(job, minute) ... ON CONFLICT DO NOTHING` → chỉ một replica thắng mỗi phút.
       "Exactly once" thực tế = at-least-once + job idempotent (theo slot) + phát hiện slot bị bỏ lỡ (catch-up).
     example: |-
       ```sql

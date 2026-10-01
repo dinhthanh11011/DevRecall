@@ -364,6 +364,7 @@ questions:
     q: Explain refresh token rotation with reuse detection. How do you implement it and avoid logging out users due to race conditions?
     hint: |-
       Mỗi lần refresh: cấp **RT mới**, đánh dấu RT cũ `used`; tất cả RT của một phiên thuộc cùng **family**. Nếu RT đã `used` bị dùng lại → coi như bị đánh cắp → **revoke cả family** (cả attacker và user thật phải login lại).
+      Giới hạn: attacker refresh **trước** thì cứ tiếp tục refresh được cho tới khi client thật dùng lại RT cũ — detection chỉ kích hoạt lúc đó.
       Lưu RT dạng **hash** trong DB: `(id, family_id, user_id, hash, used_at, expires_at, absolute_expires_at)`.
       Race: hai tab refresh cùng lúc với cùng RT → tab thứ hai bị coi là reuse. Giảm bằng: **grace period** ngắn (vài giây) trả lại cùng cặp token cho RT vừa dùng, hoặc đồng bộ refresh giữa tab (BroadcastChannel/lock), hoặc refresh qua BFF duy nhất.
       Có absolute lifetime (vd 30 ngày) + idle timeout.
@@ -378,9 +379,9 @@ questions:
       2. Redirect `/authorize` với `response_type=code`, `client_id`, **exact** `redirect_uri`, `scope=openid ...`, `state`, `nonce`, `code_challenge`, `S256`.
       3. User login + consent ở AS → redirect về `redirect_uri?code&state` (có thể kèm `iss` — RFC 9207 chống mix-up).
       4. Client **check `state`** → POST `/token` với `code`, `code_verifier`, `redirect_uri`, client auth (nếu confidential).
-      5. AS check code chưa dùng, còn hạn (ngắn, ~≤ 1 phút), đúng client, `redirect_uri` khớp, **SHA256(verifier) = challenge**.
+      5. AS check code chưa dùng, còn hạn (RFC 6749 §4.1.2: tối đa **10 phút**, thực tế ~1 phút), đúng client, `redirect_uri` khớp, **SHA256(verifier) = challenge**.
       6. Client verify ID token (chữ ký, `iss`, `aud`, `exp`, **`nonce`**) → tạo session.
-      Code **dùng một lần**; dùng lại → AS nên revoke token đã cấp từ code đó.
+      Code **dùng một lần**; dùng lại → AS nên revoke token đã cấp từ code đó (Keycloak làm vậy).
     followUp: What is the OAuth "mix-up attack" and how does the `iss` parameter in the authorization response help?
     tags: [oauth2, pkce, oidc]
   - id: auth-identity-017
@@ -401,7 +402,7 @@ questions:
     q: When do you use the Client Credentials grant, and what are its security considerations?
     hint: |-
       Machine-to-machine không có user: cron job, service A gọi service B, đối tác tích hợp server-side. Client xác thực trực tiếp với AS (`client_id` + secret, hoặc tốt hơn **`private_key_jwt`**/mTLS) → nhận access token, không có refresh token, không có ID token.
-      Lưu ý: secret là credential dài hạn → secrets manager + rotation; scope tối thiểu per client; `aud` đúng API; token ngắn hạn, cache và tái dùng tới gần hết hạn (đừng xin token mỗi request).
+      Lưu ý: secret là credential dài hạn → secrets manager + rotation; scope tối thiểu per client; `aud` đúng API (Keycloak mặc định `aud: account` → cần **audience mapper**); token ngắn hạn, cache và tái dùng tới gần hết hạn (đừng xin token mỗi request).
       Không dùng để "đại diện user" — nếu service cần hành động thay user → token exchange hoặc propagate user token.
     example: |-
       ```bash
@@ -441,8 +442,8 @@ questions:
     hint: |-
       Discovery: `GET {issuer}/.well-known/openid-configuration` → `issuer`, `authorization_endpoint`, `token_endpoint`, `jwks_uri`, thuật toán hỗ trợ… `issuer` trong document phải **đúng bằng** issuer đã cấu hình.
       JWKS: tập public key, mỗi key có `kid`. Token header có `kid` → chọn key.
-      Rotation đúng: IdP publish key mới **trước** khi dùng (hai key song song), sau đó mới ngừng key cũ. Verifier: **cache JWKS** (theo Cache-Control/TTL), khi gặp `kid` lạ thì **refetch một lần** (có rate limit/cooldown để attacker không ép bạn gọi IdP liên tục), không hardcode key.
-      `jose.createRemoteJWKSet` đã làm cache + cooldown.
+      Rotation đúng: IdP publish key mới **trước** khi dùng (hai key song song), sau đó mới ngừng key cũ. Verifier: **cache JWKS** (TTL), khi gặp `kid` lạ thì **refetch một lần** (có rate limit/cooldown để attacker không ép bạn gọi IdP liên tục), không hardcode key.
+      `jose.createRemoteJWKSet` đã làm cache + cooldown: cache cố định **10 phút** (`cacheMaxAge`), cooldown **30s** (`cooldownDuration`), **bỏ qua Cache-Control** của IdP → chỉnh option nếu IdP rotate nhanh.
     example: |-
       ```ts
       import { createRemoteJWKSet, jwtVerify } from 'jose';
@@ -563,7 +564,7 @@ questions:
       ```
     hint: |-
       1. `jwt.decode` **không verify chữ ký** → ai cũng tự tạo token `{sub: 'admin', roles: ['owner']}`. "Gateway đã verify" không đủ: service vẫn bị gọi trực tiếp trong mạng nội bộ (zero trust) hoặc qua SSRF → luôn `verify` (hoặc chỉ tin header nội bộ có mTLS).
-      2. `jwt.verify` không có `algorithms` allowlist → rủi ro **algorithm confusion** (nếu key là RSA public key dạng PEM, token HS256 ký bằng chính public key có thể được chấp nhận ở thư viện/phiên bản cũ; `jsonwebtoken` ≥ 9 đã chặn một phần, nhưng đừng dựa vào default).
+      2. `jwt.verify` không có `algorithms` allowlist → rủi ro **algorithm confusion** (token HS256 ký bằng chính RSA public key). Thực tế với `jsonwebtoken` 8.5.1: bỏ trống `algorithms` + key SPKI PEM thì lib tự giới hạn RS/ES; forge được khi allowlist **trộn HS + RS** (CVE-2022-23541, fix ở 9.0.0). Đừng dựa vào default — luôn khai báo allowlist một họ thuật toán.
       Fix: `jwt.verify(token, key, { algorithms: ['RS256'], issuer, audience })`, hoặc `jose.jwtVerify` với JWKS; thiếu token → 401 rõ ràng.
     followUp: Your gateway verifies tokens. How should downstream services receive identity without re-verifying a JWT on every hop — and is that safe?
     verify: true
@@ -583,7 +584,7 @@ questions:
     hint: |-
       Thiếu check **`aud`** → mọi access token hợp lệ từ cùng IdP (cấp cho analytics, cho app bên thứ ba, thậm chí ID token nếu cùng key) đều được billing chấp nhận → **token substitution / confused deputy**; service analytics bị compromise có thể dùng token của user để gọi billing.
       Bug thứ hai: `scope.includes('read')` khớp chuỗi con — `analytics:read` hay `unread` cũng qua. Tách scope bằng khoảng trắng và so khớp chính xác (`scopes.includes('billing:read')`).
-      Fix: `audience: 'billing-api'`, kiểm tra `typ: at+jwt` (RFC 9068) để loại ID token, scope chính xác, cấu hình IdP phát audience theo resource (resource indicators RFC 8707).
+      Fix: `audience: 'billing-api'`, kiểm tra `typ: at+jwt` (RFC 9068) để loại ID token, scope chính xác, cấu hình IdP phát audience theo resource (resource indicators RFC 8707; Keycloak mặc định chỉ `aud: account` → thêm **audience mapper** / client scope).
     followUp: How does an IdP know which audience to put in the token when a client calls several APIs?
     tags: [jwt, audience, debug]
   - id: auth-identity-030
@@ -708,6 +709,7 @@ questions:
     type: scenario
     q: Your reuse-detection alert fires — a refresh token family was used from two countries within a minute. What does the system do automatically, and what do you do as the engineer on call?
     hint: |-
+      Lưu ý: alert chỉ bắn khi bên **thứ hai** dùng RT cũ — nếu attacker refresh trước, họ đã giữ phiên từ lúc đó tới khi client thật refresh.
       Tự động: revoke **cả family**, huỷ access token còn hiệu lực nếu có cơ chế (denylist `jti`/`session_id`), buộc re-login + (tuỳ) MFA, notify user ("phát hiện đăng nhập bất thường").
       On call: xác định có phải false positive (race nhiều tab/app retry, VPN) hay thật; nếu nhiều family cùng lúc → nghi ngờ **nguồn lộ chung** (XSS đọc token, malware extension, log chứa token, SDK bên thứ ba); kiểm tra hành động đã làm bằng token bị lạm dụng (audit log), rollback nếu cần.
       Sửa gốc: chuyển sang BFF/HttpOnly, sender-constrained token (DPoP), rút ngắn TTL, bỏ token khỏi log.
