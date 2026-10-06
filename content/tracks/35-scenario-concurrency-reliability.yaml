@@ -583,7 +583,7 @@ questions:
       CMD npm start
       ```
     hint: |-
-      (1) `CMD npm start` (shell form) → PID 1 là `/bin/sh -c`, sh **không forward SIGTERM** cho con → Node không bao giờ nhận signal → sau 30s bị SIGKILL (đúng `terminationGracePeriodSeconds`).
+      (1) `CMD npm start` (shell form) → PID 1 là `/bin/sh -c`; với `dash` (image Debian như `node:22-slim`) sh **không forward SIGTERM** cho con → Node không bao giờ nhận signal → hết grace period thì bị SIGKILL (exit 137). Busybox `sh` (alpine) thường `exec` thẳng lệnh đơn nên có thể "may mắn" chạy đúng — đừng dựa vào đó (verify theo image).
       (2) Kể cả exec form `CMD ["npm", "start"]`: npm là process trung gian, forward signal không đáng tin cậy và thêm một lớp process (verify theo version npm).
       (3) Fix: `CMD ["node", "dist/server.js"]` (exec form, Node là PID 1) **và** tự handle SIGTERM/SIGINT — PID 1 không có default handler, signal không có handler sẽ bị kernel bỏ qua. Hoặc dùng init nhỏ: `tini` / `docker run --init` / `shareProcessNamespace` để reap zombie và forward signal.
       (4) Kiểm chứng: `kubectl exec ... -- ps -o pid,comm` xem PID 1 là gì.
@@ -738,7 +738,7 @@ questions:
       ```
     hint: |-
       (1) `hgetall` trả **string** (và `{}` khi key chưa có, không phải null): `"9" + 1 = "91"` → `Math.min(10, "91")` = 10 → bucket luôn đầy (unlimited). Lần đầu `ts` undefined → `now - undefined = NaN` → `current = NaN` → `NaN < 1` false nhưng `hset tokens: NaN` → lần sau hỏng tiếp.
-      (2) Refill `Math.floor` theo giây nhưng luôn ghi `ts = now` → request mỗi 900ms **không bao giờ** được refill (phần lẻ bị vứt) → user đều đặn bị chặn mãi. Phải refill **fractional**: `tokens += elapsedMs * rate / 1000`, lưu tokens dạng float.
+      (2) Refill `Math.floor` theo giây rồi ghi `ts = now` → phần lẻ bị vứt mỗi lần cho qua: request đều mỗi 900ms chỉ được ~1/1.8s (đo: 50/100 thay vì 90); biến thể ghi `ts = now` cả khi chặn thì user đều đặn bị chặn **mãi** (đo: 0/100). Phải refill **fractional**: `tokens += elapsedMs * rate / 1000`, lưu tokens dạng float.
       (3) Read-then-write qua 2 round-trip, không atomic → N pod cùng đọc `tokens=1` và cùng cho qua. Fix: toàn bộ logic trong **một Lua script** (EVALSHA), dùng thời gian của Redis (`TIME`) hoặc truyền `now` từ app nhất quán.
       (4) Không có TTL → key rác cho mọi user từng gọi; đặt `PEXPIRE` ≈ thời gian refill đầy.
     followUp: Write the Lua version. Whose clock should `now` come from, and why?
@@ -1090,7 +1090,7 @@ questions:
     type: design
     q: Design read-your-writes on top of Postgres async replicas without routing all reads to the primary.
     hint: |-
-      (1) Sau write, lấy **LSN** của commit: `SELECT pg_current_wal_lsn()` (hoặc `pg_current_wal_insert_lsn`) và trả về client dưới dạng token (cookie/header), vd `x-min-lsn`.
+      (1) Sau write, lấy **LSN** **sau khi COMMIT** (câu riêng): `SELECT pg_current_wal_lsn()` — gọi trong cùng transaction thì LSN nằm trước commit record, replica đạt LSN đó mà vẫn chưa thấy data (đã đo) và trả về client dưới dạng token (cookie/header), vd `x-min-lsn`.
       (2) Khi đọc: chọn replica có `pg_last_wal_replay_lsn() >= token` (poll/cached per replica mỗi ~100ms); không có → chờ ngắn (≤ 200ms) hoặc đọc primary.
       (3) Rẻ hơn: "sticky primary" N giây theo user sau write (N > p99 lag); hoặc chỉ các endpoint "của tôi" đọc primary.
       (4) Monitor `pg_stat_replication.replay_lag`; lag > ngưỡng → circuit tự chuyển read về primary (cẩn thận primary quá tải). Aurora/RDS có metric riêng (`AuroraReplicaLag`, `ReplicaLag`, verify).
