@@ -6,10 +6,11 @@ import { LEVELS, LEVEL_LABELS, type Level } from "@/lib/constants";
 import { RATINGS, rate, useProgress, type ProgressMap, type Rating } from "@/lib/progress";
 import { loadTrack, slugOf } from "@/lib/trackData";
 import type { RichQuestion, Section } from "@/lib/types";
-import { Chip, EssentialBadge, LevelBadge } from "@/components/Badges";
+import { Chip, EssentialBadge, LevelBadge, VerifyChip } from "@/components/Badges";
 import { LearnPanel } from "@/components/LearnPanel";
 import { Markdown } from "@/components/Markdown";
 import { Answer, RatingButtons } from "@/components/QuestionCard";
+import { Icon } from "@/components/Icon";
 
 type TierOption = { id: number; title: string; tracks: { slug: string; title: string; total: number }[] };
 type Pool = "all" | "unrated" | "weak" | "not-strong";
@@ -152,14 +153,14 @@ export function PracticeSession({ tiers }: { tiers: TierOption[] }) {
   const pill = (active: boolean) =>
     `rounded-full px-3 py-1 text-xs font-medium transition ${
       active
-        ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
-        : "border border-zinc-300 text-zinc-600 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+        ? "bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900"
+        : "border border-slate-300 text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
     }`;
 
   if (!deck && fixedIds.length) {
     return (
-      <div className="space-y-3 rounded-xl border border-zinc-200 bg-white p-6 dark:border-zinc-800 dark:bg-zinc-900">
-        <p className="text-zinc-600 dark:text-zinc-400">
+      <div className="space-y-3 rounded-xl border border-slate-200 bg-white p-6 dark:border-slate-800 dark:bg-slate-900">
+        <p className="text-slate-600 dark:text-slate-400">
           {error ?? `Đang tải ${fixedIds.length} câu của lộ trình…`}
         </p>
         <button type="button" onClick={() => setFixedIds([])} className="text-sm underline">
@@ -171,17 +172,17 @@ export function PracticeSession({ tiers }: { tiers: TierOption[] }) {
 
   if (!deck) {
     return (
-      <div className="space-y-6 rounded-xl border border-zinc-200 bg-white p-6 dark:border-zinc-800 dark:bg-zinc-900">
+      <div className="space-y-6 rounded-xl border border-slate-200 bg-white p-6 dark:border-slate-800 dark:bg-slate-900">
         <fieldset className="space-y-3">
           <legend className="text-sm font-semibold">
-            Tracks <span className="font-normal text-zinc-500">({selected.size ? `${selected.size} selected` : "all"})</span>
+            Tracks <span className="font-normal text-slate-500">({selected.size ? `${selected.size} selected` : "all"})</span>
           </legend>
-          {allSlugs.length === 0 && <p className="text-sm text-zinc-500">Chưa có track nào có câu hỏi.</p>}
+          {allSlugs.length === 0 && <p className="text-sm text-slate-500">Chưa có track nào có câu hỏi.</p>}
           {tiers
             .filter((t) => t.tracks.length)
             .map((tier) => (
               <div key={tier.id} className="space-y-1">
-                <p className="text-xs uppercase tracking-wide text-zinc-500">{tier.title}</p>
+                <p className="text-xs uppercase tracking-wide text-slate-500">{tier.title}</p>
                 <div className="flex flex-wrap gap-2">
                   {tier.tracks.map((t) => (
                     <button
@@ -233,7 +234,7 @@ export function PracticeSession({ tiers }: { tiers: TierOption[] }) {
               Tất cả câu
             </button>
             <button type="button" className={pill(essentialOnly)} onClick={() => setEssentialOnly(true)}>
-              ⭐ Chỉ trọng điểm
+              <Icon name="star" className="mr-1 h-3 w-3 text-yellow-500" />Chỉ trọng điểm
             </button>
           </div>
         </fieldset>
@@ -262,7 +263,7 @@ export function PracticeSession({ tiers }: { tiers: TierOption[] }) {
           type="button"
           disabled={loading || allSlugs.length === 0}
           onClick={start}
-          className="rounded-lg bg-sky-600 px-4 py-2 font-medium text-white hover:bg-sky-700 disabled:opacity-50"
+          className="rounded-lg bg-blue-600 px-4 py-2 font-medium text-white hover:bg-blue-700 disabled:opacity-50"
         >
           {loading ? "Loading…" : "Start session"}
         </button>
@@ -275,12 +276,12 @@ export function PracticeSession({ tiers }: { tiers: TierOption[] }) {
     const avg = graded.length ? graded.reduce((a: number, b) => a + b, 0) / graded.length : 0;
     const weak = deck.filter((c) => results[c.id] !== undefined && results[c.id] <= 1);
     return (
-      <div className="space-y-6 rounded-xl border border-zinc-200 bg-white p-6 dark:border-zinc-800 dark:bg-zinc-900">
+      <div className="space-y-6 rounded-xl border border-slate-200 bg-white p-6 dark:border-slate-800 dark:bg-slate-900">
         <h2 className="text-xl font-semibold">Session done</h2>
         {deck.length === 0 ? (
-          <p className="text-zinc-600 dark:text-zinc-400">Không có câu hỏi nào khớp bộ lọc — thử pool &quot;Tất cả&quot;.</p>
+          <p className="text-slate-600 dark:text-slate-400">Không có câu hỏi nào khớp bộ lọc — thử pool &quot;Tất cả&quot;.</p>
         ) : (
-          <p className="text-zinc-600 dark:text-zinc-400">
+          <p className="text-slate-600 dark:text-slate-400">
             Graded {graded.length}/{deck.length} · average {avg.toFixed(1)} / 4
           </p>
         )}
@@ -290,7 +291,7 @@ export function PracticeSession({ tiers }: { tiers: TierOption[] }) {
             <ul className="space-y-1 text-sm">
               {weak.map((c) => (
                 <li key={c.id}>
-                  <a href={`/tracks/${c.slug}#${c.id}`} className="text-sky-700 hover:underline dark:text-sky-400">
+                  <a href={`/tracks/${c.slug}#${c.id}`} className="text-blue-700 hover:underline dark:text-blue-400">
                     {c.trackTitle}: {c.q.slice(0, 100)}
                     {c.q.length > 100 ? "…" : ""}
                   </a>
@@ -300,7 +301,7 @@ export function PracticeSession({ tiers }: { tiers: TierOption[] }) {
           </div>
         )}
         <div className="flex gap-3">
-          <button type="button" onClick={start} className="rounded-lg bg-sky-600 px-4 py-2 font-medium text-white hover:bg-sky-700">
+          <button type="button" onClick={start} className="rounded-lg bg-blue-600 px-4 py-2 font-medium text-white hover:bg-blue-700">
             New session, same settings
           </button>
           <button
@@ -309,7 +310,7 @@ export function PracticeSession({ tiers }: { tiers: TierOption[] }) {
               setFixedIds([]);
               setDeck(null);
             }}
-            className="rounded-lg border border-zinc-300 px-4 py-2 dark:border-zinc-700"
+            className="rounded-lg border border-slate-300 px-4 py-2 dark:border-slate-700"
           >
             Change settings
           </button>
@@ -320,7 +321,7 @@ export function PracticeSession({ tiers }: { tiers: TierOption[] }) {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between text-sm text-zinc-500">
+      <div className="flex items-center justify-between text-sm text-slate-500">
         <span>
           {pos + 1} / {deck.length} · {card.trackTitle}
         </span>
@@ -335,15 +336,15 @@ export function PracticeSession({ tiers }: { tiers: TierOption[] }) {
           End session
         </button>
       </div>
-      <div className="h-1 w-full overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-800">
-        <div className="h-full bg-sky-500 transition-all" style={{ width: `${(pos / deck.length) * 100}%` }} />
+      <div className="h-1 w-full overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
+        <div className="h-full bg-blue-500 transition-all" style={{ width: `${(pos / deck.length) * 100}%` }} />
       </div>
-      <article className="space-y-4 rounded-xl border border-zinc-200 bg-white p-6 dark:border-zinc-800 dark:bg-zinc-900">
+      <article className="space-y-4 rounded-xl border border-slate-200 bg-white p-6 dark:border-slate-800 dark:bg-slate-900">
         <div className="flex flex-wrap items-center gap-2">
           <LevelBadge level={card.level} />
           <Chip>{card.type}</Chip>
           {card.essential && <EssentialBadge />}
-          {card.verify && <Chip>⚠ verify</Chip>}
+          {card.verify && <VerifyChip />}
           {progress[card.id] && <Chip>last: {RATINGS[progress[card.id].r].label}</Chip>}
         </div>
         <div className="text-lg font-medium">
@@ -355,16 +356,16 @@ export function PracticeSession({ tiers }: { tiers: TierOption[] }) {
             <button
               type="button"
               onClick={() => setRevealed(true)}
-              className="rounded-lg bg-zinc-900 px-4 py-2 font-medium text-white dark:bg-zinc-100 dark:text-zinc-900"
+              className="rounded-lg bg-slate-900 px-4 py-2 font-medium text-white dark:bg-slate-100 dark:text-slate-900"
             >
               Show answer (Space)
             </button>
-            <button type="button" onClick={advance} className="rounded-lg border border-zinc-300 px-4 py-2 dark:border-zinc-700">
+            <button type="button" onClick={advance} className="rounded-lg border border-slate-300 px-4 py-2 dark:border-slate-700">
               Skip (S)
             </button>
           </div>
         ) : (
-          <div className="space-y-4 border-t border-zinc-100 pt-4 dark:border-zinc-800">
+          <div className="space-y-4 border-t border-slate-100 pt-4 dark:border-slate-800">
             <Answer q={card} />
             <LearnPanel
               refs={card.refs}

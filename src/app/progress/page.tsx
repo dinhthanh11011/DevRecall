@@ -12,7 +12,7 @@ export default function ProgressPage() {
     <div className="space-y-6">
       <header className="space-y-2">
         <h1 className="text-3xl font-semibold tracking-tight">Your progress</h1>
-        <p className="text-zinc-600 dark:text-zinc-400">
+        <p className="text-slate-600 dark:text-slate-400">
           Lưu trong trình duyệt này (localStorage). Export file JSON để backup hoặc chuyển sang máy khác.
         </p>
       </header>

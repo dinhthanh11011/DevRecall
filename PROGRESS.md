@@ -172,6 +172,7 @@ Per track: (1) read the track YAML, its `notionRefs` and the Notion map entry in
 
 ## Work log
 
+- 2026-10-07: **UI pass with the ui-ux-pro-max skill** (installed at `.claude/skills/ui-ux-pro-max`, MIT; design system saved to `design-system/devrecall/MASTER.md`, style "Minimalism & Swiss"). Palette zinc/sky → slate/blue (sky-600 text was 4.1:1, now blue-600 5.2:1); light-mode `text-zinc-400` → slate-500; fonts Geist → IBM Plex Sans + JetBrains Mono (Vietnamese subsets); emoji icons → inline SVG `Icon` + `VerifyChip`; global `:focus-visible` ring, `cursor: pointer`, `prefers-reduced-motion`; skip link; nav with `aria-current`; rating buttons `aria-pressed`, ≥36px, AA `selected` colours (white on amber-400 was 1.7:1); progress bars `role="progressbar"`; question toggle chevron. Deviation from MASTER: headings stay in Plex Sans, not JetBrains Mono (long Vietnamese titles read poorly in mono).
 - 2026-10-06: **Mini-batch 1 done: 22 lessons** (25: 01–02 · 27: 03–06 · 31: 01–03 · 32: 02–04 · 33: 01–02 · 34: 02–04 · 35: 04–06 · 36: 01–05). Validator 0/0, all Qs linked. Real runs: Docker 29.7, Node 24.21, Postgres 16/17/18, Redis 7.4, MinIO, supabase/postgres 17 + GoTrue + PostgREST + PgBouncer 1.26, Vitest 5 / Jest 30, Testcontainers 12, opossum 10.
   - Hint fixes in 35: `029` (the limiter as written allows 50/100, it doesn't block forever), `045` (read `pg_current_wal_lsn()` after COMMIT), `021` (shell form loses SIGTERM with dash on Debian images; busybox may forward it).
   - Possible fix, not applied: 25-`011` says `docker stop` waits 10s; Docker Desktop 29 stopped after ~3s by default (verify).
@@ -612,6 +613,7 @@ Personal Notion notes found to be wrong or outdated while writing content (fix t
 
 ## Decisions
 
+- UI follows `design-system/devrecall/MASTER.md` (ui-ux-pro-max). Components use Tailwind slate/blue scales directly; `globals.css` holds the matching tokens for focus ring, accent and `:target`.
 - "Learn more" refs are computed at build time, not stored in YAML: every question gets one without hand work, and headings are the only coupling. `learn:` overrides a bad match.
 
 - Content is YAML, not MDX: diff-friendly for review, validated by zod at build (`prebuild`).

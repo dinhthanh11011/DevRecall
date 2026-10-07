@@ -14,8 +14,8 @@ export function PlanProgress({ ids, label = "câu đạt ≥ 3" }: { ids: string
   const rated = ids.filter((id) => progress[id]).length;
   return (
     <div className="space-y-1">
-      <Bar value={ids.length ? done / ids.length : 0} className="bg-emerald-500" />
-      <p className="text-xs text-zinc-500">
+      <Bar value={ids.length ? done / ids.length : 0} className="bg-emerald-500" label="Plan progress" />
+      <p className="text-xs text-slate-500">
         {done}/{ids.length} {label}
         {rated > done ? ` · ${rated - done} đã chấm nhưng chưa vững` : ""}
       </p>

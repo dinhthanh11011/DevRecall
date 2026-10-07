@@ -1,29 +1,64 @@
 @import "tailwindcss";
 @plugin "@tailwindcss/typography";
 
+/*
+ * Design tokens: see design-system/devrecall/MASTER.md (ui-ux-pro-max, "Minimalism & Swiss Style").
+ * Neutral slate surfaces + link-blue accent; components use Tailwind's slate/blue scales that match these.
+ */
 :root {
-  --background: #fafafa;
-  --foreground: #18181b;
+  --background: #f8fafc; /* slate-50 */
+  --foreground: #1e293b; /* slate-800 */
+  --accent: #2563eb; /* blue-600, 5.2:1 on white */
+  --ring: #2563eb;
+  --target: #dbeafe; /* blue-100: highlighted :target heading */
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #020617; /* slate-950 */
+    --foreground: #f1f5f9; /* slate-100 */
+    --accent: #60a5fa; /* blue-400 */
+    --ring: #60a5fa;
+    --target: #172554; /* blue-950 */
+  }
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #09090b;
-    --foreground: #f4f4f5;
-  }
+  --color-accent: var(--accent);
+  --color-ring: var(--ring);
+  --font-sans: var(--font-plex-sans);
+  --font-mono: var(--font-jetbrains-mono);
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
   font-family: var(--font-sans), system-ui, sans-serif;
+}
+
+/* Visible keyboard focus on every interactive element (mouse clicks don't trigger :focus-visible). */
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+  border-radius: 0.25rem;
+}
+
+/* Tailwind v4 preflight sets buttons to cursor: default. */
+:where(button, [role="button"], summary, label[for]):not(:disabled) {
+  cursor: pointer;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 /* highlight.js theme is dark; keep code blocks readable in both modes. */
@@ -40,11 +75,5 @@ body {
 .prose h2[id]:target,
 .prose h3[id]:target {
   border-radius: 0.25rem;
-  background: #e0f2fe;
-}
-@media (prefers-color-scheme: dark) {
-  .prose h2[id]:target,
-  .prose h3[id]:target {
-    background: #082f49;
-  }
+  background: var(--target);
 }

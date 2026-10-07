@@ -33,10 +33,10 @@ export function Mermaid({ chart }: { chart: string }) {
       </div>
     );
   }
-  if (!svg) return <div className="not-prose my-4 h-24 animate-pulse rounded-lg bg-zinc-100 dark:bg-zinc-800" />;
+  if (!svg) return <div className="not-prose my-4 h-24 animate-pulse rounded-lg bg-slate-100 dark:bg-slate-800" />;
   return (
     <div
-      className="not-prose my-4 flex justify-center overflow-x-auto rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950 [&_svg]:max-w-full"
+      className="not-prose my-4 flex justify-center overflow-x-auto rounded-lg border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950 [&_svg]:max-w-full"
       dangerouslySetInnerHTML={{ __html: svg }}
     />
   );

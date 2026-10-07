@@ -39,10 +39,10 @@ export function ProgressDashboard({ tracks }: { tracks: T[] }) {
   return (
     <div className="space-y-8">
       <div className="flex flex-wrap gap-3 text-sm">
-        <button type="button" onClick={download} className="rounded-lg border border-zinc-300 px-3 py-1.5 dark:border-zinc-700">
+        <button type="button" onClick={download} className="rounded-lg border border-slate-300 px-3 py-1.5 dark:border-slate-700">
           Export JSON
         </button>
-        <button type="button" onClick={() => fileRef.current?.click()} className="rounded-lg border border-zinc-300 px-3 py-1.5 dark:border-zinc-700">
+        <button type="button" onClick={() => fileRef.current?.click()} className="rounded-lg border border-slate-300 px-3 py-1.5 dark:border-slate-700">
           Import JSON
         </button>
         <input
@@ -65,7 +65,7 @@ export function ProgressDashboard({ tracks }: { tracks: T[] }) {
         >
           Reset
         </button>
-        {message && <span className="self-center text-zinc-500">{message}</span>}
+        {message && <span className="self-center text-slate-500">{message}</span>}
       </div>
 
       {weakest.length > 0 && (
@@ -88,7 +88,7 @@ export function ProgressDashboard({ tracks }: { tracks: T[] }) {
 
       <section className="overflow-x-auto">
         <table className="w-full min-w-[560px] text-sm">
-          <thead className="text-left text-xs uppercase tracking-wide text-zinc-500">
+          <thead className="text-left text-xs uppercase tracking-wide text-slate-500">
             <tr>
               <th className="py-2">Track</th>
               <th className="w-24 py-2 text-right">Rated</th>
@@ -96,14 +96,14 @@ export function ProgressDashboard({ tracks }: { tracks: T[] }) {
               <th className="w-48 py-2 pl-4">Mastery</th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800">
+          <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
             {rows.map((r) => (
               <tr key={r.slug}>
                 <td className="py-2">
                   <Link href={`/tracks/${r.slug}`} className="hover:underline">
                     {r.title}
                   </Link>
-                  <div className="text-xs text-zinc-500">{r.tier}</div>
+                  <div className="text-xs text-slate-500">{r.tier}</div>
                 </td>
                 <td className="py-2 text-right tabular-nums">
                   {r.rated}/{r.total}
@@ -111,7 +111,7 @@ export function ProgressDashboard({ tracks }: { tracks: T[] }) {
                 <td className="py-2 text-right tabular-nums">{r.weak || ""}</td>
                 <td className="py-2 pl-4">
                   <div className="flex items-center gap-2">
-                    <Bar value={r.mastery} />
+                    <Bar value={r.mastery} label="Mastery" />
                     <span className="w-10 text-right text-xs tabular-nums">{Math.round(r.mastery * 100)}%</span>
                   </div>
                 </td>

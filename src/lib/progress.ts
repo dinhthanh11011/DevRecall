@@ -7,12 +7,13 @@ export type Rating = 0 | 1 | 2 | 3 | 4;
 export type Entry = { r: Rating; t: number; n: number };
 export type ProgressMap = Record<string, Entry>;
 
-export const RATINGS: { value: Rating; label: string; hint: string; className: string }[] = [
-  { value: 0, label: "Blank", hint: "Không biết / quên hẳn", className: "bg-rose-600" },
-  { value: 1, label: "Weak", hint: "Nhớ mang máng, sai ý chính", className: "bg-orange-500" },
-  { value: 2, label: "Partial", hint: "Đúng cơ chế, thiếu trade-off/ví dụ", className: "bg-amber-400" },
-  { value: 3, label: "Solid", hint: "Cơ chế + trade-off + ví dụ", className: "bg-emerald-500" },
-  { value: 4, label: "Strong", hint: "Thêm failure modes, số liệu, kinh nghiệm thật", className: "bg-sky-500" },
+/** `className` colours dots and bars; `selected` is the AA-contrast background for white button text. */
+export const RATINGS: { value: Rating; label: string; hint: string; className: string; selected: string }[] = [
+  { value: 0, label: "Blank", hint: "Không biết / quên hẳn", className: "bg-rose-600", selected: "bg-rose-700" },
+  { value: 1, label: "Weak", hint: "Nhớ mang máng, sai ý chính", className: "bg-orange-500", selected: "bg-orange-700" },
+  { value: 2, label: "Partial", hint: "Đúng cơ chế, thiếu trade-off/ví dụ", className: "bg-amber-400", selected: "bg-amber-700" },
+  { value: 3, label: "Solid", hint: "Cơ chế + trade-off + ví dụ", className: "bg-emerald-500", selected: "bg-emerald-700" },
+  { value: 4, label: "Strong", hint: "Thêm failure modes, số liệu, kinh nghiệm thật", className: "bg-blue-500", selected: "bg-blue-700" },
 ];
 
 const KEY = "devrecall:progress:v1";

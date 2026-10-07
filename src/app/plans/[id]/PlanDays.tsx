@@ -7,6 +7,7 @@ import { RATINGS, useProgress } from "@/lib/progress";
 import { LevelBadge } from "@/components/Badges";
 import { Markdown } from "@/components/Markdown";
 import { doneCount, PlanProgress } from "../PlanProgress";
+import { Icon } from "@/components/Icon";
 
 type Day = ResolvedPlan["days"][number];
 
@@ -37,36 +38,36 @@ export function PlanDays({ days }: { days: Day[] }) {
         return (
           <li
             key={day.title}
-            className={`rounded-xl border bg-white dark:bg-zinc-900 ${
-              i === today ? "border-sky-400 dark:border-sky-700" : "border-zinc-200 dark:border-zinc-800"
+            className={`rounded-xl border bg-white dark:bg-slate-900 ${
+              i === today ? "border-blue-400 dark:border-blue-700" : "border-slate-200 dark:border-slate-800"
             }`}
           >
             <button type="button" onClick={() => toggle(i)} aria-expanded={isOpen(i)} className="flex w-full items-start gap-3 p-4 text-left">
               <span
                 className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-sm font-semibold ${
-                  complete ? "bg-emerald-500 text-white" : i === today ? "bg-sky-600 text-white" : "bg-zinc-200 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
+                  complete ? "bg-emerald-500 text-white" : i === today ? "bg-blue-600 text-white" : "bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-300"
                 }`}
               >
-                {complete ? "✓" : i + 1}
+                {complete ? <Icon name="check" className="h-4 w-4" label="Hoàn thành" /> : i + 1}
               </span>
               <span className="flex-1 space-y-1">
                 <span className="flex flex-wrap items-center gap-2">
                   <span className="font-semibold">{day.title}</span>
-                  {i === today && <span className="rounded-full bg-sky-100 px-2 py-0.5 text-[11px] font-medium text-sky-800 dark:bg-sky-950 dark:text-sky-300">Hôm nay</span>}
+                  {i === today && <span className="rounded-full bg-blue-100 px-2 py-0.5 text-[11px] font-medium text-blue-800 dark:bg-blue-950 dark:text-blue-300">Hôm nay</span>}
                 </span>
-                <span className="block text-sm text-zinc-600 dark:text-zinc-400">{day.goal}</span>
+                <span className="block text-sm text-slate-600 dark:text-slate-400">{day.goal}</span>
                 <span className="block max-w-sm pt-1">
                   <PlanProgress ids={day.questionIds} />
                 </span>
               </span>
-              <span className="mt-1 text-zinc-400">{isOpen(i) ? "−" : "+"}</span>
+              <span className="mt-1 text-slate-500">{isOpen(i) ? "−" : "+"}</span>
             </button>
             {isOpen(i) && (
-              <div className="space-y-5 border-t border-zinc-100 p-4 dark:border-zinc-800">
+              <div className="space-y-5 border-t border-slate-100 p-4 dark:border-slate-800">
                 <div className="flex flex-wrap gap-3">
                   <Link
                     href={`/practice?ids=${day.questionIds.join(",")}`}
-                    className="rounded-lg bg-sky-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-sky-700"
+                    className="rounded-lg bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700"
                   >
                     Practice phần này ({day.questionIds.length} câu)
                   </Link>
@@ -78,8 +79,8 @@ export function PlanDays({ days }: { days: Day[] }) {
                         {item.title}
                       </Link>
                       {item.lessons.length > 0 && (
-                        <span className="text-xs text-zinc-500">
-                          📚 Bài học:{" "}
+                        <span className="text-xs text-slate-500">
+                          <Icon name="book" className="mr-1 h-3 w-3" />Bài học:{" "}
                           {item.lessons.map((l, k) => (
                             <span key={l.slug}>
                               {k > 0 && " · "}
@@ -91,12 +92,12 @@ export function PlanDays({ days }: { days: Day[] }) {
                         </span>
                       )}
                       {item.read.length > 0 && (
-                        <span className="text-xs text-zinc-500">
+                        <span className="text-xs text-slate-500">
                           Đọc:{" "}
                           {item.read.map((r, k) => (
                             <span key={r.anchor}>
                               {k > 0 && " · "}
-                              <Link href={`/tracks/${item.slug}#${r.anchor}`} className="text-sky-700 hover:underline dark:text-sky-400">
+                              <Link href={`/tracks/${item.slug}#${r.anchor}`} className="text-blue-700 hover:underline dark:text-blue-400">
                                 {r.title}
                               </Link>
                             </span>
@@ -111,12 +112,12 @@ export function PlanDays({ days }: { days: Day[] }) {
                           <li key={q.id} className="flex items-start gap-2 text-sm">
                             <span
                               title={r === undefined ? "chưa chấm" : RATINGS[r].label}
-                              className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${r === undefined ? "bg-zinc-300 dark:bg-zinc-700" : RATINGS[r].className}`}
+                              className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${r === undefined ? "bg-slate-300 dark:bg-slate-700" : RATINGS[r].className}`}
                             />
                             <span className="shrink-0">
                               <LevelBadge level={q.level} />
                             </span>
-                            <Link href={`/tracks/${q.slug}#${q.id}`} className="hover:text-sky-700 hover:underline dark:hover:text-sky-400">
+                            <Link href={`/tracks/${q.slug}#${q.id}`} className="hover:text-blue-700 hover:underline dark:hover:text-blue-400">
                               <Markdown inline>{q.q}</Markdown>
                             </Link>
                           </li>

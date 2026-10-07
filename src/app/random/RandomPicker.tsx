@@ -7,10 +7,11 @@ import { LEVELS, LEVEL_LABELS, QUESTION_TYPES, type Level, type QuestionType } f
 import { RATINGS, rate, useProgress, type Rating } from "@/lib/progress";
 import { loadTrack, slugOf } from "@/lib/trackData";
 import type { IndexEntry, RichQuestion, TrackData } from "@/lib/types";
-import { Chip, EssentialBadge, LevelBadge } from "@/components/Badges";
+import { Chip, EssentialBadge, LevelBadge, VerifyChip } from "@/components/Badges";
 import { LearnPanel } from "@/components/LearnPanel";
 import { Markdown } from "@/components/Markdown";
 import { Answer, RatingButtons } from "@/components/QuestionCard";
+import { Icon } from "@/components/Icon";
 
 type TierOption = { id: number; title: string; tracks: { slug: string; title: string }[] };
 type Pool = "all" | "unrated" | "weak" | "not-strong";
@@ -171,8 +172,8 @@ export function RandomPicker({ index, tiers }: { index: IndexEntry[]; tiers: Tie
   const pill = (active: boolean) =>
     `rounded-full px-3 py-1 text-xs font-medium transition ${
       active
-        ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
-        : "border border-zinc-300 text-zinc-600 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+        ? "bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900"
+        : "border border-slate-300 text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
     }`;
 
   const filterCount = tracks.size + levels.size + types.size + (pool !== "all" ? 1 : 0) + (essentialOnly ? 1 : 0);
@@ -182,18 +183,18 @@ export function RandomPicker({ index, tiers }: { index: IndexEntry[]; tiers: Tie
     <div className="space-y-6">
       <details
         open={!current}
-        className="group rounded-xl border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900"
+        className="group rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900"
       >
         <summary className="flex cursor-pointer list-none items-center justify-between gap-3 p-4 text-sm">
           <span className="font-semibold">
             Bộ lọc{" "}
-            <span className="font-normal text-zinc-500">
+            <span className="font-normal text-slate-500">
               {filterCount ? `(${filterCount} đang bật)` : "(tất cả)"} · {candidates.length} câu khớp
             </span>
           </span>
-          <span className="text-zinc-400 group-open:rotate-180">▾</span>
+          <span className="text-slate-500 group-open:rotate-180">▾</span>
         </summary>
-        <div className="space-y-5 border-t border-zinc-100 p-4 dark:border-zinc-800">
+        <div className="space-y-5 border-t border-slate-100 p-4 dark:border-slate-800">
           <fieldset className="space-y-3">
             <legend className="flex items-center gap-2 text-sm font-semibold">
               Topic
@@ -219,7 +220,7 @@ export function RandomPicker({ index, tiers }: { index: IndexEntry[]; tiers: Tie
                           return next;
                         })
                       }
-                      className={`text-xs uppercase tracking-wide hover:underline ${all ? "text-sky-700 dark:text-sky-400" : "text-zinc-500"}`}
+                      className={`text-xs uppercase tracking-wide hover:underline ${all ? "text-blue-700 dark:text-blue-400" : "text-slate-500"}`}
                       title="Chọn / bỏ cả tier"
                     >
                       {tier.id} · {tier.title}
@@ -284,7 +285,7 @@ export function RandomPicker({ index, tiers }: { index: IndexEntry[]; tiers: Tie
                   Tất cả câu
                 </button>
                 <button type="button" className={pill(essentialOnly)} onClick={() => setEssentialOnly(true)}>
-                  ⭐ Chỉ trọng điểm
+                  <Icon name="star" className="mr-1 h-3 w-3 text-yellow-500" />Chỉ trọng điểm
                 </button>
               </div>
             </fieldset>
@@ -297,27 +298,28 @@ export function RandomPicker({ index, tiers }: { index: IndexEntry[]; tiers: Tie
           type="button"
           onClick={pick}
           disabled={loading}
-          className="rounded-lg bg-sky-600 px-5 py-2.5 font-medium text-white hover:bg-sky-700 disabled:opacity-50"
+          className="rounded-lg bg-blue-600 px-5 py-2.5 font-medium text-white hover:bg-blue-700 disabled:opacity-50"
         >
-          {loading ? "Loading…" : current ? "🎲 Câu khác (R)" : "🎲 Bốc câu hỏi (R)"}
+          {!loading && <Icon name="shuffle" className="mr-2 h-4 w-4" />}
+          {loading ? "Loading…" : current ? "Câu khác (R)" : "Bốc câu hỏi (R)"}
         </button>
-        <span className="text-sm text-zinc-500">{candidates.length} câu khớp bộ lọc</span>
+        <span className="text-sm text-slate-500">{candidates.length} câu khớp bộ lọc</span>
       </div>
       {notice && <p className="text-sm text-amber-700 dark:text-amber-400">{notice}</p>}
       {error && <p className="text-sm text-rose-600">{error}</p>}
 
       {current && q && (
-        <article className="space-y-4 rounded-xl border border-zinc-200 bg-white p-6 dark:border-zinc-800 dark:bg-zinc-900">
+        <article className="space-y-4 rounded-xl border border-slate-200 bg-white p-6 dark:border-slate-800 dark:bg-slate-900">
           <div className="flex flex-wrap items-center gap-2">
-            <Link href={`/tracks/${current.track.slug}`} className="text-sm font-medium text-sky-700 hover:underline dark:text-sky-400">
+            <Link href={`/tracks/${current.track.slug}`} className="text-sm font-medium text-blue-700 hover:underline dark:text-blue-400">
               {current.track.title}
             </Link>
             <LevelBadge level={q.level} />
             <Chip>{q.type}</Chip>
             {q.essential && <EssentialBadge />}
-            {q.verify && <Chip>⚠ verify</Chip>}
+            {q.verify && <VerifyChip />}
             {progress[q.id] && <Chip>last: {RATINGS[progress[q.id].r].label}</Chip>}
-            <span className="ml-auto font-mono text-xs text-zinc-400">{q.id}</span>
+            <span className="ml-auto font-mono text-xs text-slate-500">{q.id}</span>
           </div>
           <div className="text-lg font-medium">
             <Markdown>{q.q}</Markdown>
@@ -328,20 +330,20 @@ export function RandomPicker({ index, tiers }: { index: IndexEntry[]; tiers: Tie
               <button
                 type="button"
                 onClick={() => setRevealed(true)}
-                className="rounded-lg bg-zinc-900 px-4 py-2 font-medium text-white dark:bg-zinc-100 dark:text-zinc-900"
+                className="rounded-lg bg-slate-900 px-4 py-2 font-medium text-white dark:bg-slate-100 dark:text-slate-900"
               >
                 Show answer (Space)
               </button>
               <button
                 type="button"
                 onClick={() => setRevealed(true)}
-                className="rounded-lg border border-zinc-300 px-4 py-2 text-sm dark:border-zinc-700"
+                className="rounded-lg border border-slate-300 px-4 py-2 text-sm dark:border-slate-700"
               >
                 Chưa biết — học luôn
               </button>
             </div>
           ) : (
-            <div className="space-y-4 border-t border-zinc-100 pt-4 dark:border-zinc-800">
+            <div className="space-y-4 border-t border-slate-100 pt-4 dark:border-slate-800">
               <Answer q={q} />
               <LearnPanel
                 refs={q.refs}
@@ -352,7 +354,7 @@ export function RandomPicker({ index, tiers }: { index: IndexEntry[]; tiers: Tie
               />
               <RatingButtons id={q.id} onRated={setGraded} />
               {graded !== null && (
-                <p className="text-sm text-zinc-500">
+                <p className="text-sm text-slate-500">
                   Đã chấm {graded} · {RATINGS[graded].label}. Nhấn <kbd>R</kbd> để bốc câu tiếp.
                 </p>
               )}
@@ -363,16 +365,16 @@ export function RandomPicker({ index, tiers }: { index: IndexEntry[]; tiers: Tie
 
       {history.length > 1 && (
         <section className="space-y-2">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-zinc-500">Vừa bốc</h2>
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">Vừa bốc</h2>
           <ul className="space-y-1 text-sm">
             {history.slice(1).map((id) => {
               const r = progress[id]?.r;
               return (
                 <li key={id} className="flex items-center gap-2">
                   <span
-                    className={`h-2 w-2 shrink-0 rounded-full ${r === undefined ? "bg-zinc-300 dark:bg-zinc-700" : RATINGS[r].className}`}
+                    className={`h-2 w-2 shrink-0 rounded-full ${r === undefined ? "bg-slate-300 dark:bg-slate-700" : RATINGS[r].className}`}
                   />
-                  <button type="button" onClick={() => show(id)} className="text-left text-sky-700 hover:underline dark:text-sky-400">
+                  <button type="button" onClick={() => show(id)} className="text-left text-blue-700 hover:underline dark:text-blue-400">
                     {titles.get(slugOf(id)) ?? slugOf(id)} · <span className="font-mono text-xs">{id}</span>
                   </button>
                 </li>

@@ -5,8 +5,9 @@ import { getAllSlugs, getLessons, getNeighbours, getTrack, getTrackData } from "
 import { readingMinutes } from "@/lib/constants";
 import { Markdown } from "@/components/Markdown";
 import { QuestionList } from "@/components/QuestionList";
-import { Chip, StatusBadge } from "@/components/Badges";
+import { StatusBadge, VerifyChip } from "@/components/Badges";
 import { TrackProgress } from "@/components/ProgressBar";
+import { Icon } from "@/components/Icon";
 
 export const dynamicParams = false;
 
@@ -31,32 +32,32 @@ export default async function TrackPage(props: PageProps<"/tracks/[slug]">) {
   return (
     <div className="space-y-10">
       <header className="space-y-3">
-        <Link href="/" className="text-sm text-zinc-500 hover:underline">
+        <Link href="/" className="text-sm text-slate-500 hover:underline">
           ← Roadmap
         </Link>
         <div className="flex flex-wrap items-center gap-3">
-          <span className="font-mono text-sm text-zinc-400">{track.id.slice(0, 2)}</span>
+          <span className="font-mono text-sm text-slate-500">{track.id.slice(0, 2)}</span>
           <h1 className="text-3xl font-semibold tracking-tight">{track.title}</h1>
           <StatusBadge status={track.status} />
         </div>
-        <p className="max-w-3xl text-zinc-600 dark:text-zinc-400">{track.summary}</p>
+        <p className="max-w-3xl text-slate-600 dark:text-slate-400">{track.summary}</p>
         <div className="max-w-md">
           <TrackProgress slug={track.slug} total={track.questions.length} />
         </div>
         <div className="flex flex-wrap gap-3 text-sm">
           <Link
             href={`/practice?tracks=${track.slug}`}
-            className="rounded-lg bg-sky-600 px-3 py-1.5 font-medium text-white hover:bg-sky-700"
+            className="rounded-lg bg-blue-600 px-3 py-1.5 font-medium text-white hover:bg-blue-700"
           >
             Practice this track
           </Link>
           <Link
             href={`/random?tracks=${track.slug}`}
-            className="rounded-lg border border-zinc-300 px-3 py-1.5 hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
+            className="rounded-lg border border-slate-300 px-3 py-1.5 hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
           >
-            🎲 Random câu hỏi
+            <Icon name="shuffle" className="mr-1.5 h-4 w-4" />Random câu hỏi
           </Link>
-          <a href="#questions" className="rounded-lg border border-zinc-300 px-3 py-1.5 dark:border-zinc-700">
+          <a href="#questions" className="rounded-lg border border-slate-300 px-3 py-1.5 dark:border-slate-700">
             Jump to questions ({track.questions.length})
           </a>
         </div>
@@ -65,8 +66,8 @@ export default async function TrackPage(props: PageProps<"/tracks/[slug]">) {
       {lessons.length > 0 && (
         <section id="lessons" className="scroll-mt-16 space-y-3">
           <div className="flex flex-wrap items-baseline justify-between gap-2">
-            <h2 className="text-2xl font-semibold">📚 Bài học</h2>
-            <span className="text-xs text-zinc-500">
+            <h2 className="text-2xl font-semibold"><Icon name="book" className="mr-2 h-5 w-5 text-blue-600 dark:text-blue-400" />Bài học</h2>
+            <span className="text-xs text-slate-500">
               {lessons.length} bài · ~{readingMinutes(lessons.reduce((n, l) => n + l.words, 0))} phút đọc. Học theo thứ tự, rồi làm câu hỏi.
             </span>
           </div>
@@ -75,16 +76,16 @@ export default async function TrackPage(props: PageProps<"/tracks/[slug]">) {
               <li key={l.slug}>
                 <Link
                   href={`/tracks/${track.slug}/learn/${l.slug}`}
-                  className="block h-full rounded-xl border border-zinc-200 bg-white p-4 hover:border-sky-400 dark:border-zinc-800 dark:bg-zinc-900"
+                  className="block h-full rounded-xl border border-slate-200 bg-white p-4 hover:border-blue-400 dark:border-slate-800 dark:bg-slate-900"
                 >
-                  <div className="mb-1 flex items-center gap-2 text-xs text-zinc-500">
+                  <div className="mb-1 flex items-center gap-2 text-xs text-slate-500">
                     <span className="font-mono">{String(l.order).padStart(2, "0")}</span>
                     <span>~{readingMinutes(l.words)} phút</span>
                     {l.questions > 0 && <span>· {l.questions} câu</span>}
-                    {l.verify && <Chip>⚠ verify</Chip>}
+                    {l.verify && <VerifyChip />}
                   </div>
                   <p className="font-medium">{l.title}</p>
-                  <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">{l.summary}</p>
+                  <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">{l.summary}</p>
                 </Link>
               </li>
             ))}
@@ -92,9 +93,9 @@ export default async function TrackPage(props: PageProps<"/tracks/[slug]">) {
         </section>
       )}
 
-      <section className="rounded-xl border border-zinc-200 bg-white p-6 dark:border-zinc-800 dark:bg-zinc-900">
+      <section className="rounded-xl border border-slate-200 bg-white p-6 dark:border-slate-800 dark:bg-slate-900">
         {lessons.length > 0 && (
-          <p className="mb-4 text-xs font-semibold uppercase tracking-wide text-zinc-500">Tóm tắt & cheat sheet của track</p>
+          <p className="mb-4 text-xs font-semibold uppercase tracking-wide text-slate-500">Tóm tắt & cheat sheet của track</p>
         )}
         <Markdown anchors>{track.overview}</Markdown>
       </section>
@@ -119,7 +120,7 @@ export default async function TrackPage(props: PageProps<"/tracks/[slug]">) {
         <QuestionList questions={data.questions} />
       </section>
 
-      <nav className="flex justify-between gap-4 border-t border-zinc-200 pt-6 text-sm dark:border-zinc-800">
+      <nav className="flex justify-between gap-4 border-t border-slate-200 pt-6 text-sm dark:border-slate-800">
         {prev ? (
           <Link href={`/tracks/${prev.slug}`} className="hover:underline">
             ← {prev.title}
@@ -140,12 +141,12 @@ export default async function TrackPage(props: PageProps<"/tracks/[slug]">) {
 function LinkList({ title, note, links }: { title: string; note?: string; links: { title: string; url: string }[] }) {
   return (
     <div className="space-y-2">
-      <h2 className="text-sm font-semibold uppercase tracking-wide text-zinc-500">{title}</h2>
-      {note && <p className="text-xs text-zinc-500">{note}</p>}
+      <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">{title}</h2>
+      {note && <p className="text-xs text-slate-500">{note}</p>}
       <ul className="space-y-1 text-sm">
         {links.map((l) => (
           <li key={l.url}>
-            <a href={l.url} target="_blank" rel="noreferrer" className="text-sky-700 hover:underline dark:text-sky-400">
+            <a href={l.url} target="_blank" rel="noreferrer" className="text-blue-700 hover:underline dark:text-blue-400">
               {l.title} ↗
             </a>
           </li>

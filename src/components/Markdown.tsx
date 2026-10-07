@@ -70,7 +70,7 @@ export function Markdown({
 }) {
   if (inline) {
     return (
-      <span className="prose prose-zinc dark:prose-invert max-w-none prose-code:before:content-none prose-code:after:content-none">
+      <span className="prose prose-slate dark:prose-invert max-w-none prose-code:before:content-none prose-code:after:content-none">
         <ReactMarkdown remarkPlugins={[remarkGfm]} components={inlineComponents}>
           {children}
         </ReactMarkdown>
@@ -78,7 +78,7 @@ export function Markdown({
     );
   }
   return (
-    <div className={`prose prose-zinc dark:prose-invert max-w-none ${compact ? "prose-sm" : ""} prose-pre:bg-zinc-900 prose-pre:text-zinc-100 prose-code:before:content-none prose-code:after:content-none`}>
+    <div className={`prose prose-slate dark:prose-invert max-w-none ${compact ? "prose-sm" : ""} prose-pre:bg-slate-900 prose-pre:text-slate-100 prose-code:before:content-none prose-code:after:content-none`}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[
