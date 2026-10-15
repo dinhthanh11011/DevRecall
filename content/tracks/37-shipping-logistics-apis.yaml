@@ -1,0 +1,907 @@
+id: 37-shipping-logistics-apis
+slug: shipping-apis
+title: "Mock: Shipping & Logistics API Integration (FedEx, UPS, USPS, DHL, EasyPost, Shippo)"
+tier: 9
+status: drafted
+summary: Bộ mock theo yêu cầu JD "proven experience integrating FedEx, UPS, USPS, DHL, EasyPost, Shippo" — domain vận chuyển (rate, label, tracking, address, customs, billable weight), cách carrier API và aggregator hoạt động, và cách thiết kế integration chịu lỗi (adapter, idempotency khi mua label, webhook, retry, reconcile, multi-tenant carrier account).
+cvLinked: true
+prerequisites: [08-api-design, 16-caching, 17-messaging-kafka, 22-web-security, 35-scenario-concurrency-reliability]
+# Must-know questions, highest priority first (study plans take the first few).
+essentials:
+  - shipping-apis-001
+  - shipping-apis-011
+  - shipping-apis-016
+  - shipping-apis-019
+  - shipping-apis-013
+  - shipping-apis-024
+  - shipping-apis-031
+  - shipping-apis-038
+overview: |-
+  ## TL;DR
+
+  - Một shipping integration làm 5 việc chính: **address validation → rate shopping → mua label (label purchase) → tracking → post-shipment** (void/refund, return label, reconcile hoá đơn carrier). Customs chỉ cần khi gửi quốc tế. Nói được flow này end-to-end là qua được 50% câu hỏi.
+  - Có 2 cách tích hợp: **trực tiếp từng carrier** (FedEx, UPS, USPS, DHL: mỗi hãng một API, auth, format, mã lỗi khác nhau) hoặc qua **aggregator** (EasyPost, Shippo, ShipEngine: một API chung cho hàng chục carrier). Trade-off: aggregator rẻ effort, đắt per-label và phụ thuộc vendor; direct thì kiểm soát và giá tốt hơn nhưng phải tự maintain N adapter.
+  - Thao tác nguy hiểm nhất là **mua label**: nó **tốn tiền thật** và **không idempotent** phía carrier. Timeout rồi retry mù là bị tính tiền 2 label. Phải dùng idempotency key/reference, ghi trạng thái trước khi gọi, và reconcile.
+  - Tracking là **event stream không tin cậy**: webhook có thể trùng lặp, đến sai thứ tự, hoặc mất. Status phải **normalize** về một state machine chung, xử lý idempotent theo event id, và có polling làm fallback.
+  - Kiến trúc chuẩn: **canonical model + carrier adapter** (anti-corruption layer), một **OAuth token cache** cho mỗi carrier account, timeout/retry/circuit breaker cho từng carrier, và queue cho tác vụ nặng (label hàng loạt, tracking sync). Tiền lưu theo minor unit, đơn vị cân/đo phải quy đổi tường minh.
+
+  ## Khái niệm cốt lõi
+
+  | Khái niệm | Một câu | Ví dụ ngắn |
+  |---|---|---|
+  | Carrier | Hãng vận chuyển thật, cầm hàng đi giao | FedEx, UPS, USPS, DHL Express |
+  | Aggregator / multi-carrier API | Lớp API chung bọc nhiều carrier, có thêm tính năng (address verify, tracker, insurance) | EasyPost, Shippo, ShipEngine |
+  | Service level | Gói dịch vụ của carrier, quyết định tốc độ và giá | `FEDEX_GROUND`, UPS `03` (Ground), USPS Priority Mail |
+  | Rate shopping | Hỏi giá nhiều carrier/service cho cùng một kiện, rồi chọn theo giá, thời gian hoặc rule | Ground $8.20 / 5 ngày vs 2Day $17.40 / 2 ngày |
+  | Label | Nhãn vận đơn có barcode + tracking number, mua xong thì carrier tính tiền | PDF 4x6, PNG, hoặc **ZPL** cho máy in nhiệt |
+  | Tracking number | Mã định danh kiện, dùng để tra trạng thái | `1Z999AA10123456784` (định dạng UPS) |
+  | Tracking event | Một mốc trên hành trình kiện (scan) | `in_transit` tại Memphis TN, 2026-10-14T03:12Z |
+  | Address validation | Chuẩn hoá và kiểm tra địa chỉ có thật/giao được, kèm cờ residential | "123 main st apt 4" → `123 MAIN ST APT 4`, ZIP+4, residential=true |
+  | Actual vs dimensional (DIM) weight | DIM weight = thể tích / divisor. **Billable weight = max(actual, DIM)** | Thùng 20×16×12 in, 5 lb → DIM = 3840/139 ≈ 27.6 → tính 28 lb |
+  | Surcharge / accessorial | Phụ phí ngoài giá gốc | Residential, fuel, delivery area, additional handling, signature |
+  | Manifest / end-of-day close | Chốt danh sách kiện trong ngày gửi cho carrier | USPS SCAN Form, FedEx Ground close |
+  | Void / refund label | Huỷ label chưa dùng để lấy lại tiền, có thời hạn | EasyPost `refund`, UPS void shipment |
+  | Return label | Label cho khách gửi trả, thường **pay-on-use** (chỉ trả tiền khi được scan) | Label in sẵn trong hộp hàng |
+  | Customs / commercial invoice | Khai hải quan khi gửi quốc tế: mô tả, HS code, giá trị, xuất xứ | CN22/CN23 cho bưu chính, commercial invoice cho express |
+  | Incoterms (DDP/DAP) | Ai trả thuế và phí nhập khẩu: người gửi (DDP) hay người nhận (DAP/DDU) | DDP: khách không bị thu thêm tiền khi nhận hàng |
+  | Carrier account (BYOA) | Tài khoản carrier của merchant, có giá đã đàm phán riêng | Tenant A dùng UPS account riêng, tenant B dùng rate của aggregator |
+  | Webhook | Carrier hoặc aggregator gọi về endpoint của mình khi có event | `tracker.updated` từ EasyPost |
+
+  ## Cơ chế hoạt động
+
+  ### Vòng đời một shipment end-to-end
+
+  ```mermaid
+  flowchart LR
+    A["Checkout: nhập địa chỉ"] --> B["Address validation<br/>+ residential flag"]
+    B --> C["Rate shopping<br/>N carrier × service"]
+    C --> D["Khách chọn rate<br/>(lưu quote + expiry)"]
+    D --> E["Order paid → fulfillment"]
+    E --> F["Re-rate + mua label<br/>(idempotency key)"]
+    F --> G["Lưu label PDF/ZPL vào S3<br/>in label, dán kiện"]
+    G --> H["Manifest / pickup"]
+    H --> I["Tracking events<br/>webhook + polling"]
+    I --> J{"Kết quả"}
+    J -->|delivered| K["Đóng shipment<br/>notify khách"]
+    J -->|exception / return| L["Xử lý ngoại lệ<br/>reship / refund"]
+    F -. "không dùng" .-> V["Void / refund label"]
+    K --> R["Reconcile hoá đơn carrier<br/>(DIM adjustment)"]
+  ```
+
+  Có 3 thời điểm tiền thật bị trừ hoặc điều chỉnh: lúc **mua label**, lúc **carrier audit lại cân/đo** (adjustment trên invoice), và khi **void/refund**. Rate hiển thị ở checkout chỉ là **quote**; giá thật chốt lúc mua label và có thể khác.
+
+  ### Mua label an toàn khi mạng chập chờn
+
+  ```mermaid
+  sequenceDiagram
+    participant W as Label worker
+    participant DB as Postgres
+    participant AG as Carrier / Aggregator
+    W->>DB: INSERT shipment_label status=PENDING, idem_key=order_id+parcel_no
+    W->>AG: Buy label (Idempotency-Key / reference = idem_key)
+    AG--xW: Timeout, không biết đã mua hay chưa
+    W->>AG: Lookup theo reference hoặc retry cùng idempotency key
+    AG-->>W: Label đã tồn tại, trả tracking + label_url
+    W->>DB: UPDATE status=PURCHASED, tracking_no, cost
+    Note over W,DB: Không bao giờ tạo request mua mới với key mới khi chưa rõ kết quả lần trước
+  ```
+
+  ### Tracking: từ event thô về state machine chung
+
+  ```mermaid
+  stateDiagram-v2
+    [*] --> pre_transit: label created
+    pre_transit --> in_transit: first scan
+    in_transit --> out_for_delivery
+    out_for_delivery --> delivered
+    in_transit --> exception: delay / damaged / address issue
+    out_for_delivery --> exception: delivery attempt failed
+    exception --> in_transit: resolved
+    exception --> return_to_sender
+    out_for_delivery --> available_for_pickup
+    available_for_pickup --> delivered
+    delivered --> [*]
+    return_to_sender --> [*]
+  ```
+
+  Mỗi carrier có hàng trăm mã scan riêng. Adapter map chúng về khoảng 8–10 status chung. Status chỉ được **tiến lên** theo thứ tự hợp lệ (event cũ đến muộn không được kéo `delivered` về `in_transit`), trừ các nhánh hợp lệ như `exception → in_transit`.
+
+  ### Kiến trúc tích hợp nhiều carrier
+
+  ```mermaid
+  flowchart TB
+    API["Shipping service API<br/>(canonical model)"] --> RS["Rate service<br/>cache + timeout budget"]
+    API --> LS["Label service<br/>idempotent, queue"]
+    API --> TS["Tracking service<br/>webhook + poller"]
+    RS --> REG["Carrier registry<br/>(strategy theo carrier)"]
+    LS --> REG
+    TS --> REG
+    REG --> FX["FedEx adapter"]
+    REG --> UP["UPS adapter"]
+    REG --> US["USPS adapter"]
+    REG --> EP["EasyPost / Shippo adapter"]
+    FX & UP & US & EP --> TOK["OAuth token cache<br/>theo carrier account"]
+    FX & UP & US & EP --> CB["Timeout · retry · circuit breaker<br/>· rate limit theo carrier"]
+    SEC["Secrets: carrier credentials<br/>mã hoá theo tenant (KMS)"] -.-> TOK
+  ```
+
+  ## Trade-offs
+
+  | Quyết định | Lựa chọn A | Lựa chọn B | Khi nào chọn |
+  |---|---|---|---|
+  | Cách tích hợp | Direct carrier API | Aggregator (EasyPost/Shippo) | A: volume lớn, ít carrier, cần tính năng sâu (freight, pickup đặc thù), muốn bỏ phí per-label. B: cần nhiều carrier nhanh, team nhỏ, muốn tracking và address verify có sẵn |
+  | Rate ở checkout | Gọi carrier realtime | Bảng giá tĩnh / flat rate / cache | Realtime cho chính xác khi giá biến động. Bảng tĩnh khi cần nhanh và ổn định, chấp nhận chênh lệch. Thực tế: realtime có cache và fallback |
+  | Mua label | Đồng bộ trong request | Bất đồng bộ qua queue | Đồng bộ cho UI "in label ngay" từng kiện. Queue cho batch hàng trăm kiện, có retry và rate limit |
+  | Tracking | Webhook | Polling | Webhook nhanh và rẻ nhưng có thể mất hoặc trùng. Polling chắc chắn nhưng tốn quota. Dùng cả hai: webhook chính, poll định kỳ những kiện "im lặng" |
+  | Address validation | Chặn cứng (block checkout) | Gợi ý + cho khách xác nhận | Gợi ý gần như luôn đúng hơn: validator có false negative (nhà mới, địa chỉ nông thôn, quốc tế) |
+  | Carrier account | Dùng account của aggregator | BYOA, mỗi tenant tự kết nối account | BYOA khi merchant có giá đàm phán, đổi lại phải lưu credential an toàn và xử lý lỗi auth theo tenant |
+  | Label format | PDF/PNG | ZPL | ZPL cho máy in nhiệt ở kho (nhanh, sắc nét). PDF cho merchant nhỏ in bằng máy văn phòng |
+
+  ## Pitfalls
+
+  - ❌ Retry mua label khi timeout bằng request mới. ✅ Idempotency key/reference cố định, lookup trước khi mua lại, reconcile cuối ngày.
+  - ❌ Lưu tiền bằng float, trộn currency. ✅ Integer minor unit (cents) + currency code; giữ nguyên chuỗi số carrier trả về để audit.
+  - ❌ Trộn lb/oz/kg, in/cm. ✅ Canonical unit (ví dụ gram + mm) và convert tại adapter; test riêng phần convert.
+  - ❌ Tin rate ở checkout bằng giá label. ✅ Re-rate lúc mua, có ngưỡng chênh lệch và cảnh báo; lưu quote kèm thời hạn.
+  - ❌ Xin OAuth token mới cho mỗi request. ✅ Cache token theo account, refresh trước khi hết hạn, single-flight để tránh đua.
+  - ❌ Map status bằng `if` rải khắp codebase. ✅ Bảng mapping trong adapter + state machine chỉ cho phép chuyển hợp lệ.
+  - ❌ Webhook handler xử lý nặng rồi mới trả 200. ✅ Verify signature → lưu event (dedupe theo id) → trả 2xx nhanh → xử lý async.
+  - ❌ Phụ thuộc `label_url` của carrier/aggregator lâu dài. ✅ Tải file về S3 ngay sau khi mua.
+  - ❌ Sandbox chạy ngon là xong. ✅ Sandbox khác production (dữ liệu giả, tracking giả, thiếu service). Có checklist go-live và test với vài label production rồi void.
+  - ❌ Log nguyên request/response. ✅ Mask PII (tên, địa chỉ, SĐT) và credential; giữ correlation id và carrier request id.
+
+  ## Cheat sheet
+
+  - Flow: **validate address → rate → mua label → manifest/pickup → track → void/return → reconcile**.
+  - Billable weight = **max(actual, DIM)**; DIM = L×W×H / divisor. Divisor phổ biến: 139 (in³/lb, FedEx/UPS daily rates), 166 (USPS cho kiện lớn), 5000 (cm³/kg, nhiều carrier quốc tế). Divisor có thể khác theo hợp đồng (verify).
+  - Auth: FedEx, UPS và USPS API mới đều dùng **OAuth 2.0 client credentials** (token sống khoảng 1 giờ, verify). EasyPost dùng API key (Basic auth), Shippo dùng `ShippoToken`.
+  - Legacy đã hoặc đang bị khai tử: FedEx SOAP Web Services, UPS access-key auth, USPS Web Tools XML (verify mốc thời gian). Câu "đã migrate lên API mới" là điểm cộng lớn.
+  - Mua label = **side effect có tiền**: idempotency key, trạng thái PENDING trước khi gọi, không retry mù, reconcile.
+  - Tracking = **at-least-once, out-of-order**: dedupe theo event id, chỉ tiến state theo thứ tự, poll fallback cho kiện im lặng.
+  - Resilience theo carrier: timeout ngắn ở checkout (khoảng 2–3 s), circuit breaker, fallback rate, rate limit 429 kèm backoff và jitter.
+  - Quốc tế: HS code, giá trị khai báo, xuất xứ, Incoterms (DDP/DAP), giấy tờ điện tử (ETD/paperless), hàng cấm và pin lithium.
+  - Multi-tenant: credential carrier mã hoá theo tenant, token cache key theo account, rate limit và circuit breaker theo account.
+  - Observability: metrics theo carrier × operation (latency, error rate, % fallback), cảnh báo tỉ lệ label fail và kiện kẹt quá N ngày.
+notionRefs: []
+references:
+  - { title: "FedEx Developer Portal", url: "https://developer.fedex.com/api/en-us/home.html" }
+  - { title: "UPS Developer Portal (OAuth + REST APIs)", url: "https://developer.ups.com/" }
+  - { title: "USPS APIs (developers.usps.com)", url: "https://developers.usps.com/" }
+  - { title: "DHL Developer Portal", url: "https://developer.dhl.com/" }
+  - { title: "EasyPost API docs", url: "https://docs.easypost.com/docs" }
+  - { title: "Shippo API docs", url: "https://docs.goshippo.com/" }
+  - { title: "Stripe: Idempotent requests (pattern reference)", url: "https://docs.stripe.com/api/idempotent_requests" }
+  - { title: "WCO: Harmonized System", url: "https://www.wcoomc.org/en/topics/nomenclature/overview/what-is-the-harmonized-system.aspx" }
+questions:
+  - id: shipping-apis-001
+    level: easy
+    type: concept
+    q: Walk me through the lifecycle of a shipment in an e-commerce system, from the moment the customer types an address at checkout until the parcel is delivered.
+    hint: |-
+      (1) **Checkout**: address validation (chuẩn hoá, residential flag) → **rate shopping** nhiều carrier/service → khách chọn → lưu **quote** (giá, service, thời hạn).
+      (2) **Fulfillment**: order paid → **re-rate + mua label** (tiền bị trừ ở đây) → lưu label (PDF/ZPL) và tracking number → in, dán kiện.
+      (3) **Bàn giao**: manifest/end-of-day close hoặc đặt pickup → carrier scan lần đầu.
+      (4) **Tracking**: webhook + polling → normalize status → notify khách (shipped, out for delivery, delivered, exception).
+      (5) **Sau giao**: void label không dùng, return label, **reconcile hoá đơn carrier** (DIM adjustment, surcharge).
+      Interviewer chấm việc bạn nhớ các điểm có tiền (label, adjustment, refund) và các điểm dễ lỗi (timeout lúc mua, webhook mất).
+    followUp: At which of these steps does real money move, and which of those steps are not safely retryable?
+    redFlags:
+      - "Describes only 'call the FedEx API and get a tracking number'"
+      - "Does not distinguish a rate quote from the purchased label cost"
+    tags: [lifecycle, fundamentals]
+  - id: shipping-apis-002
+    level: easy
+    type: compare
+    q: What is the difference between integrating a carrier directly (FedEx, UPS, USPS, DHL) and going through an aggregator like EasyPost or Shippo?
+    hint: |-
+      (1) **Direct**: mỗi carrier một API riêng (auth, schema, mã lỗi, mã service, format label khác nhau). Mình tự maintain N adapter, tự lo certification/go-live từng hãng. Đổi lại: không phí per-label, dùng được giá đàm phán và tính năng sâu.
+      (2) **Aggregator**: một API chung (Shipment → Rates → buy → Tracker) cho hàng chục carrier, có sẵn address verification, tracking webhook chuẩn hoá, insurance. Đổi lại: phí per-label hoặc subscription, phụ thuộc uptime và roadmap của vendor, đôi khi thiếu tính năng đặc thù của carrier.
+      (3) Thực tế hay **lai**: aggregator để đi nhanh, sau đó direct cho 1–2 carrier chiếm phần lớn volume. Vì vậy cần **canonical model + adapter** để đổi provider mà không sửa business code.
+    followUp: Your volume grows to 50,000 labels a day, 80% on UPS. What would make you move UPS to a direct integration, and what would you keep on the aggregator?
+    redFlags:
+      - "Thinks an aggregator removes the need to handle carrier failures"
+      - "Cannot name a cost or a lock-in downside"
+    tags: [aggregator, architecture, build-vs-buy]
+  - id: shipping-apis-003
+    level: easy
+    type: concept
+    q: What is dimensional weight, and how does a carrier decide the billable weight of a parcel?
+    hint: |-
+      (1) Carrier tính phí theo **không gian** chiếm trên xe/máy bay, không chỉ theo cân nặng. **DIM weight = L × W × H / divisor**.
+      (2) **Billable weight = max(actual weight, DIM weight)**, thường làm tròn lên lb (hoặc 0.5 kg) gần nhất.
+      (3) Divisor phổ biến: **139** (in³/lb, FedEx/UPS daily rates), **166** (USPS cho kiện lớn hơn 1 ft³), **5000** (cm³/kg, nhiều tuyến quốc tế). Hợp đồng riêng có thể khác (verify).
+      (4) Hệ quả cho hệ thống: phải lưu **kích thước** của kiện, không chỉ cân. Thùng to mà nhẹ (gối, đèn) bị tính rất đắt. Kho khai sai kích thước thì carrier **audit và tính thêm** trên hoá đơn.
+    example: |-
+      ```ts
+      // 20 x 16 x 12 in, actual 5 lb, divisor 139
+      const dim = Math.ceil((20 * 16 * 12) / 139); // 3840 / 139 = 27.6 → 28
+      const billable = Math.max(Math.ceil(5), dim); // 28 lb
+      console.log({ dim, billable }); // { dim: 28, billable: 28 }
+      ```
+    followUp: Your merchants keep getting carrier adjustments on their invoices. Where in your system would you look first, and how would you prevent them?
+    redFlags:
+      - "Uses only actual weight to quote rates"
+      - "Does not store parcel dimensions"
+    tags: [dim-weight, pricing]
+    verify: true
+  - id: shipping-apis-004
+    level: easy
+    type: concept
+    q: What does a shipping label contain, and when would you request ZPL instead of PDF or PNG?
+    hint: |-
+      (1) Label = địa chỉ gửi/nhận, service, **tracking number + barcode** (thường kèm MaxiCode/2D), routing code, cân nặng, ngày gửi. Mua label xong là carrier coi như đã có giao dịch tính tiền.
+      (2) **PDF/PNG**: in bằng máy in văn phòng, phù hợp merchant nhỏ hoặc in qua trình duyệt.
+      (3) **ZPL** (Zebra Programming Language): lệnh gửi thẳng tới **máy in nhiệt** ở kho, in nhanh, sắc nét, không cần render. Phù hợp kho in hàng trăm label một giờ.
+      (4) Kích thước chuẩn là **4×6 in**. Phải lưu file label về storage của mình (S3) ngay, vì URL của carrier/aggregator có thể hết hạn và label cần in lại khi máy kẹt giấy.
+    followUp: The warehouse says reprinting a label sometimes produces a different tracking number. What went wrong in the design?
+    redFlags:
+      - "Re-buys a label to reprint it"
+    tags: [label, zpl]
+  - id: shipping-apis-005
+    level: easy
+    type: concept
+    q: How do the modern FedEx, UPS and USPS APIs authenticate, and what changed compared with their legacy APIs?
+    hint: |-
+      (1) Cả ba chuyển sang REST/JSON + **OAuth 2.0 client credentials**: gửi `client_id` + `client_secret` lên token endpoint → nhận **access token ngắn hạn** (khoảng 1 giờ, verify) → gắn `Authorization: Bearer` cho mỗi call.
+      (2) Legacy: **FedEx SOAP Web Services** (key + password + account + meter), **UPS access key** trong header/XML, **USPS Web Tools** (XML với USERID). Các hãng đã/đang tắt các API này (verify mốc thời gian cụ thể).
+      (3) Aggregator đơn giản hơn: **EasyPost** dùng API key qua Basic auth (key test và key production riêng), **Shippo** dùng header `Authorization: ShippoToken <key>`.
+      (4) Hệ quả thiết kế: **cache token** theo carrier account, refresh trước khi hết hạn, không xin token mới cho mỗi request (bị rate limit và chậm thêm một round-trip).
+    followUp: Where do you store the client secret for each merchant's own UPS account, and who can read it?
+    redFlags:
+      - "Requests a new OAuth token on every API call"
+      - "Hard-codes carrier credentials in the repo or env per merchant"
+    tags: [oauth, auth, fedex, ups, usps]
+    verify: true
+  - id: shipping-apis-006
+    level: easy
+    type: concept
+    q: Why do shipping systems validate addresses, and why does the residential versus commercial flag matter for cost?
+    hint: |-
+      (1) Địa chỉ sai → giao thất bại, trả về người gửi, phí **address correction** (carrier tự sửa và tính phụ phí), khách chờ lâu. Validation chuẩn hoá (viết hoa, viết tắt chuẩn USPS, ZIP+4) và cho biết địa chỉ có giao được không (US: DPV).
+      (2) **Residential flag**: FedEx/UPS tính **residential surcharge** cho địa chỉ nhà ở. Quote ở checkout sai cờ này thì lệch vài đô mỗi kiện, nhân với volume là tiền lớn.
+      (3) Nguồn: USPS Addresses API, UPS Address Validation (chủ yếu US/PR, verify), FedEx Address Validation, hoặc aggregator (EasyPost `verify`, Shippo address validation).
+      (4) Validation là **gợi ý**, không phải sự thật tuyệt đối: nhà mới xây, khu nông thôn, quốc tế thường không có trong dữ liệu.
+    followUp: A customer insists their address is correct but your validator rejects it. What should checkout do?
+    redFlags:
+      - "Blocks checkout whenever the validator does not return an exact match"
+    tags: [address-validation, surcharge]
+    verify: true
+  - id: shipping-apis-007
+    level: easy
+    type: compare
+    q: How do you get tracking updates from a carrier? Compare webhooks and polling.
+    hint: |-
+      (1) **Webhook**: carrier/aggregator gọi về endpoint của mình khi có event. Nhanh, không tốn quota. Nhưng **at-least-once**: có thể trùng, đến sai thứ tự, hoặc mất (endpoint down, vendor lỗi).
+      (2) **Polling**: định kỳ gọi tracking API theo tracking number. Chắc chắn có dữ liệu, nhưng tốn quota, chậm theo chu kỳ, bị rate limit khi nhiều kiện.
+      (3) Direct carrier: nhiều hãng có tracking webhook hoặc push notification nhưng đăng ký phức tạp hơn (verify từng hãng). Aggregator gom về một chuẩn (EasyPost Tracker + webhook `tracker.updated`, Shippo `track_updated`).
+      (4) Production: **webhook là đường chính + poller cho kiện "im lặng"** quá N giờ, và ngừng poll khi đã ở trạng thái cuối (delivered, returned).
+    followUp: How would you decide the polling interval for 2 million active shipments without blowing through the carrier's rate limit?
+    redFlags:
+      - "Assumes webhooks arrive exactly once and in order"
+    tags: [tracking, webhook, polling]
+    verify: true
+  - id: shipping-apis-008
+    level: easy
+    type: concept
+    q: What is a manifest or end-of-day close, and how does it relate to scheduling a pickup?
+    hint: |-
+      (1) **Manifest** = danh sách các kiện đã mua label trong ngày, gửi cho carrier để bàn giao. Ví dụ **USPS SCAN Form** (một barcode đại diện cả lô, nhân viên scan một lần), **FedEx Ground end-of-day close** (verify yêu cầu hiện tại).
+      (2) Lợi ích: kiện có "accepted" scan sớm hơn, tracking có dữ liệu ngay, một số carrier yêu cầu bắt buộc.
+      (3) **Pickup**: đặt lịch carrier tới lấy hàng (ngày, khung giờ, địa chỉ, số kiện). Khác với drop-off ở điểm gửi.
+      (4) Thiết kế: job chạy trước **cutoff time** của từng carrier, chỉ gom label chưa void, và idempotent (chạy lại không tạo manifest trùng).
+    followUp: A label was voided after it was included in today's manifest. What happens, and how should your close job behave?
+    tags: [manifest, pickup, operations]
+    verify: true
+  - id: shipping-apis-009
+    level: easy
+    type: concept
+    q: What extra data does an international shipment need compared with a domestic one?
+    hint: |-
+      (1) **Customs info** cho từng dòng hàng: mô tả rõ ràng, **HS code** (mã hàng hoá quốc tế 6 số, nước nhập có thể thêm số), số lượng, giá trị, **country of origin**, cân nặng.
+      (2) **Commercial invoice** (express) hoặc **CN22/CN23** (bưu chính). Nhiều carrier hỗ trợ gửi chứng từ điện tử (ETD/paperless).
+      (3) **Incoterms**: **DDP** (người gửi trả thuế, khách không bị thu tiền khi nhận) vs **DAP/DDU** (người nhận trả). Sai cái này thì khách từ chối nhận hàng.
+      (4) Các thứ khác: EORI/tax ID cho một số nước (EU, UK), hàng cấm hoặc hạn chế (pin lithium), lý do xuất (sale, gift, return).
+      Giá trị và mô tả sai → hàng bị **giữ ở hải quan**, phạt, hoặc trả về.
+    followUp: Where in your data model do HS codes and country of origin live, and who is responsible for keeping them correct?
+    redFlags:
+      - "Writes 'gift' or a generic description to reduce duties"
+    tags: [international, customs]
+  - id: shipping-apis-010
+    level: medium
+    type: design
+    q: Sketch the canonical data model you would use so that business code never depends on a specific carrier's schema.
+    hint: |-
+      (1) Entity chính: **Address** (đã normalize + residential flag), **Parcel** (weight gram, dims mm, packaging), **Shipment** (from, to, parcels, order_id, tenant_id, status), **RateQuote** (carrier, service, amount minor unit, currency, ETA, expires_at, provider_rate_id), **Label** (tracking_no, label file key, format, cost, idem_key, status), **TrackingEvent** (normalized status, raw code, occurred_at, location, provider_event_id), **CustomsItem**.
+      (2) Mỗi bảng giữ **cả giá trị chuẩn và dữ liệu thô** (`raw jsonb`) để debug và audit, nhưng code nghiệp vụ chỉ đọc giá trị chuẩn.
+      (3) Mã service chuẩn của mình (`ground`, `express_2day`) map sang mã carrier ở adapter. Đây là **anti-corruption layer**.
+      (4) Lưu `provider` (easypost/direct) tách khỏi `carrier` (ups) để sau này đổi đường tích hợp mà không mất lịch sử.
+    example: |-
+      ```ts
+      interface RateQuote {
+        carrier: 'ups' | 'fedex' | 'usps' | 'dhl';
+        provider: 'direct' | 'easypost' | 'shippo';
+        service: 'ground' | 'express_2day' | 'overnight' | 'intl_economy';
+        amount: number;        // minor units, e.g. 1740 = $17.40
+        currency: 'USD' | 'EUR';
+        estDeliveryDays?: number;
+        providerRateId: string; // needed to buy this exact rate later
+        expiresAt: string;      // ISO 8601
+      }
+      ```
+    followUp: Why keep the raw carrier payload at all if business code must not read it?
+    redFlags:
+      - "Passes the FedEx response object straight to the frontend"
+    tags: [data-model, adapter, anti-corruption-layer]
+  - id: shipping-apis-011
+    level: medium
+    type: design
+    q: Checkout must show shipping options from four carriers within a 2-second budget. How do you implement rate shopping?
+    hint: |-
+      (1) Gọi các carrier **song song**, mỗi call có **timeout riêng** (ví dụ 1.5 s) bằng `AbortController`. Dùng `Promise.allSettled`, không dùng `Promise.all`: một carrier lỗi không được làm hỏng cả trang.
+      (2) Trả **kết quả từng phần**: carrier nào kịp thì hiển thị. Nếu không carrier nào kịp → **fallback** (bảng giá tĩnh hoặc flat rate) và gắn cờ để re-rate lúc mua label.
+      (3) **Cache** theo key (origin ZIP, dest ZIP, residential, billable weight bucket, dims bucket, service) với TTL ngắn (phút đến giờ) để khách sửa giỏ hàng không gọi lại.
+      (4) Áp **business rule** sau khi có giá: markup, free shipping threshold, ẩn service quá chậm, sắp xếp theo giá hoặc ETA.
+      (5) Lưu quote đã chọn kèm `expires_at` và `provider_rate_id`; theo dõi latency p95 và tỉ lệ fallback theo carrier.
+    example: |-
+      ```ts
+      const results = await Promise.allSettled(
+        carriers.map((c) => withTimeout(c.getRates(shipment), 1500)),
+      );
+      const rates = results.flatMap((r) => (r.status === 'fulfilled' ? r.value : []));
+      return rates.length ? applyRules(rates) : fallbackTableRates(shipment);
+      ```
+    followUp: The cached rate shown at checkout is $8.20, but at label purchase the carrier returns $9.70. Who absorbs the difference, and how does the system decide?
+    redFlags:
+      - "Calls carriers sequentially"
+      - "Uses Promise.all so one slow carrier blocks checkout"
+    tags: [rate-shopping, checkout, latency, resilience]
+  - id: shipping-apis-012
+    level: medium
+    type: concept
+    q: You want to cache carrier rates. What goes into the cache key, what TTL do you choose, and what are the risks?
+    hint: |-
+      (1) Key phải chứa **mọi thứ làm giá thay đổi**: carrier account (giá đàm phán khác nhau theo tenant), origin + dest postal code và country, residential flag, billable weight (làm tròn theo bậc tính giá), dims, service, ngày gửi nếu có, các tuỳ chọn (signature, insurance).
+      (2) Thiếu `account_id`/`tenant_id` trong key → tenant này thấy giá của tenant khác. Đó là **lỗi rò rỉ dữ liệu**, không chỉ sai giá.
+      (3) TTL ngắn (vài phút đến vài giờ). Carrier đổi giá theo đợt (general rate increase đầu năm, fuel surcharge thay đổi hàng tuần, verify), nên có nút **flush theo carrier**.
+      (4) Cache là **quote**, không phải giá cuối: luôn re-rate hoặc mua theo `provider_rate_id` còn hạn lúc mua label.
+    followUp: How would you prevent a thundering herd of rate requests when a popular product page triggers the same quote thousands of times after a cache flush?
+    redFlags:
+      - "Caches by destination ZIP only"
+    tags: [caching, rates, multi-tenant]
+    verify: true
+  - id: shipping-apis-013
+    level: medium
+    type: design
+    q: Buying a label costs real money and the carrier call is not idempotent. How do you make label purchase safe against timeouts and retries?
+    hint: |-
+      (1) **Ghi trước, gọi sau**: insert `labels(status=PENDING, idem_key)` với `idem_key` xác định từ nghiệp vụ (`order_id + parcel_index`), có **unique constraint**. Request trùng sẽ chạm constraint, không gọi carrier lần hai.
+      (2) Gửi **idempotency key** nếu provider hỗ trợ, hoặc một **reference** do mình tạo (customer reference, shipment reference) để sau này **lookup** được.
+      (3) Timeout = **không biết kết quả** (unknown), không phải thất bại. Xử lý: tra cứu theo reference/shipment id trước khi mua lại. Nếu không tra cứu được → đánh dấu `NEEDS_RECONCILE`, không mua lại tự động.
+      (4) Thành công → update `PURCHASED` + tracking + cost trong một transaction, rồi phát event qua **outbox**.
+      (5) Lưới an toàn cuối: **job reconcile** so label đã tính tiền (từ API/hoá đơn) với DB, void label mồ côi trong thời hạn void.
+    followUp: Your provider does not support idempotency keys and has no search-by-reference endpoint. What is your fallback?
+    redFlags:
+      - "Retries the purchase on timeout with no lookup"
+      - "Generates a new random idempotency key on each retry"
+    tags: [idempotency, label, reliability]
+  - id: shipping-apis-014
+    level: medium
+    type: concept
+    q: How would you manage OAuth access tokens for many carrier accounts across several service instances?
+    hint: |-
+      (1) Cache token theo **(carrier, account/credential id, environment)**, lưu kèm `expires_at`. Refresh khi còn khoảng 5 phút (**proactive refresh**), không đợi đến khi lỗi 401.
+      (2) Nhiều instance: cache dùng chung (Redis) + **single-flight**/lock khi refresh, để 50 request đồng thời không cùng xin 50 token (bị rate limit token endpoint, hoặc token mới vô hiệu hoá token cũ nếu carrier làm vậy, verify).
+      (3) Vẫn xử lý **401**: invalidate token → refresh một lần → retry request đúng một lần. Lỗi tiếp thì báo lỗi credential, đánh dấu account cần merchant kết nối lại.
+      (4) Không log token hay secret. Secret của từng merchant mã hoá (KMS/envelope encryption), chỉ adapter được giải mã.
+    followUp: A merchant rotates their UPS client secret without telling you. What does your system see, and how should it react?
+    redFlags:
+      - "Refreshes the token on every request"
+      - "Retries 401 in an infinite loop"
+    tags: [oauth, token-cache, concurrency]
+    verify: true
+  - id: shipping-apis-015
+    level: medium
+    type: design
+    q: Each carrier has hundreds of tracking event codes. How do you turn them into one status model your product can rely on?
+    hint: |-
+      (1) Định nghĩa **enum chuẩn** nhỏ: `pre_transit, in_transit, out_for_delivery, available_for_pickup, delivered, exception, return_to_sender, cancelled, unknown` (tương tự status chuẩn của EasyPost).
+      (2) Mỗi adapter có **bảng mapping** `(carrier, raw_code) → status`, đặt trong code hoặc config có version. Code lạ map về `unknown`, **log + metric** để bổ sung, không throw.
+      (3) **State machine**: chỉ cho chuyển hợp lệ, xét theo `occurred_at` của event chứ không theo thời điểm nhận. Event cũ đến muộn chỉ được thêm vào lịch sử, không ghi đè status hiện tại.
+      (4) Lưu **toàn bộ event thô** (append-only) và tính status hiện tại từ đó. Khi mapping thay đổi, có thể tính lại.
+    followUp: Product wants a 'delayed' badge. Is that a status or a derived flag, and how would you compute it?
+    redFlags:
+      - "Stores only the latest raw carrier status string"
+    tags: [tracking, state-machine, normalization]
+  - id: shipping-apis-016
+    level: medium
+    type: design
+    q: Design the webhook endpoint that receives tracking updates from EasyPost or Shippo. What does it do, in what order?
+    hint: |-
+      (1) **Verify** request thật: chữ ký HMAC trên **raw body** với secret, so sánh constant-time (EasyPost có HMAC signature header, verify tên header). Nếu provider chỉ hỗ trợ basic auth hoặc secret trong URL thì dùng cách đó + allowlist IP nếu có.
+      (2) **Persist rồi ack**: lưu event vào bảng `webhook_events` với **unique(provider, event_id)** → trả **2xx ngay**. Không gọi API khác, không gửi email trong request.
+      (3) **Xử lý async** bằng worker/queue: dedupe, normalize, cập nhật state machine, phát domain event (notify khách).
+      (4) Trùng event → unique constraint bỏ qua. Lỗi xử lý → retry ở worker, có DLQ, không bắt provider gửi lại.
+      (5) Có **replay**: event đã lưu có thể xử lý lại khi sửa bug mapping.
+    example: |-
+      ```ts
+      app.post('/webhooks/easypost', express.raw({ type: 'application/json' }), async (req, res) => {
+        if (!verifyHmac(req.body, req.header('x-hmac-signature'), secret)) return res.sendStatus(401);
+        const evt = JSON.parse(req.body.toString('utf8'));
+        await db.query(
+          `insert into webhook_events(provider, event_id, payload) values ('easypost', $1, $2)
+           on conflict (provider, event_id) do nothing`, [evt.id, evt]);
+        res.sendStatus(200);           // ack fast, process in a worker
+      });
+      ```
+    followUp: The provider retries a webhook for 3 days if you return non-2xx. What happens if you return 500 because your mapping threw on an unknown status code?
+    redFlags:
+      - "Processes the whole update and sends emails before returning 200"
+      - "Verifies the signature against JSON.stringify(req.body)"
+    tags: [webhook, security, idempotency]
+    verify: true
+  - id: shipping-apis-017
+    level: medium
+    type: gotcha
+    q: What goes wrong when a shipping system mixes units and stores money as floating-point numbers?
+    hint: |-
+      (1) **Đơn vị**: USPS và UPS (US) dùng **lb/oz** và **inch**, DHL và quốc tế thường dùng **kg/cm**. 16 oz = 1 lb, 1 lb = 453.592 g. Gửi `weight: 2` mà không ghi unit → carrier hiểu 2 lb thay vì 2 kg, sai giá hơn 2 lần.
+      (2) Chọn **canonical unit** (gram, mm) trong DB; convert ở adapter; **làm tròn lên** theo quy tắc carrier (lb tiếp theo) chỉ ở bước cuối.
+      (3) **Tiền**: float `0.1 + 0.2 !== 0.3`. Cộng phí và markup, rồi nhân volume là lệch cents, và hoá đơn không khớp. Lưu **integer minor units** + `currency`; parse chuỗi carrier trả về (`"17.40"`) bằng decimal, không bằng `parseFloat` rồi nhân.
+      (4) Đa tiền tệ: rate có thể trả bằng currency của account (CAD, EUR). Không cộng hai currency; convert theo tỉ giá có ghi lại nguồn và thời điểm.
+    followUp: How would you write a test that would have caught the kg-versus-lb bug before production?
+    tags: [units, money, gotcha]
+  - id: shipping-apis-018
+    level: medium
+    type: concept
+    q: Why can the rate shown at checkout, the cost of the purchased label, and the amount on the carrier's invoice all be different?
+    hint: |-
+      (1) **Quote vs label**: quote lấy lúc checkout (cache, cân/đo ước lượng từ sản phẩm); lúc mua label, kho đóng gói thật → cân, thùng khác → giá khác. Fuel surcharge hoặc rate cũng có thể đã đổi.
+      (2) **Label vs invoice**: carrier **đo lại** kiện ở hub (DIM audit), phát hiện residential, address correction, additional handling (thùng quá dài/nặng) → **adjustment** xuất hiện trên hoá đơn vài ngày hoặc vài tuần sau.
+      (3) Xử lý: lưu cả 3 con số (quoted, purchased, invoiced) theo shipment; báo cáo chênh lệch theo merchant/SKU; chính sách ai chịu (merchant, platform, khách); dữ liệu cân/đo SKU tốt hơn; dùng DIM khi quote.
+    followUp: Which of these differences can your system detect in real time, and which only appear in reconciliation?
+    redFlags:
+      - "Assumes the label price is final"
+    tags: [pricing, reconciliation, surcharge]
+  - id: shipping-apis-019
+    level: medium
+    type: concept
+    q: Which carrier API calls are safe to retry automatically, and how do you retry them correctly?
+    hint: |-
+      (1) **An toàn (read)**: get rates, track, validate address, get label lại theo id. Retry với **exponential backoff + jitter**, số lần giới hạn.
+      (2) **Không an toàn (side effect)**: mua label, tạo pickup, tạo manifest, void (thường an toàn khi lặp, nhưng phải xử lý "already voided"). Chỉ retry khi có **idempotency key** hoặc sau khi **lookup** xác nhận chưa thực hiện.
+      (3) Phân loại lỗi: **retryable** = timeout, connection reset, 5xx, **429** (theo `Retry-After` nếu có). **Không retryable** = 400 validation (sai địa chỉ, service không hỗ trợ tuyến), 401/403 (credential), 404.
+      (4) Có **retry budget** và **circuit breaker** theo carrier, để khi carrier sập không nhân lưu lượng gấp 3 và làm nghẽn thread/connection của mình.
+    example: |-
+      ```ts
+      const RETRYABLE = new Set([408, 429, 500, 502, 503, 504]);
+      function shouldRetry(op: 'rate' | 'track' | 'buy', status?: number, err?: Error) {
+        if (op === 'buy') return false;              // buy goes through lookup + idem key instead
+        if (err && (err.name === 'AbortError' || /ECONNRESET|ETIMEDOUT/.test(err.message))) return true;
+        return status !== undefined && RETRYABLE.has(status);
+      }
+      ```
+    followUp: UPS starts returning 429 at 3 pm during peak. What does your system do in the next 10 minutes, step by step?
+    redFlags:
+      - "Retries every error the same way"
+      - "Retries 400 validation errors"
+    tags: [retry, resilience, rate-limit]
+  - id: shipping-apis-020
+    level: medium
+    type: concept
+    q: How do label voids, refunds and return labels work, and what should the system track for each?
+    hint: |-
+      (1) **Void/refund**: label chưa dùng có thể huỷ để lấy lại tiền, nhưng **có thời hạn** và quy trình khác nhau: UPS/FedEx thường void trong ngày hoặc trước khi scan; USPS refund qua yêu cầu và xử lý trong nhiều ngày (verify thời hạn cụ thể). Qua aggregator: `refund` trả trạng thái `submitted → refunded/rejected`.
+      (2) Label đã có scan thì không void được. Refund có thể **bị từ chối**, nên phải lưu trạng thái refund riêng, không coi "đã gửi yêu cầu" là "đã nhận tiền".
+      (3) **Return label**: thường **pay-on-use / scan-based**, chỉ tính tiền khi khách thực sự gửi. Phù hợp để in sẵn trong hộp. Return label trả trước thì tốn tiền ngay cả khi khách không dùng.
+      (4) Job định kỳ: tìm label `PURCHASED` không có scan sau N ngày và order đã huỷ → void tự động trong thời hạn.
+    followUp: An order is cancelled 10 minutes after its label was printed and the parcel is already in the pickup cage. What should the system and the warehouse do?
+    tags: [void, refund, returns]
+    verify: true
+  - id: shipping-apis-021
+    level: medium
+    type: concept
+    q: How do you test a carrier integration when the sandbox behaves differently from production?
+    hint: |-
+      (1) **Unit**: adapter mapping (request build, response parse, unit convert, status mapping) với **fixture JSON** lấy từ response thật (đã mask PII).
+      (2) **Contract/recorded tests**: ghi lại request/response (nock, Polly.js, WireMock) và chạy lại trong CI. Định kỳ chạy **live sandbox test** riêng (nightly) để phát hiện API thay đổi.
+      (3) Biết giới hạn sandbox: tracking giả (EasyPost có tracking number test như `EZ1000000001` → trạng thái giả lập, verify), một số service hoặc tuyến không có, rate khác production, có hãng yêu cầu certification label trước khi bật production.
+      (4) **Go-live**: mua vài label production thật rồi void, kiểm tra in ZPL trên máy kho, bật dần theo tenant (feature flag).
+      (5) Test các nhánh lỗi: timeout, 429, 500, địa chỉ sai, webhook trùng và sai thứ tự.
+    followUp: Your nightly sandbox test starts failing because FedEx renamed a field. How do you stop that from breaking production?
+    redFlags:
+      - "Only tests the happy path against the sandbox"
+    tags: [testing, sandbox, contract-test]
+    verify: true
+  - id: shipping-apis-022
+    level: medium
+    type: concept
+    q: An order ships in three boxes, and one item is backordered. How does that change the shipping model and API calls?
+    hint: |-
+      (1) **Multi-piece shipment (MPS)**: nhiều parcel trong một shipment. Có carrier tạo một master tracking + các child tracking (FedEx MPS), có carrier chỉ cho tạo nhiều shipment rời. Adapter phải che sự khác biệt này.
+      (2) **Partial fulfillment**: order → nhiều **fulfillment/shipment**, mỗi cái có label và tracking riêng. Status order = tổng hợp (`partially_shipped`, `delivered` khi tất cả xong).
+      (3) Rate ở checkout tính cho cả order, nhưng tiền label thực tế là tổng nhiều lần mua → chênh lệch so với quote.
+      (4) Idempotency key theo `order_id + fulfillment_id + parcel_index`, không theo `order_id`, nếu không thì kiện thứ hai bị coi là trùng.
+      (5) Thông báo cho khách theo từng kiện, tránh "đã giao" khi mới giao 1 trên 3.
+    followUp: The customer gets three "delivered" emails and one "your order is complete" email on the same day. How would you design notifications instead?
+    tags: [multi-parcel, fulfillment, data-model]
+    verify: true
+  - id: shipping-apis-023
+    level: medium
+    type: scenario
+    q: Address validation returns a suggestion that differs from what the customer typed. Design the checkout behavior, including PO boxes and international addresses.
+    hint: |-
+      (1) Ba trường hợp: **khớp/đã chuẩn hoá** → dùng bản chuẩn hoá (giữ bản gốc); **có gợi ý** → hiển thị "Ý bạn là…?", khách chọn; **không xác minh được** → cho khách xác nhận giữ nguyên, ghi cờ `unverified`.
+      (2) **PO Box/APO/FPO**: UPS và FedEx thường không giao tới PO Box (một số dịch vụ ngoại lệ, verify), USPS giao được → ẩn service không hợp lệ thay vì báo lỗi lúc mua label.
+      (3) Quốc tế: dữ liệu validation yếu hơn; validate định dạng postal code theo nước, không chặn cứng.
+      (4) Lưu `validated_at`, nguồn validation, residential flag; đổi địa chỉ thì validate và **re-rate** lại.
+      (5) Đo: tỉ lệ khách chấp nhận gợi ý, tỉ lệ giao thất bại theo cờ `unverified`.
+    followUp: How do you avoid adding 600 ms of address validation latency to every checkout page load?
+    redFlags:
+      - "Silently replaces the customer's address with the suggestion"
+    tags: [address-validation, checkout, ux]
+    verify: true
+  - id: shipping-apis-024
+    level: medium
+    type: debug
+    q: This rate-shopping code sometimes makes checkout hang for 30 seconds and sometimes shows no shipping options at all. Find the bugs.
+    hint: |-
+      (1) `Promise.all` **fail-fast**: một carrier reject (ví dụ USPS 500) → cả hàm throw → checkout không có option nào, dù 3 carrier kia OK. Dùng `Promise.allSettled`.
+      (2) Không có **timeout**: `fetch` mặc định chờ tới khi socket timeout (rất lâu). Một carrier treo → cả checkout treo. Dùng `AbortSignal.timeout(ms)`.
+      (3) `getToken()` gọi mỗi lần → thêm một round-trip OAuth cho mỗi carrier, mỗi request, và dễ bị rate limit token endpoint. Cần cache token.
+      (4) `res.json()` không check `res.ok` → lỗi 4xx/5xx bị parse như dữ liệu, `data.rates` undefined → crash ở `flat()`.
+      (5) Không có fallback khi tất cả đều fail.
+    example: |-
+      ```ts
+      async function getAllRates(s: Shipment) {
+        const all = await Promise.all(
+          carriers.map(async (c) => {
+            const token = await c.getToken(); // new OAuth token every call
+            const res = await fetch(c.ratesUrl, {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${token}` },
+              body: JSON.stringify(c.toRequest(s)),
+            });
+            const data = await res.json();
+            return data.rates.map(c.fromRate);
+          }),
+        );
+        return all.flat();
+      }
+      ```
+    followUp: After the fix, p95 is still 1.9 s because one carrier is always slow. What product or architecture change would you propose?
+    tags: [debug, rate-shopping, timeout]
+  - id: shipping-apis-025
+    level: medium
+    type: debug
+    q: Merchants say UPS quotes are sometimes more than twice the real price, and totals are off by a cent. What is wrong with this adapter code?
+    hint: |-
+      (1) `weightKg` được gửi vào field mà UPS hiểu là **LBS** (unit code `LBS`). 2 kg gửi thành 2 lb, hoặc ngược lại khi convert sai chiều. Phải convert `kg → lb` (× 2.20462) và **làm tròn lên** đúng quy tắc.
+      (2) Dims gửi bằng cm nhưng khai unit `IN` → DIM weight bị tính gấp khoảng 16 lần (2.54³), nên giá lên mạnh với thùng lớn.
+      (3) `parseFloat(total) * 1.1` rồi `toFixed(2)` → lỗi làm tròn float và tính markup trên chuỗi. Dùng integer cents: `Math.round(Number(total) * 100)` rồi markup bằng phép nhân số nguyên và quy tắc làm tròn rõ ràng.
+      (4) Thiếu test cho phần convert: đây là chỗ cần **unit test theo bảng** (input kg/cm → output lb/in).
+    example: |-
+      ```ts
+      function toUpsPackage(p: Parcel) {           // Parcel stores grams and millimeters
+        const weightKg = p.weightGrams / 1000;
+        return {
+          PackageWeight: { UnitOfMeasurement: { Code: 'LBS' }, Weight: String(weightKg) },
+          Dimensions: {
+            UnitOfMeasurement: { Code: 'IN' },
+            Length: String(p.lengthMm / 10), Width: String(p.widthMm / 10), Height: String(p.heightMm / 10),
+          },
+        };
+      }
+      const price = (parseFloat(rate.TotalCharges.MonetaryValue) * 1.1).toFixed(2);
+      ```
+    followUp: Where would you put unit conversion so that a new carrier adapter cannot repeat this mistake?
+    tags: [debug, units, money]
+    verify: true
+  - id: shipping-apis-026
+    level: medium
+    type: design
+    q: Every carrier returns errors in a different format. How do you map them into something the UI, the retry logic and support can all use?
+    hint: |-
+      (1) Định nghĩa **canonical error**: `code` (`ADDRESS_INVALID`, `SERVICE_UNAVAILABLE_FOR_ROUTE`, `WEIGHT_LIMIT_EXCEEDED`, `AUTH_FAILED`, `RATE_LIMITED`, `CARRIER_UNAVAILABLE`, `UNKNOWN`), `retryable: boolean`, `userMessage`, `carrier`, `rawCode`, `rawMessage`, `carrierRequestId`.
+      (2) Adapter map lỗi carrier → canonical. Lỗi chưa biết → `UNKNOWN` + log raw (đã mask PII) + metric để bổ sung mapping.
+      (3) UI chỉ hiển thị `userMessage` (không lộ message thô kiểu "Missing or invalid ShipTo/Address/PostalCode"). Retry logic đọc `retryable`. Support đọc raw + request id để mở ticket với carrier.
+      (4) Một response có thể chứa **warning** mà không lỗi (UPS/FedEx trả alerts/notes): lưu lại, không bỏ qua.
+    followUp: A carrier returns HTTP 200 with an error inside the body. How do you make sure your adapter does not treat it as success?
+    tags: [error-handling, adapter, api-design]
+  - id: shipping-apis-027
+    level: hard
+    type: scenario
+    q: Finance reports that 140 orders last week were billed for two labels each. Walk me through how you investigate and fix it.
+    hint: |-
+      (1) **Khoanh vùng**: join label đã tính tiền (API list/hoá đơn) với DB theo order → các cặp label trùng có cùng thời điểm? cùng instance? sau timeout? sau deploy?
+      (2) Giả thuyết thường gặp: **retry khi timeout** tạo request mua mới; **double-click** "Buy label" trên UI; **job chạy lại** sau crash giữa "mua xong" và "ghi DB"; **hai worker** cùng nhận một message (at-least-once queue) mà không có unique constraint.
+      (3) **Cầm máu**: void ngay các label trùng chưa scan (còn trong thời hạn) → lấy lại tiền.
+      (4) **Sửa gốc**: unique `idem_key` (theo nghiệp vụ), trạng thái PENDING trước khi gọi, lookup trước khi mua lại, disable nút, consumer idempotent, và **reconcile hằng ngày** để phát hiện trong vòng 24 h thay vì 1 tuần.
+      (5) Postmortem: metric "labels per parcel > 1" với alert.
+    followUp: Your logs show the duplicates always happen within 200 ms of each other on two different pods. What is the most likely cause?
+    redFlags:
+      - "Only adds a frontend debounce"
+    tags: [scenario, idempotency, reconciliation]
+  - id: shipping-apis-028
+    level: hard
+    type: scenario
+    q: It is Black Friday and the UPS API is returning errors for 40% of requests. What happens to checkout and to the warehouse, and what should happen?
+    hint: |-
+      (1) **Checkout**: timeout ngắn + circuit breaker mở cho UPS → không chờ UPS; hiển thị carrier khác, hoặc **fallback rate** cho UPS (bảng giá/quote cache) kèm cờ re-rate. Đơn hàng vẫn chốt được, đây là ưu tiên số một.
+      (2) **Warehouse**: label job cho UPS đưa vào queue, **retry có backoff + giới hạn concurrency** (không dội UPS thêm). Ưu tiên đơn có cutoff/SLA gấp. Cân nhắc **chuyển carrier** cho đơn express nếu business cho phép (rule rõ ràng, không tự ý).
+      (3) **Bảo vệ hệ thống mình**: bulkhead (pool riêng theo carrier) để UPS chậm không chiếm hết connection hoặc worker của FedEx/USPS.
+      (4) Giao tiếp: status page/banner cho merchant, theo dõi carrier status page, ước lượng backlog.
+      (5) Sau sự cố: drain backlog có kiểm soát, reconcile, review timeout và ngưỡng breaker.
+    followUp: The circuit breaker is open, but some UPS requests would succeed. How do you design half-open probing so you recover quickly without a retry storm?
+    redFlags:
+      - "Retries every failed request immediately"
+      - "Lets checkout wait for the carrier timeout"
+    tags: [scenario, resilience, circuit-breaker, peak]
+  - id: shipping-apis-029
+    level: hard
+    type: scenario
+    q: Support says about 3% of shipments have been stuck in in_transit for over ten days, but customers say they received their parcels. How do you debug it?
+    hint: |-
+      (1) Lấy mẫu kiện bị kẹt, tra trực tiếp carrier → thật sự đã `delivered`? Nếu đúng, lỗi ở pipeline của mình.
+      (2) Giả thuyết: **webhook mất** (endpoint trả 5xx, vendor ngừng retry; secret xoay vòng → verify fail), **mapping thiếu** (code mới của carrier → `unknown` → bỏ qua), **out-of-order** (event `in_transit` cũ đến sau ghi đè `delivered`), **tracker chưa đăng ký** cho kiện tạo bằng đường khác (label mua ngoài hệ thống, đổi carrier).
+      (3) Kiểm tra theo carrier/ngày: nếu 3% tập trung vào một carrier hoặc một ngày → nghiêng về mapping hoặc sự cố webhook.
+      (4) Sửa: replay event đã lưu sau khi sửa mapping; **poller cho kiện im lặng quá 48–72 h**; state machine theo `occurred_at`; alert "% shipments without event in N days" theo carrier.
+    followUp: You find the webhook secret was rotated two weeks ago. How do you recover the missing events and prevent this class of incident?
+    tags: [scenario, tracking, webhook, observability]
+  - id: shipping-apis-030
+    level: hard
+    type: debug
+    q: Customers occasionally see their parcel go from Delivered back to In transit. Here is the event handler. What is wrong?
+    hint: |-
+      (1) Handler **ghi đè status bằng event mới nhận**, không xét `occurred_at`. Event scan cũ (vd. hub scan lúc 08:00) đến sau event delivered (12:00) → status lùi lại.
+      (2) Không có **dedupe**: webhook trùng được xử lý hai lần → hai email "Out for delivery".
+      (3) Read-modify-write không có lock hoặc điều kiện → hai worker xử lý hai event cùng shipment đồng thời, ghi đè nhau (**lost update**).
+      (4) Sửa: append event với unique `(provider, event_id)`; update status bằng **conditional update** (`where last_event_at < $occurred_at` và transition hợp lệ), hoặc `select … for update`, hoặc tính status từ event mới nhất theo `occurred_at`. Gửi notify chỉ khi status thật sự đổi.
+    example: |-
+      ```ts
+      async function onTrackingEvent(evt: NormalizedEvent) {
+        const shipment = await repo.findByTracking(evt.trackingNo);
+        shipment.status = evt.status;           // whatever arrived last wins
+        shipment.lastEventAt = new Date();      // time received, not time scanned
+        await repo.save(shipment);
+        await notifyCustomer(shipment, evt.status);
+      }
+      ```
+    followUp: Write the SQL for an update that only moves the status forward and is safe under concurrent workers.
+    tags: [debug, tracking, concurrency, ordering]
+  - id: shipping-apis-031
+    level: hard
+    type: scenario
+    q: The monthly carrier invoice is 12% higher than the sum of label costs in your database. How do you reconcile it and reduce the gap?
+    hint: |-
+      (1) **Thu dữ liệu**: invoice chi tiết (file EDI/CSV từ carrier, hoặc API/billing report của aggregator), join theo **tracking number** với bảng label.
+      (2) **Phân loại chênh lệch**: DIM/weight adjustment, residential, address correction, additional handling/oversize, label không có trong DB (mua ngoài hệ thống, hoặc label trùng), label đã void mà vẫn bị tính, return label đã dùng.
+      (3) **Hành động**: refund/dispute những dòng sai (void không được ghi nhận, tính trùng); chuyển chi phí cho merchant theo hợp đồng; sửa **nguồn**: dữ liệu cân/đo SKU, packaging rule, quote theo DIM, cờ residential từ address validation.
+      (4) **Hệ thống**: bảng `carrier_charges` (tracking, loại phí, số tiền, nguồn), job reconcile định kỳ, dashboard chênh lệch theo merchant/SKU/carrier, alert khi vượt ngưỡng.
+    followUp: Adjustments arrive up to six weeks after delivery, after you have already charged the merchant. How do you design billing so this is not a support nightmare?
+    redFlags:
+      - "Treats the gap as carrier error and does not look at its own data"
+    tags: [scenario, reconciliation, billing]
+  - id: shipping-apis-032
+    level: hard
+    type: debug
+    q: Under load, the carrier starts rejecting your token requests and some API calls fail with 401. Here is the token cache. What is wrong?
+    hint: |-
+      (1) **Thundering herd khi refresh**: token hết hạn → mọi request đồng thời thấy `!cached` và cùng gọi `fetchToken()` → hàng chục request token cùng lúc → bị rate limit token endpoint.
+      (2) Kiểm tra `expiresAt > Date.now()` sát giờ: token còn 1 giây vẫn được dùng, đến carrier thì đã hết hạn → 401. Cần **buffer** (refresh trước khoảng 60–300 s).
+      (3) Cache key chỉ theo `carrier`, không theo **account**: tenant A và B dùng chung token → gọi API bằng account sai (rò rỉ giá, tính tiền nhầm account). Lỗi nghiêm trọng nhất trong đoạn code.
+      (4) Cache trong memory mỗi pod → N pod là N token. Có thể chấp nhận được, nhưng nên share (Redis) nếu carrier giới hạn số token hoặc số lần xin.
+      (5) Sửa: key `(carrier, accountId, env)`, **single-flight** (giữ promise refresh đang chạy), buffer hết hạn, xử lý 401 bằng invalidate + retry một lần.
+    example: |-
+      ```ts
+      const cache: Record<string, { token: string; expiresAt: number }> = {};
+      export async function getToken(carrier: string, creds: Creds) {
+        const cached = cache[carrier];
+        if (cached && cached.expiresAt > Date.now()) return cached.token;
+        const t = await fetchToken(carrier, creds);   // { access_token, expires_in }
+        cache[carrier] = { token: t.access_token, expiresAt: Date.now() + t.expires_in * 1000 };
+        return t.access_token;
+      }
+      ```
+    followUp: Rewrite getToken with single-flight per account. What happens if the in-flight refresh promise rejects?
+    tags: [debug, oauth, concurrency, multi-tenant]
+  - id: shipping-apis-033
+    level: hard
+    type: design
+    q: A warehouse needs 5,000 labels generated between 2 pm and the 4 pm carrier cutoff. Design the batch label pipeline.
+    hint: |-
+      (1) **Queue** job theo parcel (SQS/BullMQ/Kafka), **concurrency giới hạn theo carrier account** để tôn trọng rate limit (token bucket). 5,000 trong 2 h ≈ 0.7 label/s, nên nút thắt là carrier, không phải mình.
+      (2) Mỗi job idempotent (idem_key theo parcel), trạng thái PENDING/PURCHASED/FAILED/NEEDS_RECONCILE.
+      (3) **Ưu tiên** theo cutoff và service (express trước), fail nhanh lỗi không retry được (địa chỉ sai) → đưa vào **hàng chờ xử lý tay** với lý do rõ ràng.
+      (4) Kết quả: lưu file label lên S3, tạo **batch PDF/ZPL** để in theo nhóm; tiến độ realtime cho kho (bao nhiêu xong, bao nhiêu lỗi).
+      (5) Sau cùng: manifest/end-of-day close chỉ với label thành công; alert nếu đến 3:30 pm còn lỗi tồn đọng.
+    followUp: At 3:40 pm, 600 labels are still failing with a carrier 503. What options do you give the warehouse manager?
+    tags: [batch, queue, rate-limit, operations]
+  - id: shipping-apis-034
+    level: hard
+    type: scenario
+    q: A carrier is retiring the legacy API you depend on (for example USPS Web Tools or FedEx SOAP). Plan the migration to the new REST and OAuth API without disrupting shipping.
+    hint: |-
+      (1) **Inventory**: mọi chỗ gọi API cũ (rate, label, track, address, pickup), mã service và format label đang dùng, field nào map sang field nào ở API mới, khác biệt hành vi (rounding, mã lỗi, service bị bỏ).
+      (2) Viết **adapter mới cùng interface canonical**, chạy **shadow/dual-run** cho read (rate, track, address): gọi cả hai, so sánh kết quả, log khác biệt mà không ảnh hưởng khách.
+      (3) Label (có tiền): test kỹ ở sandbox + một ít label production thật rồi void; kiểm tra in ZPL ở kho; certification nếu carrier yêu cầu.
+      (4) **Rollout dần** bằng feature flag theo tenant/%, theo dõi error rate và chênh lệch giá; rollback bằng flag.
+      (5) Bắt đầu sớm trước deadline; theo dõi changelog/deprecation email của carrier; credential mới (OAuth app) cho từng merchant BYOA → cần UX để merchant kết nối lại.
+    followUp: In shadow mode the new API's rates differ from the old one by 2–3% for some routes. How do you decide whether that is a bug?
+    tags: [migration, deprecation, feature-flag]
+    verify: true
+  - id: shipping-apis-035
+    level: hard
+    type: design
+    q: In a multi-tenant platform, each merchant can connect their own carrier accounts. How do you store credentials, isolate failures and enforce rate limits per tenant?
+    hint: |-
+      (1) **Lưu trữ**: bảng `carrier_accounts(tenant_id, carrier, account_number, credential_ciphertext, status)`; secret mã hoá bằng **envelope encryption** (KMS data key), không trả về API sau khi lưu, audit log khi giải mã. Có thể dùng OAuth "connect" flow của carrier/aggregator thay vì nhận secret thô (verify hỗ trợ).
+      (2) **Isolation**: token cache, circuit breaker, retry budget, rate limiter **key theo account**. Account của tenant A bị 401 thì chỉ A bị ảnh hưởng, A được đánh dấu `needs_reauth` và nhận thông báo.
+      (3) **Noisy neighbor**: tenant lớn chạy batch không được chiếm hết worker → fair queue theo tenant hoặc concurrency cap theo tenant.
+      (4) Mọi query/label/webhook luôn có `tenant_id`; webhook từ aggregator map về tenant qua id mà mình lưu, không tin field tenant trong payload.
+      (5) Platform account (dùng giá của platform) vs BYOA: tách rõ ai trả tiền label.
+    followUp: A webhook arrives for a tracking number that exists under two tenants. How can that happen and how do you route it?
+    redFlags:
+      - "Stores carrier secrets in plaintext columns"
+      - "Uses one global circuit breaker per carrier"
+    tags: [multi-tenant, security, secrets, isolation]
+    verify: true
+  - id: shipping-apis-036
+    level: hard
+    type: design
+    q: Your system supports UPS and FedEx. Product asks to add DHL Express in four weeks. What changes, and what should not change?
+    hint: |-
+      (1) **Không đổi**: business code, canonical model, API của shipping service, UI (chỉ thêm option). Nếu phải sửa các chỗ này thì abstraction đang rò rỉ.
+      (2) **Thêm**: DHL adapter implement interface (`getRates, buyLabel, void, track, validateAddress?`), mapping service code, status code, error code, unit (DHL quốc tế dùng kg/cm), customs (DHL Express chủ yếu quốc tế → bắt buộc customs data).
+      (3) **Capability matrix**: không phải carrier nào cũng hỗ trợ mọi thao tác (void, pickup, address validation, return, paperless). Interface trả `unsupported`, UI/flow đọc capability thay vì `if (carrier === 'dhl')`.
+      (4) Credential, sandbox, go-live checklist, contract test fixture, dashboard theo carrier.
+      (5) Rủi ro thời gian: onboarding account/certification phía carrier thường chậm hơn code.
+    followUp: Would you implement DHL directly or through your existing aggregator for this deadline? Defend the choice.
+    tags: [adapter, extensibility, design]
+    verify: true
+  - id: shipping-apis-037
+    level: hard
+    type: scenario
+    q: International parcels to the UK are being held at customs and some customers refuse delivery because of import charges. What is wrong and how should the system prevent it?
+    hint: |-
+      (1) **Giữ ở hải quan**: thiếu hoặc sai HS code, mô tả chung chung ("goods", "parts"), giá trị khai báo không khớp invoice, thiếu tax ID/EORI hoặc số đăng ký VAT của người bán theo quy định nước nhập (verify quy định UK cụ thể).
+      (2) **Khách từ chối**: gửi **DAP/DDU** nên khách bị thu thuế + phí xử lý khi nhận. Giải pháp: **DDP** (thu thuế lúc checkout, carrier/aggregator tính duties & taxes, verify hỗ trợ) hoặc hiển thị rõ ở checkout.
+      (3) **Hệ thống**: HS code + country of origin là **dữ liệu sản phẩm** bắt buộc (validate trước khi cho bán quốc tế), customs info sinh tự động từ order line, chặn mua label quốc tế khi thiếu dữ liệu, gửi chứng từ điện tử.
+      (4) Theo dõi: tỉ lệ kiện quốc tế `exception` hoặc `return_to_sender` theo nước đến.
+    followUp: Who in the company should own HS code accuracy, and how does engineering support them?
+    tags: [scenario, international, customs, incoterms]
+    verify: true
+  - id: shipping-apis-038
+    level: hard
+    type: debug
+    q: This webhook signature check passes in local tests but rejects most real webhooks in production, and it also has a security bug. Explain both.
+    hint: |-
+      (1) **Ký trên raw body**: provider ký đúng chuỗi byte họ gửi. `express.json()` đã parse, `JSON.stringify(req.body)` tạo lại chuỗi khác (thứ tự key, khoảng trắng, unicode escape) → HMAC khác → reject. Local test pass vì test tự tạo body bằng `JSON.stringify`. Dùng `express.raw()` hoặc `verify` callback để giữ raw buffer.
+      (2) **So sánh `===`** → timing attack (theo lý thuyết). Dùng `crypto.timingSafeEqual` với hai buffer cùng độ dài.
+      (3) Không kiểm tra định dạng header (prefix kiểu `hmac-sha256-hex=`, verify format của provider) và không xử lý header thiếu → crash 500 → provider retry liên tục.
+      (4) Thêm: chống replay nếu provider có timestamp; secret lấy từ env/secret manager, hỗ trợ **hai secret khi xoay vòng**.
+    example: |-
+      ```ts
+      app.use(express.json());
+      app.post('/webhooks/carrier', (req, res) => {
+        const expected = crypto.createHmac('sha256', process.env.WEBHOOK_SECRET!)
+          .update(JSON.stringify(req.body)).digest('hex');
+        if (req.headers['x-hmac-signature'] !== expected) return res.sendStatus(401);
+        handle(req.body);
+        res.sendStatus(200);
+      });
+      ```
+    followUp: How do you rotate the webhook secret without dropping events during the rotation window?
+    redFlags:
+      - "Says HMAC over the parsed object is fine"
+    tags: [debug, webhook, security, hmac]
+    verify: true
+  - id: shipping-apis-039
+    level: senior
+    type: design
+    q: Design the shipping platform for a multi-tenant marketplace doing 100,000 shipments a day across five carriers, covering rates, labels, tracking and billing.
+    hint: |-
+      (1) **Service boundaries**: Rate service (đồng bộ, latency-sensitive, cache), Label service (async qua queue, idempotent, tiền), Tracking service (ingest webhook + poller, event store, state machine), Billing/Reconcile (batch). Chung: carrier adapter layer + credential vault.
+      (2) **Data**: Postgres cho shipment/label (transaction, unique idem), bảng event append-only (partition theo tháng), S3 cho file label, Redis cho rate cache và token. Outbox → Kafka cho domain event (shipped, delivered).
+      (3) **Scale**: 100k/ngày ≈ 1.2 label/s trung bình, peak gấp 5–10 lần lúc cutoff; tracking ≈ 5–10 event/kiện → khoảng 1M event/ngày. Nút thắt là rate limit carrier và burst lúc cutoff → queue + token bucket theo account.
+      (4) **Resilience**: timeout/breaker/bulkhead theo carrier × account, fallback rate, reconcile hằng ngày.
+      (5) **Multi-tenant**: tenant_id khắp nơi, BYOA, fair scheduling, quota.
+      (6) **Observability**: SLO cho rate p95, tỉ lệ label thành công, độ trễ tracking.
+    followUp: Which part of this design would you build first if you only had one engineer for six weeks?
+    tags: [system-design, architecture, scale]
+  - id: shipping-apis-040
+    level: senior
+    type: open
+    q: Your startup uses Shippo today. The CFO asks whether to integrate carriers directly to cut per-label fees. How do you make the decision, and how do you keep the option open either way?
+    hint: |-
+      (1) **Số liệu**: volume theo carrier, phí per-label/subscription của aggregator, giá đàm phán nếu đi direct, chi phí kỹ sư (build + maintain hằng năm, mỗi carrier vài tuần lúc đầu cộng việc theo deprecation), chi phí sự cố.
+      (2) **Ngoài tiền**: tính năng aggregator đang cho miễn phí (tracking chuẩn hoá, address verify, insurance, customs/DDP, dashboard), uptime, support, lock-in dữ liệu (tracking history, label ở đâu).
+      (3) Thường là **hybrid**: direct cho 1–2 carrier chiếm phần lớn volume, giữ aggregator cho long tail và làm fallback.
+      (4) **Giữ quyền chọn**: canonical model + adapter interface ngay từ đầu, lưu `provider` riêng với `carrier`, không để ID của aggregator lan ra ngoài shipping service, feature flag chọn provider theo tenant/carrier.
+      (5) Trình bày cho CFO: break-even volume, rủi ro, kế hoạch rollout và rollback.
+    followUp: Six months after going direct with UPS, the UPS adapter has caused two incidents. How do you evaluate whether the decision was right?
+    tags: [build-vs-buy, judgment, cost]
+  - id: shipping-apis-041
+    level: senior
+    type: design
+    q: Product wants checkout to promise "Arrives by Thursday". How would you build an estimated delivery date you can trust?
+    hint: |-
+      (1) EDD = **thời điểm handover** (xử lý kho + cutoff time của carrier, ngày làm việc, ngày lễ của kho) + **transit time** (carrier trả ETA trong rate/time-in-transit API, hoặc mô hình của mình) + buffer.
+      (2) Transit time từ carrier là **ước lượng lạc quan**. Học từ dữ liệu thật: phân phối thời gian giao theo (carrier, service, origin zone, dest zone, mùa), chọn percentile (p85–p90) cho lời hứa.
+      (3) Cập nhật lời hứa sau khi ship (ETA mới từ tracking), thông báo chủ động khi trễ.
+      (4) Đo **on-time rate** của lời hứa, A/B test giữa conversion và độ chính xác (hứa sớm thì tăng conversion nhưng tăng complaint).
+      (5) Edge: cuối tuần, lễ, peak season, vùng xa (delivery area surcharge thường đi kèm thêm ngày), hàng backorder.
+    followUp: Marketing wants to show p50 dates because they convert better. How do you respond?
+    tags: [edd, data, product]
+  - id: shipping-apis-042
+    level: senior
+    type: design
+    q: What would you measure and alert on for a shipping integration, and what SLOs would you set?
+    hint: |-
+      (1) **Metrics theo carrier × operation × account**: latency p50/p95/p99, error rate theo canonical error code, 429 count, % timeout, % fallback rate ở checkout, trạng thái circuit breaker.
+      (2) **Business metrics**: tỉ lệ label mua thành công, label/parcel > 1 (trùng), kiện không có scan sau 24–48 h, kiện kẹt `in_transit` quá N ngày, % `unknown` status, chênh lệch quote–label–invoice.
+      (3) **SLO** ví dụ: rate API p95 < 1.5 s và 99.5% có ít nhất một rate; 99.9% label thành công trong 5 phút từ khi job vào queue; 99% tracking event được xử lý trong 10 phút từ khi nhận.
+      (4) **Alert** theo burn rate SLO và theo bất thường (webhook về 0 trong 30 phút khi đang giờ cao điểm), không alert từng lỗi đơn lẻ.
+      (5) Log/trace có correlation id, carrier request id, tenant id; mask PII.
+    followUp: Webhook volume from one aggregator drops to zero at 2 am. Is that an incident? How does your alerting tell the difference?
+    tags: [observability, slo, alerting]
+  - id: shipping-apis-043
+    level: senior
+    type: open
+    q: Carrier APIs change, deprecate fields and retire versions every year. How do you keep a set of carrier integrations healthy over time?
+    hint: |-
+      (1) **Ownership** rõ: một nhóm/người owner cho shipping integrations, đăng ký developer newsletter/changelog/deprecation email của từng carrier (email gửi tới alias của team, không phải cá nhân).
+      (2) **Kỹ thuật**: adapter cô lập, contract test với fixture, **nightly live sandbox test**, alert khi response có field lạ hoặc warning deprecation, pin version API khi carrier cho phép.
+      (3) **Inventory**: bảng các API version đang dùng + ngày hết hạn đã biết + credential/OAuth app, review hằng quý.
+      (4) **Quy trình**: migration làm sớm, shadow mode, feature flag, runbook sự cố cho từng carrier.
+      (5) Cân nhắc aggregator cho carrier ít volume để chuyển gánh nặng maintenance.
+    followUp: Tell me how you would convince your manager to spend a sprint on a migration whose deadline is nine months away.
+    tags: [maintenance, deprecation, ownership]
+  - id: shipping-apis-044
+    level: cv
+    type: behavioral
+    q: Your CV says you built Checkout and Address Management for a multi-tenant e-commerce platform. How did shipping options and addresses flow through that checkout?
+    hint: |-
+      (1) Trả lời **đúng phần mình thật sự làm**: lưu và chọn địa chỉ (address book, default, validation ở mức nào), cách checkout lấy phí ship (realtime carrier, aggregator, bảng giá của retailer, hay flat rate), và tenant-scoping của địa chỉ/đơn hàng.
+      (2) Nối sang JD: chỉ ra những chỗ đã chạm tới integration (gọi API bên ngoài, timeout/fallback, normalize dữ liệu, chống double-submit ở checkout). Đó là cùng loại vấn đề như rate shopping và mua label.
+      (3) Nếu chưa gọi trực tiếp FedEx/UPS: nói thẳng, rồi mô tả bạn **sẽ** thiết kế thế nào (adapter, idempotency, webhook) dựa trên kinh nghiệm thật, đừng bịa.
+      (4) Số liệu nên chuẩn bị: số tenant, volume order/ngày, latency checkout, sự cố từng gặp.
+    followUp: What happened in your checkout when the external service you depended on was slow? Show me the timeout and fallback code you wrote.
+    redFlags:
+      - "Claims carrier integrations they did not build and collapses under a follow-up"
+    tags: [cv, checkout, address]
+  - id: shipping-apis-045
+    level: cv
+    type: behavioral
+    q: You built a Data Enrichment Service that syncs product data from external providers. Which lessons from it apply directly to integrating shipping carriers?
+    hint: |-
+      (1) Map từng bài học sang shipping: **normalize** dữ liệu nhiều provider về canonical model ↔ normalize rate, status, error của carrier; **rate limit + retry/backoff** ↔ carrier 429; **idempotent upsert** ↔ webhook dedupe và mua label idempotent; **giữ raw payload** để debug ↔ raw carrier response.
+      (2) Nêu một sự cố thật (provider đổi schema, gửi dữ liệu trùng, chậm) và cách bạn phát hiện (metric, alert) rồi xử lý.
+      (3) Điểm khác cần thừa nhận: shipping có **side effect tốn tiền** (label) và cần độ trễ thấp ở checkout, khác với sync batch.
+    followUp: How did you detect that a provider silently changed its data format, and how quickly?
+    tags: [cv, integration, normalization]
+  - id: shipping-apis-046
+    level: cv
+    type: behavioral
+    q: Tell me about a time a third-party API failed or misbehaved in production. What did you do during the incident and after it?
+    hint: |-
+      STAR:
+      (1) **S/T**: API nào, ảnh hưởng gì (đơn không đặt được, dữ liệu sai), quy mô (bao nhiêu user/tenant, bao lâu).
+      (2) **A trong sự cố**: phát hiện bằng gì, cầm máu (fallback, tắt tính năng bằng flag, tăng timeout hay giảm timeout và vì sao), giao tiếp với vendor và stakeholder.
+      (3) **A sau sự cố**: timeout, circuit breaker, retry đúng loại, idempotency, alert, runbook, contract test.
+      (4) **R**: số liệu trước/sau (error rate, MTTR, số ticket support).
+      (5) **Reflection**: bạn sẽ làm gì khác ngay từ đầu.
+    followUp: What would you have done differently if that third-party call had moved money?
+    tags: [cv, behavioral, incident]
+  - id: shipping-apis-047
+    level: cv
+    type: behavioral
+    q: The job requires proven experience with FedEx, UPS, USPS, DHL, EasyPost or Shippo. Which of these have you integrated, and how deep did you go?
+    hint: |-
+      (1) **Trung thực, cụ thể**: liệt kê đúng những gì đã làm (carrier nào, rate/label/tracking/webhook/address, direct hay qua aggregator, môi trường production hay chỉ sandbox). Không phóng đại; interviewer sẽ hỏi chi tiết như format label, OAuth, void window.
+      (2) Nếu kinh nghiệm là **gián tiếp**: kể các integration bên thứ ba thật (payment, OAuth, data provider) có cùng vấn đề, rồi chứng minh hiểu domain: billable weight, idempotency khi mua label, normalize tracking, webhook dedupe, deprecation của legacy API.
+      (3) Đưa ra **kế hoạch 30 ngày** cụ thể: đọc code adapter hiện có, chạy sandbox, viết contract test, nắm dashboard và quy trình reconcile.
+      (4) Chuẩn bị một ví dụ nhỏ tự làm (ví dụ project mẫu với EasyPost/Shippo test key: tạo shipment, mua label test, nhận webhook) để nói bằng trải nghiệm thật.
+    followUp: Walk me through the exact API calls to buy a test label with EasyPost or Shippo, and what you store from each response.
+    redFlags:
+      - "Lists every carrier from the JD without being able to describe one concretely"
+    tags: [cv, behavioral, positioning]
